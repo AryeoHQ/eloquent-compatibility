@@ -7,6 +7,10 @@ namespace Support\Database\Eloquent\Compatibility;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Tests\Fixtures\Support\Workbench\Tables;
+use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
 #[CoversClass(Provider::class)]
@@ -30,5 +34,24 @@ class ProviderTest extends TestCase
         $server = intdiv((int) $connection->scalar('show server_version_num'), 10000);
 
         $this->assertSame($selected, $server);
+    }
+
+    #[Test]
+    public function it_shares_one_set_of_compatibility_maps_and_one_event_bridge_across_the_application(): void
+    {
+        $this->assertSame(resolve(CompatibilityMaps::class), resolve(CompatibilityMaps::class));
+        $this->assertSame(resolve(EventBridge::class), resolve(EventBridge::class));
+    }
+
+    #[Test]
+    public function it_registers_the_divergence_check(): void
+    {
+        Tables::create();
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap);
+
+        $this->artisan('compatibility:check', ['--map' => ['widgets']])
+            ->expectsOutputToContain('No divergence in 1 compatibility map.')
+            ->assertSuccessful();
     }
 }

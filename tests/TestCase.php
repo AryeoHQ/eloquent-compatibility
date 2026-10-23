@@ -40,5 +40,6 @@ abstract class TestCase extends Testbench\TestCase
         }
 
         $app['config']->set('database.default', $connection);
+        $app['config']->set('cache.default', 'array');
     }
 }

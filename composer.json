@@ -30,6 +30,7 @@
     },
     "require": {
         "php": "^8.4",
+        "ext-pdo": "*",
         "laravel/framework": "12.x || ^13"
     },
     "require-dev": {
