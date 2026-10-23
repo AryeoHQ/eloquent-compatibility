@@ -1,0 +1,16 @@
+.vscode/
+.DS_Store
+.env.devbox
+.env.testing
+.envrc
+.idea/
+.phpunit.cache
+devbox.json
+devbox.lock
+devbox.d/
+tests/coverage
+vendor/
+workbench/*
+!workbench/app
+workbench/app/*
+!workbench/app/.gitkeep

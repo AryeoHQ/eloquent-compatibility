@@ -1,0 +1,45 @@
+services:
+  php:
+    build:
+      dockerfile_inline: |
+        FROM composer:2
+        RUN install-php-extensions pdo_pgsql
+    working_dir: /app
+    volumes:
+      - .:/app
+      - composer-cache:/tmp/composer
+    environment:
+      COMPOSER_HOME: /tmp/composer
+      DB_CONNECTION: ${DB_CONNECTION:-pgsql}
+      DB_HOST: ${DB_HOST:-postgres16}
+    depends_on:
+      postgres14:
+        condition: service_healthy
+      postgres16:
+        condition: service_healthy
+      postgres18:
+        condition: service_healthy
+
+  postgres14:
+    image: postgres:14
+    environment: &postgres-environment
+      POSTGRES_DB: testing
+      POSTGRES_PASSWORD: secret
+    healthcheck: &postgres-healthcheck
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testing"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres16:
+    image: postgres:16
+    environment: *postgres-environment
+    healthcheck: *postgres-healthcheck
+
+  postgres18:
+    image: postgres:18
+    environment: *postgres-environment
+    healthcheck: *postgres-healthcheck
+
+volumes:
+  composer-cache:

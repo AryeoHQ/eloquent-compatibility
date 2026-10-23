@@ -1,0 +1,3 @@
+env:
+  - QUEUE_CONNECTION=sync
+  - DB_CONNECTION=pgsql

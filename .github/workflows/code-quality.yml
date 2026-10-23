@@ -1,0 +1,149 @@
+name: Code Quality
+
+# Jobs run on the VPC CodeBuild runner, which can reach Artifactory, and run PHP in
+# Docker through ./.github/actions/php, because the runner has no PHP of its own.
+
+on:
+  push:
+
+concurrency:
+  cancel-in-progress: true
+  group: code-quality-${{ github.ref }}
+
+jobs:
+  code-style:
+    runs-on: codebuild-linux-amd64-vpc-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: ./.github/actions/php
+
+      - name: Install Composer dependencies
+        run: php-ci composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Check code style
+        run: php-ci ./vendor/bin/testbench tooling:pint --test
+
+  static-analysis:
+    runs-on: codebuild-linux-amd64-vpc-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: ./.github/actions/php
+
+      - name: Install Composer dependencies
+        run: php-ci composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare Testbench cache dir
+        run: mkdir -p ./vendor/orchestra/testbench-core/laravel/bootstrap/cache
+
+      - name: Run static analysis on application
+        run: php-ci ./vendor/bin/testbench tooling:phpstan --memory-limit=4G --error-format=github
+
+  dependency-analysis:
+    runs-on: codebuild-linux-amd64-vpc-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: ./.github/actions/php
+
+      - name: Install Composer dependencies
+        run: php-ci composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Check dependencies
+        run: php-ci ./vendor/bin/composer-dependency-analyser
+
+  tests:
+    runs-on: codebuild-linux-amd64-vpc-${{ github.run_id }}-${{ github.run_attempt }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest]
+        php: [8.4]
+        laravel: [12.*, 13.*]
+        postgres: [14, 16, 18]
+        include:
+          - laravel: 12.*
+            testbench: 10.*
+          - laravel: 13.*
+            testbench: 11.*
+
+    name: P${{ matrix.php }} - L${{ matrix.laravel }} - PostgreSQL ${{ matrix.postgres }} - ${{ matrix.os }}
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: ./.github/actions/php
+        with:
+          php_version: ${{ matrix.php }}
+          coverage: pcov
+
+      - name: Start PostgreSQL ${{ matrix.postgres }}
+        env:
+          POSTGRES_VERSION: ${{ matrix.postgres }}
+        run: |
+          docker network create php-ci-postgres
+          docker run --detach --name "postgres$POSTGRES_VERSION" --network php-ci-postgres \
+            -e POSTGRES_DB=testing -e POSTGRES_PASSWORD=secret \
+            --health-cmd "pg_isready -U postgres -d testing" \
+            --health-interval 2s --health-timeout 3s --health-retries 30 \
+            "postgres:$POSTGRES_VERSION"
+          for attempt in $(seq 60); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' "postgres$POSTGRES_VERSION")" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs "postgres$POSTGRES_VERSION"
+          echo "::error::PostgreSQL $POSTGRES_VERSION did not become healthy"
+          exit 1
+
+      - name: Join php-ci to the PostgreSQL network
+        env:
+          POSTGRES_VERSION: ${{ matrix.postgres }}
+        run: |
+          wrapper="$RUNNER_TEMP/php-ci/bin/php-ci"
+          sed -i "s|exec docker run --rm |exec docker run --rm --network php-ci-postgres -e DB_HOST=postgres$POSTGRES_VERSION |" "$wrapper"
+          grep -q -- "--network php-ci-postgres" "$wrapper" || { echo "::error::$wrapper no longer starts with 'exec docker run --rm'"; exit 1; }
+
+      - name: Install Laravel ${{ matrix.laravel }} and Testbench ${{ matrix.testbench }}
+        run: |
+          php-ci composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          php-ci composer update --prefer-dist --no-interaction --no-progress
+
+      - name: List installed Composer dependencies
+        run: php-ci composer show -D
+
+      - name: Run tests
+        run: php-ci ./vendor/bin/testbench package:test --parallel --coverage-cobertura coverage.xml
+
+      - name: Code Coverage Report
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: coverage.xml
+          badge: true
+          fail_below_min: true
+          format: markdown
+          hide_branch_rate: false
+          hide_complexity: false
+          indicators: true
+          output: both
+          thresholds: '75 90'
+
+      - name: Add Coverage PR Comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request'
+        with:
+          recreate: true
+          path: code-coverage-results.md

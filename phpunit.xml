@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/12.4/phpunit.xsd"
+  bootstrap="vendor/autoload.php" colors="true" cacheDirectory=".phpunit.cache">
+  <testsuites>
+    <testsuite name="All">
+      <directory suffix="Test.php">./src</directory>
+    </testsuite>
+  </testsuites>
+  <source>
+    <include>
+      <directory suffix=".php">./src</directory>
+    </include>
+    <exclude>
+      <directory suffix="Test.php">./src</directory>
+      <directory suffix="TestCases.php">./src</directory>
+    </exclude>
+  </source>
+  <php>
+    <env name="APP_KEY" value="base64:sqZsknu3DcUA1iUynaz3a6Rf4SslS3YoZ8Bal/JP8GQ=" />
+    <env name="BCRYPT_ROUNDS" value="4" />
+    <env name="QUEUE_CONNECTION" value="sync" />
+    <env name="DB_CONNECTION" value="pgsql" />
+    <env name="DB_HOST" value="postgres16" />
+    <env name="DB_PORT" value="5432" />
+    <env name="DB_DATABASE" value="testing" />
+    <env name="DB_USERNAME" value="postgres" />
+    <env name="DB_PASSWORD" value="secret" />
+  </php>
+</phpunit>
