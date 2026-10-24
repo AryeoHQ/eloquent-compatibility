@@ -12,6 +12,7 @@ services:
       COMPOSER_HOME: /tmp/composer
       DB_CONNECTION: ${DB_CONNECTION:-pgsql}
       DB_HOST: ${DB_HOST:-postgres16}
+      POSTGRES_VERSION: ${POSTGRES_VERSION:-16}
     depends_on:
       postgres14:
         condition: service_healthy

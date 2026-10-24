@@ -67,6 +67,10 @@ final readonly class Declaration
             if (preg_match(self::IDENTIFIER, $alias) !== 1 || in_array($alias, ['new', 'old'], true)) {
                 throw InvalidCompatibilityMap::because($name, "alias '{$alias}' must be a lowercase identifier other than new and old");
             }
+
+            if (in_array($alias, ReservedWords::POSTGRESQL, true)) {
+                throw InvalidCompatibilityMap::because($name, "alias '{$alias}' is a reserved PostgreSQL word");
+            }
         }
 
         $attributes = array_map(fn (Attribute $attribute) => $attribute->resolve((string) $previous->alias), $map->attributes());

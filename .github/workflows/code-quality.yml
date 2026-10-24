@@ -114,7 +114,7 @@ jobs:
           POSTGRES_VERSION: ${{ matrix.postgres }}
         run: |
           wrapper="$RUNNER_TEMP/php-ci/bin/php-ci"
-          sed -i "s|exec docker run --rm |exec docker run --rm --network php-ci-postgres -e DB_HOST=postgres$POSTGRES_VERSION |" "$wrapper"
+          sed -i "s|exec docker run --rm |exec docker run --rm --network php-ci-postgres -e DB_CONNECTION=pgsql -e DB_HOST=postgres$POSTGRES_VERSION -e POSTGRES_VERSION=$POSTGRES_VERSION |" "$wrapper"
           grep -q -- "--network php-ci-postgres" "$wrapper" || { echo "::error::$wrapper no longer starts with 'exec docker run --rm'"; exit 1; }
 
       - name: Install Laravel ${{ matrix.laravel }} and Testbench ${{ matrix.testbench }}

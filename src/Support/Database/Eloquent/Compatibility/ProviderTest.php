@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility;
 
+use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -23,14 +24,14 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_connects_to_the_postgresql_major_version_the_host_names(): void
+    public function it_connects_to_the_postgresql_major_version_postgres_version_names(): void
     {
         $connection = DB::connection();
 
         $this->assertSame('pgsql', $connection->getDriverName());
-        $this->assertMatchesRegularExpression('/^postgres\d+$/', $connection->getConfig('host'));
+        $this->assertMatchesRegularExpression('/^\d+$/', (string) Env::get('POSTGRES_VERSION'));
 
-        $selected = (int) substr($connection->getConfig('host'), strlen('postgres'));
+        $selected = (int) Env::get('POSTGRES_VERSION');
         $server = intdiv((int) $connection->scalar('show server_version_num'), 10000);
 
         $this->assertSame($selected, $server);

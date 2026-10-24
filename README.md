@@ -12,6 +12,15 @@ The package supports PostgreSQL 14, 16 and 18, on Laravel 12 and 13.
 A compatibility map declares how the previous model's attributes map onto its current models. One record of the previous model becomes a primary current model and any number of dependent current models.
 
 ```php
+use App\Models\Gadget;
+use App\Models\GadgetPlace;
+use App\Models\Widget;
+use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
+use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
+
 final class WidgetCompatibilityMap implements CompatibilityMap
 {
     public function name(): string
@@ -63,6 +72,28 @@ final class WidgetCompatibilityMap implements CompatibilityMap
 A migration installs the compatibility view and its triggers. A service provider registers an event mirror, a class that implements `Contracts\EventMirror` and names the map, so each side's model events fire for writes through the other:
 
 ```php
+use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
+
+final class WidgetEventMirror implements EventMirror
+{
+    public function compatibilityMap(): CompatibilityMap
+    {
+        return new WidgetCompatibilityMap;
+    }
+
+    public function excludedListeners(): array
+    {
+        return [];
+    }
+}
+```
+
+```php
+use Illuminate\Support\Facades\DB;
+use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+
 (new Installer(DB::connection()))->install(new WidgetCompatibilityMap);
 
 resolve(EventBridge::class)->mirror(new WidgetEventMirror);

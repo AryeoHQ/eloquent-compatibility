@@ -50,6 +50,14 @@ final class DeclarationTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['order'])]
+    #[TestWith(['join'])]
+    public function it_refuses_an_alias_that_is_a_reserved_postgresql_word(string $alias): void
+    {
+        $this->expectDeclarationError("alias '{$alias}' is a reserved PostgreSQL word", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs($alias)->primaryForeignKey('gadget_id')]]);
+    }
+
+    #[Test]
     public function it_refuses_a_dependent_current_model_with_no_primary_foreign_key(): void
     {
         $this->expectDeclarationError("dependent current model 'place' says no primaryForeignKey()", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('place')]]);

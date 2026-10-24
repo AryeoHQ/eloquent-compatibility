@@ -33,11 +33,12 @@ tests:
   extends: .php-tests
   services:
     - name: postgres:$POSTGRES_VERSION
-      alias: postgres$POSTGRES_VERSION
+      alias: postgres
   variables:
     POSTGRES_DB: testing
     POSTGRES_PASSWORD: secret
-    DB_HOST: postgres$POSTGRES_VERSION
+    DB_CONNECTION: pgsql
+    DB_HOST: postgres
   parallel:
     matrix:
       - POSTGRES_VERSION: ["14", "16", "18"]
