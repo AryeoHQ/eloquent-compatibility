@@ -9,6 +9,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -604,9 +605,96 @@ final class InstallerTest extends TestCase
         }
     }
 
+    #[Test]
+    public function it_copies_the_retained_tables_grants_to_the_view_when_it_installs(): void
+    {
+        $reader = $this->role('Compatibility Reader');
+        $editor = $this->role('compatibility_editor');
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('grant select on retained_widgets to '.SqlFragments::id($reader).' with grant option');
+        DB::statement('grant insert, update (sku), select (place_id) on retained_widgets to '.SqlFragments::id($editor));
+        DB::statement('grant select on retained_widgets to public');
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $this->assertSame([
+            'reader selects with grant option' => true,
+            'reader inserts' => false,
+            'editor inserts' => true,
+            'editor updates every column' => false,
+            'editor updates sku' => true,
+            'editor updates status' => false,
+            'public selects' => true,
+        ], [
+            'reader selects with grant option' => $this->viewPrivilege($reader, 'SELECT WITH GRANT OPTION'),
+            'reader inserts' => $this->viewPrivilege($reader, 'INSERT'),
+            'editor inserts' => $this->viewPrivilege($editor, 'INSERT'),
+            'editor updates every column' => $this->viewPrivilege($editor, 'UPDATE'),
+            'editor updates sku' => $this->viewPrivilege($editor, 'UPDATE', 'sku'),
+            'editor updates status' => $this->viewPrivilege($editor, 'UPDATE', 'status'),
+            'public selects' => $this->viewPrivilege('public', 'SELECT'),
+        ]);
+    }
+
+    #[Test]
+    public function it_lets_a_role_granted_a_retained_column_write_that_column_through_the_view(): void
+    {
+        $editor = $this->role('compatibility_editor');
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('grant select, update (sku) on retained_widgets to '.SqlFragments::id($editor));
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $id = $this->widget();
+
+        DB::statement('set role '.SqlFragments::id($editor));
+
+        try {
+            DB::table('widgets')->where('id', $id)->update(['sku' => 'Set by the editor']);
+        } finally {
+            DB::statement('reset role');
+        }
+
+        $this->assertSame('Set by the editor', DB::table('retained_widgets')->value('sku'));
+    }
+
+    #[Test]
+    public function it_leaves_the_views_grants_as_they_are_when_it_recompiles(): void
+    {
+        $reader = $this->role('compatibility_reader');
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('grant select, insert on retained_widgets to '.SqlFragments::id($reader));
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::statement('revoke insert on widgets from '.SqlFragments::id($reader));
+        DB::statement('grant delete on retained_widgets to '.SqlFragments::id($reader));
+
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+
+        $this->assertSame(
+            ['select' => true, 'insert' => false, 'delete' => false],
+            ['select' => $this->viewPrivilege($reader, 'SELECT'), 'insert' => $this->viewPrivilege($reader, 'INSERT'), 'delete' => $this->viewPrivilege($reader, 'DELETE')],
+        );
+    }
+
     private function widget(): int
     {
         return DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'price' => '12.50', 'street' => '1 Main St', 'latitude' => 47.5]);
+    }
+
+    private function role(string $name): string
+    {
+        $role = $name.'_'.Str::lower(Str::random(8));
+        DB::statement('create role '.SqlFragments::id($role));
+        $this->beforeApplicationDestroyed(function () use ($role): void {
+            DB::statement('drop role if exists '.SqlFragments::id($role));
+        });
+
+        return $role;
+    }
+
+    private function viewPrivilege(string $role, string $privilege, null|string $column = null): bool
+    {
+        return $column === null
+            ? DB::scalar('select has_table_privilege(cast(? as name), cast(? as text), cast(? as text))', [$role, 'widgets', $privilege]) === true
+            : DB::scalar('select has_column_privilege(cast(? as name), cast(? as text), cast(? as text), cast(? as text))', [$role, 'widgets', $column, $privilege]) === true;
     }
 
     private function objects(string $catalog, string $column): int
