@@ -43,6 +43,7 @@ final readonly class ResolvedMap
 
         $previous = self::previous($name, $previous);
         $tables = [(string) $previous->alias => new AliasedTable((string) $previous->table, (string) $previous->key)];
+        $aliases = [];
 
         foreach ([$primary, ...$dependents] as $current) {
             $model = self::model($name, $current->model);
@@ -55,6 +56,11 @@ final readonly class ResolvedMap
                 throw InvalidCompatibilityMap::because($name, "alias '{$current->alias}' is used twice");
             }
 
+            if (array_key_exists($model::class, $aliases)) {
+                throw InvalidCompatibilityMap::because($name, "aliases '{$aliases[$model::class]}' and '{$current->alias}' both name current model ".$model::class.'; each current model class has one alias');
+            }
+
+            $aliases[$model::class] = $current->alias;
             $tables[$current->alias] = new AliasedTable($model->getTable(), $model->getKeyName());
         }
 

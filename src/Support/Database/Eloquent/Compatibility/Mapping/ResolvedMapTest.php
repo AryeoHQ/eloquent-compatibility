@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Illuminate\Database\Eloquent\Model;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -11,6 +12,7 @@ use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Compiler;
+use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
@@ -47,6 +49,20 @@ final class ResolvedMapTest extends TestCase
     public function it_refuses_an_alias_used_twice(): void
     {
         $this->expectInvalidMap("alias 'gadget' is used twice", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('gadget')->primaryForeignKey('gadget_id')]]);
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    #[Test]
+    #[TestWith(['gadget', Gadget::class])]
+    #[TestWith(['place', GadgetPlace::class])]
+    public function it_refuses_two_current_models_of_one_class(string $first, string $model): void
+    {
+        $this->expectInvalidMap("aliases '{$first}' and 'twin' both name current model {$model}; each current model class has one alias", ['dependentCurrentModels' => [
+            ...(new WidgetCompatibilityMap)->dependentCurrentModels(),
+            DependentCurrentModel::for($model)->aliasedAs('twin')->primaryForeignKey('gadget_id'),
+        ]]);
     }
 
     #[Test]

@@ -500,6 +500,53 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_installs_recompiles_and_uninstalls_ahead_of_a_later_schema_that_has_the_compatibility_map(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('drop schema if exists "Tenant" cascade');
+        DB::statement('create schema "Tenant"');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists "Tenant" cascade');
+        });
+
+        try {
+            DB::statement('set search_path to "Tenant", '.$searchPath);
+            Tables::create();
+            resolve(Installer::class)->install(new WidgetCompatibilityMap);
+            resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+            $title = DB::table('widgets')->where('id', $this->widget())->sole()->title;
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+            $view = DB::scalar("select to_regclass('\"Tenant\".widgets')");
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        $this->assertSame(['Blue gadget', 1, null], [$title, DB::table('Tenant.retained_widgets')->count(), $view]);
+        $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $this->widget())->sole()->title);
+    }
+
+    #[Test]
+    public function it_uninstalls_nothing_of_a_later_schema_when_the_current_schema_has_no_compatibility_view(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('drop schema if exists "Tenant" cascade');
+        DB::statement('create schema "Tenant"');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists "Tenant" cascade');
+        });
+
+        try {
+            DB::statement('set search_path to "Tenant", '.$searchPath);
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        $this->assertSame('widgets', DB::scalar("select to_regclass('widgets')::text"));
+        $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $this->widget())->sole()->title);
+    }
+
+    #[Test]
     public function it_drops_a_view_default_the_compatibility_map_no_longer_declares(): void
     {
         resolve(Installer::class)->recompile(new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo("'SKU-0'")]));

@@ -17,7 +17,7 @@ final readonly class Installer
     {
         $resolvedMap = ResolvedMap::of($map);
 
-        if ($this->viewExists($resolvedMap->previousModel->view)) {
+        if ($this->relation($resolvedMap->previousModel->view) !== null) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$resolvedMap->previousModel->view} already exists; use recompile() to recompile the compatibility map");
         }
 
@@ -39,7 +39,11 @@ final readonly class Installer
 
         $this->connection->transaction(function () use ($resolvedMap): void {
             $this->dropObjects($resolvedMap);
-            $this->connection->unprepared('DROP VIEW IF EXISTS '.SqlFragments::id($resolvedMap->previousModel->view));
+            $view = $this->relation($resolvedMap->previousModel->view);
+
+            if ($view !== null) {
+                $this->connection->unprepared('DROP VIEW '.$view);
+            }
         });
     }
 
@@ -105,8 +109,10 @@ final readonly class Installer
         }
     }
 
-    private function viewExists(string $view): bool
+    private function relation(string $name): null|string
     {
-        return $this->connection->scalar('select to_regclass(?) is not null', [SqlFragments::id($view)]) === true;
+        $relation = $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?)::text", [SqlFragments::id($name)]);
+
+        return is_string($relation) ? $relation : null;
     }
 }
