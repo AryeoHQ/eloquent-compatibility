@@ -52,12 +52,12 @@ final class MirrorIndex
         return $added;
     }
 
-    public function declaration(string $map): ResolvedMap
+    public function resolvedMap(string $map): ResolvedMap
     {
         return $this->maps[$map]->resolvedMap;
     }
 
-    public function locator(string $map): KeyTranslator
+    public function keyTranslator(string $map): KeyTranslator
     {
         return $this->maps[$map]->keyTranslator;
     }

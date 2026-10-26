@@ -20,8 +20,8 @@ final readonly class AffectedRecords
         $records = [];
 
         foreach ($this->mirrorIndex->forModel($model::class) as $member) {
-            $resolvedMap = $this->mirrorIndex->declaration($member->map);
-            $keyTranslator = $this->mirrorIndex->locator($member->map);
+            $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
+            $keyTranslator = $this->mirrorIndex->keyTranslator($member->map);
             $alias = $member->alias;
             $column = $resolvedMap->key($alias);
 
@@ -75,7 +75,7 @@ final readonly class AffectedRecords
      * @param  array<string, AffectedRecord>  $records
      * @return array<string, RecordSnapshot>
      */
-    public function rows(ConnectionInterface $connection, array $records, null|AffectedRecord $native, bool $lock): array
+    public function snapshots(ConnectionInterface $connection, array $records, null|AffectedRecord $native, bool $lock): array
     {
         if ($lock) {
             $locks = array_values($records);
@@ -111,7 +111,7 @@ final readonly class AffectedRecords
     public function native(Model $model): null|AffectedRecord
     {
         foreach ($this->mirrorIndex->forModel($model::class) as $member) {
-            $resolvedMap = $this->mirrorIndex->declaration($member->map);
+            $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
             $key = $this->key($model, $resolvedMap->key($member->alias));
 
             if ($key === null) {
@@ -119,8 +119,8 @@ final readonly class AffectedRecords
             }
 
             return $member->alias === $resolvedMap->previousModel->alias
-                ? $this->mirrorIndex->locator($member->map)->previousRecord($key)
-                : $this->mirrorIndex->locator($member->map)->currentRecord($member->alias, $key);
+                ? $this->mirrorIndex->keyTranslator($member->map)->previousRecord($key)
+                : $this->mirrorIndex->keyTranslator($member->map)->currentRecord($member->alias, $key);
         }
 
         return null;
@@ -142,8 +142,8 @@ final readonly class AffectedRecords
                     continue;
                 }
 
-                $resolvedMap = $this->mirrorIndex->declaration($member->map);
-                $keyTranslator = $this->mirrorIndex->locator($member->map);
+                $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
+                $keyTranslator = $this->mirrorIndex->keyTranslator($member->map);
                 $dependent = $resolvedMap->dependent($member->alias);
                 $primaryKey = $dependent === null
                     ? $record->key

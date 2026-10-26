@@ -135,7 +135,7 @@ final readonly class ResolvedMap
     /**
      * @return list<Assignment>
      */
-    public function writesTo(string $alias): array
+    public function assignmentsTo(string $alias): array
     {
         $assignments = [];
 

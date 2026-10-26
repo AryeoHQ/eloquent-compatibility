@@ -11,7 +11,7 @@ final readonly class ParsedWrite
         public string $relation,
     ) {}
 
-    public static function write(string $sql): null|self
+    public static function of(string $sql): null|self
     {
         if (preg_match('/^\s*(insert\s+into|update|delete\s+from)\s+(?:"?[a-z_][a-z0-9_]*"?\.)?"?([a-z_][a-z0-9_]*)"?/i', $sql, $matches) !== 1) {
             return null;

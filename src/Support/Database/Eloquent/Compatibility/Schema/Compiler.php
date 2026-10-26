@@ -145,7 +145,7 @@ final class Compiler
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
 
-            if ($resolvedMap->writesTo($alias) === [] && $dependent->fillWhenCreatedFromPrevious === []) {
+            if ($resolvedMap->assignmentsTo($alias) === [] && $dependent->fillWhenCreatedFromPrevious === []) {
                 continue;
             }
 
@@ -326,7 +326,7 @@ final class Compiler
 
     private function updateTable(ResolvedMap $resolvedMap, string $alias, string $key, bool $mustExist): string
     {
-        $assignments = $resolvedMap->writesTo($alias);
+        $assignments = $resolvedMap->assignmentsTo($alias);
 
         if ($assignments === []) {
             return '';
@@ -346,7 +346,7 @@ final class Compiler
     private function updateDependent(ResolvedMap $resolvedMap, DependentCurrentModel $dependent, string $primaryKey): string
     {
         $alias = (string) $dependent->alias;
-        $assignments = $resolvedMap->writesTo($alias);
+        $assignments = $resolvedMap->assignmentsTo($alias);
 
         if ($assignments === []) {
             return '';
@@ -443,7 +443,7 @@ final class Compiler
     {
         $values = [];
 
-        foreach ($resolvedMap->writesTo($alias) as $assignment) {
+        foreach ($resolvedMap->assignmentsTo($alias) as $assignment) {
             if (! $mappedOnly || ! $assignment->attribute->retained) {
                 $values[$assignment->targetColumn->column] = $this->value($resolvedMap, $alias, $assignment->targetColumn);
             }
@@ -474,7 +474,7 @@ final class Compiler
             return $dependent->createdWhen;
         }
 
-        $columns = $this->attributeColumns($resolvedMap->writesTo((string) $dependent->alias));
+        $columns = $this->attributeColumns($resolvedMap->assignmentsTo((string) $dependent->alias));
 
         return $columns === []
             ? 'true'

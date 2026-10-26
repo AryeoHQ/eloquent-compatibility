@@ -22,7 +22,7 @@ class Provider extends ServiceProvider
     {
         $release = function (): void {
             if ($this->app->resolved(EventBridge::class)) {
-                $this->app->make(EventBridge::class)->releaseAbandoned();
+                $this->app->make(EventBridge::class)->releaseFailed();
             }
         };
 

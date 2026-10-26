@@ -40,13 +40,13 @@ final class ResolvedMapTest extends TestCase
     #[TestWith(['a_name_much_longer_than_24'])]
     public function it_refuses_a_name_that_cannot_prefix_database_objects(string $name): void
     {
-        $this->expectDeclarationError('its name must be at most 24 lowercase letters, digits and single underscores', ['name' => $name]);
+        $this->expectInvalidMap('its name must be at most 24 lowercase letters, digits and single underscores', ['name' => $name]);
     }
 
     #[Test]
     public function it_refuses_an_alias_used_twice(): void
     {
-        $this->expectDeclarationError("alias 'gadget' is used twice", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('gadget')->primaryForeignKey('gadget_id')]]);
+        $this->expectInvalidMap("alias 'gadget' is used twice", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('gadget')->primaryForeignKey('gadget_id')]]);
     }
 
     #[Test]
@@ -54,13 +54,13 @@ final class ResolvedMapTest extends TestCase
     #[TestWith(['join'])]
     public function it_refuses_an_alias_that_is_a_reserved_postgresql_word(string $alias): void
     {
-        $this->expectDeclarationError("alias '{$alias}' is a reserved PostgreSQL word", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs($alias)->primaryForeignKey('gadget_id')]]);
+        $this->expectInvalidMap("alias '{$alias}' is a reserved PostgreSQL word", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs($alias)->primaryForeignKey('gadget_id')]]);
     }
 
     #[Test]
     public function it_refuses_a_dependent_current_model_with_no_primary_foreign_key(): void
     {
-        $this->expectDeclarationError("dependent current model 'place' says no primaryForeignKey()", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('place')]]);
+        $this->expectInvalidMap("dependent current model 'place' says no primaryForeignKey()", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('place')]]);
     }
 
     #[Test]
@@ -78,7 +78,7 @@ final class ResolvedMapTest extends TestCase
         ];
         unset($calls[$skipped]);
 
-        $this->expectDeclarationError("the previous model says no {$skipped}()", [
+        $this->expectInvalidMap("the previous model says no {$skipped}()", [
             'previousModel' => array_reduce($calls, fn (PreviousModel $previous, callable $call) => $call($previous), PreviousModel::servedAsView('widgets')),
         ]);
     }
@@ -100,19 +100,19 @@ final class ResolvedMapTest extends TestCase
     #[Test]
     public function it_refuses_a_mapped_attribute_that_names_no_owner(): void
     {
-        $this->expectDeclarationError("mapped attribute 'title' says neither storedAs() nor readAs()", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')]]);
+        $this->expectInvalidMap("mapped attribute 'title' says neither storedAs() nor readAs()", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')]]);
     }
 
     #[Test]
     public function it_refuses_a_mapped_attribute_whose_writes_through_the_previous_model_would_be_lost(): void
     {
-        $this->expectDeclarationError("attribute 'title' declares no write and is not read-only", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->readAs('gadget', 'gadget.name')]]);
+        $this->expectInvalidMap("attribute 'title' declares no write and is not read-only", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->readAs('gadget', 'gadget.name')]]);
     }
 
     #[Test]
     public function it_refuses_two_attributes_that_own_one_stored_column(): void
     {
-        $this->expectDeclarationError("attributes 'title' and 'label' both write gadget.name", ['attributes' => [
+        $this->expectInvalidMap("attributes 'title' and 'label' both write gadget.name", ['attributes' => [
             Attribute::retained('id'),
             Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name'),
             Attribute::mapped('label')->asType('text')->storedAs('gadget', 'name'),
@@ -122,25 +122,25 @@ final class ResolvedMapTest extends TestCase
     #[Test]
     public function it_refuses_a_write_to_an_unknown_alias(): void
     {
-        $this->expectDeclarationError("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', 'NEW.title')]]);
+        $this->expectInvalidMap("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', 'NEW.title')]]);
     }
 
     #[Test]
     public function it_refuses_a_map_whose_previous_model_key_is_not_an_attribute(): void
     {
-        $this->expectDeclarationError("the previous model's key 'id' is not an attribute", ['attributes' => [Attribute::retained('sku')]]);
+        $this->expectInvalidMap("the previous model's key 'id' is not an attribute", ['attributes' => [Attribute::retained('sku')]]);
     }
 
     #[Test]
     public function it_refuses_a_map_whose_primary_foreign_key_is_not_an_attribute(): void
     {
-        $this->expectDeclarationError("the primary foreign key 'gadget_id' is not an attribute", ['attributes' => [Attribute::retained('id')]]);
+        $this->expectInvalidMap("the primary foreign key 'gadget_id' is not an attribute", ['attributes' => [Attribute::retained('id')]]);
     }
 
     #[Test]
     public function it_refuses_a_refused_state_that_names_no_state_to_check(): void
     {
-        $this->expectDeclarationError("refused state 'never' says neither checkedOn() nor checkedOnPreviousUpdate()", ['unrepresentableStates' => [UnrepresentableState::refuse('never', 'a state', 'because', 'instead')]]);
+        $this->expectInvalidMap("refused state 'never' says neither checkedOn() nor checkedOnPreviousUpdate()", ['unrepresentableStates' => [UnrepresentableState::refuse('never', 'a state', 'because', 'instead')]]);
     }
 
     /**
@@ -169,7 +169,7 @@ final class ResolvedMapTest extends TestCase
     /**
      * @param  array<string, mixed>  $overrides
      */
-    private function expectDeclarationError(string $message, array $overrides): void
+    private function expectInvalidMap(string $message, array $overrides): void
     {
         $this->assertThrows(fn () => ResolvedMap::of($this->compatibilityMap($overrides)), InvalidCompatibilityMap::class, $message);
     }

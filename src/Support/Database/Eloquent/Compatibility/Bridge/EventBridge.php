@@ -96,7 +96,7 @@ final class EventBridge
             return;
         }
 
-        $parsedWrite = ParsedWrite::write($query->sql);
+        $parsedWrite = ParsedWrite::of($query->sql);
 
         if ($parsedWrite === null) {
             return;
@@ -113,13 +113,13 @@ final class EventBridge
         $this->guard($parsedWrite);
     }
 
-    public function releaseAbandoned(): void
+    public function releaseFailed(): void
     {
         foreach ($this->pendingWrites as $pendingWrites) {
             $pendingWrite = $pendingWrites[0] ?? null;
 
             if ($pendingWrite !== null) {
-                $this->settleAbandoned($pendingWrite->model->getConnection());
+                $this->finishFailed($pendingWrite->model->getConnection());
             }
         }
     }
@@ -137,17 +137,17 @@ final class EventBridge
                 $target = $payload[0] ?? null;
 
                 if ($fired === $name && $target instanceof Model && $operation !== null) {
-                    $this->arm($target, $operation);
+                    $this->begin($target, $operation);
                 }
             });
         }
 
         foreach (ModelEvent::settling() as $event) {
-            $this->events->listen($event->for($model), $this->settle(...));
+            $this->events->listen($event->for($model), $this->finish(...));
         }
     }
 
-    private function arm(Model $model, Operation $operation): void
+    private function begin(Model $model, Operation $operation): void
     {
         if ($this->disabled > 0 || $this->eventReplayer->isReplaying($model)) {
             return;
@@ -155,7 +155,7 @@ final class EventBridge
 
         $connection = $model->getConnection();
         $this->watch($connection);
-        $this->settleAbandoned($connection);
+        $this->finishFailed($connection);
         $level = $connection->transactionLevel();
         $pendingWrite = new PendingMirroredWrite($model, $operation, $level, $level > 0 ? 'compatibility_'.++$this->savepoints : null);
 
@@ -168,7 +168,7 @@ final class EventBridge
         });
 
         try {
-            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->rows(
+            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->snapshots(
                 $connection,
                 $this->affectedRecords->of($connection, $model, $operation, false),
                 $this->affectedRecords->native($model),
@@ -207,7 +207,7 @@ final class EventBridge
                 return;
             }
 
-            $parsedWrite = ParsedWrite::write($query);
+            $parsedWrite = ParsedWrite::of($query);
             $pendingWrite->started = $parsedWrite !== null && $pendingWrite->expects($parsedWrite);
         });
     }
@@ -223,7 +223,7 @@ final class EventBridge
                 $entries[$id] ??= new RecordSnapshot($record, null);
             }
 
-            $after = $this->internally(fn () => $this->affectedRecords->rows(
+            $after = $this->internally(fn () => $this->affectedRecords->snapshots(
                 $connection,
                 array_map(fn (RecordSnapshot $entry) => $entry->record, $entries),
                 null,
@@ -250,7 +250,7 @@ final class EventBridge
         $this->close($connection, $pendingWrite, true);
     }
 
-    private function settle(Model $model): void
+    private function finish(Model $model): void
     {
         $connection = $model->getConnection();
         $pendingWrite = $this->top($connection->getName());
@@ -260,7 +260,7 @@ final class EventBridge
         }
     }
 
-    private function settleAbandoned(Connection $connection): void
+    private function finishFailed(Connection $connection): void
     {
         while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending) {
             if ($pendingWrite->savepoint !== null) {
