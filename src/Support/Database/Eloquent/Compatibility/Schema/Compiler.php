@@ -104,10 +104,8 @@ final class Compiler
                 $default = $this->columnCatalog->of($resolvedMap->table($attribute->alias))[$attribute->storedAs]->default ?? null;
             }
 
-            if ($default !== null) {
-                $statements[] = 'ALTER VIEW '.SqlFragments::id($resolvedMap->previousModel->view)
-                    .' ALTER COLUMN '.SqlFragments::id($attribute->column).' SET DEFAULT '.$default;
-            }
+            $statements[] = 'ALTER VIEW '.SqlFragments::id($resolvedMap->previousModel->view)
+                .' ALTER COLUMN '.SqlFragments::id($attribute->column).($default === null ? ' DROP DEFAULT' : ' SET DEFAULT '.$default);
         }
 
         return $statements;
@@ -282,8 +280,19 @@ final class Compiler
     private function refuseFunction(ResolvedMap $resolvedMap, UnrepresentableState $state): string
     {
         $alias = (string) $state->alias;
+        $dependent = $resolvedMap->dependent($alias);
+        $primaryForeignKey = match (true) {
+            $dependent !== null => $resolvedMap->primaryForeignKey($dependent),
+            $alias === $resolvedMap->previousModel->alias => (string) $resolvedMap->previousModel->primaryForeignKey,
+            default => null,
+        };
+        $serialize = $primaryForeignKey === null ? [] : [
+            '  PERFORM pg_advisory_xact_lock(hashtextextended(concat('.SqlFragments::literal($resolvedMap->refuseFunction($state).':')
+                .', NEW.'.SqlFragments::id($primaryForeignKey).'), 0));',
+        ];
 
         return $this->function($resolvedMap->refuseFunction($state), '', [
+            ...$serialize,
             '  IF EXISTS (SELECT 1 FROM (SELECT NEW.*) AS '.$alias.' WHERE COALESCE(('.$state->condition.'), false)) THEN'."\n    "
                 .SqlFragments::refuse(
                     SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused {$state->state} in ".$resolvedMap->table($alias).' record ')

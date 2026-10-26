@@ -11,6 +11,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
@@ -31,8 +32,23 @@ final class InstallerTest extends TestCase
     {
         parent::setUp();
 
+        Tables::drop();
         Tables::create();
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
+    }
+
+    protected function tearDown(): void
+    {
+        DB::rollBack(0);
+        Tables::drop();
+
+        parent::tearDown();
+    }
+
+    /** @return list<string> */
+    protected function connectionsToTransact(): array
+    {
+        return [];
     }
 
     #[Test]
@@ -158,6 +174,34 @@ final class InstallerTest extends TestCase
         ]);
 
         $this->assertSame('1 Main St', DB::table('widgets')->where('id', $id)->sole()->street);
+    }
+
+    #[Test]
+    public function it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record(): void
+    {
+        DB::table('widgets')->insert(['title' => 'No place yet']);
+        $gadget = DB::table('gadgets')->value('id');
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+        $concurrent = DB::connection('concurrent');
+        $concurrent->statement("set lock_timeout = '200ms'");
+
+        DB::beginTransaction();
+        DB::table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => 'First root']);
+
+        try {
+            $concurrent->table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => 'Concurrent root']);
+        } catch (QueryException $e) {
+            $this->assertSame('55P03', $e->getCode());
+        }
+
+        DB::commit();
+
+        $this->assertSame(['First root'], DB::table('gadget_places')->orderBy('street')->pluck('street')->all());
+        $this->assertWriteRefused(
+            fn () => $concurrent->table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => 'Concurrent root']),
+            'refused a second root place for one gadget',
+        );
     }
 
     #[Test]
@@ -304,6 +348,85 @@ final class InstallerTest extends TestCase
         $this->assertSame(6, $this->objects('pg_proc', 'proname'));
         $this->assertSame(1, DB::table('gadgets')->count());
         $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $id)->sole()->title);
+    }
+
+    #[Test]
+    public function it_keeps_the_installed_compatibility_map_when_a_recompile_fails(): void
+    {
+        $retyped = new WidgetCompatibilityMap(['title' => Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')]);
+
+        $this->assertThrows(fn () => resolve(Installer::class)->recompile($retyped), QueryException::class, 'cannot change data type of view column');
+
+        DB::table('gadgets')->insert(['name' => 'After a failed recompile']);
+
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+    }
+
+    #[Test]
+    public function it_leaves_nothing_behind_when_an_install_fails(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        $broken = new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo('no_such_function()')]);
+
+        $this->assertThrows(fn () => resolve(Installer::class)->install($broken), QueryException::class, 'no_such_function');
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $this->widget())->sole()->title);
+    }
+
+    #[Test]
+    public function it_keeps_the_installed_compatibility_map_when_an_uninstall_fails(): void
+    {
+        DB::statement('create view widget_titles as select title from widgets');
+
+        $this->assertThrows(fn () => resolve(Installer::class)->uninstall(new WidgetCompatibilityMap), QueryException::class, 'other objects depend on it');
+
+        DB::table('gadgets')->insert(['name' => 'After a failed uninstall']);
+
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+    }
+
+    #[Test]
+    public function it_leaves_the_same_compatibility_map_in_another_schema_installed(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('drop schema if exists elsewhere cascade');
+        DB::statement('create schema elsewhere');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists elsewhere cascade');
+        });
+
+        try {
+            DB::statement('set search_path to elsewhere');
+            Tables::create();
+            resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        DB::table('gadgets')->insert(['name' => 'Here']);
+        $here = DB::table('retained_widgets')->count();
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::table('elsewhere.gadgets')->insert(['name' => 'Elsewhere']);
+
+        $this->assertSame([1, 1], [$here, DB::table('elsewhere.retained_widgets')->count()]);
+    }
+
+    #[Test]
+    public function it_drops_a_view_default_the_compatibility_map_no_longer_declares(): void
+    {
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo("'SKU-0'")]));
+        $declared = $this->widget();
+
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+        $removed = $this->widget();
+
+        $this->assertSame(
+            ['SKU-0', null],
+            [DB::table('widgets')->where('id', $declared)->value('sku'), DB::table('widgets')->where('id', $removed)->value('sku')],
+        );
     }
 
     #[Test]

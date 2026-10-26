@@ -13,6 +13,11 @@ use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 
 final class WidgetCompatibilityMap implements CompatibilityMap
 {
+    /**
+     * @param  array<string, Attribute>  $replacedAttributes
+     */
+    public function __construct(private readonly array $replacedAttributes = []) {}
+
     public function name(): string
     {
         return 'widgets';
@@ -50,7 +55,7 @@ final class WidgetCompatibilityMap implements CompatibilityMap
 
     public function attributes(): array
     {
-        return [
+        return array_map(fn (Attribute $attribute) => $this->replacedAttributes[$attribute->column] ?? $attribute, [
             Attribute::retained('id')->readOnlyBecause('A widget keeps the id other records and queued jobs hold.'),
             Attribute::retained('uuid')->readOnlyBecause('A widget keeps the public id partners hold.'),
             Attribute::retained('sku'),
@@ -67,7 +72,7 @@ final class WidgetCompatibilityMap implements CompatibilityMap
             Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at'),
             Attribute::mapped('updated_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'updated_at'),
             Attribute::mapped('deleted_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'deleted_at'),
-        ];
+        ]);
     }
 
     public function unrepresentableStates(): array

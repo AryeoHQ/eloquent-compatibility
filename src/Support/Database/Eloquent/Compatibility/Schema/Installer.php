@@ -21,20 +21,26 @@ final readonly class Installer
             throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$resolvedMap->previousModel->view} already exists; use recompile() to recompile the compatibility map");
         }
 
-        $this->apply($resolvedMap);
-        $this->copyPrivileges($resolvedMap);
+        $this->connection->transaction(function () use ($resolvedMap): void {
+            $this->apply($resolvedMap);
+            $this->copyPrivileges($resolvedMap);
+        });
     }
 
     public function recompile(CompatibilityMap $map): void
     {
-        $this->apply(ResolvedMap::of($map));
+        $resolvedMap = ResolvedMap::of($map);
+        $this->connection->transaction(fn () => $this->apply($resolvedMap));
     }
 
     public function uninstall(CompatibilityMap $map): void
     {
         $resolvedMap = ResolvedMap::of($map);
-        $this->dropObjects($resolvedMap);
-        $this->connection->unprepared('DROP VIEW IF EXISTS '.SqlFragments::id($resolvedMap->previousModel->view));
+
+        $this->connection->transaction(function () use ($resolvedMap): void {
+            $this->dropObjects($resolvedMap);
+            $this->connection->unprepared('DROP VIEW IF EXISTS '.SqlFragments::id($resolvedMap->previousModel->view));
+        });
     }
 
     private function apply(ResolvedMap $resolvedMap): void
@@ -52,7 +58,9 @@ final readonly class Installer
         $prefix = SqlFragments::like($resolvedMap->objectPrefix());
 
         $triggers = $this->connection->select(
-            "select tgname as name, tgrelid::regclass::text as relation from pg_trigger where not tgisinternal and tgname like {$prefix}",
+            "select table_trigger.tgname as name, table_trigger.tgrelid::regclass::text as relation
+             from pg_trigger table_trigger join pg_proc trigger_function on trigger_function.oid = table_trigger.tgfoid
+             where not table_trigger.tgisinternal and table_trigger.tgname like {$prefix} and trigger_function.pronamespace = current_schema()::regnamespace",
         );
 
         foreach ($triggers as $trigger) {
