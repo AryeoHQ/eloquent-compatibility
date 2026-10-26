@@ -46,6 +46,9 @@ jobs:
       - name: Run static analysis on application
         run: php-ci ./vendor/bin/testbench tooling:phpstan --memory-limit=4G --error-format=github
 
+      - name: Check the names the documentation uses
+        run: php-ci php bin/check-doc-names.php
+
   dependency-analysis:
     runs-on: codebuild-linux-amd64-vpc-${{ github.run_id }}-${{ github.run_attempt }}
 

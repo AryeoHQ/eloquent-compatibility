@@ -56,7 +56,8 @@
             "phpstan": {
                 "config": {
                     "paths": [
-                        "src"
+                        "src",
+                        "bin"
                     ]
                 }
             },
@@ -64,7 +65,8 @@
                 "config": {
                     "paths": [
                         "src",
-                        "tests"
+                        "tests",
+                        "bin"
                     ]
                 }
             }

@@ -103,3 +103,5 @@ resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
+
+Maintainers and reviewers: start at [docs/architecture.md](docs/architecture.md).
