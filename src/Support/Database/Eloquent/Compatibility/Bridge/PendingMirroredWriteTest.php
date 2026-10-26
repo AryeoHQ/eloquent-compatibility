@@ -53,10 +53,18 @@ final class PendingMirroredWriteTest extends TestCase
     #[Test]
     #[TestWith(['public.widgets', 'update "widgets" set "title" = ?'])]
     #[TestWith(['widgets', 'update "public"."widgets" set "title" = ?'])]
-    #[TestWith(['Legacy.Widgets', 'update "legacy"."widgets" set "title" = ?'])]
-    public function it_expects_a_write_to_its_relation_whatever_the_schema_or_case_of_either_name(string $table, string $sql): void
+    #[TestWith(['Legacy.Widgets', 'update "legacy"."Widgets" set "title" = ?'])]
+    public function it_expects_a_write_to_its_relation_whatever_the_schema_of_either_name(string $table, string $sql): void
     {
         $this->assertTrue($this->pendingWrite((new Widget)->setTable($table), Operation::Update)->expects($this->parsed($sql)));
+    }
+
+    #[Test]
+    #[TestWith(['Widgets', 'update "widgets" set "title" = ?'])]
+    #[TestWith(['widgets', 'update "Widgets" set "title" = ?'])]
+    public function it_expects_no_write_to_a_relation_whose_quoted_name_differs_in_case(string $table, string $sql): void
+    {
+        $this->assertFalse($this->pendingWrite((new Widget)->setTable($table), Operation::Update)->expects($this->parsed($sql)));
     }
 
     private function pendingWrite(Widget $widget, Operation $operation): PendingMirroredWrite
