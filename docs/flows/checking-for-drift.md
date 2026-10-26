@@ -44,3 +44,4 @@ The backing value of each `DriftCheck` case is the label the table prints. `Chec
 - `CheckDriftTest::it_checks_only_the_compatibility_maps_it_is_given()`: the `--map` option.
 - `DependentCurrentModelTest::the_check_names_a_designation_of_a_missing_row_or_of_a_row_of_another_record()`: the designation check.
 - `ProviderTest::it_registers_the_divergence_check()`: the command's registration.
+- `DriftQueriesTest`: each of the five queries on its own, the hidden-state filter, and the order and limit of the report.

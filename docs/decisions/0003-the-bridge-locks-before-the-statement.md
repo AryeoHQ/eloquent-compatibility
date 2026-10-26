@@ -13,6 +13,6 @@ The update trigger raises 40001 when the record changed after the statement's sn
 - No other transaction can change a locked record between the bridge's two reads.
 - A write through a model does not meet the 40001 conflict check.
 - The bridge's lock order must match the triggers' order, or two writers can deadlock. The refused-state lock joins that order: a refuse function locks the primary row before its advisory lock. [INV-1](../invariants.md) records the rule.
-- Two paths still break the order, and INV-1 records both. A writer that locks a dependent row and then updates it can deadlock a write through the view, raw or bridged. A newcomer dependent row that the bridge finds on its second read locks after the first pass's dependent rows.
+- Two paths still break the order, and INV-1 records both. A writer that locks a dependent row and then updates it can deadlock a write through the view, raw or bridged. The bridge runs `AffectedRecords::of()` again under its first locks, and a newcomer record it finds there locks after every record of the first pass.
 - A write locks the previous records of every map that shares a current table, not only its own.
 - A delete through the previous model that removes the row also locks every dependent row the trigger removes. That includes a row another transaction committed before the bridge locked the primary row. See [INV-25](../invariants.md).

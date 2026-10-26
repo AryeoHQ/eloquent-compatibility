@@ -14,7 +14,7 @@ Each term has one meaning across the code and these docs.
 - **compiled SQL**: the view, function and trigger statements a map compiles to; `CompiledSql`.
 - **conflict check**: the update trigger's second read, which raises 40001 when the record changed after the statement's snapshot.
 - **created key**: the retained key of a record just created, which the triggers store in `Setting::Created` for the event bridge.
-- **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model.
+- **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model. A map names each current model class once.
 - **degrade**: an unrepresentable state the map documents and lets through; no code reads it.
 - **dependent current model**: a current model whose rows link the primary current model's row by a primary foreign key; `DependentCurrentModel`.
 - **designation**: a retained column that names the one dependent row the previous model reads; see `DependentCurrentModel::designatedBy()`.

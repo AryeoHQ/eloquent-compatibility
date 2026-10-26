@@ -61,5 +61,5 @@ A caller that wrapped the write in `Connection::transaction()` rolls back to its
 - `EventBridgeOutsideTransactionTest::it_leaves_a_caller_transaction_aborted_after_a_database_refusal_inside_it_as_a_native_write_would()` and `EventBridgeTest::it_leaves_the_callers_transaction_usable_after_a_database_refusal()`: savepoint mode.
 - `EventBridgeTest::it_rolls_back_the_whole_write_when_a_mirrored_listener_refuses()` and `EventBridgeTest::it_rolls_back_the_write_and_its_after_commit_work_when_a_mirrored_listener_throws()`: PHP failures in savepoint mode.
 - `InstallerTest::it_refuses_a_change_to_a_read_only_attribute_with_what_why_and_what_to_do()`: the three parts of a refusal.
-
-No test covers the 40001 conflict check.
+- `CompatibilityWriteRefusedTest`: `CompatibilityWriteRefused::isRefusal()`, `CompatibilityWriteRefused::fromQueryException()` and the two PHP refusals.
+- `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_lets_a_write_through_proceed_when_only_a_dependent_attribute_changed_after_the_statement_read_the_view()`: the 40001 conflict check.

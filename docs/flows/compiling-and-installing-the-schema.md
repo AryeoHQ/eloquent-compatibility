@@ -16,16 +16,16 @@ flowchart LR
 ## Installing
 
 1. `Installer::install()` resolves the map with `ResolvedMap::of()`.
-2. It refuses when any relation already has the view's name. The message points at `Installer::recompile()`.
+2. It refuses when a relation with the view's name already exists in the current schema. The private `Installer::relation()` looks the name up there alone, so a relation of that name in a later schema on the search path does not count. The message points at `Installer::recompile()`.
 3. It opens one transaction with `Connection::transaction()`, which takes a savepoint inside a caller's transaction. Steps 4 to 7 run inside it.
 4. `Installer::apply()` compiles first, so a compile error leaves the database unchanged.
 5. `Installer::dropObjects()` drops every trigger whose name starts with the map's object prefix and whose table and function are in the current schema. It then drops every function with that prefix in the current schema.
 6. `Installer::apply()` runs each of `CompiledSql::statements()` with `Connection::unprepared()`.
-7. `Installer::copyPrivileges()` copies the retained table's grants to the view, except the owner's. Column grants follow only for columns the view also has.
+7. `Installer::copyPrivileges()` copies the retained table's grants to the view, except the grants held by the view's owner. Column grants follow only for columns the view also has.
 
-A failed statement rolls back the whole install, so it leaves nothing behind. `Installer::recompile()` runs steps 3 to 6 only: it neither refuses an existing view nor copies grants. `Installer::uninstall()` drops the objects and then the view in one transaction, and leaves every table as it is. A failed recompile or uninstall therefore keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
+A failed statement rolls back the whole install, so it leaves nothing behind. `Installer::recompile()` runs steps 3 to 6 only: it neither refuses an existing view nor copies grants. `Installer::uninstall()` drops the objects in one transaction, then the view when `Installer::relation()` finds it in the current schema. It leaves every table as it is. A failed recompile or uninstall therefore keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
 
-The schema scope lets one map name be installed in two schemas. Each install, recompile and uninstall changes only the objects in `current_schema()`. `Installer::dropObjects()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, so a schema whose name needs quoting works too.
+The schema scope lets one map name be installed in two schemas. Each install, recompile and uninstall changes only the objects in `current_schema()`. `Installer::dropObjects()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, and `Installer::relation()` through `quote_ident(current_schema())`. So a schema whose name needs quoting works too.
 
 ## Compiling
 
@@ -70,8 +70,15 @@ Each trigger shares its function's name. `Compiler::function()` writes every fun
 - `InstallerTest::it_leaves_nothing_behind_when_an_install_fails()`, `InstallerTest::it_keeps_the_installed_compatibility_map_when_a_recompile_fails()` and `InstallerTest::it_keeps_the_installed_compatibility_map_when_an_uninstall_fails()`: each method runs in one transaction.
 - `InstallerTest::it_leaves_the_same_compatibility_map_in_another_schema_installed()` and `InstallerTest::it_keeps_a_prefixed_trigger_on_another_schemas_table_that_calls_a_function_of_this_schema()`: the cleanup keeps to the current schema.
 - `InstallerTest::it_installs_recompiles_and_uninstalls_in_a_schema_whose_name_needs_quoting()`: the three Installer methods in a schema whose name needs quoting.
+- `InstallerTest::it_installs_recompiles_and_uninstalls_ahead_of_a_later_schema_that_has_the_compatibility_map()` and `InstallerTest::it_uninstalls_nothing_of_a_later_schema_when_the_current_schema_has_no_compatibility_view()`: the view is looked up in the current schema alone.
+- `InstallerTest::it_copies_the_retained_tables_grants_to_the_view_when_it_installs()`, `InstallerTest::it_lets_a_role_granted_a_retained_column_write_that_column_through_the_view()` and `InstallerTest::it_leaves_the_views_grants_as_they_are_when_it_recompiles()`: the copied grants, and `SECURITY DEFINER`.
 - `InstallerTest::it_drops_a_view_default_the_compatibility_map_no_longer_declares()`: a recompile removes a default.
 - `InstallerTest::it_compiles_only_full_word_aliases_variables_and_object_names()`: the identifiers in the compiled SQL.
 - `ResolvedMapTest::it_refuses_an_attribute_the_tables_cannot_store()`, `DependentCurrentModelTest::it_refuses_a_designation_the_retained_table_does_not_have()` and `DependentCurrentModelTest::it_refuses_an_attribute_that_writes_the_designation()`: the compile-time refusals.
+- `CompilerTest::it_refuses_at_compile_time_a_map_the_tables_cannot_store()`: every compile-time refusal, the fill collision and the 63-character limit included.
+- `CompilerTest::it_installs_an_object_name_of_exactly_63_characters_without_truncating_it()` and `CompilerTest::it_compiles_every_trigger_function_of_a_map_whose_name_has_the_most_characters_allowed()`: the 63-character limit's edge.
+- `CompilerTest::it_compiles_the_view_before_its_trigger_functions_and_the_functions_before_their_triggers()` and `CompilerTest::it_attaches_each_trigger_function_to_its_table_and_events()`: the statement order and the trigger table above.
+- `CompilerTest::it_defaults_a_view_column_to_its_declared_default_or_else_to_the_default_of_a_retained_or_primary_column_that_stores_it()`: the view defaults.
+- `CompilerTest::it_runs_the_trigger_functions_on_the_schema_of_the_connection_it_was_built_on_whatever_the_writers_search_path()`: the pinned `search_path`.
 
-No test covers the copied grants or the 63-character limit.
+`ColumnCatalogTest`, `CompiledSqlTest` and `SqlFragmentsTest` cover their classes' own contracts. No test pins that `Installer::copyPrivileges()` skips the grants of the view's owner.

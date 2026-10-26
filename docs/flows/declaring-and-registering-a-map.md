@@ -29,7 +29,7 @@ A map implements `CompatibilityMap`, whose six methods return builders. Every bu
 
 1. The name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore.
 2. The previous model made every required call. `ResolvedMap::previous()` fills a missing key from the model's key name.
-3. Each current model is an Eloquent model with a unique alias. A fresh instance of each model gives its table and key, held as an `AliasedTable`.
+3. Each current model is an Eloquent model with a unique alias, and its class appears once among the map's current models. `ResolvedMap::of()` compares the class names of the instances it creates, so two spellings of one class count as one class. A fresh instance of each model gives its table and key, held as an `AliasedTable`.
 4. Each dependent declares its primary foreign key.
 5. Each alias is a lowercase identifier other than `new` and `old`, and not one of `ReservedWords::POSTGRESQL`.
 6. `Attribute::resolve()` points each retained attribute at the previous model's alias. A retained attribute that is not read-only writes its own column.
@@ -52,4 +52,4 @@ Three callers resolve a map, and each resolves it again:
 
 ## Tests
 
-`ResolvedMapTest` covers the registration refusals. Most of its tests call `ResolvedMap::of()` directly. `ResolvedMapTest::it_refuses_a_mapped_attribute_without_a_type_when_the_map_is_registered()` goes through `CompatibilityMaps::register()`, and `ResolvedMapTest::it_refuses_an_attribute_the_tables_cannot_store()` compiles. `ProviderTest::it_shares_one_set_of_compatibility_maps_and_one_event_bridge_across_the_application()` covers the singletons.
+`ResolvedMapTest` covers the registration refusals. Most of its tests call `ResolvedMap::of()` directly. `ResolvedMapTest::it_refuses_a_mapped_attribute_without_a_type_when_the_map_is_registered()` goes through `CompatibilityMaps::register()`, and `ResolvedMapTest::it_refuses_an_attribute_the_tables_cannot_store()` compiles. `ResolvedMapTest::it_refuses_two_current_models_of_one_class()` covers a repeated current model class. `CompatibilityMapsTest` covers `CompatibilityMaps::register()` and its refusal of a second map with the same name. `ProviderTest::it_shares_one_set_of_compatibility_maps_and_one_event_bridge_across_the_application()` covers the singletons.
