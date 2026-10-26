@@ -16,6 +16,7 @@ use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
+use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
@@ -181,6 +182,23 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertSame('committed', $this->concurrentOutcome);
         $this->assertMirrored(GadgetPlace::class, ModelEvent::ForceDeleted, times: 2);
         $this->assertSame(0, DB::table('gadget_places')->count());
+    }
+
+    #[Test]
+    public function it_raises_the_update_events_of_a_readable_dependent_row_committed_before_the_primary_record_is_locked(): void
+    {
+        $widget = Widget::query()->create(['title' => 'No place yet'])->refresh();
+        $this->recordMirroredEvents();
+        $this->concurrently(
+            fn (string $query) => str_ends_with($query, ' for update'),
+            fn (Connection $concurrent) => $concurrent->table('gadget_places')->insert(['gadget_id' => $widget->gadget_id, 'street' => '2 Concurrent St']),
+        );
+
+        $widget->update(['street' => '3 Updated St']);
+
+        $this->assertSame('committed', $this->concurrentOutcome);
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (Model $place, RecordMirrored $event) => $event->before['street'] === '2 Concurrent St' && $place->getAttribute('street') === '3 Updated St');
+        $this->assertSame('3 Updated St', DB::table('gadget_places')->value('street'));
     }
 
     #[Test]

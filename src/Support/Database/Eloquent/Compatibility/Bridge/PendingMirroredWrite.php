@@ -25,7 +25,7 @@ final class PendingMirroredWrite
 
     public function expects(ParsedWrite $parsedWrite): bool
     {
-        if ($parsedWrite->relation !== strtolower(Str::afterLast($this->model->getTable(), '.'))) {
+        if ($parsedWrite->relation !== Str::afterLast($this->model->getTable(), '.')) {
             return false;
         }
 

@@ -71,6 +71,19 @@ final class Tables
         });
     }
 
+    public static function createItems(): void
+    {
+        Schema::create('Gadget-Items', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('label');
+        });
+
+        Schema::create('retained_items', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->foreignUuid('item_id')->nullable()->constrained('Gadget-Items');
+        });
+    }
+
     public static function drop(): void
     {
         foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {

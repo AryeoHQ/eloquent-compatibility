@@ -20,8 +20,7 @@ final readonly class AffectedRecords
         $records = $this->of($connection, $model, $operation, false);
         $native = $this->native($connection, $model);
         $this->lock($connection, $native === null ? $records : [...array_values($records), $native]);
-        $removed = array_diff_key($this->removed($connection, $model, $operation), $records);
-        $newcomers = array_diff_key($this->acrossMaps($connection, $removed), $records);
+        $newcomers = array_diff_key($this->of($connection, $model, $operation, false), $records);
         $this->lock($connection, $newcomers);
 
         return $this->snapshots($connection, [...$records, ...$newcomers]);

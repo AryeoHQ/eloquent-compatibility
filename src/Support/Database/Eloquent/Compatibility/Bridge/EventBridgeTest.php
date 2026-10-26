@@ -23,9 +23,12 @@ use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
+use Tests\Fixtures\Support\Workbench\GadgetItem;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
+use Tests\Fixtures\Support\Workbench\ItemCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Journal;
+use Tests\Fixtures\Support\Workbench\LegacyItem;
 use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
@@ -608,6 +611,20 @@ final class EventBridgeTest extends TestCase
 
         $this->assertMirrored(Account::class, ModelEvent::Updated);
         $this->assertMirrored(Profile::class, ModelEvent::Updated);
+    }
+
+    #[Test]
+    public function it_raises_the_previous_model_events_of_a_write_to_a_current_table_whose_quoted_name_keeps_its_case_and_a_hyphen(): void
+    {
+        Tables::createItems();
+        resolve(Installer::class)->install(new ItemCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ItemCompatibilityMap));
+        LegacyItem::query()->create(['label' => 'Quoted']);
+        $this->recordMirroredEvents();
+
+        GadgetItem::query()->sole()->update(['label' => 'Renamed']);
+
+        $this->assertMirrored(LegacyItem::class, ModelEvent::Updated, fn (Model $legacyItem, RecordMirrored $event) => $event->before['label'] === 'Quoted' && $legacyItem->getAttribute('label') === 'Renamed');
     }
 
     #[Test]
