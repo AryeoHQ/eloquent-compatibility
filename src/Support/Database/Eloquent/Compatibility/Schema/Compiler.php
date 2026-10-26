@@ -286,7 +286,10 @@ final class Compiler
             $alias === $resolvedMap->previousModel->alias => (string) $resolvedMap->previousModel->primaryForeignKey,
             default => null,
         };
+        $primary = (string) $resolvedMap->primaryCurrentModel->alias;
         $serialize = $primaryForeignKey === null ? [] : [
+            '  PERFORM 1 FROM '.SqlFragments::id($resolvedMap->table($primary))
+                .' WHERE '.SqlFragments::id($resolvedMap->key($primary)).' = NEW.'.SqlFragments::id($primaryForeignKey).' FOR KEY SHARE;',
             '  PERFORM pg_advisory_xact_lock(hashtextextended(concat('.SqlFragments::literal($resolvedMap->refuseFunction($state).':')
                 .', NEW.'.SqlFragments::id($primaryForeignKey).'), 0));',
         ];

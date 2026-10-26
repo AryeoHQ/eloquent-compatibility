@@ -6,7 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Closure;
 use Illuminate\Database\QueryException;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -27,6 +29,16 @@ final class InstallerTest extends TestCase
     use InteractsWithCompatibilityMaps;
 
     private const array KEYWORDS = ['as', 'for', 'join', 'left', 'limit', 'on', 'order', 'returning', 'set', 'where'];
+
+    private const string CONCURRENT_WRITER = <<<'PHP'
+        $config = json_decode((string) getenv('CONCURRENT_CONNECTION'), true);
+        $connection = new PDO("pgsql:host={$config['host']};port={$config['port']};dbname={$config['database']}", $config['username'], $config['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $connection->exec("set application_name = 'compatibility_concurrent_writer'");
+        $connection->exec("set lock_timeout = '10s'");
+        $connection->beginTransaction();
+        $connection->exec((string) getenv('CONCURRENT_STATEMENT'));
+        $connection->commit();
+        PHP;
 
     protected function setUp(): void
     {
@@ -202,6 +214,33 @@ final class InstallerTest extends TestCase
             fn () => $concurrent->table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => 'Concurrent root']),
             'refused a second root place for one gadget',
         );
+    }
+
+    #[Test]
+    public function it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock(): void
+    {
+        $id = $this->widget();
+        $gadget = DB::table('gadgets')->value('id');
+        $root = DB::table('gadget_places')->value('id');
+        $child = DB::table('gadget_places')->insertGetId(['gadget_id' => $gadget, 'parent_id' => $root, 'street' => 'Unit B']);
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+
+        DB::beginTransaction();
+        DB::table('gadget_places')->where('id', $child)->update(['street' => 'Unit C']);
+        $viewWriter = $this->writeConcurrently("update widgets set street = 'New St' where id = {$id}");
+
+        try {
+            DB::table('gadget_places')->insert(['gadget_id' => $gadget, 'parent_id' => $root, 'street' => 'Unit D']);
+            DB::commit();
+        } finally {
+            DB::rollBack(0);
+            $result = $viewWriter->wait();
+        }
+
+        $this->assertTrue($result->successful(), $result->output().$result->errorOutput());
+        $this->assertSame(['New St', 'Unit C', 'Unit D'], DB::table('gadget_places')->orderBy('street')->pluck('street')->all());
+        $this->assertSame('New St', DB::table('widgets')->where('id', $id)->sole()->street);
     }
 
     #[Test]
@@ -415,6 +454,52 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_a_prefixed_trigger_on_another_schemas_table_that_calls_a_function_of_this_schema(): void
+    {
+        DB::statement('drop schema if exists elsewhere cascade');
+        DB::statement('create schema elsewhere');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists elsewhere cascade');
+            DB::statement('drop function if exists audit_row()');
+        });
+        DB::statement('create table elsewhere.audited (id integer)');
+        DB::unprepared('create function audit_row() returns trigger language plpgsql as $audit$ begin return new; end; $audit$');
+        DB::statement('create trigger compatibility__widgets__audit before insert on elsewhere.audited for each row execute function audit_row()');
+
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+
+        $this->assertSame(1, DB::scalar("select count(*) from pg_trigger where tgname = 'compatibility__widgets__audit' and tgrelid = 'elsewhere.audited'::regclass"));
+    }
+
+    #[Test]
+    public function it_installs_recompiles_and_uninstalls_in_a_schema_whose_name_needs_quoting(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('drop schema if exists "Tenant" cascade');
+        DB::statement('create schema "Tenant"');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists "Tenant" cascade');
+        });
+
+        try {
+            DB::statement('set search_path to "Tenant"');
+            Tables::create();
+            resolve(Installer::class)->install(new WidgetCompatibilityMap);
+            resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+            $title = DB::table('widgets')->where('id', $this->widget())->sole()->title;
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+            DB::table('gadgets')->insert(['name' => 'After retirement']);
+            $retained = DB::table('retained_widgets')->count();
+            $view = DB::scalar("select to_regclass('widgets')");
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        $this->assertSame(['Blue gadget', 1, null], [$title, $retained, $view]);
+    }
+
+    #[Test]
     public function it_drops_a_view_default_the_compatibility_map_no_longer_declares(): void
     {
         resolve(Installer::class)->recompile(new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo("'SKU-0'")]));
@@ -480,6 +565,26 @@ final class InstallerTest extends TestCase
     private function objects(string $catalog, string $column): int
     {
         return (int) DB::scalar("select count(*) from {$catalog} where {$column} like 'compatibility\\_\\_widgets\\_\\_%'");
+    }
+
+    private function writeConcurrently(string $statement): InvokedProcess
+    {
+        $writer = Process::env([
+            'CONCURRENT_CONNECTION' => (string) json_encode(config('database.connections.concurrent')),
+            'CONCURRENT_STATEMENT' => $statement,
+        ])->start([PHP_BINARY, '-r', self::CONCURRENT_WRITER]);
+
+        for ($attempt = 0; $attempt < 250 && $writer->running(); $attempt++) {
+            if (DB::connection('concurrent')->scalar("select exists (select 1 from pg_stat_activity where datname = current_database() and application_name = 'compatibility_concurrent_writer' and wait_event_type = 'Lock')") === true) {
+                return $writer;
+            }
+
+            usleep(20_000);
+        }
+
+        $result = $writer->wait();
+
+        $this->fail('The concurrent writer never waited on a lock. '.$result->output().$result->errorOutput());
     }
 
     /**

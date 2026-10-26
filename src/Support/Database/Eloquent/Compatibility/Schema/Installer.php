@@ -60,7 +60,10 @@ final readonly class Installer
         $triggers = $this->connection->select(
             "select table_trigger.tgname as name, table_trigger.tgrelid::regclass::text as relation
              from pg_trigger table_trigger join pg_proc trigger_function on trigger_function.oid = table_trigger.tgfoid
-             where not table_trigger.tgisinternal and table_trigger.tgname like {$prefix} and trigger_function.pronamespace = current_schema()::regnamespace",
+             join pg_class trigger_relation on trigger_relation.oid = table_trigger.tgrelid
+             where not table_trigger.tgisinternal and table_trigger.tgname like {$prefix}
+               and trigger_function.pronamespace = to_regnamespace(quote_ident(current_schema()))
+               and trigger_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))",
         );
 
         foreach ($triggers as $trigger) {
@@ -68,7 +71,7 @@ final readonly class Installer
         }
 
         $functions = $this->connection->select(
-            "select oid::regprocedure::text as signature from pg_proc where proname like {$prefix} and pronamespace = current_schema()::regnamespace",
+            "select oid::regprocedure::text as signature from pg_proc where proname like {$prefix} and pronamespace = to_regnamespace(quote_ident(current_schema()))",
         );
 
         foreach ($functions as $function) {
