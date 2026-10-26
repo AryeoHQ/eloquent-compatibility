@@ -16,7 +16,7 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 **Rule.** The view, the update trigger and the event bridge pick a dependent row with the same subquery, from `ResolvedMap::locate()`.
 
-**Why.** The bridge must mirror the row the view reads and the trigger writes. Two copies of the condition could pick two rows.
+**Why.** The bridge must mirror the row the view reads and the trigger writes. Two copies of the condition could pick two rows. A delete that removes the row is the one exception: the trigger removes every dependent row, and INV-25 mirrors them all.
 
 **Code that must agree.** `ResolvedMap::locate()`, called by `Compiler::read()`, `Compiler::updateDependent()` and `KeyTranslator::currentKeys()`.
 
@@ -84,13 +84,13 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 ## INV-9: Each map owns a prefix no other map's prefix begins
 
-**Rule.** Every trigger and function of a map starts with `compatibility__<name>__` and fits in 63 characters. A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore.
+**Rule.** Every trigger and function of a map starts with `compatibility__<name>__` and fits in 63 characters. A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore. The Installer drops only the prefixed triggers and functions of the current schema.
 
-**Why.** The Installer finds a map's triggers and functions by prefix alone. A name with a double or trailing underscore could make one map's prefix begin another's. Uninstalling one map would then drop the other's objects.
+**Why.** The Installer finds a map's triggers and functions by prefix and schema alone. A name with a double or trailing underscore could make one map's prefix begin another's. Uninstalling one map would then drop the other's objects. Without the schema, an install in one schema would drop the same map's triggers in another.
 
-**Code that must agree.** `ResolvedMap::of()` checks the name. `ResolvedMap::objectPrefix()`, `ResolvedMap::function()`, `ResolvedMap::refuseFunction()` and `ResolvedMap::designateFunction()` build every name, through the private `ResolvedMap::object()`. `Installer::dropObjects()` matches the prefix through `SqlFragments::like()`.
+**Code that must agree.** `ResolvedMap::of()` checks the name. `ResolvedMap::objectPrefix()`, `ResolvedMap::function()`, `ResolvedMap::refuseFunction()` and `ResolvedMap::designateFunction()` build every name, through the private `ResolvedMap::object()`. `Installer::dropObjects()` matches the prefix through `SqlFragments::like()`. It keeps a trigger only when its function's namespace is `current_schema()`, and a function only when it is in that schema. `Compiler` creates every function in that same schema.
 
-**Pinned by.** `ResolvedMapTest::it_refuses_a_name_that_cannot_prefix_database_objects()`, `InstallerTest::it_recompiles_a_compatibility_map_without_duplicating_its_triggers()` and `InstallerTest::it_uninstalls_the_compatibility_view_and_leaves_the_current_models_untouched()`. No test pins the 63-character limit.
+**Pinned by.** `ResolvedMapTest::it_refuses_a_name_that_cannot_prefix_database_objects()`, `InstallerTest::it_recompiles_a_compatibility_map_without_duplicating_its_triggers()` and `InstallerTest::it_uninstalls_the_compatibility_view_and_leaves_the_current_models_untouched()`. `InstallerTest::it_leaves_the_same_compatibility_map_in_another_schema_installed()` pins the schema. No test pins the 63-character limit.
 
 ## INV-10: Reads and writes carry their types
 
@@ -142,15 +142,17 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 **Pinned by.** `InstallerTest::it_applies_a_refused_state_to_every_write_that_reaches_it()` and `CheckDriftTest::it_names_the_record_and_the_attribute_of_each_divergence_made_by_hand()`.
 
+The trigger checks each writer against committed rows and its own. On the primary table, two concurrent writers can both reach a cross-row state, as INV-23 records.
+
 ## INV-15: A mirrored listener may refuse a write, never change it
 
 **Rule.** A mirrored `-ing` listener that returns false, or changes an attribute, refuses the whole write with `CompatibilityWriteRefused`.
 
 **Why.** The write has already reached the database when mirrored events fire, so a listener's change has nowhere to go.
 
-**Code that must agree.** `EventReplayer::ing()`, `EventReplayer::changed()` and `EventReplayer::equivalent()`. `CompatibilityWriteRefused::byMirroredListener()` and `CompatibilityWriteRefused::byMirroredChange()` build the refusals.
+**Code that must agree.** `EventReplayer::ing()`, `EventReplayer::changed()` and `EventReplayer::equivalent()`. `EventReplayer::number()` compares two numbers by their exact decimal value, never through a float, so a change below float precision still counts. `CompatibilityWriteRefused::byMirroredListener()` and `CompatibilityWriteRefused::byMirroredChange()` build the refusals.
 
-**Pinned by.** `EventBridgeTest::it_rolls_back_the_whole_write_when_a_mirrored_listener_refuses()` and `EventBridgeTest::it_refuses_a_mirrored_listener_that_changes_the_mirrored_record()`.
+**Pinned by.** `EventBridgeTest::it_rolls_back_the_whole_write_when_a_mirrored_listener_refuses()` and `EventBridgeTest::it_refuses_a_mirrored_listener_that_changes_the_mirrored_record()`. `EventBridgeTest::it_refuses_a_mirrored_listener_change_to_a_number_that_a_float_cannot_tell_apart()` and `EventBridgeTest::it_accepts_a_mirrored_listener_that_rewrites_a_number_as_the_same_value()` pin the number comparison.
 
 ## INV-16: A replayed instance never begins a pending write
 
@@ -204,13 +206,13 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 ## INV-21: A faked dispatcher cannot hide a mirrored write
 
-**Rule.** A write to a mirrored relation throws `CompatibilityEventMirrorBypassed` when the model dispatcher is an `EventFake`. The fake recorded the arming event instead of running the bridge's listener, so no pending write began.
+**Rule.** A write to a mirrored relation throws `CompatibilityEventMirrorBypassed` when the model dispatcher is an `EventFake`. The fake recorded the arming event instead of running the bridge's listener, so no pending write began. The guard keeps its count per fake and per relation, so each relation's bypass throws.
 
 **Why.** A test that fakes every event and writes through a mirrored model proves nothing about the other side.
 
-**Code that must agree.** `EventBridge::guard()`, `MirrorIndex::modelsOf()`, `MirrorIndex::mapsOf()` and `ModelEvent::arming()`. `EventBridge::withoutMirroring()` switches the guard off.
+**Code that must agree.** `EventBridge::guard()`, `EventBridge::$faked`, `MirrorIndex::modelsOf()`, `MirrorIndex::mapsOf()` and `ModelEvent::arming()`. `EventBridge::withoutMirroring()` switches the guard off.
 
-**Pinned by.** `EventBridgeTest::it_fails_loudly_when_a_test_fakes_the_model_events()`, `EventBridgeTest::it_mirrors_under_a_fake_that_leaves_model_events_alone()` and `EventBridgeTest::it_switches_the_mirror_off_only_when_a_test_says_so()`.
+**Pinned by.** `EventBridgeTest::it_fails_loudly_when_a_test_fakes_the_model_events()`, `EventBridgeTest::it_fails_loudly_for_each_relation_a_faked_dispatcher_bypasses()`, `EventBridgeTest::it_mirrors_under_a_fake_that_leaves_model_events_alone()` and `EventBridgeTest::it_switches_the_mirror_off_only_when_a_test_says_so()`.
 
 ## INV-22: Compiled identifiers are full words
 
@@ -221,3 +223,33 @@ Each rule below holds today, and a change must keep it. Each names the code that
 **Code that must agree.** `ResolvedMap::of()` and `ReservedWords::POSTGRESQL`. `Compiler::variables()` names `previous_row`, `affected_rows` and `key_<alias>`, and `Compiler::primaryInsertFunction()` names `created_key`.
 
 **Pinned by.** `InstallerTest::it_compiles_only_full_word_aliases_variables_and_object_names()` and `ResolvedMapTest::it_refuses_an_alias_that_is_a_reserved_postgresql_word()`. The first compiles the workbench maps, whose aliases are full words too. An application chooses its own aliases.
+
+## INV-23: A refused-state check is serialized per record
+
+**Rule.** A refuse function on a dependent's table or the retained table first takes `pg_advisory_xact_lock()`. Its key is the refuse function's name, a colon and the row's primary foreign key, hashed with `hashtextextended()`. A refuse function on the primary table takes no lock.
+
+**Why.** A condition that reads other rows of the same record would otherwise miss a concurrent writer's uncommitted row, and both writers would commit the state. The key must name both parts. Without the function name, two states would wait on each other. Without the primary foreign key, every writer of the table would wait on one lock. A primary row has no primary foreign key, so the primary table stays unserialized. [0016](decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records that limit.
+
+**Code that must agree.** `Compiler::refuseFunction()` builds the lock from `ResolvedMap::refuseFunction()`, `ResolvedMap::dependent()` and `ResolvedMap::primaryForeignKey()`, or from the previous model's primary foreign key. The lock is the function's first statement, before the `IF EXISTS` check. `Compiler::function()` declares no volatility, so the check after the wait reads a new snapshot under READ COMMITTED.
+
+**Pinned by.** `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()`, which writes from a second connection. No test pins the primary-table limit or the REPEATABLE READ limit.
+
+## INV-24: Each Installer method is atomic
+
+**Rule.** `Installer::install()`, `Installer::recompile()` and `Installer::uninstall()` each run every statement inside one `Connection::transaction()`. Inside a caller's transaction, that is a savepoint.
+
+**Why.** Each method drops the map's triggers before it creates or drops anything else. A failure part way would leave a half-installed map, or a map without its triggers. A new primary row would then get no retained row. A concurrent writer waits on the dropped triggers' locks until the commit.
+
+**Code that must agree.** `Installer::install()` wraps `Installer::apply()` and `Installer::copyPrivileges()`. `Installer::recompile()` wraps `Installer::apply()`. `Installer::uninstall()` wraps `Installer::dropObjects()` and the `DROP VIEW`. The check for an existing view in `Installer::install()` stays outside, because it throws before any change.
+
+**Pinned by.** `InstallerTest::it_leaves_nothing_behind_when_an_install_fails()`, `InstallerTest::it_keeps_the_installed_compatibility_map_when_a_recompile_fails()` and `InstallerTest::it_keeps_the_installed_compatibility_map_when_an_uninstall_fails()`. `InstallerTest` runs outside a test transaction, so these tests see a real commit and rollback.
+
+## INV-25: A delete through the previous model mirrors every row it removes
+
+**Rule.** A delete through the previous model that removes the row mirrors every dependent row under the record's primary foreign key. A soft delete mirrors only the rows the view reads.
+
+**Why.** The delete trigger removes every dependent row of the primary row, including rows the view does not read. Each removed row must raise its own delete events.
+
+**Code that must agree.** `Compiler::deleteFunction()` deletes by primary foreign key. `KeyTranslator::dependentKeys()` selects by the same key, and `AffectedRecords::of()` adds those records when the private `AffectedRecords::removes()` holds. A change to which rows the trigger deletes must change `KeyTranslator::dependentKeys()` with it.
+
+**Pinned by.** `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()`.

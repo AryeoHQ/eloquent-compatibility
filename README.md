@@ -101,6 +101,15 @@ resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 
 `php artisan compatibility:check` names every record where the previous and current models disagree.
 
+### Refused states
+`UnrepresentableState::refuse()` declares a state one side can hold and the other cannot express. Its `UnrepresentableState::checkedOn()` condition compiles to a trigger that refuses every insert or update reaching the state, whoever writes it. On a dependent current model's table or the retained table, that trigger serializes the writers of one record. So two concurrent writes to one record cannot both reach a state that compares the record's own rows.
+
+The serialization has limits:
+
+- **A state checked on the primary current model's table is not serialized.** Two concurrent writes can both reach it. Enforce a rule that compares rows of that table with a unique or exclusion constraint. `compatibility:check` still reports a row in the state.
+- **A condition that compares rows of different records, or reads another table, can still race.**
+- **Under REPEATABLE READ, the check after the wait misses the row the other writer committed.** The serialization holds under READ COMMITTED, PostgreSQL's default.
+
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
 

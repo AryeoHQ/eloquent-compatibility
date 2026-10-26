@@ -13,4 +13,4 @@ The other classes serve `EventBridge`. `AffectedRecords` and `KeyTranslator` fin
 
 Flows: [mirroring a write](../../../../../../docs/flows/mirroring-a-write.md) and [failure and rollback](../../../../../../docs/flows/failure-and-rollback.md).
 
-[Invariants](../../../../../../docs/invariants.md) held here: INV-1, INV-6 and INV-15 to INV-21.
+[Invariants](../../../../../../docs/invariants.md) held here: INV-1, INV-6, INV-15 to INV-21 and INV-25.

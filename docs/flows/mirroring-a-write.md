@@ -42,8 +42,11 @@ A throw in step 4 rolls the transaction or savepoint back and rethrows.
 `AffectedRecords::of()` asks `MirrorIndex::forModel()` which maps the model belongs to, and under which alias. Each `MapMember` adds records:
 
 - **A previous model** adds its current records. `KeyTranslator::currentKeys()` turns its key into the primary key and the key of each dependent row the view reads. After an insert, the key comes from `Setting::Created`.
+- **A previous model's delete that removes the row** also adds every dependent row under the record's primary foreign key, through `KeyTranslator::dependentKeys()`. The delete trigger removes them all, child rows and soft-deleted rows included, so each one raises its delete events. A delete removes the row when the model has no `isForceDeleting()` method, or when that method returns true. A soft delete keeps to the rows the view reads, and locks no others.
 - **A primary current model** adds the previous records that link it, through `KeyTranslator::previousKeys()`. Before an insert there are none.
 - **A dependent current model** adds the previous records of its original and its new primary foreign key. A move between primary rows mirrors both.
+
+A model loaded without the column that names its record still mirrors. `AffectedRecords::originalKey()` reads the original value from the loaded attributes when the column is there. Otherwise it selects the persisted value by the model's own key: from the view for the previous model, and from the table for a current model. That column is the mapped key for a previous or primary model, and the primary foreign key for a dependent.
 
 `AffectedRecords::acrossMaps()` then adds, for each current record, the previous records of every other map over the same table. Each `AffectedRecord` carries a `RecordRole`. A previous record locks its retained table, `AffectedRecord::$lockTable`, but reads its view, `AffectedRecord::$relation`.
 
@@ -81,7 +84,9 @@ In savepoint mode, step 4 runs inside `Connection::transaction()`, a Laravel nes
 | `deleted_at` cleared | restoring, saving, updating, updated, saved, restored |
 | any other change | saving, updating, updated, saved |
 
-Each `-ing` event can stop the write. A listener that returns false raises `CompatibilityWriteRefused::byMirroredListener()`. A listener that changes an attribute raises `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::equivalent()` compares numbers and JSON strings by value. The `-ed` events cannot stop anything.
+For a soft-deleting model, `EventReplayer::deleted()` sets the model's `forceDeleting` property as a native force delete does. It is false for forceDeleting, true for deleting and deleted, and false again for forceDeleted. So `isForceDeleting()` reports to a mirrored listener what it reports to a native one.
+
+Each `-ing` event can stop the write. A listener that returns false raises `CompatibilityWriteRefused::byMirroredListener()`. A listener that changes an attribute raises `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::equivalent()` compares numbers and JSON strings by value. It compares two numbers by their exact decimal value, never through a float, so `'47.600000000000'` equals `47.6` and differs from `'47.600000000000001'`. A number it cannot parse, such as INF or NAN, equals only an identical value. The `-ed` events cannot stop anything.
 
 A class in the model's `$dispatchesEvents` fires before the string event, as Eloquent does it. After the events, `EventReplayer::record()` dispatches `RecordMirrored` with the map, the source model, the mirrored instance, the events and both rows.
 
@@ -99,10 +104,10 @@ A replayed instance never begins a pending write. A native write inside a mirror
 
 `saveQuietly()`, query builder writes and raw SQL fire no model events. The triggers still store them correctly, and nothing is mirrored.
 
-`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked arming events for that relation's models. A count that grew since its last check throws `CompatibilityEventMirrorBypassed`. `EventBridge::withoutMirroring()` switches the guard off with the mirror.
+`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked arming events for that relation's models. It keeps one count per fake and per relation. A count that grew since its last check of that relation throws `CompatibilityEventMirrorBypassed`. So a bypass on one relation does not hide a bypass on another. `EventBridge::withoutMirroring()` switches the guard off with the mirror.
 
 `EventBridge::internally()` marks the bridge's own statements, and `EventBridge::handleQuery()` and the `beforeExecuting` callback ignore them.
 
 ## Tests
 
-`EventBridgeTest` covers the events of each kind of write, refusals and excluded listeners. It also covers fakes, quiet and bulk writes, maps that share a current table, re-entry and the caller's transaction. `DependentCurrentModelTest::a_previous_model_write_mirrors_only_the_designated_dependent_row()` covers the dependent row the bridge mirrors.
+`EventBridgeTest` covers the events of each kind of write, refusals and excluded listeners. It also covers fakes, quiet and bulk writes, maps that share a current table, re-entry and the caller's transaction. Its tests named for a model loaded without its mapped key or primary foreign key cover `AffectedRecords::originalKey()`. `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()` covers the removed dependent rows. `DependentCurrentModelTest::a_previous_model_write_mirrors_only_the_designated_dependent_row()` covers the dependent row the bridge mirrors.

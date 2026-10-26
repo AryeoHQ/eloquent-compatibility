@@ -24,7 +24,7 @@ A write that skips model events, such as a query builder update, still reaches t
 | compatibility map | Contracts, Mapping | `CompatibilityMap` and the Mapping builders | the application's declaration |
 | resolved map | Mapping | `ResolvedMap::of()` | validates a map and answers every question about it |
 | registry | root | `CompatibilityMaps::register()`, `CompatibilityMaps::get()` | holds the application's maps by name |
-| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()` | reads the catalog, compiles SQL and installs it |
+| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()` | reads the catalog, compiles SQL and installs it in one transaction |
 | event bridge | Bridge | `EventBridge::mirror()`, `EventBridge::withoutMirroring()` | mirrors model events across the two sides |
 | drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree |
 | exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap`, `CompatibilityEventMirrorBypassed` | every error the package raises |

@@ -70,10 +70,26 @@ The other trigger functions react to writes that do not come through the view. `
 - `Compiler::designateFunction()`: a new readable dependent row fills an empty designation on its primary row's retained rows.
 - `Compiler::refuseFunction()`: a row that enters a refused state refuses with CM001. It never skips, so it holds for every writer, the view included.
 
+## The refused-state lock
+
+A refused state's condition can read other rows of its table, as the workbench `second_root_place` state does. Two transactions that each insert one root place would each miss the other's uncommitted row, and both would commit. So on a dependent's table or the retained table, the refuse function first takes a transaction-scoped advisory lock:
+
+```
+PERFORM pg_advisory_xact_lock(hashtextextended(concat('<refuse function>:', NEW."<primary foreign key>"), 0));
+```
+
+The key joins the refuse function's name, from `ResolvedMap::refuseFunction()`, with the row's primary foreign key. A dependent uses `ResolvedMap::primaryForeignKey()`, and the retained table uses the previous model's primary foreign key. So two writers of one record's rows check the state one after the other. `concat` turns a null key into an empty string, so every row with a null key shares one lock. `Compiler::function()` declares no volatility, so each function is VOLATILE. Under READ COMMITTED, the check after the wait therefore takes a new snapshot and sees the committed row.
+
+The lock has three limits:
+
+- **A state checked on the primary table takes no lock.** A primary row has no primary foreign key, and its condition always compares different records. Its check can race, and two writers can both commit the state. Enforce a cross-row rule on the primary table with a unique or exclusion constraint instead. `compatibility:check` still reports a row in the state. [0016](../decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records the decision.
+- **A condition that compares rows of different records can still race.** So can a condition that reads another table, whose writers take no lock.
+- **Under REPEATABLE READ, the check after the wait misses the committed row.** The snapshot stays fixed for the whole transaction.
+
 ## Writes the view cannot take
 
 An upsert, an update with a limit and a truncate fail on the view. The error is PostgreSQL's own, and `CompatibilityWriteRefused::isRefusal()` does not recognise it. A `FOR UPDATE` read through the view succeeds.
 
 ## Tests
 
-`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `DependentCurrentModelTest` covers designation.
+`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `DependentCurrentModelTest` covers designation.

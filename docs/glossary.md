@@ -43,6 +43,7 @@ Each term has one meaning across the code and these docs.
 - **record snapshot**: an affected record with its row at one moment; a `RecordSnapshot`.
 - **refusal**: a write the package rejects, raised as CM001 in SQL and as `CompatibilityWriteRefused` in PHP.
 - **refuse**: an unrepresentable state that refuses every write reaching it; see `UnrepresentableState::refuse()`.
+- **refused-state lock**: the transaction-scoped advisory lock a refuse function on a dependent's table or the retained table takes, keyed on the function and the row's primary foreign key; see `Compiler::refuseFunction()`.
 - **resolved map**: the checked, immutable form of a compatibility map that every part reads; `ResolvedMap`.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
