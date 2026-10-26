@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
-final readonly class Compiled
+final readonly class CompiledSql
 {
     /**
      * @param  list<string>  $view

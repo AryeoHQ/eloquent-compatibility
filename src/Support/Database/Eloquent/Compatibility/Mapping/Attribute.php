@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
-use Support\Database\Eloquent\Compatibility\Schema\Sql;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class Attribute
 {
     /**
-     * @param  list<Write>  $writesTo
+     * @param  list<TargetColumn>  $writesTo
      */
     private function __construct(
         public string $column,
@@ -45,8 +45,8 @@ final readonly class Attribute
             $this->retained,
             $this->type,
             $alias,
-            $alias.'.'.Sql::id($column),
-            [new Write($alias, $column, 'NEW.'.Sql::id($this->column))],
+            $alias.'.'.SqlFragments::id($column),
+            [new TargetColumn($alias, $column, 'NEW.'.SqlFragments::id($this->column))],
             $this->readOnlyBecause,
             $this->defaultsTo,
             $column,
@@ -66,7 +66,7 @@ final readonly class Attribute
             $this->type,
             $this->alias,
             $this->readAs,
-            [...$this->writesTo, new Write($alias, $column, $expression)],
+            [...$this->writesTo, new TargetColumn($alias, $column, $expression)],
             $this->readOnlyBecause,
             $this->defaultsTo,
             $this->storedAs,
@@ -94,8 +94,8 @@ final readonly class Attribute
             true,
             null,
             $previousAlias,
-            $previousAlias.'.'.Sql::id($this->column),
-            $this->readOnlyBecause === null ? [new Write($previousAlias, $this->column, 'NEW.'.Sql::id($this->column))] : [],
+            $previousAlias.'.'.SqlFragments::id($this->column),
+            $this->readOnlyBecause === null ? [new TargetColumn($previousAlias, $this->column, 'NEW.'.SqlFragments::id($this->column))] : [],
             $this->readOnlyBecause,
             $this->defaultsTo,
             $this->column,

@@ -8,7 +8,7 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Support\ServiceProvider;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
-use Support\Database\Eloquent\Compatibility\Console\CheckDivergence;
+use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
 
 class Provider extends ServiceProvider
 {
@@ -29,6 +29,6 @@ class Provider extends ServiceProvider
         $events->listen(Looping::class, $release);
         $this->app->terminating($release);
 
-        $this->commands([CheckDivergence::class]);
+        $this->commands([CheckDrift::class]);
     }
 }

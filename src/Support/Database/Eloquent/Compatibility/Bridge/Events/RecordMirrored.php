@@ -5,11 +5,12 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Bridge\Events;
 
 use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 
-final readonly class Mirrored
+final readonly class RecordMirrored
 {
     /**
-     * @param  list<string>  $events
+     * @param  list<ModelEvent>  $events
      * @param  null|array<string, mixed>  $before
      * @param  null|array<string, mixed>  $after
      */

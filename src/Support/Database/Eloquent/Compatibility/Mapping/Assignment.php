@@ -4,11 +4,10 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
-final readonly class Write
+final readonly class Assignment
 {
     public function __construct(
-        public string $alias,
-        public string $column,
-        public string $expression,
+        public Attribute $attribute,
+        public TargetColumn $targetColumn,
     ) {}
 }

@@ -6,18 +6,18 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 
-final class MirroredCompatibilityMaps
+final class MirrorIndex
 {
-    /** @var array<string, array{declaration: Declaration, mirror: EventMirror, locator: Locator}> */
+    /** @var array<string, MirroredMap> */
     private array $maps = [];
 
-    /** @var array<class-string<Model>, list<array{map: string, alias: string}>> */
+    /** @var array<class-string<Model>, list<MapMember>> */
     private array $models = [];
 
-    /** @var array<string, list<array{map: string, alias: string}>> */
+    /** @var array<string, list<MapMember>> */
     private array $tables = [];
 
     /** @var array<string, list<class-string<Model>>> */
@@ -26,18 +26,18 @@ final class MirroredCompatibilityMaps
     /**
      * @return list<class-string<Model>> the model classes this compatibility map adds
      */
-    public function add(Declaration $declaration, EventMirror $mirror): array
+    public function add(ResolvedMap $resolvedMap, EventMirror $mirror): array
     {
-        $name = $declaration->name;
-        $this->maps[$name] = ['declaration' => $declaration, 'mirror' => $mirror, 'locator' => new Locator($declaration)];
+        $name = $resolvedMap->name;
+        $this->maps[$name] = new MirroredMap($resolvedMap, $mirror, new KeyTranslator($resolvedMap));
         $added = [];
 
-        $previous = $declaration->previousModel;
+        $previous = $resolvedMap->previousModel;
         $members = [(string) $previous->alias => [(string) $previous->model, $previous->view]];
 
-        foreach ($declaration->currentModels() as $model => $alias) {
-            $members[$alias] = [$model, $declaration->table($alias)];
-            $this->tables[$declaration->table($alias)][] = ['map' => $name, 'alias' => $alias];
+        foreach ($resolvedMap->currentModels() as $model => $alias) {
+            $members[$alias] = [$model, $resolvedMap->table($alias)];
+            $this->tables[$resolvedMap->table($alias)][] = new MapMember($name, $alias);
         }
 
         foreach ($members as $alias => [$model, $relation]) {
@@ -45,36 +45,36 @@ final class MirroredCompatibilityMaps
                 $added[] = $model;
             }
 
-            $this->models[$model][] = ['map' => $name, 'alias' => $alias];
+            $this->models[$model][] = new MapMember($name, $alias);
             $this->relations[$relation][] = $model;
         }
 
         return $added;
     }
 
-    public function declaration(string $map): Declaration
+    public function declaration(string $map): ResolvedMap
     {
-        return $this->maps[$map]['declaration'];
+        return $this->maps[$map]->resolvedMap;
     }
 
-    public function locator(string $map): Locator
+    public function locator(string $map): KeyTranslator
     {
-        return $this->maps[$map]['locator'];
+        return $this->maps[$map]->keyTranslator;
     }
 
     /** @return list<ExcludedListener> */
     public function excludedListeners(string $map): array
     {
-        return $this->maps[$map]['mirror']->excludedListeners();
+        return $this->maps[$map]->mirror->excludedListeners();
     }
 
-    /** @return list<array{map: string, alias: string}> */
+    /** @return list<MapMember> */
     public function forModel(string $class): array
     {
         return $this->models[$class] ?? [];
     }
 
-    /** @return list<array{map: string, alias: string}> */
+    /** @return list<MapMember> */
     public function forTable(string $table): array
     {
         return $this->tables[$table] ?? [];
@@ -93,7 +93,7 @@ final class MirroredCompatibilityMaps
 
         foreach ($this->modelsOf($relation) as $model) {
             foreach ($this->forModel($model) as $member) {
-                $maps[] = $member['map'];
+                $maps[] = $member->map;
             }
         }
 

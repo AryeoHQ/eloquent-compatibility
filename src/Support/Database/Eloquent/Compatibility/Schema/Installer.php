@@ -7,7 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 
 final readonly class Installer
 {
@@ -15,48 +15,48 @@ final readonly class Installer
 
     public function install(CompatibilityMap $map): void
     {
-        $declaration = Declaration::of($map);
+        $resolvedMap = ResolvedMap::of($map);
 
-        if ($this->viewExists($declaration->previousModel->view)) {
-            throw InvalidCompatibilityMap::because($declaration->name, "a relation named {$declaration->previousModel->view} already exists; use recompile() to recompile the compatibility map");
+        if ($this->viewExists($resolvedMap->previousModel->view)) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$resolvedMap->previousModel->view} already exists; use recompile() to recompile the compatibility map");
         }
 
-        $this->apply($declaration);
-        $this->copyPrivileges($declaration);
+        $this->apply($resolvedMap);
+        $this->copyPrivileges($resolvedMap);
     }
 
     public function recompile(CompatibilityMap $map): void
     {
-        $this->apply(Declaration::of($map));
+        $this->apply(ResolvedMap::of($map));
     }
 
     public function uninstall(CompatibilityMap $map): void
     {
-        $declaration = Declaration::of($map);
-        $this->dropObjects($declaration);
-        $this->connection->unprepared('DROP VIEW IF EXISTS '.Sql::id($declaration->previousModel->view));
+        $resolvedMap = ResolvedMap::of($map);
+        $this->dropObjects($resolvedMap);
+        $this->connection->unprepared('DROP VIEW IF EXISTS '.SqlFragments::id($resolvedMap->previousModel->view));
     }
 
-    private function apply(Declaration $declaration): void
+    private function apply(ResolvedMap $resolvedMap): void
     {
-        $compiled = (new Compiler($this->connection))->compile($declaration);
-        $this->dropObjects($declaration);
+        $compiledSql = (new Compiler($this->connection))->compile($resolvedMap);
+        $this->dropObjects($resolvedMap);
 
-        foreach ($compiled->statements() as $statement) {
+        foreach ($compiledSql->statements() as $statement) {
             $this->connection->unprepared($statement);
         }
     }
 
-    private function dropObjects(Declaration $declaration): void
+    private function dropObjects(ResolvedMap $resolvedMap): void
     {
-        $prefix = Sql::like($declaration->objectPrefix());
+        $prefix = SqlFragments::like($resolvedMap->objectPrefix());
 
         $triggers = $this->connection->select(
             "select tgname as name, tgrelid::regclass::text as relation from pg_trigger where not tgisinternal and tgname like {$prefix}",
         );
 
         foreach ($triggers as $trigger) {
-            $this->connection->unprepared('DROP TRIGGER IF EXISTS '.Sql::id((string) $trigger->name).' ON '.$trigger->relation);
+            $this->connection->unprepared('DROP TRIGGER IF EXISTS '.SqlFragments::id((string) $trigger->name).' ON '.$trigger->relation);
         }
 
         $functions = $this->connection->select(
@@ -68,12 +68,12 @@ final readonly class Installer
         }
     }
 
-    private function copyPrivileges(Declaration $declaration): void
+    private function copyPrivileges(ResolvedMap $resolvedMap): void
     {
         $grantee = "CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END";
         $option = "CASE WHEN privilege.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END";
-        $view = Sql::id($declaration->previousModel->view);
-        $table = Sql::id((string) $declaration->previousModel->table);
+        $view = SqlFragments::id($resolvedMap->previousModel->view);
+        $table = SqlFragments::id((string) $resolvedMap->previousModel->table);
 
         $grants = $this->connection->select(
             "select privilege.privilege_type || ' ON ' || ? || ' TO ' || {$grantee} || {$option} as statement
@@ -96,6 +96,6 @@ final readonly class Installer
 
     private function viewExists(string $view): bool
     {
-        return $this->connection->scalar('select to_regclass(?) is not null', [Sql::id($view)]) === true;
+        return $this->connection->scalar('select to_regclass(?) is not null', [SqlFragments::id($view)]) === true;
     }
 }

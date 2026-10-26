@@ -7,8 +7,8 @@ namespace Tests\Fixtures\Support\Workbench;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
-use Support\Database\Eloquent\Compatibility\Schema\Sql;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final class Tables
 {
@@ -82,7 +82,7 @@ final class Tables
         }
 
         foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
-            $prefix = Sql::like(Declaration::of($map)->objectPrefix());
+            $prefix = SqlFragments::like(ResolvedMap::of($map)->objectPrefix());
 
             Schema::getConnection()->unprepared(
                 "DO \$drop\$ DECLARE trigger_function regprocedure; BEGIN

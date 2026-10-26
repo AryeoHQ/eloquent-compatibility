@@ -8,23 +8,24 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
-use Support\Database\Eloquent\Compatibility\Bridge\Events\Mirrored;
+use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
+use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use WeakMap;
 
-final class Replay
+final class EventReplayer
 {
     /** @var WeakMap<Model, true> */
     private WeakMap $replaying;
 
-    /** @var list<string> */
+    /** @var list<ModelEvent> */
     private array $fired = [];
 
-    /** @var WeakMap<object, array{0: string, 1: list<ExcludedListener>}> */
+    /** @var WeakMap<object, Exclusion> */
     private WeakMap $excluded;
 
-    public function __construct(private readonly MirroredCompatibilityMaps $mirroredMaps)
+    public function __construct(private readonly MirrorIndex $mirrorIndex)
     {
         $this->replaying = new WeakMap;
         $this->excluded = new WeakMap;
@@ -39,7 +40,7 @@ final class Replay
      * @param  null|array<string, mixed>  $before
      * @param  null|array<string, mixed>  $after
      */
-    public function record(Record $record, null|array $before, null|array $after, Model $source, string $connection): void
+    public function record(AffectedRecord $record, null|array $before, null|array $after, Model $source, string $connection): void
     {
         $class = $record->model;
         $template = new $class;
@@ -66,7 +67,7 @@ final class Replay
                 default => $this->updated($record, $model, $before, $after),
             };
 
-            event(new Mirrored($record->map, $source, $model, $this->fired, $before, $after));
+            event(new RecordMirrored($record->map, $source, $model, $this->fired, $before, $after));
         } finally {
             unset($this->replaying[$model]);
             $this->fired = $outer;
@@ -76,7 +77,7 @@ final class Replay
     /**
      * @param  array<string, mixed>  $after
      */
-    private function created(Record $record, Model $model, array $after): void
+    private function created(AffectedRecord $record, Model $model, array $after): void
     {
         $model->setRawAttributes($after);
 
@@ -84,13 +85,13 @@ final class Replay
             $model->offsetUnset($model->getKeyName());
         }
 
-        $this->ing($record, $model, 'saving');
-        $this->ing($record, $model, 'creating');
+        $this->ing($record, $model, ModelEvent::Saving);
+        $this->ing($record, $model, ModelEvent::Creating);
         $model->setAttribute($model->getKeyName(), $after[$model->getKeyName()] ?? $model->getKey());
         $model->exists = true;
         $model->wasRecentlyCreated = true;
-        $this->ed($record, $model, 'created');
-        $this->ed($record, $model, 'saved');
+        $this->ed($record, $model, ModelEvent::Created);
+        $this->ed($record, $model, ModelEvent::Saved);
         $model->syncOriginal();
     }
 
@@ -98,15 +99,15 @@ final class Replay
      * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $after
      */
-    private function updated(Record $record, Model $model, array $before, array $after): void
+    private function updated(AffectedRecord $record, Model $model, array $before, array $after): void
     {
         $model->setRawAttributes($before, true);
         $model->setRawAttributes($after);
-        $this->ing($record, $model, 'saving');
-        $this->ing($record, $model, 'updating');
+        $this->ing($record, $model, ModelEvent::Saving);
+        $this->ing($record, $model, ModelEvent::Updating);
         $model->syncChanges();
-        $this->ed($record, $model, 'updated');
-        $this->ed($record, $model, 'saved');
+        $this->ed($record, $model, ModelEvent::Updated);
+        $this->ed($record, $model, ModelEvent::Saved);
         $model->syncOriginal();
     }
 
@@ -114,54 +115,54 @@ final class Replay
      * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $after
      */
-    private function trashed(Record $record, Model $model, array $before, array $after): void
+    private function trashed(AffectedRecord $record, Model $model, array $before, array $after): void
     {
         $model->setRawAttributes($before, true);
-        $this->ing($record, $model, 'deleting');
+        $this->ing($record, $model, ModelEvent::Deleting);
         $model->setRawAttributes($after, true);
-        $this->ed($record, $model, 'trashed');
-        $this->ed($record, $model, 'deleted');
+        $this->ed($record, $model, ModelEvent::Trashed);
+        $this->ed($record, $model, ModelEvent::Deleted);
     }
 
     /**
      * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $after
      */
-    private function restored(Record $record, Model $model, array $before, array $after): void
+    private function restored(AffectedRecord $record, Model $model, array $before, array $after): void
     {
         $model->setRawAttributes($before, true);
-        $this->ing($record, $model, 'restoring');
+        $this->ing($record, $model, ModelEvent::Restoring);
         $model->setRawAttributes($after);
-        $this->ing($record, $model, 'saving');
-        $this->ing($record, $model, 'updating');
+        $this->ing($record, $model, ModelEvent::Saving);
+        $this->ing($record, $model, ModelEvent::Updating);
         $model->syncChanges();
-        $this->ed($record, $model, 'updated');
-        $this->ed($record, $model, 'saved');
+        $this->ed($record, $model, ModelEvent::Updated);
+        $this->ed($record, $model, ModelEvent::Saved);
         $model->syncOriginal();
-        $this->ed($record, $model, 'restored');
+        $this->ed($record, $model, ModelEvent::Restored);
     }
 
     /**
      * @param  array<string, mixed>  $before
      */
-    private function deleted(Record $record, Model $model, array $before, bool $softDeletes): void
+    private function deleted(AffectedRecord $record, Model $model, array $before, bool $softDeletes): void
     {
         $model->setRawAttributes($before, true);
 
         if ($softDeletes) {
-            $this->ing($record, $model, 'forceDeleting');
+            $this->ing($record, $model, ModelEvent::ForceDeleting);
         }
 
-        $this->ing($record, $model, 'deleting');
+        $this->ing($record, $model, ModelEvent::Deleting);
         $model->exists = false;
-        $this->ed($record, $model, 'deleted');
+        $this->ed($record, $model, ModelEvent::Deleted);
 
         if ($softDeletes) {
-            $this->ed($record, $model, 'forceDeleted');
+            $this->ed($record, $model, ModelEvent::ForceDeleted);
         }
     }
 
-    private function ing(Record $record, Model $model, string $event): void
+    private function ing(AffectedRecord $record, Model $model, ModelEvent $event): void
     {
         $attributes = $model->getAttributes();
 
@@ -176,12 +177,12 @@ final class Replay
         }
     }
 
-    private function ed(Record $record, Model $model, string $event): void
+    private function ed(AffectedRecord $record, Model $model, ModelEvent $event): void
     {
         $this->fire($record->map, $model, $event, false);
     }
 
-    private function fire(string $map, Model $model, string $event, bool $halt): mixed
+    private function fire(string $map, Model $model, ModelEvent $event, bool $halt): mixed
     {
         $this->fired[] = $event;
         $dispatcher = $model::getEventDispatcher();
@@ -190,8 +191,8 @@ final class Replay
             return null;
         }
 
-        $excludedListeners = array_values(array_filter($this->mirroredMaps->excludedListeners($map), fn (ExcludedListener $excludedListener) => $excludedListener->appliesTo($event)));
-        $custom = $model->dispatchesEvents()[$event] ?? null;
+        $excludedListeners = array_values(array_filter($this->mirrorIndex->excludedListeners($map), fn (ExcludedListener $excludedListener) => $excludedListener->appliesTo($event)));
+        $custom = $model->dispatchesEvents()[$event->value] ?? null;
 
         if (is_string($custom) && class_exists($custom)) {
             $result = $this->dispatch($dispatcher, new $custom($model), $model, $halt, $excludedListeners, $event);
@@ -209,13 +210,13 @@ final class Replay
             }
         }
 
-        return $this->dispatch($dispatcher, "eloquent.{$event}: ".$model::class, $model, $halt, $excludedListeners, $event);
+        return $this->dispatch($dispatcher, $event->for($model::class), $model, $halt, $excludedListeners, $event);
     }
 
     /**
      * @param  list<ExcludedListener>  $excludedListeners
      */
-    private function dispatch(Dispatcher $dispatcher, object|string $event, Model $model, bool $halt, array $excludedListeners, string $modelEvent): mixed
+    private function dispatch(Dispatcher $dispatcher, object|string $event, Model $model, bool $halt, array $excludedListeners, ModelEvent $modelEvent): mixed
     {
         $payload = is_object($event) ? [] : [$model];
 
@@ -226,7 +227,7 @@ final class Replay
         $real = $dispatcher instanceof EventFake ? $dispatcher->dispatcher : $dispatcher;
         $subject = is_object($event) ? $event : $model;
         $masked = $this->mask($real, is_object($event) ? $event::class : $event, $excludedListeners, $modelEvent);
-        $this->excluded[$subject] = [$modelEvent, $excludedListeners];
+        $this->excluded[$subject] = new Exclusion($modelEvent, $excludedListeners);
 
         try {
             return $halt ? $real->until($event, $payload) : $real->dispatch($event, $payload);
@@ -240,7 +241,7 @@ final class Replay
      * @param  list<ExcludedListener>  $excludedListeners
      * @return array<string, list<mixed>>
      */
-    private function mask(Dispatcher $events, string $name, array $excludedListeners, string $modelEvent): array
+    private function mask(Dispatcher $events, string $name, array $excludedListeners, ModelEvent $modelEvent): array
     {
         $keys = [$name];
 
@@ -295,16 +296,16 @@ final class Replay
 
         return function (mixed ...$payload) use ($prepared, $key, $listener): mixed {
             $subject = $payload[0] ?? null;
-            [$event, $excludedListeners] = is_object($subject) ? $this->excluded[$subject] ?? ['', []] : ['', []];
+            $exclusion = is_object($subject) ? $this->excluded[$subject] ?? null : null;
 
-            return $this->excludes($excludedListeners, $event, $listener) ? null : $prepared($key, $payload);
+            return $exclusion !== null && $this->excludes($exclusion->listeners, $exclusion->event, $listener) ? null : $prepared($key, $payload);
         };
     }
 
     /**
      * @param  list<ExcludedListener>  $excludedListeners
      */
-    private function excludes(array $excludedListeners, string $event, mixed $listener): bool
+    private function excludes(array $excludedListeners, ModelEvent $event, mixed $listener): bool
     {
         [$class, $method] = $this->identify($listener);
 

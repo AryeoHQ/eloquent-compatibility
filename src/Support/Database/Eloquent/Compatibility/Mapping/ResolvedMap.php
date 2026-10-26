@@ -7,9 +7,10 @@ namespace Support\Database\Eloquent\Compatibility\Mapping;
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Schema\Sql;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\TriggerFunction;
 
-final readonly class Declaration
+final readonly class ResolvedMap
 {
     private const string IDENTIFIER = '/^[a-z_][a-z0-9_]*$/';
 
@@ -17,7 +18,7 @@ final readonly class Declaration
      * @param  list<DependentCurrentModel>  $dependentCurrentModels
      * @param  list<Attribute>  $attributes
      * @param  list<UnrepresentableState>  $unrepresentableStates
-     * @param  array<string, array{table: string, key: string}>  $tables
+     * @param  array<string, AliasedTable>  $tables
      */
     private function __construct(
         public string $name,
@@ -41,7 +42,7 @@ final readonly class Declaration
         }
 
         $previous = self::previous($name, $previous);
-        $tables = [(string) $previous->alias => ['table' => (string) $previous->table, 'key' => (string) $previous->key]];
+        $tables = [(string) $previous->alias => new AliasedTable((string) $previous->table, (string) $previous->key)];
 
         foreach ([$primary, ...$dependents] as $current) {
             $model = self::model($name, $current->model);
@@ -54,7 +55,7 @@ final readonly class Declaration
                 throw InvalidCompatibilityMap::because($name, "alias '{$current->alias}' is used twice");
             }
 
-            $tables[$current->alias] = ['table' => $model->getTable(), 'key' => $model->getKeyName()];
+            $tables[$current->alias] = new AliasedTable($model->getTable(), $model->getKeyName());
         }
 
         foreach ($dependents as $dependent) {
@@ -74,21 +75,21 @@ final readonly class Declaration
         }
 
         $attributes = array_map(fn (Attribute $attribute) => $attribute->resolve((string) $previous->alias), $map->attributes());
-        $declaration = new self($name, $previous, $primary, $dependents, $attributes, $map->unrepresentableStates(), $tables);
-        $declaration->validateAttributes();
-        $declaration->validateUnrepresentableStates();
+        $resolvedMap = new self($name, $previous, $primary, $dependents, $attributes, $map->unrepresentableStates(), $tables);
+        $resolvedMap->validateAttributes();
+        $resolvedMap->validateUnrepresentableStates();
 
-        return $declaration;
+        return $resolvedMap;
     }
 
     public function table(string $alias): string
     {
-        return $this->tables[$alias]['table'];
+        return $this->tables[$alias]->table;
     }
 
     public function key(string $alias): string
     {
-        return $this->tables[$alias]['key'];
+        return $this->tables[$alias]->key;
     }
 
     /** @return list<string> */
@@ -116,11 +117,11 @@ final readonly class Declaration
     public function locate(DependentCurrentModel $dependent, string $primaryKey, string $previous): string
     {
         $alias = (string) $dependent->alias;
-        $key = $alias.'.'.Sql::id($this->key($alias));
+        $key = $alias.'.'.SqlFragments::id($this->key($alias));
 
-        return 'FROM '.Sql::id($this->table($alias)).' '.$alias
-            .' WHERE '.$alias.'.'.Sql::id($this->primaryForeignKey($dependent)).' = '.$primaryKey
-            .($dependent->designation === null ? '' : ' AND '.$key.' = '.$previous.'.'.Sql::id($dependent->designation))
+        return 'FROM '.SqlFragments::id($this->table($alias)).' '.$alias
+            .' WHERE '.$alias.'.'.SqlFragments::id($this->primaryForeignKey($dependent)).' = '.$primaryKey
+            .($dependent->designation === null ? '' : ' AND '.$key.' = '.$previous.'.'.SqlFragments::id($dependent->designation))
             .' AND ('.$dependent->readableWhen.')'
             .' ORDER BY '.$key.' LIMIT 1';
     }
@@ -132,21 +133,21 @@ final readonly class Declaration
     }
 
     /**
-     * @return list<array{attribute: Attribute, write: Write}>
+     * @return list<Assignment>
      */
     public function writesTo(string $alias): array
     {
-        $writes = [];
+        $assignments = [];
 
         foreach ($this->attributes as $attribute) {
-            foreach ($attribute->writesTo as $write) {
-                if ($write->alias === $alias) {
-                    $writes[] = ['attribute' => $attribute, 'write' => $write];
+            foreach ($attribute->writesTo as $targetColumn) {
+                if ($targetColumn->alias === $alias) {
+                    $assignments[] = new Assignment($attribute, $targetColumn);
                 }
             }
         }
 
-        return $writes;
+        return $assignments;
     }
 
     /** @return list<Attribute> */
@@ -175,7 +176,27 @@ final readonly class Declaration
         return $models;
     }
 
-    public function object(string $suffix): string
+    public function function(TriggerFunction $function): string
+    {
+        return $this->object($function->value);
+    }
+
+    public function refuseFunction(UnrepresentableState $state): string
+    {
+        return $this->object('refuse_'.$state->name);
+    }
+
+    public function designateFunction(DependentCurrentModel $dependent): string
+    {
+        return $this->object('designate_'.$dependent->alias);
+    }
+
+    public function objectPrefix(): string
+    {
+        return 'compatibility__'.$this->name.'__';
+    }
+
+    private function object(string $suffix): string
     {
         $object = $this->objectPrefix().$suffix;
 
@@ -184,11 +205,6 @@ final readonly class Declaration
         }
 
         return $object;
-    }
-
-    public function objectPrefix(): string
-    {
-        return 'compatibility__'.$this->name.'__';
     }
 
     private function validateAttributes(): void
@@ -223,12 +239,12 @@ final readonly class Declaration
                 throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' declares no write and is not read-only, so a write through the previous model would be lost");
             }
 
-            foreach ($attribute->writesTo as $write) {
-                if (! array_key_exists($write->alias, $this->tables)) {
-                    throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' writes unknown alias '{$write->alias}'");
+            foreach ($attribute->writesTo as $targetColumn) {
+                if (! array_key_exists($targetColumn->alias, $this->tables)) {
+                    throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' writes unknown alias '{$targetColumn->alias}'");
                 }
 
-                $target = $write->alias.'.'.$write->column;
+                $target = $targetColumn->alias.'.'.$targetColumn->column;
 
                 if (array_key_exists($target, $targets)) {
                     throw InvalidCompatibilityMap::because($this->name, "attributes '{$targets[$target]}' and '{$attribute->column}' both write {$target}; each stored column has one owner");

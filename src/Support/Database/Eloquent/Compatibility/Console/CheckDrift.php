@@ -6,9 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Illuminate\Console\Command;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 
-final class CheckDivergence extends Command
+final class CheckDrift extends Command
 {
     protected $signature = 'compatibility:check
         {--map=* : Check only the named compatibility maps}
@@ -16,12 +16,12 @@ final class CheckDivergence extends Command
 
     protected $description = 'Name every record and attribute where the previous and current models of a compatibility map disagree.';
 
-    public function handle(CompatibilityMaps $compatibilityMaps, Divergence $divergence): int
+    public function handle(CompatibilityMaps $compatibilityMaps, DriftQueries $driftQueries): int
     {
         $names = array_values(array_filter((array) $this->option('map'), is_string(...)));
         $maps = $names === [] ? $compatibilityMaps->all() : array_map($compatibilityMaps->get(...), $names);
         $limit = max(1, (int) $this->option('limit'));
-        $findings = array_merge(...array_map(fn (Declaration $map) => $divergence->find($map, $limit), $maps));
+        $findings = array_merge(...array_map(fn (ResolvedMap $map) => $driftQueries->find($map, $limit), $maps));
 
         if ($findings === []) {
             $this->components->info('No divergence in '.count($maps).' compatibility '.str('map')->plural(count($maps)).'.');
@@ -31,7 +31,7 @@ final class CheckDivergence extends Command
 
         $this->table(
             ['Map', 'Check', 'Record', 'Attribute', 'Detail'],
-            array_map(fn (Finding $finding) => [$finding->map, $finding->check, $finding->record, $finding->attribute, $finding->detail], $findings),
+            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check->value, $finding->record, $finding->attribute, $finding->detail], $findings),
         );
 
         $this->components->error(count($findings).' divergent '.str('record')->plural(count($findings)).' found.');

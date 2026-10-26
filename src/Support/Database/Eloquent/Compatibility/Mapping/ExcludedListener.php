@@ -10,7 +10,7 @@ final readonly class ExcludedListener
 {
     private function __construct(
         public string $listener,
-        public null|string $event,
+        public null|ModelEvent $event,
         public string $because,
     ) {}
 
@@ -19,17 +19,17 @@ final readonly class ExcludedListener
         return new self($listener, null, $because);
     }
 
-    public function forEvent(string $event): self
+    public function forEvent(ModelEvent $event): self
     {
         return new self($this->listener, $event, $this->because);
     }
 
-    public function appliesTo(string $event): bool
+    public function appliesTo(ModelEvent $event): bool
     {
         return $this->event === null || $this->event === $event;
     }
 
-    public function matches(string $event, string $class, string $method): bool
+    public function matches(ModelEvent $event, string $class, string $method): bool
     {
         if (! $this->appliesTo($event)) {
             return false;

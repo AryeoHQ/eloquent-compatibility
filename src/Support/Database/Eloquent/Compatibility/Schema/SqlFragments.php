@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
-final class Sql
+final class SqlFragments
 {
     public static function id(string $identifier): string
     {
@@ -34,12 +34,12 @@ final class Sql
 
     public static function refuse(string $message, string $detail, string $hint): string
     {
-        return self::raise('CM001', $message, $detail, $hint);
+        return self::raise(SqlState::Refused, $message, $detail, $hint);
     }
 
-    public static function raise(string $code, string $message, string $detail, string $hint): string
+    public static function raise(SqlState $code, string $message, string $detail, string $hint): string
     {
-        return 'RAISE EXCEPTION USING ERRCODE = '.self::literal($code)
+        return 'RAISE EXCEPTION USING ERRCODE = '.self::literal($code->value)
             .', MESSAGE = '.$message
             .', DETAIL = '.self::literal($detail)
             .', HINT = '.self::literal($hint).';';

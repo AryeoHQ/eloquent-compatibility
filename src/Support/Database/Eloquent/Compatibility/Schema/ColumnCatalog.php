@@ -6,15 +6,15 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
 
-final class Columns
+final class ColumnCatalog
 {
-    /** @var array<string, array<string, array{type: string, default: null|string, notNull: bool}>> */
+    /** @var array<string, array<string, Column>> */
     private array $tables = [];
 
     public function __construct(private readonly ConnectionInterface $connection) {}
 
     /**
-     * @return array<string, array{type: string, default: null|string, notNull: bool}>
+     * @return array<string, Column>
      */
     public function of(string $table): array
     {
@@ -28,17 +28,17 @@ final class Columns
              left join pg_attrdef column_default on column_default.adrelid = table_column.attrelid and column_default.adnum = table_column.attnum
              where table_column.attrelid = to_regclass(?) and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [Sql::id($table)],
+            [SqlFragments::id($table)],
         );
 
         $columns = [];
 
         foreach ($rows as $row) {
-            $columns[(string) $row->name] = [
-                'type' => (string) $row->type,
-                'default' => $row->default === null ? null : (string) $row->default,
-                'notNull' => $row->not_null === true,
-            ];
+            $columns[(string) $row->name] = new Column(
+                (string) $row->type,
+                $row->default === null ? null : (string) $row->default,
+                $row->not_null === true,
+            );
         }
 
         return $this->tables[$table] = $columns;
@@ -46,11 +46,11 @@ final class Columns
 
     public function type(string $table, string $column): null|string
     {
-        return $this->of($table)[$column]['type'] ?? null;
+        return $this->of($table)[$column]->type ?? null;
     }
 
     public function notNull(string $table, string $column): bool
     {
-        return $this->of($table)[$column]['notNull'] ?? false;
+        return $this->of($table)[$column]->notNull ?? false;
     }
 }

@@ -11,13 +11,14 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Assert;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
-use Support\Database\Eloquent\Compatibility\Bridge\Events\Mirrored;
+use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Throwable;
 
 trait InteractsWithCompatibilityMaps
 {
-    /** @var list<Mirrored> */
+    /** @var list<RecordMirrored> */
     private array $mirroredEvents = [];
 
     private bool $recordingMirroredEvents = false;
@@ -32,12 +33,12 @@ trait InteractsWithCompatibilityMaps
 
         $this->recordingMirroredEvents = true;
 
-        Event::listen(Mirrored::class, function (Mirrored $mirrored): void {
-            $this->mirroredEvents[] = $mirrored;
+        Event::listen(RecordMirrored::class, function (RecordMirrored $recordMirrored): void {
+            $this->mirroredEvents[] = $recordMirrored;
         });
     }
 
-    /** @return list<Mirrored> */
+    /** @return list<RecordMirrored> */
     protected function mirroredEvents(): array
     {
         return $this->mirroredEvents;
@@ -47,21 +48,21 @@ trait InteractsWithCompatibilityMaps
      * @template TModel of Model
      *
      * @param  class-string<TModel>  $model
-     * @param  null|Closure(TModel, Mirrored): bool  $where
+     * @param  null|Closure(TModel, RecordMirrored): bool  $where
      */
-    protected function assertMirrored(string $model, string $event, null|Closure $where = null, int $times = 1): void
+    protected function assertMirrored(string $model, ModelEvent $event, null|Closure $where = null, int $times = 1): void
     {
         $matches = array_filter(
             $this->mirroredEvents,
-            fn (Mirrored $mirrored) => $mirrored->model instanceof $model
-                && in_array($event, $mirrored->events, true)
-                && ($where === null || $where($mirrored->model, $mirrored)),
+            fn (RecordMirrored $recordMirrored) => $recordMirrored->model instanceof $model
+                && in_array($event, $recordMirrored->events, true)
+                && ($where === null || $where($recordMirrored->model, $recordMirrored)),
         );
 
         Assert::assertCount(
             $times,
             $matches,
-            "Expected the event bridge to raise '{$event}' on {$model} {$times} time(s). It raised: ".$this->describeMirroredEvents(),
+            "Expected the event bridge to raise '{$event->value}' on {$model} {$times} time(s). It raised: ".$this->describeMirroredEvents(),
         );
     }
 
@@ -116,7 +117,7 @@ trait InteractsWithCompatibilityMaps
         }
 
         return implode('; ', array_map(
-            fn (Mirrored $mirrored) => class_basename($mirrored->model).' '.json_encode($mirrored->model->getKey()).' ['.implode(', ', $mirrored->events).']',
+            fn (RecordMirrored $recordMirrored) => class_basename($recordMirrored->model).' '.json_encode($recordMirrored->model->getKey()).' ['.implode(', ', array_map(fn (ModelEvent $event) => $event->value, $recordMirrored->events)).']',
             $this->mirroredEvents,
         ));
     }

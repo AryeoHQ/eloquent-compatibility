@@ -9,10 +9,11 @@ use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
-use Support\Database\Eloquent\Compatibility\Bridge\Locator;
+use Support\Database\Eloquent\Compatibility\Bridge\KeyTranslator;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
-use Support\Database\Eloquent\Compatibility\Console\Divergence;
-use Support\Database\Eloquent\Compatibility\Console\Finding;
+use Support\Database\Eloquent\Compatibility\Console\DriftCheck;
+use Support\Database\Eloquent\Compatibility\Console\DriftFinding;
+use Support\Database\Eloquent\Compatibility\Console\DriftQueries;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Compiler;
@@ -27,8 +28,8 @@ use Tests\TestCase;
 
 #[CoversClass(DependentCurrentModel::class)]
 #[CoversClass(Compiler::class)]
-#[CoversClass(Locator::class)]
-#[CoversClass(Divergence::class)]
+#[CoversClass(KeyTranslator::class)]
+#[CoversClass(DriftQueries::class)]
 final class DependentCurrentModelTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
@@ -123,8 +124,8 @@ final class DependentCurrentModelTest extends TestCase
 
         Widget::query()->where('gadget_id', $gadget)->sole()->update(['street' => '5 Mirror St']);
 
-        $this->assertMirrored(GadgetPlace::class, 'updated', fn (GadgetPlace $place) => $place->id === $first);
-        $this->assertMirrored(GadgetPlace::class, 'updated', fn (GadgetPlace $place) => $place->id === $lower, 0);
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (GadgetPlace $place) => $place->id === $first);
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (GadgetPlace $place) => $place->id === $lower, 0);
         $this->assertSame('5 Mirror St', DB::table('gadget_places')->where('id', $first)->value('street'));
     }
 
@@ -141,11 +142,11 @@ final class DependentCurrentModelTest extends TestCase
 
         $this->artisan('compatibility:check', ['--map' => ['widgets']])->assertFailed();
         $this->assertSame([
-            ['designation', 'retained_widgets#'.$this->retainedKey($stray), 'retained_widgets.place_id', 'it names a gadget_places row of another gadgets row'],
-            ['designation', 'retained_widgets#'.$this->retainedKey($missing), 'retained_widgets.place_id', 'it names a gadget_places row that does not exist'],
+            [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($stray), 'retained_widgets.place_id', 'it names a gadget_places row of another gadgets row'],
+            [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($missing), 'retained_widgets.place_id', 'it names a gadget_places row that does not exist'],
         ], array_map(
-            fn (Finding $finding) => [$finding->check, $finding->record, $finding->attribute, $finding->detail],
-            resolve(Divergence::class)->find(Declaration::of($this->designated()), 100),
+            fn (DriftFinding $finding) => [$finding->check, $finding->record, $finding->attribute, $finding->detail],
+            resolve(DriftQueries::class)->find(ResolvedMap::of($this->designated()), 100),
         ));
     }
 

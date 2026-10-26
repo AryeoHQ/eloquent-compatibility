@@ -11,7 +11,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
@@ -334,7 +334,7 @@ final class InstallerTest extends TestCase
             preg_match_all('/"(compatibility__[a-z0-9_]+)"/', $sql, $objects);
 
             $identifiers = [
-                ...Declaration::of($map)->aliases(),
+                ...ResolvedMap::of($map)->aliases(),
                 ...array_filter($relations[1], fn (string $alias) => ! in_array(strtolower($alias), self::KEYWORDS, true)),
                 ...$rows[1],
                 ...$variables[1],

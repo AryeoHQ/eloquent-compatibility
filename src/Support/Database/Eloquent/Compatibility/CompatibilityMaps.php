@@ -6,33 +6,33 @@ namespace Support\Database\Eloquent\Compatibility;
 
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Mapping\Declaration;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 
 final class CompatibilityMaps
 {
-    /** @var array<string, Declaration> */
-    private array $declarations = [];
+    /** @var array<string, ResolvedMap> */
+    private array $resolvedMaps = [];
 
-    public function register(CompatibilityMap $map): Declaration
+    public function register(CompatibilityMap $map): ResolvedMap
     {
-        $declaration = Declaration::of($map);
-        $existing = $this->declarations[$declaration->name] ?? null;
+        $resolvedMap = ResolvedMap::of($map);
+        $existing = $this->resolvedMaps[$resolvedMap->name] ?? null;
 
-        if ($existing !== null && $existing->previousModel->view !== $declaration->previousModel->view) {
-            throw InvalidCompatibilityMap::because($declaration->name, 'another compatibility map with this name is already registered');
+        if ($existing !== null && $existing->previousModel->view !== $resolvedMap->previousModel->view) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, 'another compatibility map with this name is already registered');
         }
 
-        return $this->declarations[$declaration->name] = $declaration;
+        return $this->resolvedMaps[$resolvedMap->name] = $resolvedMap;
     }
 
-    /** @return list<Declaration> */
+    /** @return list<ResolvedMap> */
     public function all(): array
     {
-        return array_values($this->declarations);
+        return array_values($this->resolvedMaps);
     }
 
-    public function get(string $name): Declaration
+    public function get(string $name): ResolvedMap
     {
-        return $this->declarations[$name] ?? throw InvalidCompatibilityMap::because($name, 'no compatibility map with this name is registered');
+        return $this->resolvedMaps[$name] ?? throw InvalidCompatibilityMap::because($name, 'no compatibility map with this name is registered');
     }
 }

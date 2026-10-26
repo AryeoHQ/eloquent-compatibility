@@ -6,7 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Database\Eloquent\Model;
 
-final readonly class Record
+final readonly class AffectedRecord
 {
     /**
      * @param  class-string<Model>  $model
@@ -18,8 +18,7 @@ final readonly class Record
         public string $lockTable,
         public string $keyName,
         public int|string $key,
-        public bool $previous,
-        public bool $primary = false,
+        public RecordRole $role,
     ) {}
 
     public function id(): string

@@ -14,9 +14,9 @@ use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
-#[CoversClass(CheckDivergence::class)]
-#[CoversClass(Divergence::class)]
-final class CheckDivergenceTest extends TestCase
+#[CoversClass(CheckDrift::class)]
+#[CoversClass(DriftQueries::class)]
+final class CheckDriftTest extends TestCase
 {
     protected function setUp(): void
     {
@@ -61,14 +61,14 @@ final class CheckDivergenceTest extends TestCase
             ->assertFailed();
 
         $this->assertSame([
-            ['previous without current', "retained_widgets#{$unlinked}", 'retained_widgets.gadget_id'],
-            ['orphan current', "gadgets#{$orphan}", 'retained_widgets.gadget_id'],
-            ['more than one primary', "gadgets#{$gadget}", 'retained_widgets.gadget_id'],
-            ['refused state', 'gadget_places#'.min($first, $second), 'second_root_place'],
-            ['refused state', 'gadget_places#'.max($first, $second), 'second_root_place'],
+            [DriftCheck::PreviousWithoutCurrent, "retained_widgets#{$unlinked}", 'retained_widgets.gadget_id'],
+            [DriftCheck::OrphanCurrent, "gadgets#{$orphan}", 'retained_widgets.gadget_id'],
+            [DriftCheck::MoreThanOnePrimary, "gadgets#{$gadget}", 'retained_widgets.gadget_id'],
+            [DriftCheck::RefusedState, 'gadget_places#'.min($first, $second), 'second_root_place'],
+            [DriftCheck::RefusedState, 'gadget_places#'.max($first, $second), 'second_root_place'],
         ], array_map(
-            fn (Finding $finding) => [$finding->check, $finding->record, $finding->attribute],
-            resolve(Divergence::class)->find(resolve(CompatibilityMaps::class)->get('widgets'), 100),
+            fn (DriftFinding $finding) => [$finding->check, $finding->record, $finding->attribute],
+            resolve(DriftQueries::class)->find(resolve(CompatibilityMaps::class)->get('widgets'), 100),
         ));
         $this->assertSame($gadget, DB::table('retained_widgets')->where('id', $sharing)->value('gadget_id'));
     }

@@ -12,9 +12,10 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Validation\ValidationException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
-use Support\Database\Eloquent\Compatibility\Bridge\Events\Mirrored;
+use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
+use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
@@ -33,8 +34,8 @@ use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
 #[CoversClass(EventBridge::class)]
-#[CoversClass(Replay::class)]
-#[CoversClass(Footprint::class)]
+#[CoversClass(EventReplayer::class)]
+#[CoversClass(AffectedRecords::class)]
 final class EventBridgeTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
@@ -72,9 +73,9 @@ final class EventBridgeTest extends TestCase
             ['event' => 'updated', 'dirty' => true, 'original' => 'Blue gadget', 'name' => 'Renamed', 'changed' => true],
             ['event' => 'saved', 'dirty' => true, 'original' => 'Blue gadget', 'name' => 'Renamed', 'changed' => true],
         ], $this->seen);
-        $this->assertMirrored(Gadget::class, 'updated');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated);
         $this->assertCount(1, $this->mirroredEvents());
-        $this->assertSame(['saving', 'updating', 'updated', 'saved'], $this->mirroredEvents()[0]->events);
+        $this->assertSame([ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], $this->mirroredEvents()[0]->events);
         $this->assertSame(1, DB::transactionLevel());
     }
 
@@ -94,7 +95,7 @@ final class EventBridgeTest extends TestCase
         ], $this->seen);
 
         foreach ([Gadget::class, GadgetPlace::class, GadgetSite::class] as $model) {
-            $this->assertMirrored($model, 'created', fn (Model $record) => $record->exists);
+            $this->assertMirrored($model, ModelEvent::Created, fn (Model $record) => $record->exists);
         }
 
         $this->assertSame(Gadget::query()->sole()->getKey(), $widget->refresh()->gadget_id);
@@ -109,13 +110,13 @@ final class EventBridgeTest extends TestCase
 
         $widget->delete();
 
-        $this->assertMirrored(Gadget::class, 'trashed', fn (Model $gadget) => $gadget->getAttribute('deleted_at') !== null);
-        $this->assertSame(['deleting', 'trashed', 'deleted'], $this->mirroredEvents()[0]->events);
+        $this->assertMirrored(Gadget::class, ModelEvent::Trashed, fn (Model $gadget) => $gadget->getAttribute('deleted_at') !== null);
+        $this->assertSame([ModelEvent::Deleting, ModelEvent::Trashed, ModelEvent::Deleted], $this->mirroredEvents()[0]->events);
 
         $widget->restore();
 
-        $this->assertMirrored(Gadget::class, 'restored', fn (Model $gadget) => $gadget->getAttribute('deleted_at') === null);
-        $this->assertSame(['restoring', 'saving', 'updating', 'updated', 'saved', 'restored'], $this->mirroredEvents()[1]->events);
+        $this->assertMirrored(Gadget::class, ModelEvent::Restored, fn (Model $gadget) => $gadget->getAttribute('deleted_at') === null);
+        $this->assertSame([ModelEvent::Restoring, ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved, ModelEvent::Restored], $this->mirroredEvents()[1]->events);
     }
 
     #[Test]
@@ -127,9 +128,9 @@ final class EventBridgeTest extends TestCase
 
         $widget->forceDelete();
 
-        $this->assertMirrored(Gadget::class, 'forceDeleted', fn (Model $gadget) => ! $gadget->exists);
-        $this->assertMirrored(GadgetPlace::class, 'forceDeleted');
-        $this->assertMirrored(GadgetSite::class, 'deleted');
+        $this->assertMirrored(Gadget::class, ModelEvent::ForceDeleted, fn (Model $gadget) => ! $gadget->exists);
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::ForceDeleted);
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Deleted);
         $this->assertSame(0, Gadget::withTrashed()->count());
     }
 
@@ -144,7 +145,7 @@ final class EventBridgeTest extends TestCase
         Gadget::query()->sole()->update(['name' => 'From the current model']);
 
         $this->assertSame([['event' => 'updated', 'original' => 'Blue gadget', 'title' => 'From the current model', 'changed' => true]], $this->seen);
-        $this->assertMirrored(Widget::class, 'updated');
+        $this->assertMirrored(Widget::class, ModelEvent::Updated);
     }
 
     #[Test]
@@ -173,7 +174,7 @@ final class EventBridgeTest extends TestCase
 
         GadgetPlace::query()->create(['gadget_id' => $widget->gadget_id, 'street' => '3 New St']);
 
-        $this->assertMirrored(Widget::class, 'updated', fn (Model $mirrored, Mirrored $event) => $mirrored->getAttribute('street') === '3 New St' && $event->before['street'] === null);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getAttribute('street') === '3 New St' && $event->before['street'] === null);
     }
 
     #[Test]
@@ -239,7 +240,7 @@ final class EventBridgeTest extends TestCase
     #[Test]
     public function it_skips_an_excluded_listener_for_mirrored_events_only(): void
     {
-        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent('updated')]);
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
         $journal = new Journal;
         $this->app->instance(Journal::class, $journal);
         Event::listen('eloquent.updated: '.Gadget::class, [Journal::class, 'handle']);
@@ -248,7 +249,7 @@ final class EventBridgeTest extends TestCase
 
         $widget->update(['title' => 'Through the previous model']);
 
-        $this->assertMirrored(Gadget::class, 'updated');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated);
         $this->assertSame([], $journal->entries);
 
         Gadget::query()->sole()->update(['name' => 'Through the current model']);
@@ -259,7 +260,7 @@ final class EventBridgeTest extends TestCase
     #[Test]
     public function it_skips_an_excluded_listener_and_records_each_mirrored_event_once_through_a_decorating_dispatcher(): void
     {
-        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent('updated')]);
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
         $journal = new Journal;
         $this->app->instance(Journal::class, $journal);
         Event::listen('eloquent.updated: '.Gadget::class, [Journal::class, 'handle']);
@@ -282,7 +283,7 @@ final class EventBridgeTest extends TestCase
     #[Test]
     public function it_skips_an_excluded_listener_for_a_mirrored_create_through_a_decorating_dispatcher_and_runs_it_for_a_native_create(): void
     {
-        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent('created')]);
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Created)]);
         $journal = new Journal;
         $this->app->instance(Journal::class, $journal);
         Event::listen('eloquent.created: '.Gadget::class, [Journal::class, 'handle']);
@@ -291,7 +292,7 @@ final class EventBridgeTest extends TestCase
 
         $widget = $this->widget()->refresh();
 
-        $this->assertMirrored(Gadget::class, 'created', fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
         $this->assertSame([], $journal->entries);
 
         $gadget = Gadget::query()->create(['name' => 'Through the current model']);
@@ -302,7 +303,7 @@ final class EventBridgeTest extends TestCase
     #[Test]
     public function it_runs_an_excluded_listener_for_a_native_write_inside_a_mirrored_event(): void
     {
-        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent('updated')]);
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
         $journal = new Journal;
         $this->app->instance(Journal::class, $journal);
         $first = $this->widget();
@@ -332,8 +333,8 @@ final class EventBridgeTest extends TestCase
         $widget->restore();
 
         $this->assertSame(
-            [['saving', 'updating', 'updated', 'saved'], ['deleting', 'trashed', 'deleted'], ['restoring', 'saving', 'updating', 'updated', 'saved', 'restored']],
-            array_map(fn (Mirrored $mirrored) => $mirrored->events, $this->mirroredEvents()),
+            [[ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], [ModelEvent::Deleting, ModelEvent::Trashed, ModelEvent::Deleted], [ModelEvent::Restoring, ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved, ModelEvent::Restored]],
+            array_map(fn (RecordMirrored $recordMirrored) => $recordMirrored->events, $this->mirroredEvents()),
         );
         $this->assertSame('Keyed by uuid', DB::table('gadgets')->value('name'));
     }
@@ -362,7 +363,7 @@ final class EventBridgeTest extends TestCase
 
         $widget->update(['title' => 'Partly faked']);
 
-        $this->assertMirrored(Gadget::class, 'updated');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated);
     }
 
     #[Test]
@@ -421,20 +422,20 @@ final class EventBridgeTest extends TestCase
 
         $account->update(['email' => 'two@example.test']);
 
-        $this->assertMirrored(Person::class, 'updated', fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
-        $this->assertMirrored(Profile::class, 'updated', fn (Model $profile, Mirrored $event) => $event->before['email'] === 'one@example.test' && $profile->getAttribute('email') === 'two@example.test');
+        $this->assertMirrored(Person::class, ModelEvent::Updated, fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
+        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile, RecordMirrored $event) => $event->before['email'] === 'one@example.test' && $profile->getAttribute('email') === 'two@example.test');
 
         $this->recordMirroredEvents();
         Person::query()->sole()->update(['display_name' => 'Two']);
 
-        $this->assertMirrored(Profile::class, 'updated', fn (Model $profile) => $profile->getAttribute('display_name') === 'Two');
+        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile) => $profile->getAttribute('display_name') === 'Two');
         $this->assertCount(1, $this->mirroredEvents(), 'Only the profile shows display_name, so only the profile changed.');
 
         $this->recordMirroredEvents();
         Person::query()->sole()->update(['email' => 'three@example.test']);
 
-        $this->assertMirrored(Account::class, 'updated');
-        $this->assertMirrored(Profile::class, 'updated');
+        $this->assertMirrored(Account::class, ModelEvent::Updated);
+        $this->assertMirrored(Profile::class, ModelEvent::Updated);
     }
 
     #[Test]
@@ -449,8 +450,8 @@ final class EventBridgeTest extends TestCase
 
         $widget->update(['title' => 'Renamed']);
 
-        $this->assertMirrored(Gadget::class, 'updated');
-        $this->assertMirrored(Widget::class, 'updated', fn (Model $mirrored) => $mirrored->getAttribute('street') === 'Added by a listener');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('street') === 'Added by a listener');
         $this->assertSame('Added by a listener', DB::table('widgets')->value('street'));
         $this->assertSame(1, DB::transactionLevel());
     }

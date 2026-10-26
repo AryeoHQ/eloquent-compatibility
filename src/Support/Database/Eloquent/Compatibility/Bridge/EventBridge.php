@@ -13,21 +13,20 @@ use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Throwable;
 use WeakMap;
 
 final class EventBridge
 {
-    private const array ARMING = ['creating' => 'insert', 'updating' => 'update', 'deleting' => 'delete'];
+    private readonly MirrorIndex $mirrorIndex;
 
-    private readonly MirroredCompatibilityMaps $mirroredMaps;
+    private readonly AffectedRecords $affectedRecords;
 
-    private readonly Footprint $footprint;
+    private readonly EventReplayer $eventReplayer;
 
-    private readonly Replay $replay;
-
-    /** @var array<string, list<Arm>> */
-    private array $arms = [];
+    /** @var array<string, list<PendingMirroredWrite>> */
+    private array $pendingWrites = [];
 
     /** @var array<string, true> */
     private array $mirrored = [];
@@ -48,28 +47,28 @@ final class EventBridge
         private readonly Dispatcher $events,
         private readonly CompatibilityMaps $compatibilityMaps,
     ) {
-        $this->mirroredMaps = new MirroredCompatibilityMaps;
-        $this->footprint = new Footprint($this->mirroredMaps);
-        $this->replay = new Replay($this->mirroredMaps);
+        $this->mirrorIndex = new MirrorIndex;
+        $this->affectedRecords = new AffectedRecords($this->mirrorIndex);
+        $this->eventReplayer = new EventReplayer($this->mirrorIndex);
         $this->faked = new WeakMap;
         $this->watched = new WeakMap;
     }
 
     public function mirror(EventMirror $mirror): void
     {
-        $declaration = $this->compatibilityMaps->register($mirror->compatibilityMap());
+        $resolvedMap = $this->compatibilityMaps->register($mirror->compatibilityMap());
 
-        if (array_key_exists($declaration->name, $this->mirrored)) {
-            throw InvalidCompatibilityMap::because($declaration->name, 'its event mirror is registered twice');
+        if (array_key_exists($resolvedMap->name, $this->mirrored)) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, 'its event mirror is registered twice');
         }
 
         if ($this->mirrored === []) {
             $this->events->listen(QueryExecuted::class, $this->handleQuery(...));
         }
 
-        $this->mirrored[$declaration->name] = true;
+        $this->mirrored[$resolvedMap->name] = true;
 
-        foreach ($this->mirroredMaps->add($declaration, $mirror) as $model) {
+        foreach ($this->mirrorIndex->add($resolvedMap, $mirror) as $model) {
             $this->listen($model);
         }
     }
@@ -97,30 +96,30 @@ final class EventBridge
             return;
         }
 
-        $statement = Statement::write($query->sql);
+        $parsedWrite = ParsedWrite::write($query->sql);
 
-        if ($statement === null) {
+        if ($parsedWrite === null) {
             return;
         }
 
-        $arm = $this->top($query->connectionName);
+        $pendingWrite = $this->top($query->connectionName);
 
-        if ($arm !== null && $arm->pending && $arm->expects($statement)) {
-            $this->complete($query->connection, $arm);
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->expects($parsedWrite)) {
+            $this->complete($query->connection, $pendingWrite);
 
             return;
         }
 
-        $this->guard($statement);
+        $this->guard($parsedWrite);
     }
 
     public function releaseAbandoned(): void
     {
-        foreach ($this->arms as $arms) {
-            $arm = $arms[0] ?? null;
+        foreach ($this->pendingWrites as $pendingWrites) {
+            $pendingWrite = $pendingWrites[0] ?? null;
 
-            if ($arm !== null) {
-                $this->settleAbandoned($arm->model->getConnection());
+            if ($pendingWrite !== null) {
+                $this->settleAbandoned($pendingWrite->model->getConnection());
             }
         }
     }
@@ -130,26 +129,27 @@ final class EventBridge
      */
     private function listen(string $model): void
     {
-        foreach (self::ARMING as $event => $operation) {
-            $name = "eloquent.{$event}: {$model}";
+        foreach (ModelEvent::arming() as $event) {
+            $name = $event->for($model);
+            $operation = $event->operation();
 
             $this->events->listen($name.'*', function (string $fired, array $payload) use ($name, $operation): void {
                 $target = $payload[0] ?? null;
 
-                if ($fired === $name && $target instanceof Model) {
+                if ($fired === $name && $target instanceof Model && $operation !== null) {
                     $this->arm($target, $operation);
                 }
             });
         }
 
-        foreach (['saved', 'updated', 'deleted'] as $event) {
-            $this->events->listen("eloquent.{$event}: {$model}", $this->settle(...));
+        foreach (ModelEvent::settling() as $event) {
+            $this->events->listen($event->for($model), $this->settle(...));
         }
     }
 
-    private function arm(Model $model, string $operation): void
+    private function arm(Model $model, Operation $operation): void
     {
-        if ($this->disabled > 0 || $this->replay->isReplaying($model)) {
+        if ($this->disabled > 0 || $this->eventReplayer->isReplaying($model)) {
             return;
         }
 
@@ -157,30 +157,30 @@ final class EventBridge
         $this->watch($connection);
         $this->settleAbandoned($connection);
         $level = $connection->transactionLevel();
-        $arm = new Arm($model, $operation, $level, $level > 0 ? 'compatibility_'.++$this->savepoints : null);
+        $pendingWrite = new PendingMirroredWrite($model, $operation, $level, $level > 0 ? 'compatibility_'.++$this->savepoints : null);
 
-        $this->internally(function () use ($connection, $arm): void {
-            if ($arm->savepoint === null) {
+        $this->internally(function () use ($connection, $pendingWrite): void {
+            if ($pendingWrite->savepoint === null) {
                 $connection->beginTransaction();
             } else {
-                $connection->unprepared('SAVEPOINT '.$arm->savepoint);
+                $connection->unprepared('SAVEPOINT '.$pendingWrite->savepoint);
             }
         });
 
         try {
-            $arm->before = $this->internally(fn () => $this->footprint->rows(
+            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->rows(
                 $connection,
-                $this->footprint->of($connection, $model, $operation, false),
-                $this->footprint->native($model),
+                $this->affectedRecords->of($connection, $model, $operation, false),
+                $this->affectedRecords->native($model),
                 true,
             ));
         } catch (Throwable $e) {
-            $this->close($connection, $arm, false);
+            $this->close($connection, $pendingWrite, false);
 
             throw $e;
         }
 
-        $this->arms[$connection->getName()][] = $arm;
+        $this->pendingWrites[$connection->getName()][] = $pendingWrite;
     }
 
     private function watch(Connection $connection): void
@@ -195,81 +195,81 @@ final class EventBridge
                 return;
             }
 
-            $arm = $this->top($connection->getName());
+            $pendingWrite = $this->top($connection->getName());
 
-            if ($arm === null || ! $arm->pending || $arm->savepoint !== null) {
+            if ($pendingWrite === null || ! $pendingWrite->pending || $pendingWrite->savepoint !== null) {
                 return;
             }
 
-            if ($arm->started) {
-                $this->close($connection, $arm, false);
+            if ($pendingWrite->started) {
+                $this->close($connection, $pendingWrite, false);
 
                 return;
             }
 
-            $statement = Statement::write($query);
-            $arm->started = $statement !== null && $arm->expects($statement);
+            $parsedWrite = ParsedWrite::write($query);
+            $pendingWrite->started = $parsedWrite !== null && $pendingWrite->expects($parsedWrite);
         });
     }
 
-    private function complete(Connection $connection, Arm $arm): void
+    private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void
     {
-        $arm->pending = false;
+        $pendingWrite->pending = false;
 
         try {
-            $entries = $arm->before;
+            $entries = $pendingWrite->before;
 
-            foreach ($this->internally(fn () => $this->footprint->of($connection, $arm->model, $arm->operation, true)) as $id => $record) {
-                $entries[$id] ??= ['record' => $record, 'row' => null];
+            foreach ($this->internally(fn () => $this->affectedRecords->of($connection, $pendingWrite->model, $pendingWrite->operation, true)) as $id => $record) {
+                $entries[$id] ??= new RecordSnapshot($record, null);
             }
 
-            $after = $this->internally(fn () => $this->footprint->rows(
+            $after = $this->internally(fn () => $this->affectedRecords->rows(
                 $connection,
-                array_map(fn (array $entry) => $entry['record'], $entries),
+                array_map(fn (RecordSnapshot $entry) => $entry->record, $entries),
                 null,
                 false,
             ));
 
-            $replay = function () use ($entries, $after, $arm, $connection): void {
+            $replay = function () use ($entries, $after, $pendingWrite, $connection): void {
                 foreach ($entries as $id => $entry) {
-                    $this->replay->record($entry['record'], $entry['row'], $after[$id]['row'] ?? null, $arm->model, (string) $connection->getName());
+                    $this->eventReplayer->record($entry->record, $entry->row, $after[$id]->row ?? null, $pendingWrite->model, (string) $connection->getName());
                 }
             };
 
-            if ($arm->savepoint === null) {
+            if ($pendingWrite->savepoint === null) {
                 $replay();
             } else {
                 $connection->transaction($replay);
             }
         } catch (Throwable $e) {
-            $this->close($connection, $arm, false);
+            $this->close($connection, $pendingWrite, false);
 
             throw $e;
         }
 
-        $this->close($connection, $arm, true);
+        $this->close($connection, $pendingWrite, true);
     }
 
     private function settle(Model $model): void
     {
         $connection = $model->getConnection();
-        $arm = $this->top($connection->getName());
+        $pendingWrite = $this->top($connection->getName());
 
-        if ($arm !== null && $arm->pending && $arm->model === $model) {
-            $this->close($connection, $arm, true);
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->model === $model) {
+            $this->close($connection, $pendingWrite, true);
         }
     }
 
     private function settleAbandoned(Connection $connection): void
     {
-        while (($arm = $this->top($connection->getName())) !== null && $arm->pending) {
-            if ($arm->savepoint !== null) {
-                $this->forget($connection, $arm);
+        while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending) {
+            if ($pendingWrite->savepoint !== null) {
+                $this->forget($connection, $pendingWrite);
 
                 continue;
             }
 
-            if ($connection->transactionLevel() !== $arm->level + 1) {
+            if ($connection->transactionLevel() !== $pendingWrite->level + 1) {
                 return;
             }
 
@@ -283,27 +283,27 @@ final class EventBridge
                 }
             });
 
-            $this->close($connection, $arm, $healthy);
+            $this->close($connection, $pendingWrite, $healthy);
         }
     }
 
-    private function forget(Connection $connection, Arm $arm): void
+    private function forget(Connection $connection, PendingMirroredWrite $pendingWrite): void
     {
         $name = (string) $connection->getName();
-        $this->arms[$name] = array_values(array_filter($this->arms[$name] ?? [], fn (Arm $open) => $open !== $arm));
+        $this->pendingWrites[$name] = array_values(array_filter($this->pendingWrites[$name] ?? [], fn (PendingMirroredWrite $open) => $open !== $pendingWrite));
     }
 
-    private function close(Connection $connection, Arm $arm, bool $commit): void
+    private function close(Connection $connection, PendingMirroredWrite $pendingWrite, bool $commit): void
     {
-        $this->forget($connection, $arm);
+        $this->forget($connection, $pendingWrite);
 
-        $this->internally(function () use ($connection, $arm, $commit): void {
-            if ($arm->savepoint !== null) {
+        $this->internally(function () use ($connection, $pendingWrite, $commit): void {
+            if ($pendingWrite->savepoint !== null) {
                 if (! $commit) {
-                    $connection->unprepared('ROLLBACK TO SAVEPOINT '.$arm->savepoint);
+                    $connection->unprepared('ROLLBACK TO SAVEPOINT '.$pendingWrite->savepoint);
                 }
 
-                $connection->unprepared('RELEASE SAVEPOINT '.$arm->savepoint);
+                $connection->unprepared('RELEASE SAVEPOINT '.$pendingWrite->savepoint);
 
                 return;
             }
@@ -311,14 +311,14 @@ final class EventBridge
             if ($commit) {
                 $connection->commit();
             } else {
-                $connection->rollBack($arm->level);
+                $connection->rollBack($pendingWrite->level);
             }
         });
     }
 
-    private function guard(Statement $statement): void
+    private function guard(ParsedWrite $parsedWrite): void
     {
-        $models = $this->mirroredMaps->modelsOf($statement->relation);
+        $models = $this->mirrorIndex->modelsOf($parsedWrite->relation);
         $dispatcher = Model::getEventDispatcher();
 
         if ($this->disabled > 0 || $models === [] || ! $dispatcher instanceof EventFake) {
@@ -328,8 +328,8 @@ final class EventBridge
         $count = 0;
 
         foreach ($models as $model) {
-            foreach (array_keys(self::ARMING) as $event) {
-                $count += $dispatcher->dispatched("eloquent.{$event}: {$model}")->count();
+            foreach (ModelEvent::arming() as $event) {
+                $count += $dispatcher->dispatched($event->for($model))->count();
             }
         }
 
@@ -337,15 +337,15 @@ final class EventBridge
         $this->faked[$dispatcher] = $count;
 
         if ($count > $seen) {
-            throw CompatibilityEventMirrorBypassed::byFakedDispatcher($statement->relation, $this->mirroredMaps->mapsOf($statement->relation));
+            throw CompatibilityEventMirrorBypassed::byFakedDispatcher($parsedWrite->relation, $this->mirrorIndex->mapsOf($parsedWrite->relation));
         }
     }
 
-    private function top(null|string $connection): null|Arm
+    private function top(null|string $connection): null|PendingMirroredWrite
     {
-        $arms = $this->arms[(string) $connection] ?? [];
+        $pendingWrites = $this->pendingWrites[(string) $connection] ?? [];
 
-        return $arms === [] ? null : $arms[array_key_last($arms)];
+        return $pendingWrites === [] ? null : $pendingWrites[array_key_last($pendingWrites)];
     }
 
     /**

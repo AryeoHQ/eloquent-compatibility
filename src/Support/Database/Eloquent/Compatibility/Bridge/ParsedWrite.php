@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
-final readonly class Statement
+final readonly class ParsedWrite
 {
     private function __construct(
-        public string $operation,
+        public Operation $operation,
         public string $relation,
     ) {}
 
@@ -17,6 +17,6 @@ final readonly class Statement
             return null;
         }
 
-        return new self(strtolower(substr($matches[1], 0, 6)), strtolower($matches[2]));
+        return new self(Operation::from(strtolower(substr($matches[1], 0, 6))), strtolower($matches[2]));
     }
 }

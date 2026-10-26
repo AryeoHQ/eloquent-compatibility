@@ -17,20 +17,20 @@ use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
-#[CoversClass(Declaration::class)]
+#[CoversClass(ResolvedMap::class)]
 #[CoversClass(Attribute::class)]
-final class DeclarationTest extends TestCase
+final class ResolvedMapTest extends TestCase
 {
     #[Test]
     public function it_resolves_a_retained_attribute_to_the_retained_table(): void
     {
-        $declaration = Declaration::of(new WidgetCompatibilityMap);
+        $resolvedMap = ResolvedMap::of(new WidgetCompatibilityMap);
 
-        $sku = array_values(array_filter($declaration->attributes, fn (Attribute $attribute) => $attribute->column === 'sku'))[0];
+        $sku = array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->column === 'sku'))[0];
 
         $this->assertSame(['widget', 'widget."sku"', 'sku'], [$sku->alias, $sku->readAs, $sku->storedAs]);
-        $this->assertSame([['widget', 'sku', 'NEW."sku"']], array_map(fn (Write $write) => [$write->alias, $write->column, $write->expression], $sku->writesTo));
-        $this->assertSame('gadgets', $declaration->table('gadget'));
+        $this->assertSame([['widget', 'sku', 'NEW."sku"']], array_map(fn (TargetColumn $targetColumn) => [$targetColumn->alias, $targetColumn->column, $targetColumn->expression], $sku->writesTo));
+        $this->assertSame('gadgets', $resolvedMap->table('gadget'));
     }
 
     #[Test]
@@ -171,7 +171,7 @@ final class DeclarationTest extends TestCase
      */
     private function expectDeclarationError(string $message, array $overrides): void
     {
-        $this->assertThrows(fn () => Declaration::of($this->compatibilityMap($overrides)), InvalidCompatibilityMap::class, $message);
+        $this->assertThrows(fn () => ResolvedMap::of($this->compatibilityMap($overrides)), InvalidCompatibilityMap::class, $message);
     }
 
     /**
