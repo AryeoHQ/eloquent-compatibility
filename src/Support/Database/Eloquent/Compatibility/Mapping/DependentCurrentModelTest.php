@@ -47,6 +47,12 @@ final class DependentCurrentModelTest extends TestCase
     }
 
     #[Test]
+    public function it_declares_the_model_by_its_declared_class_name(): void
+    {
+        $this->assertSame(GadgetPlace::class, DependentCurrentModel::for('\\'.GadgetPlace::class)->model);
+    }
+
+    #[Test]
     public function a_create_through_the_previous_model_designates_the_dependent_row_it_inserts(): void
     {
         $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'street' => '1 Main St']);

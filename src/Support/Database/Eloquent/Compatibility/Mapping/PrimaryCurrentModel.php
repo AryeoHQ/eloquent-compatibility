@@ -23,7 +23,7 @@ final readonly class PrimaryCurrentModel
      */
     public static function for(string $model): self
     {
-        return new self($model, null, []);
+        return new self(ModelClass::canonical($model), null, []);
     }
 
     public function aliasedAs(string $alias): self

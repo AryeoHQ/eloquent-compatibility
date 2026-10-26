@@ -21,6 +21,12 @@ final class PrimaryCurrentModelTest extends TestCase
     }
 
     #[Test]
+    public function it_declares_the_model_by_its_declared_class_name(): void
+    {
+        $this->assertSame(Gadget::class, PrimaryCurrentModel::for('\\'.Gadget::class)->model);
+    }
+
+    #[Test]
     public function it_sets_the_alias_on_a_copy_and_keeps_the_rest(): void
     {
         $original = PrimaryCurrentModel::for(Gadget::class)->fillWhenCreatedFromPrevious(['id' => 'gen_random_uuid()']);

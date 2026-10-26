@@ -14,9 +14,12 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
+use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
@@ -645,6 +648,34 @@ final class EventBridgeTest extends TestCase
         $this->assertSame(1, DB::transactionLevel());
     }
 
+    /**
+     * @param  class-string<Model>  $previous
+     * @param  class-string<Model>  $primary
+     */
+    #[Test]
+    #[TestWith(['\\Tests\\Fixtures\\Support\\Workbench\\Widget', '\\Tests\\Fixtures\\Support\\Workbench\\Gadget'])]
+    #[TestWith(['tests\\fixtures\\support\\workbench\\widget', 'tests\\fixtures\\support\\workbench\\gadget'])]
+    public function it_mirrors_the_writes_of_models_its_map_names_with_a_leading_backslash_or_in_another_letter_case(string $previous, string $primary): void
+    {
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->respelled($previous, $primary)));
+        $widget = $this->widget();
+        $this->recordMirroredEvents();
+        $this->watch(Gadget::class, 'updated', fn (Gadget $gadget) => ['name' => $gadget->name]);
+        $this->watch(Widget::class, 'updated', fn (Widget $widget) => ['title' => $widget->title]);
+
+        $widget->update(['title' => 'Renamed']);
+        Gadget::query()->sole()->update(['name' => 'From the current model']);
+
+        $this->assertSame([
+            ['event' => 'updated', 'name' => 'Renamed'],
+            ['event' => 'updated', 'title' => 'Renamed'],
+            ['event' => 'updated', 'title' => 'From the current model'],
+            ['event' => 'updated', 'name' => 'From the current model'],
+        ], $this->seen);
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated);
+    }
+
     #[Test]
     public function it_leaves_the_callers_transaction_usable_after_a_database_refusal(): void
     {
@@ -664,6 +695,54 @@ final class EventBridgeTest extends TestCase
     private function mirror(array $excludedListeners = []): void
     {
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new WidgetCompatibilityMap, $excludedListeners));
+    }
+
+    /**
+     * @param  class-string<Model>  $previous
+     * @param  class-string<Model>  $primary
+     */
+    private function respelled(string $previous, string $primary): CompatibilityMap
+    {
+        return new readonly class(new WidgetCompatibilityMap, $previous, $primary) implements CompatibilityMap
+        {
+            /**
+             * @param  class-string<Model>  $previous
+             * @param  class-string<Model>  $primary
+             */
+            public function __construct(private WidgetCompatibilityMap $base, private string $previous, private string $primary) {}
+
+            public function name(): string
+            {
+                return $this->base->name();
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return $this->base->previousModel()->forModel($this->previous);
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return PrimaryCurrentModel::for($this->primary)
+                    ->aliasedAs('gadget')
+                    ->fillWhenCreatedFromPrevious($this->base->primaryCurrentModel()->fillWhenCreatedFromPrevious);
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return $this->base->dependentCurrentModels();
+            }
+
+            public function attributes(): array
+            {
+                return $this->base->attributes();
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return $this->base->unrepresentableStates();
+            }
+        };
     }
 
     private function decorateTheModelDispatcher(): void

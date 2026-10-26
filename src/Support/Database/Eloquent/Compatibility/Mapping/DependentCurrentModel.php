@@ -27,7 +27,7 @@ final readonly class DependentCurrentModel
      */
     public static function for(string $model): self
     {
-        return new self($model, null, null, 'true', [], null, null);
+        return new self(ModelClass::canonical($model), null, null, 'true', [], null, null);
     }
 
     public function aliasedAs(string $alias): self

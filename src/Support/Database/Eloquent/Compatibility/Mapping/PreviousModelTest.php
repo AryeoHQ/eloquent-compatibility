@@ -50,6 +50,12 @@ final class PreviousModelTest extends TestCase
     }
 
     #[Test]
+    public function it_declares_the_model_by_its_declared_class_name(): void
+    {
+        $this->assertSame(Gadget::class, $this->widgets()->forModel('\\'.Gadget::class)->model);
+    }
+
+    #[Test]
     public function it_replaces_the_values_to_fill_on_a_copy_and_keeps_the_rest(): void
     {
         $original = $this->widgets();

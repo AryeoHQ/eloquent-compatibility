@@ -65,6 +65,17 @@ final class ResolvedMapTest extends TestCase
         ]]);
     }
 
+    /**
+     * @param  class-string<Model>  $model
+     */
+    #[Test]
+    #[TestWith(['Tests\\Fixtures\\Support\\Workbench\\Nothing'])]
+    #[TestWith(['\\Tests\\Fixtures\\Support\\Workbench\\Nothing'])]
+    public function it_refuses_a_current_model_class_that_does_not_load(string $model): void
+    {
+        $this->expectInvalidMap("{$model} is not an Eloquent model", ['dependentCurrentModels' => [DependentCurrentModel::for($model)->aliasedAs('twin')->primaryForeignKey('gadget_id')]]);
+    }
+
     #[Test]
     #[TestWith(['order'])]
     #[TestWith(['join'])]

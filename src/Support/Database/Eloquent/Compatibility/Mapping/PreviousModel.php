@@ -37,7 +37,7 @@ final readonly class PreviousModel
      */
     public function forModel(string $model): self
     {
-        return new self($this->view, $this->table, $model, $this->keyColumn, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
+        return new self($this->view, $this->table, ModelClass::canonical($model), $this->keyColumn, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
     }
 
     public function keyedBy(string $column): self
