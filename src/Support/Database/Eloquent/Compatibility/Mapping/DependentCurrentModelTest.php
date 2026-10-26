@@ -140,7 +140,7 @@ final class DependentCurrentModelTest extends TestCase
         DB::table('retained_widgets')->where('gadget_id', $stray)->update(['place_id' => $first]);
         DB::table('retained_widgets')->where('gadget_id', $missing)->update(['place_id' => Str::uuid()->toString()]);
 
-        $this->artisan('compatibility:check', ['--map' => ['widgets']])->assertFailed();
+        $this->artisan('compatibility:check', ['--map' => ['widgets']])->expectsOutputToContain('designation')->assertFailed();
         $this->assertSame([
             [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($stray), 'retained_widgets.place_id', 'it names a gadget_places row of another gadgets row'],
             [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($missing), 'retained_widgets.place_id', 'it names a gadget_places row that does not exist'],

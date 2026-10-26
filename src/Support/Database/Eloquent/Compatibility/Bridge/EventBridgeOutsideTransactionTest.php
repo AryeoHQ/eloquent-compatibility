@@ -15,7 +15,6 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
-use Support\Database\Eloquent\Compatibility\Schema\SqlState;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -129,7 +128,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->artisan('queue:work', ['connection' => 'isolated', '--queue' => $queue, '--once' => true, '--tries' => 1])->assertSuccessful();
 
         $failed = DB::table('failed_jobs')->where('queue', $queue)->sole();
-        $this->assertStringContainsString(SqlState::Refused->value, (string) $failed->exception);
+        $this->assertStringContainsString('CM001', (string) $failed->exception);
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
     }
