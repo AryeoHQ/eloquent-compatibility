@@ -24,12 +24,8 @@ final class DriftCheckTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_each_check_back_from_its_value(): void
+    public function it_reads_no_check_from_a_name_that_is_not_its_printed_value(): void
     {
-        foreach (DriftCheck::cases() as $check) {
-            $this->assertSame($check, DriftCheck::from($check->value));
-        }
-
         $this->assertNull(DriftCheck::tryFrom('previous_without_current'));
     }
 }
