@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
@@ -20,7 +21,6 @@ use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
-use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -444,7 +444,10 @@ final class CompilerTest extends TestCase
             ]],
             'long_designate_function' => ['dependentCurrentModels' => [
                 ...$widgets->dependentCurrentModels(),
-                DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('another_place_with_a_long_name')->primaryForeignKey('gadget_id')->designatedBy('place_id'),
+                DependentCurrentModel::for((new class extends Model
+                {
+                    protected $table = 'gadget_places';
+                })::class)->aliasedAs('another_place_with_a_long_name')->primaryForeignKey('gadget_id')->designatedBy('place_id'),
             ]],
         ][$case]);
     }
