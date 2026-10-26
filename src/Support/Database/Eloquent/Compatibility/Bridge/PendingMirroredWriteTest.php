@@ -14,14 +14,14 @@ use Tests\TestCase;
 final class PendingMirroredWriteTest extends TestCase
 {
     #[Test]
-    public function it_starts_pending_and_unstarted_with_no_snapshot_of_the_write_it_was_given(): void
+    public function it_starts_pending_with_no_statement_sent_and_no_snapshot_of_the_write_it_was_given(): void
     {
         $widget = new Widget;
 
         $pendingWrite = new PendingMirroredWrite($widget, Operation::Update, 1, 'compatibility_1');
 
         $this->assertSame(
-            ['pending' => true, 'started' => false, 'before' => [], 'model' => $widget, 'operation' => Operation::Update, 'level' => 1, 'savepoint' => 'compatibility_1'],
+            ['pending' => true, 'statementSent' => false, 'snapshotsBefore' => [], 'source' => $widget, 'operation' => Operation::Update, 'transactionLevel' => 1, 'savepoint' => 'compatibility_1'],
             get_object_vars($pendingWrite),
         );
     }

@@ -71,7 +71,7 @@ final class DriftQueriesTest extends TestCase
 
         $this->assertSame(
             ["retained_widgets#{$dangling}", "retained_widgets#{$draft}"],
-            array_map(fn (DriftFinding $finding) => $finding->record, $this->find()),
+            array_map(fn (DriftFinding $finding) => $finding->recordId, $this->find()),
         );
     }
 
@@ -154,7 +154,7 @@ final class DriftQueriesTest extends TestCase
             ['orphan current', "gadgets#{$orphans[0]}"],
             ['orphan current', "gadgets#{$orphans[1]}"],
             ['more than one primary', "gadgets#{$shared}"],
-        ], array_map(fn (DriftFinding $finding) => [$finding->check->value, $finding->record], $this->find(2)));
+        ], array_map(fn (DriftFinding $finding) => [$finding->check->value, $finding->recordId], $this->find(2)));
     }
 
     /**
@@ -164,7 +164,7 @@ final class DriftQueriesTest extends TestCase
     {
         $this->assertSame(
             array_map(fn (array $finding) => ['widgets', ...$finding], $expected),
-            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check, $finding->record, $finding->attribute, $finding->detail], $this->find()),
+            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check, $finding->recordId, $finding->attribute, $finding->detail], $this->find()),
         );
     }
 

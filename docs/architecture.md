@@ -58,7 +58,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 6. The view's update trigger checks every refusal, locks the gadget row and the retained row, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
 8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which matches the statement to the pending write.
-9. `EventBridge::complete()` reads each record again, and `EventReplayer::record()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
+9. `EventBridge::complete()` reads each record again, and `EventReplayer::replay()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
 10. The bridge commits or releases its savepoint, and Eloquent fires the widget's own `updated` and `saved`.
 
 The flows below take each step in depth:

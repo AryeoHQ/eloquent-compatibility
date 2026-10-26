@@ -19,7 +19,7 @@ final class AffectedRecordTest extends TestCase
         $record = new AffectedRecord('widgets', Widget::class, 'widgets', 'retained_widgets', 'id', 7, RecordRole::Previous);
 
         $this->assertSame(
-            ['map' => 'widgets', 'model' => Widget::class, 'relation' => 'widgets', 'lockTable' => 'retained_widgets', 'keyName' => 'id', 'key' => 7, 'role' => RecordRole::Previous],
+            ['map' => 'widgets', 'model' => Widget::class, 'readFrom' => 'widgets', 'lockedTable' => 'retained_widgets', 'keyColumn' => 'id', 'keyValue' => 7, 'role' => RecordRole::Previous],
             get_object_vars($record),
         );
     }

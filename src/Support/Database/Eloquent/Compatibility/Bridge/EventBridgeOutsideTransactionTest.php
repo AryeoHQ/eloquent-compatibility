@@ -197,7 +197,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $widget->update(['street' => '3 Updated St']);
 
         $this->assertSame('committed', $this->concurrentOutcome);
-        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (Model $place, RecordMirrored $event) => $event->before['street'] === '2 Concurrent St' && $place->getAttribute('street') === '3 Updated St');
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (Model $place, RecordMirrored $event) => $event->rowBefore['street'] === '2 Concurrent St' && $place->getAttribute('street') === '3 Updated St');
         $this->assertSame('3 Updated St', DB::table('gadget_places')->value('street'));
     }
 

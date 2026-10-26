@@ -145,7 +145,7 @@ final class DependentCurrentModelTest extends TestCase
             [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($stray), 'retained_widgets.place_id', 'it names a gadget_places row of another gadgets row'],
             [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($missing), 'retained_widgets.place_id', 'it names a gadget_places row that does not exist'],
         ], array_map(
-            fn (DriftFinding $finding) => [$finding->check, $finding->record, $finding->attribute, $finding->detail],
+            fn (DriftFinding $finding) => [$finding->check, $finding->recordId, $finding->attribute, $finding->detail],
             resolve(DriftQueries::class)->find(ResolvedMap::of($this->designated()), 100),
         ));
     }

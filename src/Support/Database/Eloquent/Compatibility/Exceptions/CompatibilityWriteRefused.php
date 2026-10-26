@@ -47,28 +47,28 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
-    public static function byMirroredListener(string $map, Model $mirrored, ModelEvent $event): self
+    public static function byMirroredListener(string $map, Model $destination, ModelEvent $event): self
     {
-        $record = class_basename($mirrored).' '.self::key($mirrored);
+        $record = class_basename($destination).' '.self::key($destination);
 
         return new self(
             "Compatibility map '{$map}' refused this write, because a '{$event->value}' listener of {$record} returned false",
             "The write changed {$record} through the other side, and every listener of that side runs for it, so that side's rules refused the change.",
-            'Make the write satisfy the rules of '.class_basename($mirrored).", or exclude the listener in the map's event mirror if it must not run for writes through the other side.",
+            'Make the write satisfy the rules of '.class_basename($destination).", or exclude the listener in the map's event mirror if it must not run for writes through the other side.",
         );
     }
 
     /**
      * @param  list<string>  $columns
      */
-    public static function byMirroredChange(string $map, Model $mirrored, ModelEvent $event, array $columns): self
+    public static function byMirroredChange(string $map, Model $destination, ModelEvent $event, array $columns): self
     {
-        $record = class_basename($mirrored).' '.self::key($mirrored);
+        $record = class_basename($destination).' '.self::key($destination);
 
         return new self(
             "Compatibility map '{$map}' refused this write, because a '{$event->value}' listener of {$record} changed ".implode(', ', $columns),
             'Mirrored events fire after the write through the other side has reached the database, so a change a listener makes to the mirrored record cannot be stored.',
-            'Make the change through '.class_basename($mirrored)." itself, or exclude the listener in the map's event mirror.",
+            'Make the change through '.class_basename($destination)." itself, or exclude the listener in the map's event mirror.",
         );
     }
 

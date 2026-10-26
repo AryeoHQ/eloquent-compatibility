@@ -119,7 +119,7 @@ final class EventBridge
             $pendingWrite = $pendingWrites[0] ?? null;
 
             if ($pendingWrite !== null) {
-                $this->finishFailed($pendingWrite->model->getConnection());
+                $this->finishFailed($pendingWrite->source->getConnection());
             }
         }
     }
@@ -129,7 +129,7 @@ final class EventBridge
      */
     private function listen(string $model): void
     {
-        foreach (ModelEvent::arming() as $event) {
+        foreach (ModelEvent::beginning() as $event) {
             $name = $event->for($model);
             $operation = $event->operation();
 
@@ -142,7 +142,7 @@ final class EventBridge
             });
         }
 
-        foreach (ModelEvent::settling() as $event) {
+        foreach (ModelEvent::finishing() as $event) {
             $this->events->listen($event->for($model), $this->finish(...));
         }
     }
@@ -168,7 +168,7 @@ final class EventBridge
         });
 
         try {
-            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->before($connection, $model, $operation));
+            $pendingWrite->snapshotsBefore = $this->internally(fn () => $this->affectedRecords->before($connection, $model, $operation));
         } catch (Throwable $e) {
             $this->close($connection, $pendingWrite, false);
 
@@ -196,14 +196,14 @@ final class EventBridge
                 return;
             }
 
-            if ($pendingWrite->started) {
+            if ($pendingWrite->statementSent) {
                 $this->close($connection, $pendingWrite, false);
 
                 return;
             }
 
             $parsedWrite = ParsedWrite::of($query);
-            $pendingWrite->started = $parsedWrite !== null && $pendingWrite->expects($parsedWrite);
+            $pendingWrite->statementSent = $parsedWrite !== null && $pendingWrite->expects($parsedWrite);
         });
     }
 
@@ -212,9 +212,9 @@ final class EventBridge
         $pendingWrite->pending = false;
 
         try {
-            $entries = $pendingWrite->before;
+            $entries = $pendingWrite->snapshotsBefore;
 
-            foreach ($this->internally(fn () => $this->affectedRecords->of($connection, $pendingWrite->model, $pendingWrite->operation, true)) as $id => $record) {
+            foreach ($this->internally(fn () => $this->affectedRecords->of($connection, $pendingWrite->source, $pendingWrite->operation, true)) as $id => $record) {
                 $entries[$id] ??= new RecordSnapshot($record, null);
             }
 
@@ -225,7 +225,7 @@ final class EventBridge
 
             $replay = function () use ($entries, $after, $pendingWrite, $connection): void {
                 foreach ($entries as $id => $entry) {
-                    $this->eventReplayer->record($entry->record, $entry->row, $after[$id]->row ?? null, $pendingWrite->model, (string) $connection->getName());
+                    $this->eventReplayer->replay($entry->record, $entry->row, $after[$id]->row ?? null, $pendingWrite->source, (string) $connection->getName());
                 }
             };
 
@@ -248,7 +248,7 @@ final class EventBridge
         $connection = $model->getConnection();
         $pendingWrite = $this->top($connection->getName());
 
-        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->model === $model) {
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->source === $model) {
             $this->close($connection, $pendingWrite, true);
         }
     }
@@ -262,7 +262,7 @@ final class EventBridge
                 continue;
             }
 
-            if ($connection->transactionLevel() !== $pendingWrite->level + 1) {
+            if ($connection->transactionLevel() !== $pendingWrite->transactionLevel + 1) {
                 return;
             }
 
@@ -304,7 +304,7 @@ final class EventBridge
             if ($commit) {
                 $connection->commit();
             } else {
-                $connection->rollBack($pendingWrite->level);
+                $connection->rollBack($pendingWrite->transactionLevel);
             }
         });
     }
@@ -321,7 +321,7 @@ final class EventBridge
         $count = 0;
 
         foreach ($models as $model) {
-            foreach (ModelEvent::arming() as $event) {
+            foreach (ModelEvent::beginning() as $event) {
                 $count += $dispatcher->dispatched($event->for($model))->count();
             }
         }

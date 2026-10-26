@@ -14,12 +14,12 @@ final class UnrepresentableStateTest extends TestCase
     private const array REFUSED = [
         'kind' => UnrepresentableStateKind::Refuse,
         'name' => 'second_root_place',
-        'state' => 'a second root place for one gadget',
+        'description' => 'a second root place for one gadget',
         'because' => 'A widget has one street.',
         'instead' => 'Give the new place a parent_id.',
-        'alias' => null,
-        'condition' => null,
-        'previousUpdate' => null,
+        'checkedOn' => null,
+        'checkCondition' => null,
+        'previousUpdateCondition' => null,
     ];
 
     #[Test]
@@ -32,7 +32,7 @@ final class UnrepresentableStateTest extends TestCase
     public function it_declares_a_degraded_state_with_its_rule_and_no_alternative(): void
     {
         $this->assertSame(
-            ['kind' => UnrepresentableStateKind::Degrade, 'name' => 'child_place', 'state' => 'a place under another place', 'because' => 'The widget shows only the root place.', 'instead' => '', 'alias' => null, 'condition' => null, 'previousUpdate' => null],
+            ['kind' => UnrepresentableStateKind::Degrade, 'name' => 'child_place', 'description' => 'a place under another place', 'because' => 'The widget shows only the root place.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => null, 'previousUpdateCondition' => null],
             get_object_vars(UnrepresentableState::degrade('child_place', 'a place under another place', 'The widget shows only the root place.')),
         );
     }
@@ -41,7 +41,7 @@ final class UnrepresentableStateTest extends TestCase
     public function it_declares_a_hidden_state_with_its_condition_and_no_alternative(): void
     {
         $this->assertSame(
-            ['kind' => UnrepresentableStateKind::Hide, 'name' => 'retired', 'state' => 'a retired widget', 'because' => 'Retired widgets predate gadgets.', 'instead' => '', 'alias' => null, 'condition' => "widget.status = 'Retired'", 'previousUpdate' => null],
+            ['kind' => UnrepresentableStateKind::Hide, 'name' => 'retired', 'description' => 'a retired widget', 'because' => 'Retired widgets predate gadgets.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => "widget.status = 'Retired'", 'previousUpdateCondition' => null],
             get_object_vars(UnrepresentableState::hide('retired', 'a retired widget', 'Retired widgets predate gadgets.', "widget.status = 'Retired'")),
         );
     }
@@ -53,8 +53,8 @@ final class UnrepresentableStateTest extends TestCase
 
         $checked = $original->checkedOn('place', 'place.parent_id IS NULL');
 
-        $this->assertSame(array_replace(self::REFUSED, ['alias' => 'place', 'condition' => 'place.parent_id IS NULL', 'previousUpdate' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($checked));
-        $this->assertSame(array_replace(self::REFUSED, ['previousUpdate' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($original));
+        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($checked));
+        $this->assertSame(array_replace(self::REFUSED, ['previousUpdateCondition' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($original));
     }
 
     #[Test]
@@ -62,7 +62,7 @@ final class UnrepresentableStateTest extends TestCase
     {
         $checked = UnrepresentableState::hide('retired', 'a retired widget', 'Retired widgets predate gadgets.', "widget.status = 'Retired'")->checkedOn('widget', 'widget.gadget_id IS NULL');
 
-        $this->assertSame(['widget', 'widget.gadget_id IS NULL', UnrepresentableStateKind::Hide], [$checked->alias, $checked->condition, $checked->kind]);
+        $this->assertSame(['widget', 'widget.gadget_id IS NULL', UnrepresentableStateKind::Hide], [$checked->checkedOn, $checked->checkCondition, $checked->kind]);
     }
 
     #[Test]
@@ -72,8 +72,8 @@ final class UnrepresentableStateTest extends TestCase
 
         $checked = $original->checkedOnPreviousUpdate('OLD.is_archived');
 
-        $this->assertSame(array_replace(self::REFUSED, ['alias' => 'place', 'condition' => 'place.parent_id IS NULL', 'previousUpdate' => 'OLD.is_archived']), get_object_vars($checked));
-        $this->assertNull($original->previousUpdate);
+        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => 'OLD.is_archived']), get_object_vars($checked));
+        $this->assertNull($original->previousUpdateCondition);
     }
 
     private function refused(): UnrepresentableState

@@ -54,9 +54,9 @@ trait InteractsWithCompatibilityMaps
     {
         $matches = array_filter(
             $this->mirroredEvents,
-            fn (RecordMirrored $recordMirrored) => $recordMirrored->model instanceof $model
+            fn (RecordMirrored $recordMirrored) => $recordMirrored->destination instanceof $model
                 && in_array($event, $recordMirrored->events, true)
-                && ($where === null || $where($recordMirrored->model, $recordMirrored)),
+                && ($where === null || $where($recordMirrored->destination, $recordMirrored)),
         );
 
         Assert::assertCount(
@@ -117,7 +117,7 @@ trait InteractsWithCompatibilityMaps
         }
 
         return implode('; ', array_map(
-            fn (RecordMirrored $recordMirrored) => class_basename($recordMirrored->model).' '.json_encode($recordMirrored->model->getKey()).' ['.implode(', ', array_map(fn (ModelEvent $event) => $event->value, $recordMirrored->events)).']',
+            fn (RecordMirrored $recordMirrored) => class_basename($recordMirrored->destination).' '.json_encode($recordMirrored->destination->getKey()).' ['.implode(', ', array_map(fn (ModelEvent $event) => $event->value, $recordMirrored->events)).']',
             $this->mirroredEvents,
         ));
     }

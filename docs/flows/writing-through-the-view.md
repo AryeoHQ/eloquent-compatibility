@@ -81,7 +81,7 @@ PERFORM pg_advisory_xact_lock(hashtextextended(concat('<refuse function>:', NEW.
 
 The primary row lock comes first, so the refused-state lock joins the order of [INV-1](../invariants.md). A view writer holds the primary row `FOR UPDATE` before it writes a dependent row. A dependent writer then waits on the primary row before it holds the advisory lock, and the two cannot deadlock on it. Both a dependent's primary foreign key and the retained table's name the primary row.
 
-The advisory lock's key joins the refuse function's name, from `ResolvedMap::refuseFunction()`, with the row's primary foreign key. A dependent uses `ResolvedMap::primaryForeignKey()`, and the retained table uses the previous model's primary foreign key. So two writers of one record's rows check the state one after the other. `concat` turns a null key into an empty string, so every row with a null key shares one lock. `Compiler::function()` declares no volatility, so each function is VOLATILE. Under READ COMMITTED, the check after the wait therefore takes a new snapshot and sees the committed row.
+The advisory lock's key joins the refuse function's name, from `ResolvedMap::refuseFunctionName()`, with the row's primary foreign key. A dependent uses `ResolvedMap::primaryForeignKey()`, and the retained table uses the previous model's primary foreign key. So two writers of one record's rows check the state one after the other. `concat` turns a null key into an empty string, so every row with a null key shares one lock. `Compiler::function()` declares no volatility, so each function is VOLATILE. Under READ COMMITTED, the check after the wait therefore takes a new snapshot and sees the committed row.
 
 The lock has four limits:
 

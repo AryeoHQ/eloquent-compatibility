@@ -17,7 +17,7 @@ final readonly class KeyTranslator
     {
         $previous = $this->resolvedMap->previousModel;
 
-        return new AffectedRecord($this->resolvedMap->name, (string) $previous->model, $previous->view, (string) $previous->table, (string) $previous->key, $key, RecordRole::Previous);
+        return new AffectedRecord($this->resolvedMap->name, (string) $previous->model, $previous->view, (string) $previous->table, (string) $previous->keyColumn, $key, RecordRole::Previous);
     }
 
     public function currentRecord(string $alias, int|string $key): AffectedRecord
@@ -25,7 +25,7 @@ final readonly class KeyTranslator
         $model = array_search($alias, $this->resolvedMap->currentModels(), true);
         $table = $this->resolvedMap->table($alias);
 
-        return new AffectedRecord($this->resolvedMap->name, (string) $model, $table, $table, $this->resolvedMap->key($alias), $key, $alias === $this->resolvedMap->primaryCurrentModel->alias ? RecordRole::Primary : RecordRole::Dependent);
+        return new AffectedRecord($this->resolvedMap->name, (string) $model, $table, $table, $this->resolvedMap->keyColumn($alias), $key, $alias === $this->resolvedMap->primaryCurrentModel->alias ? RecordRole::Primary : RecordRole::Dependent);
     }
 
     /**
@@ -34,18 +34,18 @@ final readonly class KeyTranslator
     public function currentKeys(ConnectionInterface $connection, int|string $previousKey): array
     {
         $previous = $this->resolvedMap->previousModel;
-        $primaryForeignKey = $previous->alias.'.'.SqlFragments::id((string) $previous->primaryForeignKey);
-        $columns = [$primaryForeignKey.' AS '.SqlFragments::id((string) $this->resolvedMap->primaryCurrentModel->alias)];
+        $primaryForeignKey = $previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey);
+        $columns = [$primaryForeignKey.' AS '.SqlFragments::identifier((string) $this->resolvedMap->primaryCurrentModel->alias)];
 
         foreach ($this->resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
-            $columns[] = '(SELECT '.$alias.'.'.SqlFragments::id($this->resolvedMap->key($alias))
-                .' '.$this->resolvedMap->locate($dependent, $primaryForeignKey, (string) $previous->alias).') AS '.SqlFragments::id($alias);
+            $columns[] = '(SELECT '.$alias.'.'.SqlFragments::identifier($this->resolvedMap->keyColumn($alias))
+                .' '.$this->resolvedMap->locate($dependent, $primaryForeignKey, (string) $previous->alias).') AS '.SqlFragments::identifier($alias);
         }
 
         $row = $connection->selectOne(
-            'select '.implode(', ', $columns).' from '.SqlFragments::id((string) $previous->table).' '.$previous->alias
-            .' where '.$previous->alias.'.'.SqlFragments::id((string) $previous->key).' = ?',
+            'select '.implode(', ', $columns).' from '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+            .' where '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = ?',
             [$previousKey],
         );
 
@@ -71,9 +71,9 @@ final readonly class KeyTranslator
         foreach ($this->resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
             $rows = $connection->select(
-                'select '.SqlFragments::id($this->resolvedMap->key($alias)).' as key from '.SqlFragments::id($this->resolvedMap->table($alias))
-                .' where '.SqlFragments::id($this->resolvedMap->primaryForeignKey($dependent)).' = (select '.SqlFragments::id((string) $previous->primaryForeignKey)
-                .' from '.SqlFragments::id((string) $previous->table).' where '.SqlFragments::id((string) $previous->key).' = ?) order by 1',
+                'select '.SqlFragments::identifier($this->resolvedMap->keyColumn($alias)).' as key from '.SqlFragments::identifier($this->resolvedMap->table($alias))
+                .' where '.SqlFragments::identifier($this->resolvedMap->primaryForeignKey($dependent)).' = (select '.SqlFragments::identifier((string) $previous->primaryForeignKey)
+                .' from '.SqlFragments::identifier((string) $previous->table).' where '.SqlFragments::identifier((string) $previous->keyColumn).' = ?) order by 1',
                 [$previousKey],
             );
 
@@ -93,8 +93,8 @@ final readonly class KeyTranslator
     {
         $previous = $this->resolvedMap->previousModel;
         $rows = $connection->select(
-            'select '.SqlFragments::id((string) $previous->key).' as key from '.SqlFragments::id((string) $previous->table)
-            .' where '.SqlFragments::id((string) $previous->primaryForeignKey).' = ? order by 1',
+            'select '.SqlFragments::identifier((string) $previous->keyColumn).' as key from '.SqlFragments::identifier((string) $previous->table)
+            .' where '.SqlFragments::identifier((string) $previous->primaryForeignKey).' = ? order by 1',
             [$primaryKey],
         );
 
@@ -104,7 +104,7 @@ final readonly class KeyTranslator
         ));
     }
 
-    public function created(ConnectionInterface $connection): null|string
+    public function createdPreviousKey(ConnectionInterface $connection): null|string
     {
         $key = $connection->scalar('select current_setting('.SqlFragments::literal(Setting::Created->for($this->resolvedMap)).', true)');
 

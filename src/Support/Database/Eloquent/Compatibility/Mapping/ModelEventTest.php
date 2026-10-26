@@ -37,15 +37,15 @@ final class ModelEventTest extends TestCase
     }
 
     #[Test]
-    public function it_lists_the_events_that_arm_a_write(): void
+    public function it_lists_the_events_that_begin_a_write(): void
     {
-        $this->assertSame([ModelEvent::Creating, ModelEvent::Updating, ModelEvent::Deleting], ModelEvent::arming());
+        $this->assertSame([ModelEvent::Creating, ModelEvent::Updating, ModelEvent::Deleting], ModelEvent::beginning());
     }
 
     #[Test]
-    public function it_lists_the_events_that_settle_a_write(): void
+    public function it_lists_the_events_that_finish_a_write(): void
     {
-        $this->assertSame([ModelEvent::Saved, ModelEvent::Updated, ModelEvent::Deleted], ModelEvent::settling());
+        $this->assertSame([ModelEvent::Saved, ModelEvent::Updated, ModelEvent::Deleted], ModelEvent::finishing());
     }
 
     #[Test]
@@ -77,7 +77,7 @@ final class ModelEventTest extends TestCase
     }
 
     #[Test]
-    public function it_maps_each_arming_event_to_its_operation_and_every_other_case_to_none(): void
+    public function it_maps_each_beginning_event_to_its_operation_and_every_other_case_to_none(): void
     {
         $this->assertSame(
             ['Creating' => Operation::Insert, 'Updating' => Operation::Update, 'Deleting' => Operation::Delete],

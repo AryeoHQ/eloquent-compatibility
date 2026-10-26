@@ -18,7 +18,7 @@ final class PreviousModelTest extends TestCase
         'view' => 'widgets',
         'table' => 'retained_widgets',
         'model' => Widget::class,
-        'key' => 'id',
+        'keyColumn' => 'id',
         'alias' => 'widget',
         'primaryForeignKey' => 'gadget_id',
         'fillWhenCreatedFromCurrent' => ['status' => "'Draft'"],
@@ -28,7 +28,7 @@ final class PreviousModelTest extends TestCase
     public function it_declares_only_the_view(): void
     {
         $this->assertSame(
-            ['view' => 'widgets', 'table' => null, 'model' => null, 'key' => null, 'alias' => null, 'primaryForeignKey' => null, 'fillWhenCreatedFromCurrent' => []],
+            ['view' => 'widgets', 'table' => null, 'model' => null, 'keyColumn' => null, 'alias' => null, 'primaryForeignKey' => null, 'fillWhenCreatedFromCurrent' => []],
             get_object_vars(PreviousModel::servedAsView('widgets')),
         );
     }
@@ -36,7 +36,7 @@ final class PreviousModelTest extends TestCase
     #[Test]
     #[TestWith(['table', 'retainedInTable', 'legacy_widgets'])]
     #[TestWith(['model', 'forModel', Gadget::class])]
-    #[TestWith(['key', 'keyedBy', 'uuid'])]
+    #[TestWith(['keyColumn', 'keyedBy', 'uuid'])]
     #[TestWith(['alias', 'aliasedAs', 'legacy'])]
     #[TestWith(['primaryForeignKey', 'primaryForeignKey', 'owner_id'])]
     public function it_sets_one_property_on_a_copy_and_keeps_the_rest(string $property, string $method, string $value): void

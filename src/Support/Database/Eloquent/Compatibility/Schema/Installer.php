@@ -71,7 +71,7 @@ final readonly class Installer
         );
 
         foreach ($triggers as $trigger) {
-            $this->connection->unprepared('DROP TRIGGER IF EXISTS '.SqlFragments::id((string) $trigger->name).' ON '.$trigger->relation);
+            $this->connection->unprepared('DROP TRIGGER IF EXISTS '.SqlFragments::identifier((string) $trigger->name).' ON '.$trigger->relation);
         }
 
         $functions = $this->connection->select(
@@ -87,8 +87,8 @@ final readonly class Installer
     {
         $grantee = "CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END";
         $option = "CASE WHEN privilege.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END";
-        $view = SqlFragments::id($resolvedMap->previousModel->view);
-        $table = SqlFragments::id((string) $resolvedMap->previousModel->table);
+        $view = SqlFragments::identifier($resolvedMap->previousModel->view);
+        $table = SqlFragments::identifier((string) $resolvedMap->previousModel->table);
 
         $grants = $this->connection->select(
             "select privilege.privilege_type || ' ON ' || ? || ' TO ' || {$grantee} || {$option} as statement
@@ -111,7 +111,7 @@ final readonly class Installer
 
     private function relation(string $name): null|string
     {
-        $relation = $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?)::text", [SqlFragments::id($name)]);
+        $relation = $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?)::text", [SqlFragments::identifier($name)]);
 
         return is_string($relation) ? $relation : null;
     }

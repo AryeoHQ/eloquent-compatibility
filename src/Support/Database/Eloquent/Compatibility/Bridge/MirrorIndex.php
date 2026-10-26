@@ -75,9 +75,9 @@ final class MirrorIndex
     }
 
     /** @return list<MapMember> */
-    public function forTable(string $table): array
+    public function forRelation(string $relation): array
     {
-        return $this->tables[$table] ?? [];
+        return $this->tables[$relation] ?? [];
     }
 
     /** @return list<class-string<Model>> */

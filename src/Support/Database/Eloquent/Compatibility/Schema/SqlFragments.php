@@ -6,7 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 final class SqlFragments
 {
-    public static function id(string $identifier): string
+    public static function identifier(string $identifier): string
     {
         return '"'.str_replace('"', '""', $identifier).'"';
     }
@@ -26,8 +26,8 @@ final class SqlFragments
      */
     public static function changed(array $columns): string
     {
-        $new = implode(', ', array_map(fn (string $column) => 'NEW.'.self::id($column), $columns));
-        $old = implode(', ', array_map(fn (string $column) => 'OLD.'.self::id($column), $columns));
+        $new = implode(', ', array_map(fn (string $column) => 'NEW.'.self::identifier($column), $columns));
+        $old = implode(', ', array_map(fn (string $column) => 'OLD.'.self::identifier($column), $columns));
 
         return "ROW({$new}) IS DISTINCT FROM ROW({$old})";
     }

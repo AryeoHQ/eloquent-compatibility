@@ -38,37 +38,37 @@ final class EventReplayer
     }
 
     /**
-     * @param  null|array<string, mixed>  $before
-     * @param  null|array<string, mixed>  $after
+     * @param  null|array<string, mixed>  $rowBefore
+     * @param  null|array<string, mixed>  $rowAfter
      */
-    public function record(AffectedRecord $record, null|array $before, null|array $after, Model $source, string $connection): void
+    public function replay(AffectedRecord $record, null|array $rowBefore, null|array $rowAfter, Model $source, string $connectionName): void
     {
         $class = $record->model;
         $template = new $class;
         $deletedAt = method_exists($template, 'getDeletedAtColumn') ? (string) $template->getDeletedAtColumn() : null;
-        $deletedBefore = $deletedAt === null ? null : ($before[$deletedAt] ?? null);
-        $deletedAfter = $deletedAt === null ? null : ($after[$deletedAt] ?? null);
+        $deletedBefore = $deletedAt === null ? null : ($rowBefore[$deletedAt] ?? null);
+        $deletedAfter = $deletedAt === null ? null : ($rowAfter[$deletedAt] ?? null);
 
-        if ($before === $after || ($before === null && $after === null)) {
+        if ($rowBefore === $rowAfter || ($rowBefore === null && $rowAfter === null)) {
             return;
         }
 
-        $model = $template->newInstance([], $before !== null);
-        $model->setConnection($connection);
+        $model = $template->newInstance([], $rowBefore !== null);
+        $model->setConnection($connectionName);
         $outer = $this->fired;
         $this->fired = [];
         $this->replaying[$model] = true;
 
         try {
             match (true) {
-                $before === null => $this->created($record, $model, (array) $after),
-                $after === null => $this->deleted($record, $model, $before, $deletedAt !== null),
-                $deletedBefore === null && $deletedAfter !== null => $this->trashed($record, $model, $before, $after),
-                $deletedBefore !== null && $deletedAfter === null => $this->restored($record, $model, $before, $after),
-                default => $this->updated($record, $model, $before, $after),
+                $rowBefore === null => $this->created($record, $model, (array) $rowAfter),
+                $rowAfter === null => $this->deleted($record, $model, $rowBefore, $deletedAt !== null),
+                $deletedBefore === null && $deletedAfter !== null => $this->trashed($record, $model, $rowBefore, $rowAfter),
+                $deletedBefore !== null && $deletedAfter === null => $this->restored($record, $model, $rowBefore, $rowAfter),
+                default => $this->updated($record, $model, $rowBefore, $rowAfter),
             };
 
-            event(new RecordMirrored($record->map, $source, $model, $this->fired, $before, $after));
+            event(new RecordMirrored($record->map, $source, $model, $this->fired, $rowBefore, $rowAfter));
         } finally {
             unset($this->replaying[$model]);
             $this->fired = $outer;

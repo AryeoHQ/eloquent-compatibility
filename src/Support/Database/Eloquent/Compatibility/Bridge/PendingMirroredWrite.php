@@ -11,21 +11,21 @@ final class PendingMirroredWrite
 {
     public bool $pending = true;
 
-    public bool $started = false;
+    public bool $statementSent = false;
 
     /** @var array<string, RecordSnapshot> */
-    public array $before = [];
+    public array $snapshotsBefore = [];
 
     public function __construct(
-        public readonly Model $model,
+        public readonly Model $source,
         public readonly Operation $operation,
-        public readonly int $level,
+        public readonly int $transactionLevel,
         public readonly null|string $savepoint,
     ) {}
 
     public function expects(ParsedWrite $parsedWrite): bool
     {
-        if ($parsedWrite->relation !== Str::afterLast($this->model->getTable(), '.')) {
+        if ($parsedWrite->relation !== Str::afterLast($this->source->getTable(), '.')) {
             return false;
         }
 

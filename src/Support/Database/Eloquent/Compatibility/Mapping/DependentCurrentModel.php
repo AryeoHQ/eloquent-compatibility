@@ -19,7 +19,7 @@ final readonly class DependentCurrentModel
         public string $readableWhen,
         public array $fillWhenCreatedFromPrevious,
         public null|string $createdWhen,
-        public null|string $designation,
+        public null|string $designationColumn,
     ) {}
 
     /**
@@ -32,17 +32,17 @@ final readonly class DependentCurrentModel
 
     public function aliasedAs(string $alias): self
     {
-        return new self($this->model, $alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designation);
+        return new self($this->model, $alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
     }
 
     public function primaryForeignKey(string $column): self
     {
-        return new self($this->model, $this->alias, $column, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designation);
+        return new self($this->model, $this->alias, $column, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
     }
 
     public function readableWhen(string $condition): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $condition, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designation);
+        return new self($this->model, $this->alias, $this->primaryForeignKey, $condition, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
     }
 
     /**
@@ -50,12 +50,12 @@ final readonly class DependentCurrentModel
      */
     public function fillWhenCreatedFromPrevious(array $values): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $values, $this->createdWhen, $this->designation);
+        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $values, $this->createdWhen, $this->designationColumn);
     }
 
     public function createdWhen(string $condition): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $condition, $this->designation);
+        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $condition, $this->designationColumn);
     }
 
     public function designatedBy(string $column): self

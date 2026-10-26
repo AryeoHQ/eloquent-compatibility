@@ -75,7 +75,7 @@ final class CompilerTest extends TestCase
         $compiledSql = $this->compiler()->compile($compatibilityMap);
         $prefix = ResolvedMap::of($compatibilityMap)->objectPrefix();
         $installed = fn () => [
-            DB::scalar('select to_regclass(?) is not null', [SqlFragments::id($compatibilityMap->previousModel()->view)]),
+            DB::scalar('select to_regclass(?) is not null', [SqlFragments::identifier($compatibilityMap->previousModel()->view)]),
             $this->objects('pg_proc', 'proname', $prefix),
             $this->objects('pg_trigger', 'tgname', $prefix),
         ];

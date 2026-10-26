@@ -117,18 +117,18 @@ final class KeyTranslatorTest extends TestCase
         resolve(Installer::class)->install(new AccountCompatibilityMap);
         $accounts = $this->keyTranslator(new AccountCompatibilityMap);
 
-        $this->assertNull($this->keyTranslator->created(DB::connection()));
+        $this->assertNull($this->keyTranslator->createdPreviousKey(DB::connection()));
 
         $widget = $this->widget();
 
-        $this->assertSame((string) $widget->getKey(), $this->keyTranslator->created(DB::connection()));
-        $this->assertNull($accounts->created(DB::connection()));
+        $this->assertSame((string) $widget->getKey(), $this->keyTranslator->createdPreviousKey(DB::connection()));
+        $this->assertNull($accounts->createdPreviousKey(DB::connection()));
 
         $gadget = Gadget::query()->create(['name' => 'Native gadget']);
         $account = Account::query()->create(['email' => 'one@example.test']);
 
-        $this->assertSame((string) DB::table('retained_widgets')->where('gadget_id', $gadget->getKey())->value('id'), $this->keyTranslator->created(DB::connection()));
-        $this->assertSame((string) $account->getKey(), $accounts->created(DB::connection()));
+        $this->assertSame((string) DB::table('retained_widgets')->where('gadget_id', $gadget->getKey())->value('id'), $this->keyTranslator->createdPreviousKey(DB::connection()));
+        $this->assertSame((string) $account->getKey(), $accounts->createdPreviousKey(DB::connection()));
     }
 
     private function keyTranslator(CompatibilityMap $map): KeyTranslator
@@ -151,6 +151,6 @@ final class KeyTranslatorTest extends TestCase
      */
     private function describe(AffectedRecord $record): array
     {
-        return [$record->map, $record->model, $record->relation, $record->lockTable, $record->keyName, $record->key, $record->role];
+        return [$record->map, $record->model, $record->readFrom, $record->lockedTable, $record->keyColumn, $record->keyValue, $record->role];
     }
 }

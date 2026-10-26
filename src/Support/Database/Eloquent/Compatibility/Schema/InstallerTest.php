@@ -611,8 +611,8 @@ final class InstallerTest extends TestCase
         $reader = $this->role('Compatibility Reader');
         $editor = $this->role('compatibility_editor');
         resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
-        DB::statement('grant select on retained_widgets to '.SqlFragments::id($reader).' with grant option');
-        DB::statement('grant insert, update (sku), select (place_id) on retained_widgets to '.SqlFragments::id($editor));
+        DB::statement('grant select on retained_widgets to '.SqlFragments::identifier($reader).' with grant option');
+        DB::statement('grant insert, update (sku), select (place_id) on retained_widgets to '.SqlFragments::identifier($editor));
         DB::statement('grant select on retained_widgets to public');
 
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
@@ -641,11 +641,11 @@ final class InstallerTest extends TestCase
     {
         $editor = $this->role('compatibility_editor');
         resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
-        DB::statement('grant select, update (sku) on retained_widgets to '.SqlFragments::id($editor));
+        DB::statement('grant select, update (sku) on retained_widgets to '.SqlFragments::identifier($editor));
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
         $id = $this->widget();
 
-        DB::statement('set role '.SqlFragments::id($editor));
+        DB::statement('set role '.SqlFragments::identifier($editor));
 
         try {
             DB::table('widgets')->where('id', $id)->update(['sku' => 'Set by the editor']);
@@ -661,10 +661,10 @@ final class InstallerTest extends TestCase
     {
         $reader = $this->role('compatibility_reader');
         resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
-        DB::statement('grant select, insert on retained_widgets to '.SqlFragments::id($reader));
+        DB::statement('grant select, insert on retained_widgets to '.SqlFragments::identifier($reader));
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
-        DB::statement('revoke insert on widgets from '.SqlFragments::id($reader));
-        DB::statement('grant delete on retained_widgets to '.SqlFragments::id($reader));
+        DB::statement('revoke insert on widgets from '.SqlFragments::identifier($reader));
+        DB::statement('grant delete on retained_widgets to '.SqlFragments::identifier($reader));
 
         resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
 
@@ -682,9 +682,9 @@ final class InstallerTest extends TestCase
     private function role(string $name): string
     {
         $role = $name.'_'.Str::lower(Str::random(8));
-        DB::statement('create role '.SqlFragments::id($role));
+        DB::statement('create role '.SqlFragments::identifier($role));
         $this->beforeApplicationDestroyed(function () use ($role): void {
-            DB::statement('drop role if exists '.SqlFragments::id($role));
+            DB::statement('drop role if exists '.SqlFragments::identifier($role));
         });
 
         return $role;

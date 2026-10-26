@@ -16,6 +16,6 @@ final class AliasedTableTest extends TestCase
     {
         $aliasedTable = new AliasedTable('gadget_places', 'gadget_id');
 
-        $this->assertSame(['table' => 'gadget_places', 'key' => 'gadget_id'], get_object_vars($aliasedTable));
+        $this->assertSame(['table' => 'gadget_places', 'keyColumn' => 'gadget_id'], get_object_vars($aliasedTable));
     }
 }

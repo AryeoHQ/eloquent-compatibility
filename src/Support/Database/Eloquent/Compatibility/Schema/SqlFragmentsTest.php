@@ -28,8 +28,8 @@ final class SqlFragmentsTest extends TestCase
     #[TestWith(['public.widgets', '"public.widgets"'])]
     public function it_quotes_an_identifier_postgresql_reads_back_as_that_one_name(string $identifier, string $quoted): void
     {
-        $this->assertSame($quoted, SqlFragments::id($identifier));
-        $this->assertSame([$identifier], array_keys((array) DB::selectOne('select 1 as '.SqlFragments::id($identifier))));
+        $this->assertSame($quoted, SqlFragments::identifier($identifier));
+        $this->assertSame([$identifier], array_keys((array) DB::selectOne('select 1 as '.SqlFragments::identifier($identifier))));
     }
 
     #[Test]

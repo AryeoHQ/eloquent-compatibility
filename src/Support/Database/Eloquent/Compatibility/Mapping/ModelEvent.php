@@ -24,13 +24,13 @@ enum ModelEvent: string
     case ForceDeleted = 'forceDeleted';
 
     /** @return list<self> */
-    public static function arming(): array
+    public static function beginning(): array
     {
         return [self::Creating, self::Updating, self::Deleting];
     }
 
     /** @return list<self> */
-    public static function settling(): array
+    public static function finishing(): array
     {
         return [self::Saved, self::Updated, self::Deleted];
     }

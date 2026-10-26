@@ -61,7 +61,7 @@ final class EventReplayerTest extends TestCase
         $this->watch(Gadget::class, 'creating', fn (Gadget $gadget) => ['key' => $gadget->getKey(), 'exists' => $gadget->exists, 'name' => $gadget->name]);
         $this->watch(Gadget::class, 'created', fn (Gadget $gadget) => ['exists' => $gadget->exists, 'recent' => $gadget->wasRecentlyCreated]);
 
-        $this->eventReplayer->record($this->gadgetRecord($id), null, $after, $this->source, 'replica');
+        $this->eventReplayer->replay($this->gadgetRecord($id), null, $after, $this->source, 'replica');
 
         $this->assertSame([
             ['event' => 'creating', 'key' => $id, 'exists' => false, 'name' => 'Blue gadget'],
@@ -69,9 +69,9 @@ final class EventReplayerTest extends TestCase
         ], $this->seen);
         $recordMirrored = $this->sole();
         $this->assertSame([ModelEvent::Saving, ModelEvent::Creating, ModelEvent::Created, ModelEvent::Saved], $recordMirrored->events);
-        $this->assertSame(['widgets', $this->source, null, $after], [$recordMirrored->map, $recordMirrored->source, $recordMirrored->before, $recordMirrored->after]);
-        $this->assertInstanceOf(Gadget::class, $recordMirrored->model);
-        $this->assertSame([$id, true, 'replica', $after, false], [$recordMirrored->model->getKey(), $recordMirrored->model->exists, $recordMirrored->model->getConnectionName(), $recordMirrored->model->getAttributes(), $recordMirrored->model->isDirty()]);
+        $this->assertSame(['widgets', $this->source, null, $after], [$recordMirrored->map, $recordMirrored->source, $recordMirrored->rowBefore, $recordMirrored->rowAfter]);
+        $this->assertInstanceOf(Gadget::class, $recordMirrored->destination);
+        $this->assertSame([$id, true, 'replica', $after, false], [$recordMirrored->destination->getKey(), $recordMirrored->destination->exists, $recordMirrored->destination->getConnectionName(), $recordMirrored->destination->getAttributes(), $recordMirrored->destination->isDirty()]);
     }
 
     #[Test]
@@ -83,7 +83,7 @@ final class EventReplayerTest extends TestCase
         $this->watch(Account::class, 'creating', fn (Account $account) => ['key' => $account->getKey()]);
         $this->watch(Account::class, 'created', fn (Account $account) => ['key' => $account->getKey()]);
 
-        $this->eventReplayer->record($this->mirrorIndex->keyTranslator('accounts')->previousRecord($account->getKey()), null, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->mirrorIndex->keyTranslator('accounts')->previousRecord($account->getKey()), null, $after, $this->source, 'pgsql');
 
         $this->assertSame([['event' => 'creating', 'key' => null], ['event' => 'created', 'key' => $account->getKey()]], $this->seen);
     }
@@ -100,7 +100,7 @@ final class EventReplayerTest extends TestCase
             $this->watch(Gadget::class, $event, fn (Gadget $gadget) => ['dirty' => $gadget->isDirty('name'), 'original' => $gadget->getOriginal('name'), 'name' => $gadget->name, 'changed' => $gadget->wasChanged('name')]);
         }
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame([
             ['event' => 'updating', 'dirty' => true, 'original' => 'Blue gadget', 'name' => 'Renamed', 'changed' => false],
@@ -109,8 +109,8 @@ final class EventReplayerTest extends TestCase
         ], $this->seen);
         $recordMirrored = $this->sole();
         $this->assertSame([ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], $recordMirrored->events);
-        $this->assertSame([$before, $after], [$recordMirrored->before, $recordMirrored->after]);
-        $this->assertSame(['Renamed', false], [$recordMirrored->model->getOriginal('name'), $recordMirrored->model->isDirty()]);
+        $this->assertSame([$before, $after], [$recordMirrored->rowBefore, $recordMirrored->rowAfter]);
+        $this->assertSame(['Renamed', false], [$recordMirrored->destination->getOriginal('name'), $recordMirrored->destination->isDirty()]);
     }
 
     #[Test]
@@ -125,7 +125,7 @@ final class EventReplayerTest extends TestCase
             $this->watch(Gadget::class, $event, fn (Gadget $gadget) => ['exists' => $gadget->exists, 'trashed' => $gadget->trashed()]);
         }
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame([
             ['event' => 'deleting', 'exists' => true, 'trashed' => false],
@@ -147,7 +147,7 @@ final class EventReplayerTest extends TestCase
             $this->watch(Gadget::class, $event, fn (Gadget $gadget) => ['trashed' => $gadget->trashed(), 'changed' => $gadget->wasChanged('deleted_at')]);
         }
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame([
             ['event' => 'restoring', 'trashed' => true, 'changed' => false],
@@ -169,7 +169,7 @@ final class EventReplayerTest extends TestCase
             $this->watch(GadgetSite::class, $event, fn (GadgetSite $site) => ['exists' => $site->exists, 'key' => $site->getKey()]);
         }
 
-        $this->eventReplayer->record($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, null, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, null, $this->source, 'pgsql');
 
         $this->assertSame([
             ['event' => 'deleting', 'exists' => true, 'key' => $id],
@@ -177,7 +177,7 @@ final class EventReplayerTest extends TestCase
         ], $this->seen);
         $recordMirrored = $this->sole();
         $this->assertSame([ModelEvent::Deleting, ModelEvent::Deleted], $recordMirrored->events);
-        $this->assertSame([$before, null], [$recordMirrored->before, $recordMirrored->after]);
+        $this->assertSame([$before, null], [$recordMirrored->rowBefore, $recordMirrored->rowAfter]);
     }
 
     #[Test]
@@ -190,7 +190,7 @@ final class EventReplayerTest extends TestCase
             $this->watch(Gadget::class, $event, fn (Gadget $gadget) => ['exists' => $gadget->exists, 'forceDeleting' => $gadget->isForceDeleting()]);
         }
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, null, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, null, $this->source, 'pgsql');
 
         $this->assertSame([
             ['event' => 'forceDeleting', 'exists' => true, 'forceDeleting' => false],
@@ -208,8 +208,8 @@ final class EventReplayerTest extends TestCase
         $row = $this->row('gadgets', $id);
         $this->watch(Gadget::class, 'saving', fn () => []);
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $row, $row, $this->source, 'pgsql');
-        $this->eventReplayer->record($this->gadgetRecord($id), null, null, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $row, $row, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), null, null, $this->source, 'pgsql');
 
         $this->assertSame([], $this->seen);
         $this->assertNothingMirrored();
@@ -222,7 +222,7 @@ final class EventReplayerTest extends TestCase
         Event::listen('eloquent.updating: '.Gadget::class, fn () => false);
         $this->watch(Gadget::class, 'updated', fn () => []);
 
-        $refusal = $this->refusal(fn () => $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
+        $refusal = $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
 
         $this->assertSame("Compatibility map 'widgets' refused this write, because a 'updating' listener of Gadget #{$id} returned false", $refusal->refused);
         $this->assertSame([], $this->seen);
@@ -235,7 +235,7 @@ final class EventReplayerTest extends TestCase
         [$id, $before, $after] = $this->renamed();
         Event::listen('eloquent.updated: '.Gadget::class, fn () => false);
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame([ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], $this->sole()->events);
     }
@@ -248,7 +248,7 @@ final class EventReplayerTest extends TestCase
             $gadget->name = 'Changed by a listener';
         });
 
-        $refusal = $this->refusal(fn () => $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
+        $refusal = $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
 
         $this->assertSame("Compatibility map 'widgets' refused this write, because a 'saving' listener of Gadget #{$id} changed name", $refusal->refused);
         $this->assertNothingMirrored();
@@ -262,7 +262,7 @@ final class EventReplayerTest extends TestCase
             $site->setAttribute('latitude', '47.600000000000001');
         });
 
-        $refusal = $this->refusal(fn () => $this->eventReplayer->record($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, $after, $this->source, 'pgsql'));
+        $refusal = $this->refusal(fn () => $this->eventReplayer->replay($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, $after, $this->source, 'pgsql'));
 
         $this->assertStringEndsWith('changed latitude', $refusal->refused);
     }
@@ -276,7 +276,7 @@ final class EventReplayerTest extends TestCase
             $site->setAttribute('longitude', '0.0');
         });
 
-        $this->eventReplayer->record($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, $after, $this->source, 'pgsql');
 
         $gadget = $this->gadget(['name' => '{"color": "blue"}']);
         $before = $this->row('gadgets', $gadget);
@@ -286,7 +286,7 @@ final class EventReplayerTest extends TestCase
             $gadget->setAttribute('price_cents', '1250');
         });
 
-        $this->eventReplayer->record($this->gadgetRecord($gadget), $before, $this->row('gadgets', $gadget), $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($gadget), $before, $this->row('gadgets', $gadget), $this->source, 'pgsql');
 
         $this->assertCount(2, $this->mirroredEvents());
     }
@@ -302,9 +302,9 @@ final class EventReplayerTest extends TestCase
             'source' => $this->eventReplayer->isReplaying($this->source),
         ]);
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
-        $replayed = $this->sole()->model;
+        $replayed = $this->sole()->destination;
         $this->assertSame([['event' => 'updating', 'model' => $replayed, 'replaying' => true, 'other' => false, 'source' => false]], $this->seen);
         $this->assertFalse($this->eventReplayer->isReplaying($replayed));
     }
@@ -316,7 +316,7 @@ final class EventReplayerTest extends TestCase
         $this->watch(Gadget::class, 'updating', fn (Gadget $gadget) => ['model' => $gadget, 'replaying' => $this->eventReplayer->isReplaying($gadget)]);
         Event::listen('eloquent.updating: '.Gadget::class, fn () => false);
 
-        $this->refusal(fn () => $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
+        $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
 
         $this->assertCount(1, $this->seen);
         $this->assertTrue($this->seen[0]['replaying']);
@@ -334,7 +334,7 @@ final class EventReplayerTest extends TestCase
         Event::listen('eloquent.saved: '.Gadget::class, [Journal::class, 'handle']);
         [$id, $before, $after] = $this->renamed();
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame(['Gadget '.json_encode($id)], $journal->entries);
 
@@ -354,7 +354,7 @@ final class EventReplayerTest extends TestCase
         [$id, $before, $after] = $this->renamed();
         Event::fake([ValidationException::class]);
 
-        $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
 
         $this->assertSame([], $journal->entries);
         $this->assertSame([['event' => 'updated']], $this->seen);
@@ -369,7 +369,7 @@ final class EventReplayerTest extends TestCase
         Model::unsetEventDispatcher();
 
         try {
-            $this->eventReplayer->record($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+            $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
         } finally {
             Model::setEventDispatcher($dispatcher);
         }

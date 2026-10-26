@@ -14,15 +14,15 @@ final readonly class AffectedRecord
     public function __construct(
         public string $map,
         public string $model,
-        public string $relation,
-        public string $lockTable,
-        public string $keyName,
-        public int|string $key,
+        public string $readFrom,
+        public string $lockedTable,
+        public string $keyColumn,
+        public int|string $keyValue,
         public RecordRole $role,
     ) {}
 
     public function id(): string
     {
-        return $this->relation.'#'.$this->key;
+        return $this->readFrom.'#'.$this->keyValue;
     }
 }

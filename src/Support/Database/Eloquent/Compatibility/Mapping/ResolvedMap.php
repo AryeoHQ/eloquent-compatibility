@@ -42,7 +42,7 @@ final readonly class ResolvedMap
         }
 
         $previous = self::previous($name, $previous);
-        $tables = [(string) $previous->alias => new AliasedTable((string) $previous->table, (string) $previous->key)];
+        $tables = [(string) $previous->alias => new AliasedTable((string) $previous->table, (string) $previous->keyColumn)];
         $aliases = [];
 
         foreach ([$primary, ...$dependents] as $current) {
@@ -93,9 +93,9 @@ final readonly class ResolvedMap
         return $this->tables[$alias]->table;
     }
 
-    public function key(string $alias): string
+    public function keyColumn(string $alias): string
     {
-        return $this->tables[$alias]->key;
+        return $this->tables[$alias]->keyColumn;
     }
 
     /** @return list<string> */
@@ -123,11 +123,11 @@ final readonly class ResolvedMap
     public function locate(DependentCurrentModel $dependent, string $primaryKey, string $previous): string
     {
         $alias = (string) $dependent->alias;
-        $key = $alias.'.'.SqlFragments::id($this->key($alias));
+        $key = $alias.'.'.SqlFragments::identifier($this->keyColumn($alias));
 
-        return 'FROM '.SqlFragments::id($this->table($alias)).' '.$alias
-            .' WHERE '.$alias.'.'.SqlFragments::id($this->primaryForeignKey($dependent)).' = '.$primaryKey
-            .($dependent->designation === null ? '' : ' AND '.$key.' = '.$previous.'.'.SqlFragments::id($dependent->designation))
+        return 'FROM '.SqlFragments::identifier($this->table($alias)).' '.$alias
+            .' WHERE '.$alias.'.'.SqlFragments::identifier($this->primaryForeignKey($dependent)).' = '.$primaryKey
+            .($dependent->designationColumn === null ? '' : ' AND '.$key.' = '.$previous.'.'.SqlFragments::identifier($dependent->designationColumn))
             .' AND ('.$dependent->readableWhen.')'
             .' ORDER BY '.$key.' LIMIT 1';
     }
@@ -135,7 +135,7 @@ final readonly class ResolvedMap
     /** @return list<DependentCurrentModel> */
     public function designated(): array
     {
-        return array_values(array_filter($this->dependentCurrentModels, fn (DependentCurrentModel $dependent) => $dependent->designation !== null));
+        return array_values(array_filter($this->dependentCurrentModels, fn (DependentCurrentModel $dependent) => $dependent->designationColumn !== null));
     }
 
     /**
@@ -182,17 +182,17 @@ final readonly class ResolvedMap
         return $models;
     }
 
-    public function function(TriggerFunction $function): string
+    public function functionName(TriggerFunction $function): string
     {
         return $this->object($function->value);
     }
 
-    public function refuseFunction(UnrepresentableState $state): string
+    public function refuseFunctionName(UnrepresentableState $state): string
     {
         return $this->object('refuse_'.$state->name);
     }
 
-    public function designateFunction(DependentCurrentModel $dependent): string
+    public function designateFunctionName(DependentCurrentModel $dependent): string
     {
         return $this->object('designate_'.$dependent->alias);
     }
@@ -260,8 +260,8 @@ final readonly class ResolvedMap
             }
         }
 
-        if (! array_key_exists((string) $this->previousModel->key, $columns)) {
-            throw InvalidCompatibilityMap::because($this->name, "the previous model's key '{$this->previousModel->key}' is not an attribute");
+        if (! array_key_exists((string) $this->previousModel->keyColumn, $columns)) {
+            throw InvalidCompatibilityMap::because($this->name, "the previous model's key '{$this->previousModel->keyColumn}' is not an attribute");
         }
 
         if (! array_key_exists((string) $this->previousModel->primaryForeignKey, $columns)) {
@@ -280,12 +280,12 @@ final readonly class ResolvedMap
 
             $names[$state->name] = true;
 
-            if ($state->kind === UnrepresentableStateKind::Refuse && $state->condition === null && $state->previousUpdate === null) {
+            if ($state->kind === UnrepresentableStateKind::Refuse && $state->checkCondition === null && $state->previousUpdateCondition === null) {
                 throw InvalidCompatibilityMap::because($this->name, "refused state '{$state->name}' says neither checkedOn() nor checkedOnPreviousUpdate()");
             }
 
-            if ($state->alias !== null && ! array_key_exists($state->alias, $this->tables)) {
-                throw InvalidCompatibilityMap::because($this->name, "unrepresentable state '{$state->name}' checks unknown alias '{$state->alias}'");
+            if ($state->checkedOn !== null && ! array_key_exists($state->checkedOn, $this->tables)) {
+                throw InvalidCompatibilityMap::because($this->name, "unrepresentable state '{$state->name}' checks unknown alias '{$state->checkedOn}'");
             }
         }
     }
@@ -300,7 +300,7 @@ final readonly class ResolvedMap
 
         $model = self::model($map, (string) $previous->model);
 
-        return $previous->key === null ? $previous->keyedBy($model->getKeyName()) : $previous;
+        return $previous->keyColumn === null ? $previous->keyedBy($model->getKeyName()) : $previous;
     }
 
     private static function model(string $map, string $class): Model

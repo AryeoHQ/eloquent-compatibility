@@ -46,7 +46,7 @@ Three callers resolve a map, and each resolves it again:
 - `CompatibilityMaps::register()` resolves a map and stores it by name. It refuses a second map with the same name and a different view. A map with the same name and the same view replaces the stored one.
 - `EventBridge::mirror()` calls `CompatibilityMaps::register()` with the map that `EventMirror::compatibilityMap()` returns.
 
-`EventBridge::mirror()` refuses a second event mirror for one map name. The first call also listens for `QueryExecuted`. `MirrorIndex::add()` then indexes the map three ways: by model class, by current table and by relation. It returns the model classes it has not seen before. `EventBridge::listen()` attaches the arming and settling listeners to each, as [mirroring a write](mirroring-a-write.md) describes.
+`EventBridge::mirror()` refuses a second event mirror for one map name. The first call also listens for `QueryExecuted`. `MirrorIndex::add()` then indexes the map three ways: by model class, by current table and by relation. It returns the model classes it has not seen before. `EventBridge::listen()` attaches the beginning and finishing listeners to each, as [mirroring a write](mirroring-a-write.md) describes.
 
 `Provider` binds `CompatibilityMaps` and `EventBridge` as singletons. A map reaches `compatibility:check` only through `CompatibilityMaps::register()`, directly or through `EventBridge::mirror()`.
 

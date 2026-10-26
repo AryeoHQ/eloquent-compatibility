@@ -6,7 +6,7 @@ A write through one side changes rows the other side's models read. Those models
 
 ## Decision
 
-After the statement succeeds, the bridge reads each affected record again and `EventReplayer::record()` raises its events on a fresh instance. For an update, the instance carries the row from before as its original and the row from after as its attributes. The `-ing` events can stop the write, but a listener cannot change the record.
+After the statement succeeds, the bridge reads each affected record again and `EventReplayer::replay()` raises its events on a fresh instance. For an update, the instance carries the row from before as its original and the row from after as its attributes. The `-ing` events can stop the write, but a listener cannot change the record.
 
 ## Consequences
 

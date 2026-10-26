@@ -8,6 +8,6 @@ final readonly class AliasedTable
 {
     public function __construct(
         public string $table,
-        public string $key,
+        public string $keyColumn,
     ) {}
 }

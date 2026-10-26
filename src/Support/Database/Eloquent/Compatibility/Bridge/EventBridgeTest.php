@@ -227,7 +227,7 @@ final class EventBridgeTest extends TestCase
 
         GadgetPlace::query()->create(['gadget_id' => $widget->gadget_id, 'street' => '3 New St']);
 
-        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getAttribute('street') === '3 New St' && $event->before['street'] === null);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getAttribute('street') === '3 New St' && $event->rowBefore['street'] === null);
     }
 
     #[Test]
@@ -260,8 +260,8 @@ final class EventBridgeTest extends TestCase
         $place->setAttribute('gadget_id', $second->gadget_id);
         $place->save();
 
-        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $first->getKey() && $event->before['street'] === '1 Main St' && $mirrored->getAttribute('street') === null);
-        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $second->getKey() && $event->before['street'] === null && $mirrored->getAttribute('street') === '1 Main St');
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $first->getKey() && $event->rowBefore['street'] === '1 Main St' && $mirrored->getAttribute('street') === null);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $second->getKey() && $event->rowBefore['street'] === null && $mirrored->getAttribute('street') === '1 Main St');
     }
 
     #[Test]
@@ -598,7 +598,7 @@ final class EventBridgeTest extends TestCase
         $account->update(['email' => 'two@example.test']);
 
         $this->assertMirrored(Person::class, ModelEvent::Updated, fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
-        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile, RecordMirrored $event) => $event->before['email'] === 'one@example.test' && $profile->getAttribute('email') === 'two@example.test');
+        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile, RecordMirrored $event) => $event->rowBefore['email'] === 'one@example.test' && $profile->getAttribute('email') === 'two@example.test');
 
         $this->recordMirroredEvents();
         Person::query()->sole()->update(['display_name' => 'Two']);
@@ -624,7 +624,7 @@ final class EventBridgeTest extends TestCase
 
         GadgetItem::query()->sole()->update(['label' => 'Renamed']);
 
-        $this->assertMirrored(LegacyItem::class, ModelEvent::Updated, fn (Model $legacyItem, RecordMirrored $event) => $event->before['label'] === 'Quoted' && $legacyItem->getAttribute('label') === 'Renamed');
+        $this->assertMirrored(LegacyItem::class, ModelEvent::Updated, fn (Model $legacyItem, RecordMirrored $event) => $event->rowBefore['label'] === 'Quoted' && $legacyItem->getAttribute('label') === 'Renamed');
     }
 
     #[Test]

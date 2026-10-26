@@ -35,18 +35,18 @@ final readonly class DriftQueries
     {
         $previous = $resolvedMap->previousModel;
         $primary = (string) $resolvedMap->primaryCurrentModel->alias;
-        $primaryForeignKey = $previous->alias.'.'.SqlFragments::id((string) $previous->primaryForeignKey);
+        $primaryForeignKey = $previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey);
         $hidden = array_map(
-            fn (UnrepresentableState $state) => 'COALESCE(('.$state->condition.'), false)',
+            fn (UnrepresentableState $state) => 'COALESCE(('.$state->checkCondition.'), false)',
             $resolvedMap->unrepresentableStates(UnrepresentableStateKind::Hide),
         );
 
         $rows = $this->connection->select(
-            'select '.$previous->alias.'.'.SqlFragments::id((string) $previous->key).' as key, '.$primaryForeignKey.' is null as unlinked'
-            .' from '.SqlFragments::id((string) $previous->table).' '.$previous->alias
-            .' left join '.SqlFragments::id($resolvedMap->table($primary)).' '.$primary
-            .' on '.$primary.'.'.SqlFragments::id($resolvedMap->key($primary)).' = '.$primaryForeignKey
-            .' where '.$primary.'.'.SqlFragments::id($resolvedMap->key($primary)).' is null'
+            'select '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' as key, '.$primaryForeignKey.' is null as unlinked'
+            .' from '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+            .' left join '.SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
+            .' on '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = '.$primaryForeignKey
+            .' where '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' is null'
             .($hidden === [] ? '' : ' and not ('.implode(' or ', $hidden).')')
             .' order by 1 limit ?',
             [$limit],
@@ -70,12 +70,12 @@ final readonly class DriftQueries
     {
         $previous = $resolvedMap->previousModel;
         $primary = (string) $resolvedMap->primaryCurrentModel->alias;
-        $primaryKey = $primary.'.'.SqlFragments::id($resolvedMap->key($primary));
+        $primaryKey = $primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary));
 
         $rows = $this->connection->select(
-            'select '.$primaryKey.' as key from '.SqlFragments::id($resolvedMap->table($primary)).' '.$primary
-            .' where not exists (select 1 from '.SqlFragments::id((string) $previous->table).' '.$previous->alias
-            .' where '.$previous->alias.'.'.SqlFragments::id((string) $previous->primaryForeignKey).' = '.$primaryKey.')'
+            'select '.$primaryKey.' as key from '.SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
+            .' where not exists (select 1 from '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+            .' where '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey).' = '.$primaryKey.')'
             .' order by 1 limit ?',
             [$limit],
         );
@@ -95,10 +95,10 @@ final readonly class DriftQueries
     private function sharedPrimaries(ResolvedMap $resolvedMap, int $limit): array
     {
         $previous = $resolvedMap->previousModel;
-        $primaryForeignKey = SqlFragments::id((string) $previous->primaryForeignKey);
+        $primaryForeignKey = SqlFragments::identifier((string) $previous->primaryForeignKey);
 
         $rows = $this->connection->select(
-            'select '.$primaryForeignKey.' as key, count(*) as records from '.SqlFragments::id((string) $previous->table)
+            'select '.$primaryForeignKey.' as key, count(*) as records from '.SqlFragments::identifier((string) $previous->table)
             .' where '.$primaryForeignKey.' is not null group by 1 having count(*) > 1 order by 1 limit ?',
             [$limit],
         );
@@ -119,9 +119,9 @@ final readonly class DriftQueries
     {
         $previous = $resolvedMap->previousModel;
         $primary = (string) $resolvedMap->primaryCurrentModel->alias;
-        $primaryForeignKey = $previous->alias.'.'.SqlFragments::id((string) $previous->primaryForeignKey);
+        $primaryForeignKey = $previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey);
         $hidden = array_map(
-            fn (UnrepresentableState $state) => 'COALESCE(('.$state->condition.'), false)',
+            fn (UnrepresentableState $state) => 'COALESCE(('.$state->checkCondition.'), false)',
             $resolvedMap->unrepresentableStates(UnrepresentableStateKind::Hide),
         );
         $findings = [];
@@ -129,16 +129,16 @@ final readonly class DriftQueries
         foreach ($resolvedMap->designated() as $dependent) {
             $alias = (string) $dependent->alias;
             $table = $resolvedMap->table($alias);
-            $key = $alias.'.'.SqlFragments::id($resolvedMap->key($alias));
+            $key = $alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias));
 
             $rows = $this->connection->select(
-                'select '.$previous->alias.'.'.SqlFragments::id((string) $previous->key).' as key, '.$key.' is null as missing'
-                .' from '.SqlFragments::id((string) $previous->table).' '.$previous->alias
-                .' join '.SqlFragments::id($resolvedMap->table($primary)).' '.$primary
-                .' on '.$primary.'.'.SqlFragments::id($resolvedMap->key($primary)).' = '.$primaryForeignKey
-                .' left join '.SqlFragments::id($table).' '.$alias.' on '.$key.' = '.$previous->alias.'.'.SqlFragments::id((string) $dependent->designation)
-                .' where '.$previous->alias.'.'.SqlFragments::id((string) $dependent->designation).' is not null'
-                .' and ('.$key.' is null or '.$alias.'.'.SqlFragments::id($resolvedMap->primaryForeignKey($dependent)).' is distinct from '.$primaryForeignKey.')'
+                'select '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' as key, '.$key.' is null as missing'
+                .' from '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+                .' join '.SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
+                .' on '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = '.$primaryForeignKey
+                .' left join '.SqlFragments::identifier($table).' '.$alias.' on '.$key.' = '.$previous->alias.'.'.SqlFragments::identifier((string) $dependent->designationColumn)
+                .' where '.$previous->alias.'.'.SqlFragments::identifier((string) $dependent->designationColumn).' is not null'
+                .' and ('.$key.' is null or '.$alias.'.'.SqlFragments::identifier($resolvedMap->primaryForeignKey($dependent)).' is distinct from '.$primaryForeignKey.')'
                 .($hidden === [] ? '' : ' and not ('.implode(' or ', $hidden).')')
                 .' order by 1 limit ?',
                 [$limit],
@@ -149,7 +149,7 @@ final readonly class DriftQueries
                     $resolvedMap->name,
                     DriftCheck::Designation,
                     $previous->table.'#'.$row->key,
-                    $previous->table.'.'.$dependent->designation,
+                    $previous->table.'.'.$dependent->designationColumn,
                     $row->missing
                         ? "it names a {$table} row that does not exist"
                         : "it names a {$table} row of another ".$resolvedMap->table($primary).' row',
@@ -168,16 +168,16 @@ final readonly class DriftQueries
         $findings = [];
 
         foreach ($resolvedMap->unrepresentableStates(UnrepresentableStateKind::Refuse) as $state) {
-            if ($state->alias === null) {
+            if ($state->checkedOn === null) {
                 continue;
             }
 
-            $alias = $state->alias;
+            $alias = $state->checkedOn;
             $table = $resolvedMap->table($alias);
 
             $rows = $this->connection->select(
-                'select '.$alias.'.'.SqlFragments::id($resolvedMap->key($alias)).' as key from '.SqlFragments::id($table).' '.$alias
-                .' where COALESCE(('.$state->condition.'), false) order by 1 limit ?',
+                'select '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' as key from '.SqlFragments::identifier($table).' '.$alias
+                .' where COALESCE(('.$state->checkCondition.'), false) order by 1 limit ?',
                 [$limit],
             );
 
@@ -187,7 +187,7 @@ final readonly class DriftQueries
                     DriftCheck::RefusedState,
                     $table.'#'.$row->key,
                     $state->name,
-                    "the record is in a refused state: {$state->state}",
+                    "the record is in a refused state: {$state->description}",
                 );
             }
         }

@@ -67,7 +67,7 @@ final class CheckDriftTest extends TestCase
             ['refused state', 'gadget_places#'.min($first, $second), 'second_root_place'],
             ['refused state', 'gadget_places#'.max($first, $second), 'second_root_place'],
         ], array_map(
-            fn (DriftFinding $finding) => [$finding->check->value, $finding->record, $finding->attribute],
+            fn (DriftFinding $finding) => [$finding->check->value, $finding->recordId, $finding->attribute],
             resolve(DriftQueries::class)->find(resolve(CompatibilityMaps::class)->get('widgets'), 100),
         ));
         $this->assertSame($gadget, DB::table('retained_widgets')->where('id', $sharing)->value('gadget_id'));

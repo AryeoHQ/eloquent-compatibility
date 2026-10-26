@@ -60,8 +60,8 @@ final class MirrorIndexTest extends TestCase
         $this->assertSame($widgets, $this->mirrorIndex->resolvedMap('widgets'));
         $this->assertSame('accounts', $this->mirrorIndex->resolvedMap('accounts')->previousModel->view);
         $this->assertSame($this->mirrorIndex->keyTranslator('widgets'), $this->mirrorIndex->keyTranslator('widgets'));
-        $this->assertSame(['widgets', 'retained_widgets'], [$this->mirrorIndex->keyTranslator('widgets')->previousRecord(1)->map, $this->mirrorIndex->keyTranslator('widgets')->previousRecord(1)->lockTable]);
-        $this->assertSame(['accounts', 'retained_accounts'], [$this->mirrorIndex->keyTranslator('accounts')->previousRecord(1)->map, $this->mirrorIndex->keyTranslator('accounts')->previousRecord(1)->lockTable]);
+        $this->assertSame(['widgets', 'retained_widgets'], [$this->mirrorIndex->keyTranslator('widgets')->previousRecord(1)->map, $this->mirrorIndex->keyTranslator('widgets')->previousRecord(1)->lockedTable]);
+        $this->assertSame(['accounts', 'retained_accounts'], [$this->mirrorIndex->keyTranslator('accounts')->previousRecord(1)->map, $this->mirrorIndex->keyTranslator('accounts')->previousRecord(1)->lockedTable]);
         $this->assertSame([$excludedListener], $this->mirrorIndex->excludedListeners('widgets'));
         $this->assertSame([], $this->mirrorIndex->excludedListeners('accounts'));
     }
@@ -82,11 +82,11 @@ final class MirrorIndexTest extends TestCase
     {
         $this->addAll();
 
-        $this->assertSame([['accounts', 'person'], ['profiles', 'person']], $this->members($this->mirrorIndex->forTable('people')));
-        $this->assertSame([['widgets', 'gadget']], $this->members($this->mirrorIndex->forTable('gadgets')));
-        $this->assertSame([['widgets', 'site']], $this->members($this->mirrorIndex->forTable('gadget_sites')));
-        $this->assertSame([], $this->mirrorIndex->forTable('widgets'));
-        $this->assertSame([], $this->mirrorIndex->forTable('retained_widgets'));
+        $this->assertSame([['accounts', 'person'], ['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('people')));
+        $this->assertSame([['widgets', 'gadget']], $this->members($this->mirrorIndex->forRelation('gadgets')));
+        $this->assertSame([['widgets', 'site']], $this->members($this->mirrorIndex->forRelation('gadget_sites')));
+        $this->assertSame([], $this->mirrorIndex->forRelation('widgets'));
+        $this->assertSame([], $this->mirrorIndex->forRelation('retained_widgets'));
     }
 
     #[Test]

@@ -16,7 +16,7 @@ final readonly class PreviousModel
         public string $view,
         public null|string $table,
         public null|string $model,
-        public null|string $key,
+        public null|string $keyColumn,
         public null|string $alias,
         public null|string $primaryForeignKey,
         public array $fillWhenCreatedFromCurrent,
@@ -29,7 +29,7 @@ final readonly class PreviousModel
 
     public function retainedInTable(string $table): self
     {
-        return new self($this->view, $table, $this->model, $this->key, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
+        return new self($this->view, $table, $this->model, $this->keyColumn, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
     }
 
     /**
@@ -37,7 +37,7 @@ final readonly class PreviousModel
      */
     public function forModel(string $model): self
     {
-        return new self($this->view, $this->table, $model, $this->key, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
+        return new self($this->view, $this->table, $model, $this->keyColumn, $this->alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
     }
 
     public function keyedBy(string $column): self
@@ -47,12 +47,12 @@ final readonly class PreviousModel
 
     public function aliasedAs(string $alias): self
     {
-        return new self($this->view, $this->table, $this->model, $this->key, $alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
+        return new self($this->view, $this->table, $this->model, $this->keyColumn, $alias, $this->primaryForeignKey, $this->fillWhenCreatedFromCurrent);
     }
 
     public function primaryForeignKey(string $column): self
     {
-        return new self($this->view, $this->table, $this->model, $this->key, $this->alias, $column, $this->fillWhenCreatedFromCurrent);
+        return new self($this->view, $this->table, $this->model, $this->keyColumn, $this->alias, $column, $this->fillWhenCreatedFromCurrent);
     }
 
     /**
@@ -60,6 +60,6 @@ final readonly class PreviousModel
      */
     public function fillWhenCreatedFromCurrent(array $values): self
     {
-        return new self($this->view, $this->table, $this->model, $this->key, $this->alias, $this->primaryForeignKey, $values);
+        return new self($this->view, $this->table, $this->model, $this->keyColumn, $this->alias, $this->primaryForeignKey, $values);
     }
 }

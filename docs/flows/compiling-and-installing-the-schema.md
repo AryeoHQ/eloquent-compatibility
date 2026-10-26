@@ -39,7 +39,7 @@ The `Compiler` constructor reads `current_schema()`, and each function pins its 
 - an attribute writes the primary foreign key or a designation column of the retained table;
 - a dependent's table lacks its primary foreign key.
 
-Three more refusals happen while the SQL is built. `Compiler::value()` refuses a write to a column its table lacks. `Compiler::insertValues()` refuses a column that both an attribute and a fill set. `ResolvedMap::function()` and its siblings refuse an object name longer than 63 characters.
+Three more refusals happen while the SQL is built. `Compiler::value()` refuses a write to a column its table lacks. `Compiler::insertValues()` refuses a column that both an attribute and a fill set. `ResolvedMap::functionName()` and its siblings refuse an object name longer than 63 characters.
 
 `CompiledSql::statements()` returns the statements in this order:
 

@@ -28,7 +28,7 @@ final class ColumnCatalog
              left join pg_attrdef column_default on column_default.adrelid = table_column.attrelid and column_default.adnum = table_column.attnum
              where table_column.attrelid = to_regclass(?) and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [SqlFragments::id($table)],
+            [SqlFragments::identifier($table)],
         );
 
         $columns = [];

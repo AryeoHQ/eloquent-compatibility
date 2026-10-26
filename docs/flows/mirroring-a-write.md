@@ -21,9 +21,9 @@ sequenceDiagram
 
 ## Listening
 
-`EventBridge::listen()` listens on each model class of a mirrored map: the previous model and every current model. Each `ModelEvent::arming()` event (creating, updating, deleting) begins a pending write. Each `ModelEvent::settling()` event (saved, updated, deleted) calls `EventBridge::finish()`.
+`EventBridge::listen()` listens on each model class of a mirrored map: the previous model and every current model. Each `ModelEvent::beginning()` event (creating, updating, deleting) begins a pending write. Each `ModelEvent::finishing()` event (saved, updated, deleted) calls `EventBridge::finish()`.
 
-The bridge listens on the arming events through a wildcard and acts only on the exact event name. Laravel runs wildcard listeners after the event's direct listeners. A direct listener that returns false therefore stops the write before the bridge begins.
+The bridge listens on the beginning events through a wildcard and acts only on the exact event name. Laravel runs wildcard listeners after the event's direct listeners. A direct listener that returns false therefore stops the write before the bridge begins.
 
 ## Beginning
 
@@ -50,7 +50,7 @@ A model loaded without the column that names its record still mirrors. `Affected
 
 The bridge reads a new value only from an attribute the model holds, through the private `AffectedRecords::loaded()`. So a bridged write does not throw under `Model::preventAccessingMissingAttributes()`. A model with no persisted key, such as one before its insert, selects nothing.
 
-`AffectedRecords::acrossMaps()` then adds, for each current record, the previous records of every other map over the same table. Each `AffectedRecord` carries a `RecordRole`. A previous record locks its retained table, `AffectedRecord::$lockTable`, but reads its view, `AffectedRecord::$relation`.
+`AffectedRecords::acrossMaps()` then adds, for each current record, the previous records of every other map over the same table. Each `AffectedRecord` carries a `RecordRole`. A previous record locks its retained table, `AffectedRecord::$lockedTable`, but reads its view, `AffectedRecord::$readFrom`.
 
 ## Locking and reading
 
@@ -77,14 +77,14 @@ Without a concurrent writer, step 2 finds no newcomer and locks nothing. A newco
 1. Marks the write as no longer pending.
 2. Adds the records `AffectedRecords::of()` finds after the write, such as the current records of a new previous record. These have no row from before.
 3. Reads every record again, without locks.
-4. Calls `EventReplayer::record()` for each record, with its row from before and after.
+4. Calls `EventReplayer::replay()` for each record, with its row from before and after.
 5. Commits at level 0, or releases its savepoint.
 
 In savepoint mode, step 4 runs inside `Connection::transaction()`, a Laravel nested transaction. Work a mirrored listener queues with `afterCommit` then rolls back with a failed replay. A throw in steps 2 to 4 rolls back and rethrows.
 
 ## Replaying
 
-`EventReplayer::record()` skips a record whose two rows are equal. Otherwise it builds a fresh instance of the record's model on the source connection, marks it as replaying, and picks the events from the rows:
+`EventReplayer::replay()` skips a record whose two rows are equal. Otherwise it builds a fresh instance of the record's model on the source connection, marks it as replaying, and picks the events from the rows:
 
 | Change | Events, in order |
 | :-- | :-- |
@@ -98,7 +98,7 @@ For a soft-deleting model, `EventReplayer::deleted()` sets the model's `forceDel
 
 Each `-ing` event can stop the write. A listener that returns false raises `CompatibilityWriteRefused::byMirroredListener()`. A listener that changes an attribute raises `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::equivalent()` compares numbers and JSON strings by value. It compares two numbers by their exact decimal value, never through a float, so `'47.600000000000'` equals `47.6` and differs from `'47.600000000000001'`. A number it cannot parse, such as INF or NAN, equals only an identical value. The `-ed` events cannot stop anything.
 
-A class in the model's `$dispatchesEvents` fires before the string event, as Eloquent does it. After the events, `EventReplayer::record()` dispatches `RecordMirrored` with the map, the source model, the mirrored instance, the events and both rows.
+A class in the model's `$dispatchesEvents` fires before the string event, as Eloquent does it. After the events, `EventReplayer::replay()` dispatches `RecordMirrored` with the map, the source model, the mirrored instance, the events and both rows.
 
 ## Excluding listeners
 
@@ -108,13 +108,13 @@ For a dispatch with exclusions, `EventReplayer::mask()` swaps the event's listen
 
 ## Finishing, re-entry and fakes
 
-`EventBridge::finish()` runs on the source model's settling events. It commits the top pending write when that write is still pending and belongs to the model. That closes a write whose statement the bridge never matched.
+`EventBridge::finish()` runs on the source model's finishing events. It commits the top pending write when that write is still pending and belongs to the model. That closes a write whose statement the bridge never matched.
 
 A replayed instance never begins a pending write. A native write inside a mirrored listener begins its own, on top of the stack. Its transaction level is above 0, so it takes a savepoint.
 
 `saveQuietly()`, query builder writes and raw SQL fire no model events. The triggers still store them correctly, and nothing is mirrored.
 
-`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked arming events for that relation's models. It keeps one count per fake and per relation. A count that grew since its last check of that relation throws `CompatibilityEventMirrorBypassed`. So a bypass on one relation does not hide a bypass on another. Inside `EventBridge::withoutMirroring()`, the guard still stores each count and only skips the throw. So a faked write with the mirror off does not make the next raw write throw.
+`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked beginning events for that relation's models. It keeps one count per fake and per relation. A count that grew since its last check of that relation throws `CompatibilityEventMirrorBypassed`. So a bypass on one relation does not hide a bypass on another. Inside `EventBridge::withoutMirroring()`, the guard still stores each count and only skips the throw. So a faked write with the mirror off does not make the next raw write throw.
 
 `EventBridge::internally()` marks the bridge's own statements, and `EventBridge::handleQuery()` and the `beforeExecuting` callback ignore them.
 

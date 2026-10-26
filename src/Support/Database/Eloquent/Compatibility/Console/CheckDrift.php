@@ -31,7 +31,7 @@ final class CheckDrift extends Command
 
         $this->table(
             ['Map', 'Check', 'Record', 'Attribute', 'Detail'],
-            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check->value, $finding->record, $finding->attribute, $finding->detail], $findings),
+            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check->value, $finding->recordId, $finding->attribute, $finding->detail], $findings),
         );
 
         $this->components->error(count($findings).' divergent '.str('record')->plural(count($findings)).' found.');

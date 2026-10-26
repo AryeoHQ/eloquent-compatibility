@@ -2,12 +2,12 @@
 
 Each term has one meaning across the code and these docs.
 
-- **affected record**: a row a write can change, with its map, model, relation, lock table and role; an `AffectedRecord`.
+- **affected record**: a row a write can change, with its map, model, the relation it reads from, the table it locks, its key and its role; an `AffectedRecord`.
 - **alias**: the lowercase name a map gives the previous model and each current model, used in the compiled SQL and in attribute declarations.
 - **aliased table**: the table and key column an alias resolves to; an `AliasedTable`.
 - **applying flag**: the transaction-local setting `Setting::Applying`, which the view's triggers set to the map's name around their writes.
-- **arming event**: a creating, updating or deleting model event, on which the event bridge begins a pending mirrored write; see `ModelEvent::arming()`.
 - **assignment**: one attribute paired with one column it writes; an `Assignment`.
+- **beginning event**: a creating, updating or deleting model event, on which the event bridge begins a pending mirrored write; see `ModelEvent::beginning()`.
 - **column catalog**: the cached reader of each table's column types, defaults and `NOT NULL` flags; `ColumnCatalog`.
 - **compatibility map**: the class that declares how a previous model maps onto its current models; it implements `CompatibilityMap`.
 - **compatibility view**: the PostgreSQL view, named after the previous model's old table, that serves the previous model.
@@ -25,6 +25,7 @@ Each term has one meaning across the code and these docs.
 - **event replayer**: the part of the event bridge that raises one record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the event bridge skips for mirrored events; `ExcludedListener`.
 - **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
+- **finishing event**: a saved, updated or deleted model event, on which the event bridge finishes a pending mirrored write; see `ModelEvent::finishing()`.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
@@ -48,7 +49,6 @@ Each term has one meaning across the code and these docs.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
 - **savepoint mode**: how the event bridge works inside a caller's transaction, in a `compatibility_<n>` savepoint.
-- **settling event**: a saved, updated or deleted model event, on which the event bridge finishes a pending mirrored write; see `ModelEvent::settling()`.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.
 - **unrepresentable state**: a state one side can hold and the other cannot express; an `UnrepresentableState`.

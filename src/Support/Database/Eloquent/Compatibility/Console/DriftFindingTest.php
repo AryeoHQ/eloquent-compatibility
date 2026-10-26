@@ -17,7 +17,7 @@ final class DriftFindingTest extends TestCase
         $finding = new DriftFinding('widgets', DriftCheck::OrphanCurrent, 'gadgets#1', 'retained_widgets.gadget_id', 'no retained row links it');
 
         $this->assertSame(
-            ['map' => 'widgets', 'check' => DriftCheck::OrphanCurrent, 'record' => 'gadgets#1', 'attribute' => 'retained_widgets.gadget_id', 'detail' => 'no retained row links it'],
+            ['map' => 'widgets', 'check' => DriftCheck::OrphanCurrent, 'recordId' => 'gadgets#1', 'attribute' => 'retained_widgets.gadget_id', 'detail' => 'no retained row links it'],
             get_object_vars($finding),
         );
     }

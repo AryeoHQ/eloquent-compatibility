@@ -46,7 +46,7 @@ final class InteractsWithCompatibilityMapsTest extends TestCase
         $widget->update(['title' => 'Renamed']);
 
         $this->assertCount(1, $this->mirroredEvents());
-        $this->assertInstanceOf(Gadget::class, $this->mirroredEvents()[0]->model);
+        $this->assertInstanceOf(Gadget::class, $this->mirroredEvents()[0]->destination);
         $this->assertSame($widget, $this->mirroredEvents()[0]->source);
     }
 
