@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Validation\ValidationException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
@@ -54,6 +55,13 @@ final class EventBridgeTest extends TestCase
 
         Tables::create();
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
+    }
+
+    protected function tearDown(): void
+    {
+        Model::preventAccessingMissingAttributes(false);
+
+        parent::tearDown();
     }
 
     #[Test]
@@ -220,8 +228,11 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
-    public function it_raises_the_previous_model_events_of_a_dependent_current_model_loaded_without_its_primary_foreign_key(): void
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_raises_the_previous_model_events_of_a_dependent_current_model_loaded_without_its_primary_foreign_key(bool $strict): void
     {
+        Model::preventAccessingMissingAttributes($strict);
         $this->mirror();
         $this->widget();
         $this->recordMirroredEvents();
@@ -232,8 +243,30 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
-    public function it_raises_the_previous_model_events_of_a_primary_current_model_loaded_without_its_mapped_key(): void
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_raises_the_previous_model_events_of_both_primary_records_when_a_dependent_loaded_without_its_primary_foreign_key_moves(bool $strict): void
     {
+        Model::preventAccessingMissingAttributes($strict);
+        $this->mirror();
+        $first = $this->widget();
+        $second = Widget::query()->create(['title' => 'Second gadget'])->refresh();
+        $place = GadgetPlace::query()->select(['id', 'street'])->firstOrFail();
+        $this->recordMirroredEvents();
+
+        $place->setAttribute('gadget_id', $second->gadget_id);
+        $place->save();
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $first->getKey() && $event->before['street'] === '1 Main St' && $mirrored->getAttribute('street') === null);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getKey() === $second->getKey() && $event->before['street'] === null && $mirrored->getAttribute('street') === '1 Main St');
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_raises_the_previous_model_events_of_a_primary_current_model_loaded_without_its_mapped_key(bool $strict): void
+    {
+        Model::preventAccessingMissingAttributes($strict);
         $this->mirror();
         $this->widget();
         Widget::query()->create(['title' => 'Second gadget']);
@@ -247,8 +280,11 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
-    public function it_raises_the_current_model_events_of_a_previous_model_loaded_without_its_mapped_key(): void
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_raises_the_current_model_events_of_a_previous_model_loaded_without_its_mapped_key(bool $strict): void
     {
+        Model::preventAccessingMissingAttributes($strict);
         $this->mirror();
         $this->widget();
         $widget = Widget::query()->select(['uuid', 'title'])->firstOrFail();
@@ -501,6 +537,19 @@ final class EventBridgeTest extends TestCase
 
         $this->assertNothingMirrored();
         $this->assertSame('Mirror off', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_lets_a_raw_write_through_after_a_faked_write_with_the_mirror_off(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::fake();
+
+        $this->withoutEventMirroring(fn () => $widget->update(['title' => 'Mirror off']));
+        DB::update('update widgets set sku = ? where id = ?', ['RAW', $widget->getKey()]);
+
+        $this->assertSame('RAW', DB::table('retained_widgets')->value('sku'));
     }
 
     #[Test]

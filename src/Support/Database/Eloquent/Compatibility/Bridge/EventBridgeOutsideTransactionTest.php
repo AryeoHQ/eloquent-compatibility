@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Closure;
+use Illuminate\Database\Connection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -12,12 +15,14 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
+use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -27,6 +32,8 @@ use Tests\TestCase;
 final class EventBridgeOutsideTransactionTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
+
+    private null|string $concurrentOutcome = null;
 
     protected function setUp(): void
     {
@@ -40,6 +47,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
 
     protected function tearDown(): void
     {
+        Model::preventAccessingMissingAttributes(false);
         DB::rollBack(0);
         Tables::drop();
 
@@ -155,6 +163,70 @@ final class EventBridgeOutsideTransactionTest extends TestCase
 
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Next write', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_raises_the_force_delete_events_of_a_dependent_row_committed_before_the_primary_record_is_locked(): void
+    {
+        $widget = $this->widget()->refresh();
+        $root = DB::table('gadget_places')->value('id');
+        $this->recordMirroredEvents();
+        $this->concurrently(
+            fn (string $query) => str_ends_with($query, ' for update'),
+            fn (Connection $concurrent) => $concurrent->table('gadget_places')->insert(['gadget_id' => $widget->gadget_id, 'parent_id' => $root, 'street' => '2 Child St']),
+        );
+
+        $widget->forceDelete();
+
+        $this->assertSame('committed', $this->concurrentOutcome);
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::ForceDeleted, times: 2);
+        $this->assertSame(0, DB::table('gadget_places')->count());
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_locks_the_own_record_of_a_model_loaded_without_its_mapped_key_before_the_statement(bool $strict): void
+    {
+        Model::preventAccessingMissingAttributes($strict);
+        $id = $this->widget()->getKey();
+        $widget = Widget::query()->select(['uuid', 'title'])->firstOrFail();
+        $widget->setKeyName('uuid')->setKeyType('string')->setIncrementing(false);
+        $this->concurrently(
+            fn (string $query) => str_starts_with($query, 'update "widgets"'),
+            fn (Connection $concurrent) => $concurrent->table('retained_widgets')->where('id', $id)->update(['sku' => 'Concurrent']),
+        );
+
+        $widget->update(['title' => 'Loaded without its id']);
+
+        $this->assertSame('55P03', $this->concurrentOutcome);
+        $this->assertNull(DB::table('retained_widgets')->value('sku'));
+        $this->assertSame('Loaded without its id', DB::table('gadgets')->value('name'));
+    }
+
+    /**
+     * @param  Closure(string): bool  $before
+     * @param  Closure(Connection): mixed  $write
+     */
+    private function concurrently(Closure $before, Closure $write): void
+    {
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+        $concurrent = DB::connection('concurrent');
+        $concurrent->statement("set lock_timeout = '200ms'");
+
+        DB::connection()->beforeExecuting(function (string $query) use ($before, $write, $concurrent): void {
+            if ($this->concurrentOutcome !== null || ! $before($query)) {
+                return;
+            }
+
+            try {
+                $write($concurrent);
+                $this->concurrentOutcome = 'committed';
+            } catch (QueryException $e) {
+                $this->concurrentOutcome = (string) $e->getCode();
+            }
+        });
     }
 
     private function widget(): Widget

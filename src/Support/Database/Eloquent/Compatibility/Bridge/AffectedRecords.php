@@ -13,6 +13,21 @@ final readonly class AffectedRecords
     public function __construct(private MirrorIndex $mirrorIndex) {}
 
     /**
+     * @return array<string, RecordSnapshot>
+     */
+    public function before(ConnectionInterface $connection, Model $model, Operation $operation): array
+    {
+        $records = $this->of($connection, $model, $operation, false);
+        $native = $this->native($connection, $model);
+        $this->lock($connection, $native === null ? $records : [...array_values($records), $native]);
+        $removed = array_diff_key($this->removed($connection, $model, $operation), $records);
+        $newcomers = array_diff_key($this->acrossMaps($connection, $removed), $records);
+        $this->lock($connection, $newcomers);
+
+        return $this->snapshots($connection, [...$records, ...$newcomers]);
+    }
+
+    /**
      * @return array<string, AffectedRecord>
      */
     public function of(ConnectionInterface $connection, Model $model, Operation $operation, bool $after): array
@@ -33,18 +48,11 @@ final readonly class AffectedRecords
                     $records[$record->id()] = $record;
                 }
 
-                foreach ($key !== null && $this->removes($model, $operation) ? $keyTranslator->dependentKeys($connection, $key) : [] as $dependent => $dependentKeys) {
-                    foreach ($dependentKeys as $dependentKey) {
-                        $record = $keyTranslator->currentRecord($dependent, $dependentKey);
-                        $records[$record->id()] = $record;
-                    }
-                }
-
                 continue;
             }
 
             if ($alias === $resolvedMap->primaryCurrentModel->alias) {
-                $primaryKey = $operation === Operation::Insert ? $this->key($model, $column) : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
+                $primaryKey = $operation === Operation::Insert ? $this->loaded($model, $column) : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
                 $previousKeys = match (true) {
                     $operation === Operation::Insert && ! $after => [],
                     $primaryKey !== null => $keyTranslator->previousKeys($connection, $primaryKey),
@@ -59,8 +67,8 @@ final readonly class AffectedRecords
 
                 $primaryForeignKey = $resolvedMap->primaryForeignKey($dependent);
                 $primaries = array_unique(array_filter(
-                    [$operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $primaryForeignKey), $model->getAttribute($primaryForeignKey)],
-                    fn (mixed $value) => is_int($value) || is_string($value),
+                    [$operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $primaryForeignKey), $this->loaded($model, $primaryForeignKey)],
+                    fn (null|int|string $value) => $value !== null,
                 ));
                 $previousKeys = [];
 
@@ -75,32 +83,15 @@ final readonly class AffectedRecords
             }
         }
 
-        return $this->acrossMaps($connection, $records);
+        return $this->acrossMaps($connection, [...$records, ...$this->removed($connection, $model, $operation)]);
     }
 
     /**
      * @param  array<string, AffectedRecord>  $records
      * @return array<string, RecordSnapshot>
      */
-    public function snapshots(ConnectionInterface $connection, array $records, null|AffectedRecord $native, bool $lock): array
+    public function snapshots(ConnectionInterface $connection, array $records): array
     {
-        if ($lock) {
-            $locks = array_values($records);
-
-            if ($native !== null) {
-                $locks[] = $native;
-            }
-
-            usort($locks, fn (AffectedRecord $a, AffectedRecord $b) => [$a->role->lockOrder(), $a->lockTable, (string) $a->key] <=> [$b->role->lockOrder(), $b->lockTable, (string) $b->key]);
-
-            foreach ($locks as $record) {
-                $connection->select(
-                    'select 1 from '.SqlFragments::id($record->lockTable).' where '.SqlFragments::id($record->keyName).' = ? for update',
-                    [$record->key],
-                );
-            }
-        }
-
         $rows = [];
 
         foreach ($records as $id => $record) {
@@ -115,22 +106,70 @@ final readonly class AffectedRecords
         return $rows;
     }
 
-    public function native(Model $model): null|AffectedRecord
+    /**
+     * @param  array<array-key, AffectedRecord>  $records
+     */
+    private function lock(ConnectionInterface $connection, array $records): void
+    {
+        $locks = array_values($records);
+        usort($locks, fn (AffectedRecord $a, AffectedRecord $b) => [$a->role->lockOrder(), $a->lockTable, (string) $a->key] <=> [$b->role->lockOrder(), $b->lockTable, (string) $b->key]);
+
+        foreach ($locks as $record) {
+            $connection->select(
+                'select 1 from '.SqlFragments::id($record->lockTable).' where '.SqlFragments::id($record->keyName).' = ? for update',
+                [$record->key],
+            );
+        }
+    }
+
+    private function native(ConnectionInterface $connection, Model $model): null|AffectedRecord
     {
         foreach ($this->mirrorIndex->forModel($model::class) as $member) {
             $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
-            $key = $this->key($model, $resolvedMap->key($member->alias));
+            $previous = $member->alias === $resolvedMap->previousModel->alias;
+            $column = $resolvedMap->key($member->alias);
+            $key = array_key_exists($column, $model->getAttributes())
+                ? $this->loaded($model, $column)
+                : $this->persisted($connection, $model, $previous ? $resolvedMap->previousModel->view : $resolvedMap->table($member->alias), $column);
 
             if ($key === null) {
                 return null;
             }
 
-            return $member->alias === $resolvedMap->previousModel->alias
+            return $previous
                 ? $this->mirrorIndex->keyTranslator($member->map)->previousRecord($key)
                 : $this->mirrorIndex->keyTranslator($member->map)->currentRecord($member->alias, $key);
         }
 
         return null;
+    }
+
+    /**
+     * @return array<string, AffectedRecord>
+     */
+    private function removed(ConnectionInterface $connection, Model $model, Operation $operation): array
+    {
+        $records = [];
+
+        foreach ($this->removes($model, $operation) ? $this->mirrorIndex->forModel($model::class) : [] as $member) {
+            $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
+
+            if ($member->alias !== $resolvedMap->previousModel->alias) {
+                continue;
+            }
+
+            $keyTranslator = $this->mirrorIndex->keyTranslator($member->map);
+            $key = $this->originalKey($connection, $model, $resolvedMap->previousModel->view, $resolvedMap->key($member->alias));
+
+            foreach ($key === null ? [] : $keyTranslator->dependentKeys($connection, $key) as $dependent => $dependentKeys) {
+                foreach ($dependentKeys as $dependentKey) {
+                    $record = $keyTranslator->currentRecord($dependent, $dependentKey);
+                    $records[$record->id()] = $record;
+                }
+            }
+        }
+
+        return $records;
     }
 
     /**
@@ -181,19 +220,27 @@ final readonly class AffectedRecords
 
     private function originalKey(ConnectionInterface $connection, Model $model, string $relation, string $column): null|int|string
     {
-        $key = array_key_exists($column, $model->getAttributes())
-            ? $model->getOriginal($column) ?? $model->getAttribute($column)
-            : $connection->scalar(
-                'select '.SqlFragments::id($column).' from '.SqlFragments::id($relation).' where '.SqlFragments::id($model->getKeyName()).' = ?',
-                [$model->getOriginal($model->getKeyName())],
-            );
+        $key = array_key_exists($column, $model->getRawOriginal())
+            ? $model->getOriginal($column) ?? $this->loaded($model, $column)
+            : $this->persisted($connection, $model, $relation, $column);
 
         return is_int($key) || is_string($key) ? $key : null;
     }
 
-    private function key(Model $model, string $column): null|int|string
+    private function persisted(ConnectionInterface $connection, Model $model, string $relation, string $column): null|int|string
     {
-        $key = $model->getAttribute($column);
+        $self = $model->getOriginal($model->getKeyName());
+        $key = $self === null ? null : $connection->scalar(
+            'select '.SqlFragments::id($column).' from '.SqlFragments::id($relation).' where '.SqlFragments::id($model->getKeyName()).' = ?',
+            [$self],
+        );
+
+        return is_int($key) || is_string($key) ? $key : null;
+    }
+
+    private function loaded(Model $model, string $column): null|int|string
+    {
+        $key = array_key_exists($column, $model->getAttributes()) ? $model->getAttribute($column) : null;
 
         return is_int($key) || is_string($key) ? $key : null;
     }

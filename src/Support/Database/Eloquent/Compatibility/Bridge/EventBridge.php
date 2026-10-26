@@ -168,12 +168,7 @@ final class EventBridge
         });
 
         try {
-            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->snapshots(
-                $connection,
-                $this->affectedRecords->of($connection, $model, $operation, false),
-                $this->affectedRecords->native($model),
-                true,
-            ));
+            $pendingWrite->before = $this->internally(fn () => $this->affectedRecords->before($connection, $model, $operation));
         } catch (Throwable $e) {
             $this->close($connection, $pendingWrite, false);
 
@@ -226,8 +221,6 @@ final class EventBridge
             $after = $this->internally(fn () => $this->affectedRecords->snapshots(
                 $connection,
                 array_map(fn (RecordSnapshot $entry) => $entry->record, $entries),
-                null,
-                false,
             ));
 
             $replay = function () use ($entries, $after, $pendingWrite, $connection): void {
@@ -321,7 +314,7 @@ final class EventBridge
         $models = $this->mirrorIndex->modelsOf($parsedWrite->relation);
         $dispatcher = Model::getEventDispatcher();
 
-        if ($this->disabled > 0 || $models === [] || ! $dispatcher instanceof EventFake) {
+        if ($models === [] || ! $dispatcher instanceof EventFake) {
             return;
         }
 
@@ -338,7 +331,7 @@ final class EventBridge
         $counts[$parsedWrite->relation] = $count;
         $this->faked[$dispatcher] = $counts;
 
-        if ($count > $seen) {
+        if ($count > $seen && $this->disabled === 0) {
             throw CompatibilityEventMirrorBypassed::byFakedDispatcher($parsedWrite->relation, $this->mirrorIndex->mapsOf($parsedWrite->relation));
         }
     }
