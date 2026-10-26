@@ -31,7 +31,7 @@ final class EventBridge
     /** @var array<string, true> */
     private array $mirrored = [];
 
-    /** @var WeakMap<EventFake, int> */
+    /** @var WeakMap<EventFake, array<string, int>> */
     private WeakMap $faked;
 
     /** @var WeakMap<Connection, true> */
@@ -333,8 +333,10 @@ final class EventBridge
             }
         }
 
-        $seen = $this->faked[$dispatcher] ?? 0;
-        $this->faked[$dispatcher] = $count;
+        $counts = $this->faked[$dispatcher] ?? [];
+        $seen = $counts[$parsedWrite->relation] ?? 0;
+        $counts[$parsedWrite->relation] = $count;
+        $this->faked[$dispatcher] = $counts;
 
         if ($count > $seen) {
             throw CompatibilityEventMirrorBypassed::byFakedDispatcher($parsedWrite->relation, $this->mirrorIndex->mapsOf($parsedWrite->relation));

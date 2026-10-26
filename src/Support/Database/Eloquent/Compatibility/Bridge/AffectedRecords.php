@@ -26,18 +26,25 @@ final readonly class AffectedRecords
             $column = $resolvedMap->key($alias);
 
             if ($alias === $resolvedMap->previousModel->alias) {
-                $key = $operation === Operation::Insert ? ($after ? $keyTranslator->created($connection) : null) : $this->originalKey($model, $column);
+                $key = $operation === Operation::Insert ? ($after ? $keyTranslator->created($connection) : null) : $this->originalKey($connection, $model, $resolvedMap->previousModel->view, $column);
 
                 foreach ($key === null ? [] : $keyTranslator->currentKeys($connection, $key) as $current => $currentKey) {
                     $record = $keyTranslator->currentRecord($current, $currentKey);
                     $records[$record->id()] = $record;
                 }
 
+                foreach ($key !== null && $this->removes($model, $operation) ? $keyTranslator->dependentKeys($connection, $key) : [] as $dependent => $dependentKeys) {
+                    foreach ($dependentKeys as $dependentKey) {
+                        $record = $keyTranslator->currentRecord($dependent, $dependentKey);
+                        $records[$record->id()] = $record;
+                    }
+                }
+
                 continue;
             }
 
             if ($alias === $resolvedMap->primaryCurrentModel->alias) {
-                $primaryKey = $operation === Operation::Insert ? $this->key($model, $column) : $this->originalKey($model, $column);
+                $primaryKey = $operation === Operation::Insert ? $this->key($model, $column) : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
                 $previousKeys = match (true) {
                     $operation === Operation::Insert && ! $after => [],
                     $primaryKey !== null => $keyTranslator->previousKeys($connection, $primaryKey),
@@ -52,7 +59,7 @@ final readonly class AffectedRecords
 
                 $primaryForeignKey = $resolvedMap->primaryForeignKey($dependent);
                 $primaries = array_unique(array_filter(
-                    [$operation === Operation::Insert ? null : $model->getOriginal($primaryForeignKey), $model->getAttribute($primaryForeignKey)],
+                    [$operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $primaryForeignKey), $model->getAttribute($primaryForeignKey)],
                     fn (mixed $value) => is_int($value) || is_string($value),
                 ));
                 $previousKeys = [];
@@ -167,9 +174,19 @@ final readonly class AffectedRecords
         return $records;
     }
 
-    private function originalKey(Model $model, string $column): null|int|string
+    private function removes(Model $model, Operation $operation): bool
     {
-        $key = $model->getOriginal($column) ?? $model->getAttribute($column);
+        return $operation === Operation::Delete && (! method_exists($model, 'isForceDeleting') || $model->isForceDeleting());
+    }
+
+    private function originalKey(ConnectionInterface $connection, Model $model, string $relation, string $column): null|int|string
+    {
+        $key = array_key_exists($column, $model->getAttributes())
+            ? $model->getOriginal($column) ?? $model->getAttribute($column)
+            : $connection->scalar(
+                'select '.SqlFragments::id($column).' from '.SqlFragments::id($relation).' where '.SqlFragments::id($model->getKeyName()).' = ?',
+                [$model->getOriginal($model->getKeyName())],
+            );
 
         return is_int($key) || is_string($key) ? $key : null;
     }

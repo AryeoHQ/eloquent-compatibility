@@ -8,6 +8,7 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
+use ReflectionProperty;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
@@ -151,6 +152,7 @@ final class EventReplayer
 
         if ($softDeletes) {
             $this->ing($record, $model, ModelEvent::ForceDeleting);
+            $this->forceDeleting($model, true);
         }
 
         $this->ing($record, $model, ModelEvent::Deleting);
@@ -158,7 +160,15 @@ final class EventReplayer
         $this->ed($record, $model, ModelEvent::Deleted);
 
         if ($softDeletes) {
+            $this->forceDeleting($model, false);
             $this->ed($record, $model, ModelEvent::ForceDeleted);
+        }
+    }
+
+    private function forceDeleting(Model $model, bool $forceDeleting): void
+    {
+        if (property_exists($model, 'forceDeleting')) {
+            new ReflectionProperty($model, 'forceDeleting')->setValue($model, $forceDeleting);
         }
     }
 
@@ -358,7 +368,9 @@ final class EventReplayer
         }
 
         if (is_numeric($before) && is_numeric($after)) {
-            return (float) $before === (float) $after;
+            $number = $this->number($before);
+
+            return $number !== null && $number === $this->number($after);
         }
 
         if (is_string($before) && is_string($after) && json_validate($before) && json_validate($after)) {
@@ -366,5 +378,19 @@ final class EventReplayer
         }
 
         return false;
+    }
+
+    private function number(float|int|string $value): null|string
+    {
+        if (preg_match('/^\s*([+-]?)(\d*)(?:\.(\d*))?(?:e([+-]?\d{1,9}))?\s*$/i', is_float($value) ? var_export($value, true) : (string) $value, $parts) !== 1) {
+            return null;
+        }
+
+        $digits = $parts[2].($parts[3] ?? '');
+        $significant = ltrim($digits, '0');
+        $exponent = (int) ($parts[4] ?? 0) + strlen($parts[2]) - strlen($digits) + strlen($significant);
+        $significant = rtrim($significant, '0');
+
+        return $significant === '' ? '0' : ($parts[1] === '-' ? '-' : '').$significant.'e'.$exponent;
     }
 }

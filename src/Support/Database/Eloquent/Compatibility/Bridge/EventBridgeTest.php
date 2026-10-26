@@ -135,6 +135,48 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $root = GadgetPlace::query()->where('gadget_id', $widget->gadget_id)->sole();
+        GadgetPlace::query()->create(['gadget_id' => $widget->gadget_id, 'parent_id' => $root->id, 'street' => '2 Child St']);
+        GadgetPlace::query()->create(['gadget_id' => $widget->gadget_id, 'street' => '3 Old St', 'deleted_at' => now()]);
+        $this->recordMirroredEvents();
+
+        $widget->forceDelete();
+
+        $this->assertMirrored(GadgetPlace::class, ModelEvent::ForceDeleted, times: 3);
+        $this->assertSame(0, GadgetPlace::withTrashed()->count());
+    }
+
+    #[Test]
+    public function it_reports_a_force_delete_to_the_mirrored_listeners_of_a_soft_deleting_model_as_a_native_force_delete_does(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        $gadget = Gadget::query()->create(['name' => 'Deleted natively']);
+
+        foreach (['forceDeleting', 'deleting', 'deleted', 'forceDeleted'] as $event) {
+            $this->watch(Gadget::class, $event, fn (Gadget $gadget) => ['forceDeleting' => $gadget->isForceDeleting()]);
+        }
+
+        $gadget->forceDelete();
+        $native = $this->seen;
+        $this->seen = [];
+
+        $widget->forceDelete();
+
+        $this->assertSame([
+            ['event' => 'forceDeleting', 'forceDeleting' => false],
+            ['event' => 'deleting', 'forceDeleting' => true],
+            ['event' => 'deleted', 'forceDeleting' => true],
+            ['event' => 'forceDeleted', 'forceDeleting' => false],
+        ], $native);
+        $this->assertSame($native, $this->seen);
+    }
+
+    #[Test]
     public function it_raises_the_previous_model_events_of_a_current_model_update(): void
     {
         $this->mirror();
@@ -175,6 +217,47 @@ final class EventBridgeTest extends TestCase
         GadgetPlace::query()->create(['gadget_id' => $widget->gadget_id, 'street' => '3 New St']);
 
         $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored, RecordMirrored $event) => $mirrored->getAttribute('street') === '3 New St' && $event->before['street'] === null);
+    }
+
+    #[Test]
+    public function it_raises_the_previous_model_events_of_a_dependent_current_model_loaded_without_its_primary_foreign_key(): void
+    {
+        $this->mirror();
+        $this->widget();
+        $this->recordMirroredEvents();
+
+        GadgetPlace::query()->select(['id', 'street'])->firstOrFail()->update(['street' => 'Changed']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('street') === 'Changed');
+    }
+
+    #[Test]
+    public function it_raises_the_previous_model_events_of_a_primary_current_model_loaded_without_its_mapped_key(): void
+    {
+        $this->mirror();
+        $this->widget();
+        Widget::query()->create(['title' => 'Second gadget']);
+        $gadget = Gadget::query()->select(['name'])->where('name', 'Blue gadget')->firstOrFail();
+        $gadget->setKeyName('name')->setKeyType('string')->setIncrementing(false);
+        $this->recordMirroredEvents();
+
+        $gadget->update(['price_cents' => 999]);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('title') === 'Blue gadget' && $mirrored->getAttribute('price') === '9.99');
+    }
+
+    #[Test]
+    public function it_raises_the_current_model_events_of_a_previous_model_loaded_without_its_mapped_key(): void
+    {
+        $this->mirror();
+        $this->widget();
+        $widget = Widget::query()->select(['uuid', 'title'])->firstOrFail();
+        $widget->setKeyName('uuid')->setKeyType('string')->setIncrementing(false);
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Loaded without its id']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Loaded without its id');
     }
 
     #[Test]
@@ -235,6 +318,35 @@ final class EventBridgeTest extends TestCase
         $this->assertWriteRefused(fn () => $widget->update(['title' => 'Renamed']), 'changed name');
 
         $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_refuses_a_mirrored_listener_change_to_a_number_that_a_float_cannot_tell_apart(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::listen('eloquent.saving: '.GadgetSite::class, function (GadgetSite $site): void {
+            $site->setAttribute('latitude', '47.600000000000001');
+        });
+
+        $this->assertWriteRefused(fn () => $widget->update(['latitude' => 47.6]), 'changed latitude');
+
+        $this->assertSame('47.500000000000', DB::table('gadget_sites')->value('latitude'));
+    }
+
+    #[Test]
+    public function it_accepts_a_mirrored_listener_that_rewrites_a_number_as_the_same_value(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::listen('eloquent.saving: '.GadgetSite::class, function (GadgetSite $site): void {
+            $site->setAttribute('latitude', (float) $site->getAttribute('latitude'));
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['latitude' => 47.6]);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated);
     }
 
     #[Test]
@@ -351,6 +463,17 @@ final class EventBridgeTest extends TestCase
             CompatibilityEventMirrorBypassed::class,
             'because Event::fake() replaced the model event dispatcher',
         );
+    }
+
+    #[Test]
+    public function it_fails_loudly_for_each_relation_a_faked_dispatcher_bypasses(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::fake();
+
+        $this->assertThrows(fn () => $widget->update(['title' => 'Faked']), CompatibilityEventMirrorBypassed::class);
+        $this->assertThrows(fn () => Gadget::query()->sole()->update(['name' => 'Faked natively']), CompatibilityEventMirrorBypassed::class);
     }
 
     #[Test]

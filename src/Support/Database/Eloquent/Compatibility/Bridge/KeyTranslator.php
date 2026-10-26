@@ -61,6 +61,32 @@ final readonly class KeyTranslator
     }
 
     /**
+     * @return array<string, list<int|string>>
+     */
+    public function dependentKeys(ConnectionInterface $connection, int|string $previousKey): array
+    {
+        $previous = $this->resolvedMap->previousModel;
+        $keys = [];
+
+        foreach ($this->resolvedMap->dependentCurrentModels as $dependent) {
+            $alias = (string) $dependent->alias;
+            $rows = $connection->select(
+                'select '.SqlFragments::id($this->resolvedMap->key($alias)).' as key from '.SqlFragments::id($this->resolvedMap->table($alias))
+                .' where '.SqlFragments::id($this->resolvedMap->primaryForeignKey($dependent)).' = (select '.SqlFragments::id((string) $previous->primaryForeignKey)
+                .' from '.SqlFragments::id((string) $previous->table).' where '.SqlFragments::id((string) $previous->key).' = ?) order by 1',
+                [$previousKey],
+            );
+
+            $keys[$alias] = array_values(array_filter(
+                array_map(fn (object $row) => $row->key, $rows),
+                fn (mixed $key) => is_int($key) || is_string($key),
+            ));
+        }
+
+        return $keys;
+    }
+
+    /**
      * @return list<int|string>
      */
     public function previousKeys(ConnectionInterface $connection, int|string $primaryKey): array
