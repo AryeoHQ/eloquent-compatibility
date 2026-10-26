@@ -10,6 +10,8 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
  * @property string $name
+ *
+ * @method null|bool restore()
  */
 final class Gadget extends Model
 {
