@@ -6,12 +6,13 @@ The update trigger raises 40001 when the record changed after the statement's sn
 
 ## Decision
 
-`EventBridge::begin()` locks every affected record with `FOR UPDATE` before the statement runs, then reads it. `AffectedRecords::snapshots()` locks in the triggers' order: primary rows, then retained rows, then dependent rows.
+`EventBridge::begin()` locks every affected record with `FOR UPDATE` before the statement runs, then reads it. `AffectedRecords::before()` locks in the triggers' order, through the private `AffectedRecords::lock()`: primary rows, then retained rows, then dependent rows. `AffectedRecords::snapshots()` only reads.
 
 ## Consequences
 
 - No other transaction can change a locked record between the bridge's two reads.
 - A write through a model does not meet the 40001 conflict check.
-- The bridge's lock order must match the triggers' order, or two writers can deadlock. [INV-1](../invariants.md) records the rule.
+- The bridge's lock order must match the triggers' order, or two writers can deadlock. The refused-state lock joins that order: a refuse function locks the primary row before its advisory lock. [INV-1](../invariants.md) records the rule.
+- Two paths still break the order, and INV-1 records both. A writer that locks a dependent row and then updates it can deadlock a write through the view, raw or bridged. A newcomer dependent row that the bridge finds on its second read locks after the first pass's dependent rows.
 - A write locks the previous records of every map that shares a current table, not only its own.
-- A delete through the previous model that removes the row also locks every dependent row the trigger removes. See [INV-25](../invariants.md).
+- A delete through the previous model that removes the row also locks every dependent row the trigger removes. That includes a row another transaction committed before the bridge locked the primary row. See [INV-25](../invariants.md).

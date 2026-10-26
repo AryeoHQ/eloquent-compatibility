@@ -4,7 +4,7 @@
 
 Copilot's review thread 4373715673 on PR #1 found a race in refused states checked on a table. A condition can read other rows of its table, as the workbench `second_root_place` state does. Two transactions that each insert a root place for one gadget each miss the other's uncommitted row. Both checks pass, and both commit the state.
 
-`Compiler::refuseFunction()` now takes a transaction-scoped advisory lock keyed on the refuse function and the row's primary foreign key. That serializes the writers of one record on a dependent's table or the retained table. A primary row has no primary foreign key, so the key has nothing to name there. A key on the row's own primary key would serialize nothing the row lock does not. A cross-row condition on the primary table always compares different records.
+`Compiler::refuseFunction()` now takes `FOR KEY SHARE` on the primary row, then a transaction-scoped advisory lock keyed on the refuse function and the row's primary foreign key. That serializes the writers of one record on a dependent's table or the retained table. A primary row has no primary foreign key, so the key has nothing to name there. A key on the row's own primary key would serialize nothing the row lock does not. A cross-row condition on the primary table always compares different records.
 
 Three options remained for a state checked on the primary table:
 

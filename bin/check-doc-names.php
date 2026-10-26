@@ -97,6 +97,9 @@ $checkMember = function (string $class, string $member, bool $called): void {
 $problems = [];
 $names = 0;
 $links = 0;
+$invariants = 0;
+preg_match_all('/^## (INV-\d+):/m', (string) file_get_contents($root.'/docs/invariants.md'), $headings);
+$headings = array_flip($headings[1]);
 
 foreach ($external as $short => $class) {
     if (! $exists($class)) {
@@ -108,23 +111,37 @@ $documents = [$root.'/README.md', ...$files($root.'/docs', '*.md'), ...$files($r
 
 foreach ($documents as $document) {
     $relative = substr($document, strlen($root) + 1);
-    $fenced = false;
+    $fence = null;
 
     foreach (explode("\n", (string) file_get_contents($document)) as $index => $line) {
         $at = $relative.':'.($index + 1).': ';
 
-        if (preg_match('/[A-Za-z0-9_\/.-]*[A-Za-z0-9_]\.php:\d+/', $line, $citation) === 1) {
+        if (preg_match('/[A-Za-z0-9_\/.-]*[A-Za-z0-9_](?:\.php:\d+|\.[A-Za-z0-9]+#L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?)/', $line, $citation) === 1) {
             $problems[] = $at."cites a line number ({$citation[0]}); name the class and method instead";
         }
 
-        if (preg_match('/^\s*(?:```|~~~)/', $line) === 1) {
-            $fenced = ! $fenced;
+        if ($fence !== null) {
+            if (preg_match('/^\s*('.preg_quote($fence[0], '/').'{'.$fence[1].',})\s*$/', $line) === 1) {
+                $fence = null;
+            }
 
             continue;
         }
 
-        if ($fenced) {
+        if (preg_match('/^\s*(`{3,}|~{3,})(.*)$/', $line, $opening) === 1 && ! ($opening[1][0] === '`' && str_contains($opening[2], '`'))) {
+            $fence = [$opening[1][0], strlen($opening[1])];
+
             continue;
+        }
+
+        preg_match_all('/\bINV-\d+\b/', $line, $invariantReferences);
+
+        foreach ($invariantReferences[0] as $reference) {
+            $invariants++;
+
+            if (! array_key_exists($reference, $headings)) {
+                $problems[] = $at."names {$reference}, which has no ## {$reference} heading in docs/invariants.md";
+            }
         }
 
         preg_match_all('/(`+)(.+?)\1/', $line, $spans);
@@ -184,12 +201,13 @@ foreach ($problems as $problem) {
 }
 
 fwrite($problems === [] ? STDOUT : STDERR, sprintf(
-    '%d %s in %d documents: %d names and %d relative links checked.'.PHP_EOL,
+    '%d %s in %d documents: %d names, %d relative links and %d invariant references checked.'.PHP_EOL,
     count($problems),
     count($problems) === 1 ? 'problem' : 'problems',
     count($documents),
     $names,
     $links,
+    $invariants,
 ));
 
 exit($problems === [] ? 0 : 1);

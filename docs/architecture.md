@@ -52,8 +52,8 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 
 1. Eloquent fires `updating` on the widget, and `EventBridge::begin()` records a `PendingMirroredWrite`.
 2. The bridge opens a transaction, or a savepoint when the caller already holds one.
-3. `AffectedRecords::of()` finds every record the write can change: the gadget, its place and its site.
-4. `AffectedRecords::snapshots()` locks those records in the triggers' order, then reads each one.
+3. `AffectedRecords::before()` asks `AffectedRecords::of()` for every record the write can change: the gadget, its place and its site.
+4. `AffectedRecords::before()` locks those records and the widget's retained row in the triggers' order. `AffectedRecords::snapshots()` then reads each one.
 5. Eloquent sends `update "widgets" set ...` to the compatibility view.
 6. The view's update trigger checks every refusal, locks the gadget row and the retained row, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
@@ -95,6 +95,8 @@ These docs name classes and methods, never line numbers. CI runs [check-doc-name
 
 - a backticked class name, or a backticked method, case, constant or property on a class, names nothing in the code;
 - a page cites a line, such as `Compiler.php` followed by a colon and a number;
-- a relative link points at a file that does not exist.
+- a file name carries a line anchor, such as `#L42`, `#L42-L48` or `#L42C3`, in a link or anywhere else on the line;
+- a relative link points at a file that does not exist;
+- an `INV-` reference names no `## INV-` heading in the [invariants](invariants.md).
 
-A short name resolves to a class in `src/` or `tests/`, or through the script's small allowlist of Laravel classes. Write any other outside class by its fully qualified name. Run the check locally with `docker compose run --rm --no-deps php php bin/check-doc-names.php`.
+The check skips fenced code. A fence closes only on a marker of its own character and at least its own length, as in Markdown. A short name resolves to a class in `src/` or `tests/`, or through the script's small allowlist of Laravel classes. Write any other outside class by its fully qualified name. Run the check locally with `docker compose run --rm --no-deps php php bin/check-doc-names.php`.

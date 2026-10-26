@@ -32,7 +32,7 @@ The bridge listens on the arming events through a wildcard and acts only on the 
 1. Adds a `Connection::beforeExecuting()` callback, once per connection, through `EventBridge::watch()`.
 2. Closes any pending write a failed statement left behind, through `EventBridge::finishFailed()`.
 3. Opens a transaction at transaction level 0. Above it, it issues `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count.
-4. Finds the affected records, locks them, and reads each into a `RecordSnapshot`, as the next two sections describe.
+4. Calls `AffectedRecords::before()`, which finds the affected records, locks them, and reads each into a `RecordSnapshot`. The next two sections describe it.
 5. Pushes the `PendingMirroredWrite` onto the connection's stack.
 
 A throw in step 4 rolls the transaction or savepoint back and rethrows.
@@ -42,17 +42,27 @@ A throw in step 4 rolls the transaction or savepoint back and rethrows.
 `AffectedRecords::of()` asks `MirrorIndex::forModel()` which maps the model belongs to, and under which alias. Each `MapMember` adds records:
 
 - **A previous model** adds its current records. `KeyTranslator::currentKeys()` turns its key into the primary key and the key of each dependent row the view reads. After an insert, the key comes from `Setting::Created`.
-- **A previous model's delete that removes the row** also adds every dependent row under the record's primary foreign key, through `KeyTranslator::dependentKeys()`. The delete trigger removes them all, child rows and soft-deleted rows included, so each one raises its delete events. A delete removes the row when the model has no `isForceDeleting()` method, or when that method returns true. A soft delete keeps to the rows the view reads, and locks no others.
+- **A previous model's delete that removes the row** also adds every dependent row under the record's primary foreign key. The private `AffectedRecords::removed()` finds them through `KeyTranslator::dependentKeys()`. The delete trigger removes them all, child rows and soft-deleted rows included, so each one raises its delete events. A delete removes the row when the model has no `isForceDeleting()` method, or when that method returns true. A soft delete keeps to the rows the view reads, and locks no others.
 - **A primary current model** adds the previous records that link it, through `KeyTranslator::previousKeys()`. Before an insert there are none.
 - **A dependent current model** adds the previous records of its original and its new primary foreign key. A move between primary rows mirrors both.
 
-A model loaded without the column that names its record still mirrors. `AffectedRecords::originalKey()` reads the original value from the loaded attributes when the column is there. Otherwise it selects the persisted value by the model's own key: from the view for the previous model, and from the table for a current model. That column is the mapped key for a previous or primary model, and the primary foreign key for a dependent.
+A model loaded without the column that names its record still mirrors. `AffectedRecords::originalKey()` reads the original value when the model's raw original, `Model::getRawOriginal()`, holds the column. Otherwise it selects the persisted value by the model's own key: from the view for the previous model, and from the table for a current model. So a column assigned but never loaded uses the persisted value too. That column is the mapped key for a previous or primary model, and the primary foreign key for a dependent.
+
+The bridge reads a new value only from an attribute the model holds, through the private `AffectedRecords::loaded()`. So a bridged write does not throw under `Model::preventAccessingMissingAttributes()`. A model with no persisted key, such as one before its insert, selects nothing.
 
 `AffectedRecords::acrossMaps()` then adds, for each current record, the previous records of every other map over the same table. Each `AffectedRecord` carries a `RecordRole`. A previous record locks its retained table, `AffectedRecord::$lockTable`, but reads its view, `AffectedRecord::$relation`.
 
 ## Locking and reading
 
-`AffectedRecords::snapshots()` locks the affected records and the model's own record, from `AffectedRecords::native()`. It sorts them by `RecordRole::lockOrder()`, then by lock table and key, and runs `select 1 ... for update` on each. Primary rows come first and retained rows second, the order the update and delete triggers use. It then reads every affected record with `select *`.
+`AffectedRecords::before()` takes three steps after `AffectedRecords::of()`:
+
+1. The private `AffectedRecords::lock()` locks the affected records and the model's own record, from the private `AffectedRecords::native()`. It sorts them by `RecordRole::lockOrder()`, then by lock table and key, and runs `select 1 ... for update` on each. Primary rows come first and retained rows second, the order the update and delete triggers use.
+2. For a delete that removes the row, `AffectedRecords::removed()` reads the dependent rows again under those locks. A row that another transaction committed before the primary lock is a newcomer. `AffectedRecords::acrossMaps()` adds the other maps' previous records for it, and `AffectedRecords::lock()` locks the newcomers.
+3. `AffectedRecords::snapshots()` reads every record with `select *`. It takes no lock.
+
+`AffectedRecords::native()` reads the model's own key from its attributes. When the model does not hold the key column, it selects the persisted value as `AffectedRecords::originalKey()` does. So a model loaded without its mapped key still locks its own row before the statement.
+
+Without a concurrent writer, step 2 finds no newcomer and locks nothing. A newcomer locks after the first pass's dependent rows, so [INV-1](../invariants.md) records it as an exception to the lock order.
 
 ## Matching the statement
 
@@ -104,10 +114,12 @@ A replayed instance never begins a pending write. A native write inside a mirror
 
 `saveQuietly()`, query builder writes and raw SQL fire no model events. The triggers still store them correctly, and nothing is mirrored.
 
-`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked arming events for that relation's models. It keeps one count per fake and per relation. A count that grew since its last check of that relation throws `CompatibilityEventMirrorBypassed`. So a bypass on one relation does not hide a bypass on another. `EventBridge::withoutMirroring()` switches the guard off with the mirror.
+`EventBridge::guard()` catches a test that fakes model events. It looks at a write that completed no pending write, to a relation a mirrored model uses. When `Model::getEventDispatcher()` is an `EventFake`, it counts the faked arming events for that relation's models. It keeps one count per fake and per relation. A count that grew since its last check of that relation throws `CompatibilityEventMirrorBypassed`. So a bypass on one relation does not hide a bypass on another. Inside `EventBridge::withoutMirroring()`, the guard still stores each count and only skips the throw. So a faked write with the mirror off does not make the next raw write throw.
 
 `EventBridge::internally()` marks the bridge's own statements, and `EventBridge::handleQuery()` and the `beforeExecuting` callback ignore them.
 
 ## Tests
 
-`EventBridgeTest` covers the events of each kind of write, refusals and excluded listeners. It also covers fakes, quiet and bulk writes, maps that share a current table, re-entry and the caller's transaction. Its tests named for a model loaded without its mapped key or primary foreign key cover `AffectedRecords::originalKey()`. `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()` covers the removed dependent rows. `DependentCurrentModelTest::a_previous_model_write_mirrors_only_the_designated_dependent_row()` covers the dependent row the bridge mirrors.
+`EventBridgeTest` covers the events of each kind of write, refusals and excluded listeners. It also covers fakes, quiet and bulk writes, maps that share a current table, re-entry and the caller's transaction. Its tests named for a model loaded without its mapped key or primary foreign key cover `AffectedRecords::originalKey()`. Each runs with `Model::preventAccessingMissingAttributes()` off and on. `EventBridgeTest::it_raises_the_previous_model_events_of_both_primary_records_when_a_dependent_loaded_without_its_primary_foreign_key_moves()` covers a primary foreign key assigned but never loaded. `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()` covers the removed dependent rows. `EventBridgeTest::it_lets_a_raw_write_through_after_a_faked_write_with_the_mirror_off()` covers the guard's count while the mirror is off.
+
+Two tests write from a second connection. `EventBridgeOutsideTransactionTest::it_raises_the_force_delete_events_of_a_dependent_row_committed_before_the_primary_record_is_locked()` covers a newcomer. `EventBridgeOutsideTransactionTest::it_locks_the_own_record_of_a_model_loaded_without_its_mapped_key_before_the_statement()` covers the model's own-row lock, in both strict modes. `DependentCurrentModelTest::a_previous_model_write_mirrors_only_the_designated_dependent_row()` covers the dependent row the bridge mirrors.

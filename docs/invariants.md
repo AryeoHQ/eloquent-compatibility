@@ -4,13 +4,18 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 ## INV-1: Locks follow one order
 
-**Rule.** The event bridge and the triggers lock the primary row before the retained row.
+**Rule.** The event bridge and the triggers lock the primary row before the retained row. A refuse function on a dependent's table or the retained table locks the primary row before it takes the refused-state lock.
 
 **Why.** The bridge locks before the statement, and the trigger locks the same rows again. Two writers that take locks in one order cannot deadlock on these rows.
 
-**Code that must agree.** `RecordRole::lockOrder()` puts primary records first, previous records second and dependent records last. `AffectedRecords::snapshots()` sorts by it, then by lock table and key. `KeyTranslator::previousRecord()` makes a previous record lock its retained table. `Compiler::updateFunction()` and `Compiler::deleteFunction()` call `Compiler::lockPrimary()` before `Compiler::loadPrevious()`.
+**Exceptions.** Two lock paths do not follow the order:
 
-**Pinned by.** No test pins the order.
+- **A writer that locks a dependent row and then updates it.** It can deadlock a concurrent write through the view with 40P01. The view writer holds the primary row `FOR UPDATE` and waits on the dependent row. The refuse function's `FOR KEY SHARE` on the primary row waits on the view writer. A raw write and a write through the event bridge both deadlock on this pattern.
+- **A newcomer dependent row in the bridge's second pass.** `AffectedRecords::before()` reads the removed dependent rows again under its first locks. It locks a row it finds only on that read after the first pass's dependent rows. It also locks any other map's previous record that `AffectedRecords::acrossMaps()` finds for that row after those dependent rows. The role order does not hold for that case.
+
+**Code that must agree.** `RecordRole::lockOrder()` puts primary records first, previous records second and dependent records last. The private `AffectedRecords::lock()` sorts by it, then by lock table and key. `KeyTranslator::previousRecord()` makes a previous record lock its retained table. `Compiler::updateFunction()` and `Compiler::deleteFunction()` call `Compiler::lockPrimary()` before `Compiler::loadPrevious()`. `Compiler::refuseFunction()` takes `FOR KEY SHARE` on the primary row before `pg_advisory_xact_lock()`.
+
+**Pinned by.** `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` pins the refused-state lock's place in the order, with a second writer in a child process. No test pins the bridge's order or the two exceptions.
 
 ## INV-2: One expression locates a dependent row
 
@@ -84,13 +89,13 @@ Each rule below holds today, and a change must keep it. Each names the code that
 
 ## INV-9: Each map owns a prefix no other map's prefix begins
 
-**Rule.** Every trigger and function of a map starts with `compatibility__<name>__` and fits in 63 characters. A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore. The Installer drops only the prefixed triggers and functions of the current schema.
+**Rule.** Every trigger and function of a map starts with `compatibility__<name>__` and fits in 63 characters. A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore. The Installer drops only the prefixed triggers on the current schema's tables and the prefixed functions of that schema.
 
-**Why.** The Installer finds a map's triggers and functions by prefix and schema alone. A name with a double or trailing underscore could make one map's prefix begin another's. Uninstalling one map would then drop the other's objects. Without the schema, an install in one schema would drop the same map's triggers in another.
+**Why.** The Installer finds a map's triggers and functions by prefix and schema alone. A name with a double or trailing underscore could make one map's prefix begin another's. Uninstalling one map would then drop the other's objects. Without the schema, an install in one schema would drop the same map's triggers in another, or a trigger on another schema's table.
 
-**Code that must agree.** `ResolvedMap::of()` checks the name. `ResolvedMap::objectPrefix()`, `ResolvedMap::function()`, `ResolvedMap::refuseFunction()` and `ResolvedMap::designateFunction()` build every name, through the private `ResolvedMap::object()`. `Installer::dropObjects()` matches the prefix through `SqlFragments::like()`. It keeps a trigger only when its function's namespace is `current_schema()`, and a function only when it is in that schema. `Compiler` creates every function in that same schema.
+**Code that must agree.** `ResolvedMap::of()` checks the name. `ResolvedMap::objectPrefix()`, `ResolvedMap::function()`, `ResolvedMap::refuseFunction()` and `ResolvedMap::designateFunction()` build every name, through the private `ResolvedMap::object()`. `Installer::dropObjects()` matches the prefix through `SqlFragments::like()`. It drops a trigger only when its table and its function are both in `current_schema()`, and a function only when it is in that schema. It names the schema through `to_regnamespace(quote_ident(current_schema()))`, so a schema whose name needs quoting resolves. `Compiler` creates every function in that same schema.
 
-**Pinned by.** `ResolvedMapTest::it_refuses_a_name_that_cannot_prefix_database_objects()`, `InstallerTest::it_recompiles_a_compatibility_map_without_duplicating_its_triggers()` and `InstallerTest::it_uninstalls_the_compatibility_view_and_leaves_the_current_models_untouched()`. `InstallerTest::it_leaves_the_same_compatibility_map_in_another_schema_installed()` pins the schema. No test pins the 63-character limit.
+**Pinned by.** `ResolvedMapTest::it_refuses_a_name_that_cannot_prefix_database_objects()`, `InstallerTest::it_recompiles_a_compatibility_map_without_duplicating_its_triggers()` and `InstallerTest::it_uninstalls_the_compatibility_view_and_leaves_the_current_models_untouched()`. `InstallerTest::it_leaves_the_same_compatibility_map_in_another_schema_installed()` and `InstallerTest::it_keeps_a_prefixed_trigger_on_another_schemas_table_that_calls_a_function_of_this_schema()` pin the schema. `InstallerTest::it_installs_recompiles_and_uninstalls_in_a_schema_whose_name_needs_quoting()` pins a quoted schema name. No test pins the 63-character limit.
 
 ## INV-10: Reads and writes carry their types
 
@@ -210,9 +215,9 @@ The trigger checks each writer against committed rows and its own. On the primar
 
 **Why.** A test that fakes every event and writes through a mirrored model proves nothing about the other side.
 
-**Code that must agree.** `EventBridge::guard()`, `EventBridge::$faked`, `MirrorIndex::modelsOf()`, `MirrorIndex::mapsOf()` and `ModelEvent::arming()`. `EventBridge::withoutMirroring()` switches the guard off.
+**Code that must agree.** `EventBridge::guard()`, `EventBridge::$faked`, `MirrorIndex::modelsOf()`, `MirrorIndex::mapsOf()` and `ModelEvent::arming()`. Inside `EventBridge::withoutMirroring()`, the guard still stores each count and only skips the throw. So a faked write with the mirror off does not make the next raw write throw.
 
-**Pinned by.** `EventBridgeTest::it_fails_loudly_when_a_test_fakes_the_model_events()`, `EventBridgeTest::it_fails_loudly_for_each_relation_a_faked_dispatcher_bypasses()`, `EventBridgeTest::it_mirrors_under_a_fake_that_leaves_model_events_alone()` and `EventBridgeTest::it_switches_the_mirror_off_only_when_a_test_says_so()`.
+**Pinned by.** `EventBridgeTest::it_fails_loudly_when_a_test_fakes_the_model_events()`, `EventBridgeTest::it_fails_loudly_for_each_relation_a_faked_dispatcher_bypasses()`, `EventBridgeTest::it_mirrors_under_a_fake_that_leaves_model_events_alone()`, `EventBridgeTest::it_switches_the_mirror_off_only_when_a_test_says_so()` and `EventBridgeTest::it_lets_a_raw_write_through_after_a_faked_write_with_the_mirror_off()`.
 
 ## INV-22: Compiled identifiers are full words
 
@@ -226,13 +231,13 @@ The trigger checks each writer against committed rows and its own. On the primar
 
 ## INV-23: A refused-state check is serialized per record
 
-**Rule.** A refuse function on a dependent's table or the retained table first takes `pg_advisory_xact_lock()`. Its key is the refuse function's name, a colon and the row's primary foreign key, hashed with `hashtextextended()`. A refuse function on the primary table takes no lock.
+**Rule.** A refuse function on a dependent's table or the retained table first takes `FOR KEY SHARE` on the primary row its row links, then `pg_advisory_xact_lock()`. The advisory lock's key is the refuse function's name, a colon and the row's primary foreign key, hashed with `hashtextextended()`. A refuse function on the primary table takes no lock.
 
-**Why.** A condition that reads other rows of the same record would otherwise miss a concurrent writer's uncommitted row, and both writers would commit the state. The key must name both parts. Without the function name, two states would wait on each other. Without the primary foreign key, every writer of the table would wait on one lock. A primary row has no primary foreign key, so the primary table stays unserialized. [0016](decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records that limit.
+**Why.** A condition that reads other rows of the same record would otherwise miss a concurrent writer's uncommitted row, and both writers would commit the state. The key must name both parts. Without the function name, two states would wait on each other. Without the primary foreign key, every writer of the table would wait on one lock. The primary row lock comes first so that the refused-state lock joins INV-1's order. INV-1 records the deadlock path that remains. A primary row has no primary foreign key, so the primary table stays unserialized. [0016](decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records that limit.
 
-**Code that must agree.** `Compiler::refuseFunction()` builds the lock from `ResolvedMap::refuseFunction()`, `ResolvedMap::dependent()` and `ResolvedMap::primaryForeignKey()`, or from the previous model's primary foreign key. The lock is the function's first statement, before the `IF EXISTS` check. `Compiler::function()` declares no volatility, so the check after the wait reads a new snapshot under READ COMMITTED.
+**Code that must agree.** `Compiler::refuseFunction()` builds the lock from `ResolvedMap::refuseFunction()`, `ResolvedMap::dependent()` and `ResolvedMap::primaryForeignKey()`, or from the previous model's primary foreign key. The two locks are the function's first statements, before the `IF EXISTS` check. `Compiler::function()` declares no volatility, so the check after the wait reads a new snapshot under READ COMMITTED.
 
-**Pinned by.** `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()`, which writes from a second connection. No test pins the primary-table limit or the REPEATABLE READ limit.
+**Pinned by.** `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()`, which writes from a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` pins the primary row lock. No test pins the primary-table limit or the REPEATABLE READ limit.
 
 ## INV-24: Each Installer method is atomic
 
@@ -246,10 +251,10 @@ The trigger checks each writer against committed rows and its own. On the primar
 
 ## INV-25: A delete through the previous model mirrors every row it removes
 
-**Rule.** A delete through the previous model that removes the row mirrors every dependent row under the record's primary foreign key. A soft delete mirrors only the rows the view reads.
+**Rule.** A delete through the previous model that removes the row mirrors every dependent row under the record's primary foreign key. That includes a row another transaction commits before the bridge locks the primary row. A soft delete mirrors only the rows the view reads.
 
 **Why.** The delete trigger removes every dependent row of the primary row, including rows the view does not read. Each removed row must raise its own delete events.
 
-**Code that must agree.** `Compiler::deleteFunction()` deletes by primary foreign key. `KeyTranslator::dependentKeys()` selects by the same key, and `AffectedRecords::of()` adds those records when the private `AffectedRecords::removes()` holds. A change to which rows the trigger deletes must change `KeyTranslator::dependentKeys()` with it.
+**Code that must agree.** `Compiler::deleteFunction()` deletes by primary foreign key. `KeyTranslator::dependentKeys()` selects by the same key. The private `AffectedRecords::removed()` turns those keys into records when the private `AffectedRecords::removes()` holds. `AffectedRecords::of()` calls it to find the records, and `AffectedRecords::before()` calls it again under the locks to find newcomers. A change to which rows the trigger deletes must change `KeyTranslator::dependentKeys()` with it.
 
-**Pinned by.** `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()`.
+**Pinned by.** `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()`. `EventBridgeOutsideTransactionTest::it_raises_the_force_delete_events_of_a_dependent_row_committed_before_the_primary_record_is_locked()` pins the newcomer, which a second connection commits.
