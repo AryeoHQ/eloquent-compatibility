@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Validation\ValidationException;
@@ -14,6 +15,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
+use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -22,6 +24,7 @@ use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
@@ -738,6 +741,45 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_mirrors_the_outer_write_when_a_beginning_listener_catches_a_refused_write_to_another_mapped_model_inside_a_callers_transaction(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        $other = Widget::query()->create(['title' => 'Other gadget']);
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($other): void {
+            if ($payload[0] instanceof Widget && $payload[0]->isNot($other)) {
+                try {
+                    DB::transaction(fn () => $other->update(['uuid' => '00000000-0000-0000-0000-000000000000']));
+                } catch (QueryException) {
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(1, DB::transactionLevel());
+        $this->assertSame(['Renamed', 'Other gadget'], [$widget->refresh()->title, $other->refresh()->title]);
+    }
+
+    #[Test]
+    public function it_mirrors_nothing_for_a_later_write_without_events_to_the_record_of_a_vetoed_save(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::listen('eloquent.updating: '.Widget::class.'*', fn (string $name, array $payload) => $payload[0] instanceof Widget && $payload[0]->is($widget) ? false : null);
+        $this->recordMirroredEvents();
+
+        $this->assertFalse($widget->update(['title' => 'Vetoed']));
+        Widget::query()->whereKey($widget->getKey())->update(['title' => 'Written without events']);
+
+        $this->assertNothingMirrored();
+        $this->assertSame('Written without events', DB::table('gadgets')->value('name'));
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
     public function it_records_a_faked_mirrored_event_and_runs_none_of_its_listeners_when_the_map_excludes_a_listener(): void
     {
         $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
@@ -774,6 +816,30 @@ final class EventBridgeTest extends TestCase
             InvalidCompatibilityMap::class,
             "Compatibility map 'widgets' is declared wrongly: {$parental} uses Tightenco\\Parental\\HasChildren, so its child classes fire model events under their own names and the event bridge would mirror none of their writes",
         );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+        $this->artisan('compatibility:check')
+            ->expectsOutputToContain('No compatibility map is registered, so nothing was checked.')
+            ->assertFailed();
+    }
+
+    #[Test]
+    public function it_keeps_the_mirrored_map_registered_when_a_second_mirror_of_its_name_is_refused(): void
+    {
+        $this->mirror();
+        $previous = (new class extends Model
+        {
+            protected $table = 'widgets';
+        })::class;
+        $respelled = $this->respelled($previous, Gadget::class);
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($respelled)),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: its event mirror is registered twice",
+        );
+
+        $this->assertSame([Widget::class], array_map(fn (ResolvedMap $resolvedMap) => (string) $resolvedMap->previousModel->model, resolve(CompatibilityMaps::class)->all()));
     }
 
     #[Test]

@@ -47,7 +47,7 @@ A `COMMIT` can fail after a successful replay, for example on a deferred constra
 
 A failed statement fires no `QueryExecuted`, so `EventBridge::complete()` never runs and the write stays pending. At level 0, PostgreSQL has aborted the bridge's own transaction. The first of four events closes it:
 
-1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` opens a write when its statement starts. A new statement while that write is still pending means its statement failed. The callback rolls back before the new statement runs.
+1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` opens a write when its statement starts. A new statement while that write is still pending means its statement failed. The callback rolls back before the new statement runs. It then tests the write below against the new statement, so an outer write whose listener caught the failure still opens.
 2. **The next bridged write.** `EventBridge::begin()` calls `EventBridge::finishFailed()`. When the connection sits one level above the write, it runs `select 1`. A failure rolls back, and a success commits. It reaps only a write whose statement started: an unstarted write holds no transaction, and may still be waiting for its statement.
 3. **A queue worker's next loop.** `Provider::boot()` calls `EventBridge::releaseFailed()` on each `Looping` event.
 4. **Application termination.** `Provider::boot()` calls `EventBridge::releaseFailed()` from the terminating callbacks too.
@@ -72,5 +72,6 @@ A caller that wrapped the write in `Connection::transaction()` rolls back to its
 - `InstallerTest::it_refuses_a_change_to_a_read_only_attribute_with_what_why_and_what_to_do()`: the three parts of a refusal.
 - `CompatibilityWriteRefusedTest`: `CompatibilityWriteRefused::isRefusal()`, `CompatibilityWriteRefused::fromQueryException()` and the two PHP refusals.
 - `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()`, `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_lets_a_write_through_proceed_when_its_dependent_row_is_gone_after_the_statement_read_the_view()`: the 40001 conflict check.
-- `EventBridgeOutsideTransactionTest::it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement()`: a throw before the statement.
+- `EventBridgeOutsideTransactionTest::it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement()` and `EventBridgeTest::it_mirrors_nothing_for_a_later_write_without_events_to_the_record_of_a_vetoed_save()`: a throw or a veto before the statement.
+- `EventBridgeOutsideTransactionTest::it_mirrors_the_outer_write_when_a_beginning_listener_catches_a_refused_write_to_another_mapped_model_outside_a_transaction()` and `EventBridgeTest::it_mirrors_the_outer_write_when_a_beginning_listener_catches_a_refused_write_to_another_mapped_model_inside_a_callers_transaction()`: a failed nested write.
 - `EventBridgeOutsideTransactionTest::it_rolls_back_a_mirrored_write_whose_commit_fails_and_leaves_the_connection_outside_a_transaction()`: a failed commit.

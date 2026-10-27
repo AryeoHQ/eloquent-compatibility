@@ -36,7 +36,7 @@ The bridge listens on the beginning events through a wildcard and acts only on t
 
 ## Opening at the statement
 
-The `beforeExecuting` callback sees each statement the connection runs, before it runs. When the top pending write's statement has not started, and `PendingMirroredWrite::expects()` accepts this statement, the callback calls the private `EventBridge::open()`. It:
+The `beforeExecuting` callback sees each statement the connection runs, before it runs. First it closes or forgets each write on top of the stack whose statement started, because a new statement means that statement failed. It also forgets each top write whose model the private `EventBridge::inProgress()` no longer finds on the call stack. A vetoed or throwing save leaves such a write. When the top pending write's statement has not started, and `PendingMirroredWrite::expects()` accepts this statement, the callback calls the private `EventBridge::open()`. It:
 
 1. Sets `PendingMirroredWrite::$statementSent`.
 2. Opens a transaction at transaction level 0. Above it, it issues `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count.

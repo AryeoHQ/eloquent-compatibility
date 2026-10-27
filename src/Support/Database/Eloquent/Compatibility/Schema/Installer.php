@@ -88,12 +88,17 @@ final readonly class Installer
 
         if ($view !== null) {
             $dependents = $this->connection->select(
-                "select distinct coalesce(rule.ev_class::regclass::text, pg_describe_object(dependency.classid, dependency.objid, dependency.objsubid)) as name
-                 from pg_depend dependency
+                "select distinct case when rule.ev_class = compatibility_view.oid then pg_describe_object(dependency.classid, dependency.objid, dependency.objsubid)
+                   else coalesce(rule.ev_class::regclass::text, pg_describe_object(dependency.classid, dependency.objid, dependency.objsubid)) end as name
+                 from pg_class compatibility_view
+                 join pg_depend dependency on (dependency.refclassid = 'pg_class'::regclass and dependency.refobjid = compatibility_view.oid)
+                   or (dependency.refclassid = 'pg_type'::regclass and dependency.refobjid = compatibility_view.reltype)
                  left join pg_rewrite rule on dependency.classid = 'pg_rewrite'::regclass and rule.oid = dependency.objid
-                 where dependency.refclassid = 'pg_class'::regclass and dependency.refobjid = ?::regclass and dependency.deptype = 'n'
-                   and rule.ev_class is distinct from dependency.refobjid
-                 order by 1",
+                 left join pg_trigger view_trigger on dependency.classid = 'pg_trigger'::regclass and view_trigger.oid = dependency.objid
+                 where compatibility_view.oid = ?::regclass
+                   and ((dependency.deptype = 'n' and rule.ev_class is distinct from compatibility_view.oid)
+                     or (dependency.deptype = 'a' and (rule.oid is not null or view_trigger.tgname not like ".SqlFragments::like($resolvedMap->objectPrefix()).')))
+                 order by 1',
                 [$view],
             );
 

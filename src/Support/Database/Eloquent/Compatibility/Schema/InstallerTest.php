@@ -471,6 +471,30 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['create function widget_label(widgets) returns text language sql as $label$ select $1.title $label$', 'drop function widget_label(widgets)', 'function widget_label(widgets)'])]
+    #[TestWith(['create table widget_snapshots (snapshot widgets)', 'drop table widget_snapshots', 'column snapshot of table widget_snapshots'])]
+    #[TestWith(['create or replace function widget_audit() returns trigger language plpgsql as $audit$ begin return null; end $audit$; create trigger widget_audit after update on widgets for each statement execute function widget_audit()', 'drop function widget_audit() cascade', 'trigger widget_audit on view widgets'])]
+    #[TestWith(['create rule widget_notice as on delete to widgets do also notify widget_notice', 'drop rule widget_notice on widgets', 'rule widget_notice on view widgets'])]
+    public function it_refuses_to_recompile_while_an_object_uses_the_views_row_type_or_sits_on_the_view_and_names_it(string $create, string $drop, string $name): void
+    {
+        DB::unprepared($create);
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::unprepared('drop table if exists widget_snapshots; drop function if exists widget_audit() cascade');
+        });
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->recompile(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: recompile() cannot replace the compatibility view widgets while other objects depend on it: {$name}; drop them first and create them again after the recompile",
+        );
+
+        DB::unprepared($drop);
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+        DB::table('gadgets')->insert(['name' => 'After a refused recompile']);
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+    }
+
+    #[Test]
     public function it_refuses_to_install_while_another_view_reads_the_retained_table_and_names_it(): void
     {
         resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);

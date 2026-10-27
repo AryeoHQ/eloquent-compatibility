@@ -649,7 +649,7 @@ final class Compiler
     private function function(ResolvedMap $resolvedMap, string $name, string $relation, string $variables, array $body): string
     {
         $owner = SqlFragments::identifier($this->schema).'.'.SqlFragments::identifier($relation);
-        $guard = '  IF TG_RELID <> '.SqlFragments::literal($owner)."::regclass THEN\n    "
+        $guard = '  IF TG_RELID <> '.SqlFragments::literal($owner).'::regclass AND pg_partition_root(TG_RELID) IS DISTINCT FROM '.SqlFragments::literal($owner)."::regclass THEN\n    "
             .SqlFragments::refuse(
                 SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused to run {$name} on ").' || TG_TABLE_SCHEMA || '.SqlFragments::literal('.').' || TG_TABLE_NAME',
                 "{$name} belongs to {$this->schema}.{$relation}, and only the compatibility map's own trigger on it may run it.",

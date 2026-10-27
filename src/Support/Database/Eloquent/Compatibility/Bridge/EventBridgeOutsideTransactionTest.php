@@ -244,12 +244,32 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['updating'])]
-    #[TestWith(['saving'])]
-    public function it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement(string $event): void
+    public function it_mirrors_the_outer_write_when_a_beginning_listener_catches_a_refused_write_to_another_mapped_model_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        $other = Widget::query()->create(['title' => 'Other gadget']);
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($other): void {
+            if ($payload[0] instanceof Widget && $payload[0]->isNot($other)) {
+                try {
+                    $other->update(['uuid' => '00000000-0000-0000-0000-000000000000']);
+                } catch (QueryException) {
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['Renamed', 'Other gadget'], [$widget->refresh()->title, $other->refresh()->title]);
+    }
+
+    #[Test]
+    public function it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement(): void
     {
         $widget = $this->widget()->refresh();
-        Event::listen("eloquent.{$event}: ".Widget::class.'*', function (): void {
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (): void {
             throw new RuntimeException('Thrown before the statement.');
         });
 
@@ -262,6 +282,10 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $concurrent->statement("set lock_timeout = '200ms'");
         $locked = $concurrent->transaction(fn () => $concurrent->table('gadgets')->where('id', $widget->gadget_id)->lockForUpdate()->value('name'));
         $this->assertSame('Blue gadget', $locked);
+        $this->recordMirroredEvents();
+        Widget::query()->whereKey($widget->getKey())->update(['title' => 'Written without events']);
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
     }
 
     #[Test]

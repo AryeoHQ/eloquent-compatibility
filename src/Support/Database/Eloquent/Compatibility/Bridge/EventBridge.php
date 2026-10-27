@@ -14,12 +14,15 @@ use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Throwable;
 use WeakMap;
 
 final class EventBridge
 {
     private const string PARENTAL = 'Tightenco\Parental\HasChildren';
+
+    private const array WRITING_METHODS = ['performInsert', 'performInsertOrIgnore', 'performUpdate', 'incrementOrDecrement', 'incrementOrDecrementEach', 'delete'];
 
     private readonly MirrorIndex $mirrorIndex;
 
@@ -58,7 +61,8 @@ final class EventBridge
 
     public function mirror(EventMirror $mirror): void
     {
-        $resolvedMap = $this->compatibilityMaps->register($mirror->compatibilityMap());
+        $map = $mirror->compatibilityMap();
+        $resolvedMap = ResolvedMap::of($map);
 
         if (array_key_exists($resolvedMap->name, $this->mirrored)) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, 'its event mirror is registered twice');
@@ -69,6 +73,8 @@ final class EventBridge
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} uses ".self::PARENTAL.', so its child classes fire model events under their own names and the event bridge would mirror none of their writes; leave Parental models out of compatibility maps');
             }
         }
+
+        $resolvedMap = $this->compatibilityMaps->register($map);
 
         if ($this->mirrored === []) {
             $this->events->listen(QueryExecuted::class, $this->handleQuery(...));
@@ -204,28 +210,40 @@ final class EventBridge
                 return;
             }
 
-            $pendingWrite = $this->top($connection->getName());
+            while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending) {
+                if ($pendingWrite->statementSent) {
+                    if ($pendingWrite->savepoint === null) {
+                        $this->close($connection, $pendingWrite, false);
+                    } else {
+                        $this->forget($connection, $pendingWrite);
+                    }
 
-            if ($pendingWrite === null || ! $pendingWrite->pending) {
-                return;
-            }
+                    continue;
+                }
 
-            if ($pendingWrite->statementSent) {
-                if ($pendingWrite->savepoint === null) {
-                    $this->close($connection, $pendingWrite, false);
-                } else {
+                if (! $this->inProgress($pendingWrite)) {
                     $this->forget($connection, $pendingWrite);
+
+                    continue;
+                }
+
+                $parsedWrite = ParsedWrite::of($query);
+
+                if ($parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
+                    $this->open($connection, $pendingWrite);
                 }
 
                 return;
             }
-
-            $parsedWrite = ParsedWrite::of($query);
-
-            if ($parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
-                $this->open($connection, $pendingWrite);
-            }
         });
+    }
+
+    private function inProgress(PendingMirroredWrite $pendingWrite): bool
+    {
+        return array_any(
+            debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT | DEBUG_BACKTRACE_IGNORE_ARGS),
+            fn (array $frame) => ($frame['object'] ?? null) === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true),
+        );
     }
 
     private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void

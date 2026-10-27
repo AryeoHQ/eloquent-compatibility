@@ -388,6 +388,28 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_runs_its_trigger_functions_on_the_partitions_of_a_partitioned_current_table(): void
+    {
+        foreach (['gadgets', 'gadget_places'] as $table) {
+            DB::unprepared("create table {$table}_partitioned (like {$table} including all) partition by hash (id); drop table {$table} cascade; alter table {$table}_partitioned rename to {$table}; create table {$table}_0 partition of {$table} for values with (modulus 1, remainder 0)");
+        }
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        DB::table('widgets')->insert(['title' => 'Through the view', 'street' => '1 Main St']);
+        $gadget = DB::table('gadgets')->insertGetId(['name' => 'Directly']);
+        DB::table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => '2 Direct St']);
+
+        $this->assertWriteRefused(fn () => DB::table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => '3 Second Root St']), 'refused a second root place for one gadget');
+        $this->assertSame(['Directly' => '2 Direct St', 'Through the view' => '1 Main St'], DB::table('widgets')->orderBy('title')->pluck('street', 'title')->all());
+
+        DB::table('widgets')->where('title', 'Through the view')->delete();
+        DB::table('gadget_places')->where('gadget_id', $gadget)->delete();
+        DB::table('gadgets')->where('id', $gadget)->delete();
+
+        $this->assertSame([0, 0, 0], [DB::table('widgets')->count(), DB::table('retained_widgets')->count(), DB::table('gadgets')->count()]);
+    }
+
+    #[Test]
     public function it_refuses_the_primary_delete_function_fired_on_another_table_before_it_deletes_a_retained_row(): void
     {
         resolve(Installer::class)->install(new WidgetCompatibilityMap);

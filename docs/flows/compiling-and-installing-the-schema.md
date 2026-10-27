@@ -29,7 +29,7 @@ A failed statement rolls back the whole install, so it leaves nothing behind.
 `Installer::recompile()` refuses no existing view and copies no grants from the retained table. In its transaction it:
 
 1. Saves the view's own grants through the private `Installer::viewGrants()`. A view with no explicit grants saves its owner's default privileges.
-2. Runs `Installer::apply()`, steps 5 to 7 above. Before step 6, it refuses while another object depends on the view, and names each one. After step 6, it drops the view, without `CASCADE`.
+2. Runs `Installer::apply()`, steps 5 to 7 above. Before step 6, it refuses while another object depends on the view or uses its row type, and names each one. It also refuses a trigger or a rule on the view that is not the map's own. After step 6, it drops the view, without `CASCADE`.
 3. Grants the saved grants again. A column grant follows only when the new view still has that column.
 
 So a recompile can drop, retype or reorder an attribute, which `CREATE OR REPLACE VIEW` cannot. [INV-41](../invariants.md) and [0022](../decisions/0022-a-recompile-replaces-the-view-and-refuses-its-dependents.md) record the rule. `Installer::uninstall()` drops the objects in one transaction, then the view when `Installer::relation()` finds it in the current schema. It leaves every table as it is. A failed recompile or uninstall therefore keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
@@ -72,7 +72,7 @@ compatibility__<name>__refuse_<state>     BEFORE INSERT OR UPDATE               
 compatibility__<name>__designate_<alias>  AFTER INSERT                          the dependent's table
 ```
 
-Each trigger shares its function's name. `Compiler::function()` writes every function as `SECURITY DEFINER` PL/pgSQL, quoted with the `$compatibility$` tag. Its first statement refuses with CM001 when `TG_RELID` names a relation other than the function's own. [INV-37](../invariants.md) records why. `Compiler::variables()` declares `previous_row`, `affected_rows` and one `key_<alias>` per current model.
+Each trigger shares its function's name. `Compiler::function()` writes every function as `SECURITY DEFINER` PL/pgSQL, quoted with the `$compatibility$` tag. Its first statement refuses with CM001 when `TG_RELID` names a relation other than the function's own or a partition of it. [INV-37](../invariants.md) records why. `Compiler::variables()` declares `previous_row`, `affected_rows` and one `key_<alias>` per current model.
 
 ## Tests
 
@@ -84,10 +84,10 @@ Each trigger shares its function's name. `Compiler::function()` writes every fun
 - `InstallerTest::it_installs_recompiles_and_uninstalls_ahead_of_a_later_schema_that_has_the_compatibility_map()` and `InstallerTest::it_uninstalls_nothing_of_a_later_schema_when_the_current_schema_has_no_compatibility_view()`: the view is looked up in the current schema alone.
 - `InstallerTest::it_copies_the_retained_tables_grants_to_the_view_when_it_installs()`, `InstallerTest::it_lets_a_role_granted_a_retained_column_write_that_column_through_the_view()` and `InstallerTest::it_leaves_the_views_grants_as_they_are_when_it_recompiles()`: the copied grants, and `SECURITY DEFINER`.
 - `InstallerTest::it_drops_a_view_default_the_compatibility_map_no_longer_declares()`: a recompile removes a default.
-- `InstallerTest::it_recompiles_a_map_that_removes_retypes_or_reorders_an_attribute()`, `InstallerTest::it_keeps_every_grant_on_the_view_when_it_recompiles_the_view_anew()` and `InstallerTest::it_refuses_to_recompile_while_another_object_depends_on_the_view_and_names_it()`: a recompile replaces the view.
+- `InstallerTest::it_recompiles_a_map_that_removes_retypes_or_reorders_an_attribute()`, `InstallerTest::it_keeps_every_grant_on_the_view_when_it_recompiles_the_view_anew()` and `InstallerTest::it_refuses_to_recompile_while_another_object_depends_on_the_view_and_names_it()` and `InstallerTest::it_refuses_to_recompile_while_an_object_uses_the_views_row_type_or_sits_on_the_view_and_names_it()`: a recompile replaces the view.
 - `InstallerTest::it_refuses_to_install_while_another_view_reads_the_retained_table_and_names_it()` and `InstallerTest::it_refuses_to_install_or_recompile_over_a_table_with_row_level_security()`: the install's refusals.
 - `InstallerTest::it_copies_the_owners_privileges_to_the_view_when_the_retained_table_was_never_granted()`: a retained table that was never granted.
-- `InstallerTest::it_lets_no_other_role_execute_a_trigger_function_after_an_install_or_a_recompile()` and `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()`: the revoke and the relation check.
+- `InstallerTest::it_lets_no_other_role_execute_a_trigger_function_after_an_install_or_a_recompile()` and `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()`: the revoke and the relation check. `CompilerTest::it_runs_its_trigger_functions_on_the_partitions_of_a_partitioned_current_table()` pins a partitioned primary and dependent table.
 - `CompilerTest::it_refuses_a_not_null_column_without_a_default_that_an_insert_leaves_empty()` and `CompilerTest::it_counts_a_filled_default_identity_or_generated_column_as_filled_on_every_insert()`: the fill check.
 - `InstallerTest::it_compiles_only_full_word_aliases_variables_and_object_names()`: the identifiers in the compiled SQL.
 - `ResolvedMapTest::it_refuses_an_attribute_the_tables_cannot_store()`, `DependentCurrentModelTest::it_refuses_a_designation_the_retained_table_does_not_have()` and `DependentCurrentModelTest::it_refuses_an_attribute_that_writes_the_designation()`: the compile-time refusals.
