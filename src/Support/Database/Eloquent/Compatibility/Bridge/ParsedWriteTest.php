@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -142,6 +143,8 @@ final class ParsedWriteTest extends TestCase
     #[TestWith(['update "widgets" set "Why?" = ? where "id" = ?', ['id' => [1]]])]
     #[TestWith(['update "widgets" set "title" = ? where "a "" where id = ?" = ?', ['a " where id = ?' => [1]]])]
     #[TestWith(["update \"widgets\" set \"title\" = ? -- why?\nwhere \"id\" = ?", ['id' => [1]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = ? -- c\rwhere \"id\" = ?", ['id' => [1]]])]
+    #[TestWith(['update "widgets" set "title" = $Q$x$q$ where "id" = ?$Q$, "updated_at" = ? where "id" = ?', ['id' => [1]]])]
     #[TestWith(['update "widgets" set "title" = ? /* why? /* where id = ? */ */ where "id" = ?', ['id' => [1]]])]
     #[TestWith(['update "widgets" set "flags" = "flags" ?? ? where "id" = ?', ['id' => [1]]])]
     #[TestWith(["update \"widgets\" set \"title\" = ' where id = ?' where \"sku\" = ?", ['sku' => [0]]])]
@@ -149,6 +152,46 @@ final class ParsedWriteTest extends TestCase
     public function it_counts_only_the_placeholders_outside_literals_identifiers_and_comments(string $sql, array $placeholders): void
     {
         $this->assertSame($placeholders, ParsedWrite::of($sql)?->wherePlaceholders);
+    }
+
+    /**
+     * @param  array<string, list<int>>  $placeholders
+     */
+    #[DataProvider('longConstructs')]
+    #[Test]
+    public function it_counts_the_placeholders_after_a_literal_identifier_or_comment_of_any_length(string $sql, array $placeholders): void
+    {
+        $this->assertSame($placeholders, ParsedWrite::of($sql)?->wherePlaceholders);
+    }
+
+    /**
+     * @return iterable<string, array{string, array<string, list<int>>}>
+     */
+    public static function longConstructs(): iterable
+    {
+        foreach ([10_000, 100_000] as $length) {
+            $filler = str_repeat('a', $length);
+
+            yield "a single-quoted literal of $length bytes" => ["update \"widgets\" set \"title\" = '$filler', \"updated_at\" = ? where \"id\" = ?", ['id' => [1]]];
+            yield "an E'' literal of $length bytes" => ["update \"widgets\" set \"title\" = E'$filler', \"updated_at\" = ? where \"id\" = ?", ['id' => [1]]];
+            yield "a quoted identifier of $length bytes" => ["update \"widgets\" set \"$filler\" = ?, \"updated_at\" = ? where \"id\" = ?", ['id' => [2]]];
+            yield "a block comment of $length bytes" => ["update \"widgets\" set \"title\" = ? /* $filler */ where \"id\" = ?", ['id' => [1]]];
+        }
+
+        $filler = str_repeat('a', 100_000);
+
+        yield 'an unterminated single-quoted literal of 100000 bytes' => ["update \"widgets\" set \"title\" = ? where \"id\" = ? and \"sku\" = '$filler", ['id' => [1]]];
+        yield "an unterminated E'' literal of 100000 bytes" => ["update \"widgets\" set \"title\" = ? where \"id\" = ? and \"sku\" = E'$filler", ['id' => [1]]];
+        yield 'an unterminated quoted identifier of 100000 bytes' => ["update \"widgets\" set \"title\" = ? where \"id\" = ? and \"$filler", ['id' => [1]]];
+        yield 'an unterminated block comment of 100000 bytes' => ["update \"widgets\" set \"title\" = ? where \"id\" = ? /* $filler", ['id' => [1]]];
+    }
+
+    #[Test]
+    public function it_parses_nothing_when_the_scan_of_the_statement_fails(): void
+    {
+        $nesting = 10_000;
+
+        $this->assertNull(ParsedWrite::of('update "widgets" set "title" = ? '.str_repeat('/*', $nesting).str_repeat('*/', $nesting).' where "id" = ?'));
     }
 
     #[Test]

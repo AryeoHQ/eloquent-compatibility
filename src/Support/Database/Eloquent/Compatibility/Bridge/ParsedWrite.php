@@ -8,7 +8,7 @@ final readonly class ParsedWrite
 {
     private const string IDENTIFIER = '(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_]*)';
 
-    private const string NOT_A_PLACEHOLDER = '/(?<quoted>"(?:[^"]|"")*")|--[^\n]*|(?<comment>\/\*(?:[^\/*]|\*(?!\/)|\/(?!\*)|(?&comment))*\*\/)|(?<![\w$])[e]\'(?:[^\'\\\\]|\\\\.|\'\')*\'|\'(?:[^\']|\'\')*\'|(?<![\w$])\$(?<tag>(?:[a-z_\x80-\xff][\w\x80-\xff]*)?)\$.*?\$\k<tag>\$|\?\?/is';
+    private const string NOT_A_PLACEHOLDER = '/(?<quoted>"(?:[^"]++|"")*+")|--[^\r\n]*|(?<comment>\/\*(?:[^\/*]++|\*(?!\/)|\/(?!\*)|(?&comment))*+\*\/)|(?<![\w$])[e]\'(?:[^\'\\\\]++|\\\\.|\'\')*+\'|\'(?:[^\']++|\'\')*+\'|(?<![\w$])\$(?<tag>(?:[a-z_\x80-\xff][\w\x80-\xff]*)?)\$.*?\$(?-i:\k<tag>)\$|\?\?/is';
 
     /**
      * @param  null|list<string>  $columns
@@ -27,13 +27,19 @@ final readonly class ParsedWrite
             return null;
         }
 
+        $wherePlaceholders = self::wherePlaceholders($sql);
+
+        if ($wherePlaceholders === null) {
+            return null;
+        }
+
         $operation = Operation::from(strtolower(substr($matches[1], 0, 6)));
 
         return new self(
             $operation,
             self::identifier($matches[2]),
             $operation === Operation::Insert ? self::columns(substr($sql, strlen($matches[0]))) : null,
-            self::wherePlaceholders($sql),
+            $wherePlaceholders,
         );
     }
 
@@ -56,11 +62,15 @@ final readonly class ParsedWrite
     }
 
     /**
-     * @return array<string, list<int>>
+     * @return null|array<string, list<int>>
      */
-    private static function wherePlaceholders(string $sql): array
+    private static function wherePlaceholders(string $sql): null|array
     {
         $tokens = self::tokens($sql);
+
+        if ($tokens === null) {
+            return null;
+        }
 
         if (preg_match('/\swhere\s/i', $tokens, $where, PREG_OFFSET_CAPTURE) !== 1) {
             return [];
@@ -76,9 +86,9 @@ final readonly class ParsedWrite
         return $placeholders;
     }
 
-    private static function tokens(string $sql): string
+    private static function tokens(string $sql): null|string
     {
-        return (string) preg_replace_callback(
+        return preg_replace_callback(
             self::NOT_A_PLACEHOLDER,
             fn (array $matches) => ($matches['quoted'] ?? '') !== '' ? '"'.str_repeat('x', strlen($matches[0]) - 2).'"' : str_repeat(' ', strlen($matches[0])),
             $sql,
