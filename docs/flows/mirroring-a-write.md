@@ -57,7 +57,7 @@ Each method hands the model to `EventBridge::markOwnStatement()`, with the save 
 
 At the start of a beginning event, before any listener runs, the private `EventBridge::begin()` prepares the connection and records the write:
 
-1. It adds a `Connection::beforeExecuting()` callback, once per connection, through `EventBridge::watch()`.
+1. It adds a `Connection::beforeExecuting()` callback, once per connection, through `EventBridge::watch()`. Before that, it refuses a connection whose class does not use `Connections\DispatchesQueryFailed`, with `CompatibilityWriteRefused::byConnection()`, as [INV-19](../invariants.md#inv-19-a-failed-write-at-level-0-releases-its-transaction) records.
 2. It closes any write a failed statement left behind, through `EventBridge::finishFailed()`. It closes only a write whose statement started.
 3. It drops the connection's armed write, whose statement never came.
 4. It pushes a `PendingMirroredWrite` onto the connection's stack, with the model dispatcher and the dispatch depth. It opens nothing yet.
@@ -72,12 +72,12 @@ Each connection holds one armed write at a time. An insert arms its write at onc
 
 ## Opening at the statement
 
-The bridge opens the armed write when the connection starts the write's statement. Its `beforeExecuting` callback sees each statement before it runs. It takes the armed write only for an `INSERT`, `UPDATE` or `DELETE` on the model's own table, written as the model's query grammar writes that table. Any other statement leaves the write armed. A `SELECT` or an audit insert into another table that an earlier `beforeExecuting` callback runs first is one example. That callback's write to the model's own table would still take the armed write, a limit [INV-33](../invariants.md#inv-33-a-pending-mirrored-write-completes-only-on-its-own-statement) records.
+The bridge opens the armed write when the connection starts the write's statement. Its `beforeExecuting` callback sees each statement before it runs. `DispatchesQueryFailed::beforeExecuting()` runs that callback before every other `beforeExecuting` callback on the connection, whichever registered first. So a statement another callback runs on the model's statement comes after the write opens, and never takes the armed write, even a write to the model's own table. The callback takes the armed write only for an `INSERT`, `UPDATE` or `DELETE` on the model's own table, written as the model's query grammar writes that table. Any other statement leaves the write armed, such as a `SELECT` a later `beforeQuery` callback runs first. [INV-33](../invariants.md#inv-33-a-pending-mirrored-write-completes-only-on-its-own-statement) records the limits.
 
 First, the callback cleans the top of the stack. For each write there whose statement started, the private `EventBridge::closeFailed()` runs `select 1`:
 
 - A failure means the write's statement failed, so the callback closes or forgets the write and goes on.
-- A healthy transaction means the write's own statement is still running, and the callback stops. A later `beforeExecuting` callback, or a `QueryExecuted` listener registered before the bridge's, runs such a statement. The write stays open.
+- A healthy transaction means the write's own statement is still running, and the callback stops. Another `beforeExecuting` callback, or a `QueryExecuted` listener registered before the bridge's, runs such a statement. The write stays open.
 
 With an armed write, the callback also forgets each other write above it. Each of those is a write whose method has returned without its statement, such as a write whose cast threw after its beginning event. It also forgets each unclaimed, unsent write of the armed write's instance and operation at its depth. Such a write is an earlier attempt that threw before its mark, such as a delete whose `touchOwners()` failed. Without an armed write, the statement belongs to a listener or another write, and the stack stays as it is.
 

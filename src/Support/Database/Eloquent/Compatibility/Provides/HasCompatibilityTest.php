@@ -90,6 +90,8 @@ final class HasCompatibilityTest extends TestCase
 
     private bool $selected = false;
 
+    private bool $audited = false;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -641,6 +643,26 @@ final class HasCompatibilityTest extends TestCase
         $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget, RecordMirrored $event) => $event->rowBefore['name'] === 'Blue gadget' && $gadget->getAttribute('name') === 'Renamed');
         $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getAttribute('name') === 'Created');
         $this->assertMirrored(Gadget::class, ModelEvent::Deleted, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
+    public function it_opens_an_armed_write_on_its_own_update_and_not_on_an_insert_into_the_same_table_an_earlier_callback_makes_first(): void
+    {
+        DB::connection()->beforeExecuting(function (string $query): void {
+            if (! $this->audited && str_starts_with($query, 'update "widgets"')) {
+                $this->audited = true;
+                DB::table('widgets')->insert(['title' => 'Audit']);
+            }
+        });
+        $widget = $this->widget();
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertTrue($this->audited);
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget, RecordMirrored $event) => $event->rowBefore['name'] === 'Blue gadget' && $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(['Audit', 'Renamed'], DB::table('gadgets')->orderBy('name')->pluck('name')->all());
     }
 
     #[Test]

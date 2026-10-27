@@ -69,7 +69,8 @@
                 "config": {
                     "paths": [
                         "src",
-                        "bin"
+                        "bin",
+                        "tests/Fixtures/Support/Connections"
                     ]
                 }
             },

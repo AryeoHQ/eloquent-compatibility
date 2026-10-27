@@ -15,9 +15,12 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use ReflectionMethod;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Connections\DispatchesQueryFailed;
+use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
@@ -116,6 +119,7 @@ final class EventBridge
 
         if ($this->mirrored === []) {
             $this->events->listen(QueryExecuted::class, $this->handleQuery(...));
+            $this->events->listen(QueryFailed::class, $this->handleFailure(...));
         }
 
         $this->mirrored[$resolvedMap->name] = true;
@@ -219,6 +223,22 @@ final class EventBridge
         }
     }
 
+    public function handleFailure(QueryFailed $query): void
+    {
+        if ($this->internal > 0) {
+            return;
+        }
+
+        $pendingWrite = $this->top($query->connectionName);
+
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->statementSent && $pendingWrite->savepoint === null && $pendingWrite->statement === $query->sql && $pendingWrite->bindings === $query->bindings) {
+            try {
+                $this->closeFailed($query->connection, $pendingWrite, false);
+            } catch (Throwable) {
+            }
+        }
+    }
+
     public function releaseFailed(): void
     {
         $this->armed = [];
@@ -245,7 +265,7 @@ final class EventBridge
 
     private function begin(Connection $connection, Model $model, Operation $operation): PendingMirroredWrite
     {
-        $this->watch($connection);
+        $this->watch($connection, $model);
         $this->finishFailed($connection);
         unset($this->armed[(string) $connection->getName()]);
         $pendingWrite = new PendingMirroredWrite($model, $operation, Model::getEventDispatcher(), $this->depth);
@@ -306,10 +326,14 @@ final class EventBridge
         }
     }
 
-    private function watch(Connection $connection): void
+    private function watch(Connection $connection, Model $model): void
     {
         if ($this->watched[$connection] ?? false) {
             return;
+        }
+
+        if (! in_array(DispatchesQueryFailed::class, class_uses_recursive($connection), true)) {
+            throw CompatibilityWriteRefused::byConnection($this->maps($model), $connection);
         }
 
         $this->watched[$connection] = true;

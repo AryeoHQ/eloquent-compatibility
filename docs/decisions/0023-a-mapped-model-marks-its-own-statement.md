@@ -41,7 +41,7 @@ Two other designs were declined too:
 - An application adds one interface and one `use` line to every mapped model. The package overrides three protected Laravel methods.
 - A model that declares any of the three methods itself, or takes one from another trait, cannot be mapped. A composite-key package that sets the save query's keys is one example.
 - A future Laravel write method that calls neither method never claims its write. A reflection test fails when Laravel adds a public write method that no test covers. At run time, the write's created, updated or deleted event refuses it, and inside a transaction the refusal rolls it back.
-- The bridge reads only the start of the SQL: the write keyword and the model's table, as the model's query grammar writes it. So a `SELECT` or a write to another table that an earlier `beforeExecuting` callback runs cannot open the armed write. That callback's write to the model's own table still can.
+- The bridge reads only the start of the SQL: the write keyword and the model's table, as the model's query grammar writes it. So a `SELECT` or a write to another table that an earlier `beforeExecuting` callback runs cannot open the armed write. That callback's write to the model's own table still could, until the connection trait of [decision 0019](0019-a-connection-trait-raises-query-failed.md) ran the bridge's callback first.
 - The faked-dispatcher guard now throws before the statement, because the mark runs before it. A raw write runs no model method, so it never throws.
 - Registration still needs no database, as [decision 0011](0011-registration-needs-no-database.md) records. The new checks read the model classes through reflection.
 - [INV-33](../invariants.md) and [INV-50](../invariants.md) record the rules.

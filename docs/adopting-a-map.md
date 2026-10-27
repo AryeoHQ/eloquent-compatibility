@@ -15,6 +15,14 @@ Two kinds of model cannot carry the mark:
 
 [INV-50](invariants.md#inv-50-every-mapped-model-marks-its-own-statement) records the rule.
 
+## Before the first mirrored write: the connection class
+
+The event bridge refuses to mirror a write on a connection whose class does not use `Connections\DispatchesQueryFailed`. The refusal is a `CompatibilityWriteRefused` that names the connection, its class and the trait. It comes at the first mirrored write on that connection, not when the application registers the map. [INV-19](invariants.md#inv-19-a-failed-write-at-level-0-releases-its-transaction) records the rule.
+
+The trait raises `QueryFailed` when a statement fails, and the bridge then rolls back the transaction it opened for a write outside a transaction. Without it, the next `Connection::transaction()` or `createOrFirst()` would fail with 25P02, and a `Connection::afterCommit()` callback could be lost.
+
+Add the trait to the connection class the application already resolves, such as Aryeo's ResilientPostgresConnection. The trait overrides `handleQueryException()` and `beforeExecuting()`, so it composes with a class that overrides `run()` or the lost-connection retry. Its `beforeExecuting()` runs the event bridge's callback before every other one, so a statement another callback runs never takes the write the bridge armed. A class that declares `beforeExecuting()` itself replaces the trait's, and the bridge's callback then runs in the order it registered. An application that resolves no class of its own registers one with `Connection::resolverFor('pgsql', …)` in a service provider's `register()`, as the README's "Failed statements" section shows.
+
 ## Before the install: views on the old table
 
 A view on the old table follows the table's rename, so it keeps reading the retained table. It then misses every mapped attribute, and the triggers never see its writes. So `Installer::install()` refuses while another view or materialized view reads the retained table, and names each one, as [INV-42](invariants.md#inv-42-only-the-compatibility-view-reads-the-retained-table) records.

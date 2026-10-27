@@ -177,9 +177,36 @@ A repair can set a state that no `#[Transition]` reaches. Two routes skip the tr
 
 A map whose current models cast no column to a state machine behaves as it does without the package. So does every map with a release of eloquent-state-machines that has no `Trigger::withoutTransition()`. The trigger runs from the first installed release that has `Trigger::withoutTransition()`, so the upgrade to that release changes what a write through the previous model does.
 
+### Failed statements
+Outside a caller's transaction, the event bridge opens its own transaction for a mirrored write. When the database refuses that write, the bridge rolls its transaction back as soon as the statement fails. For that, the bridge requires `Connections\DispatchesQueryFailed` on every connection it mirrors a write on. It refuses every mirrored write on a connection whose class does not use the trait, with a `CompatibilityWriteRefused` that names the connection, its class and the trait.
+
+Add the trait to the connection class the application already resolves. When the application resolves none, register a resolver as below, in a service provider's `register()`:
+
+```php
+use Illuminate\Database\Connection;
+use Illuminate\Database\PostgresConnection;
+use Support\Database\Eloquent\Compatibility\Connections\DispatchesQueryFailed;
+
+final class AppPostgresConnection extends PostgresConnection
+{
+    use DispatchesQueryFailed;
+}
+
+Connection::resolverFor('pgsql', fn ($pdo, $database, $prefix, $config) => new AppPostgresConnection($pdo, $database, $prefix, $config));
+```
+
+The trait raises `Connections\Events\QueryFailed` once for each statement that fails with a `QueryException`, inside a transaction or outside one:
+
+- The event fires after Laravel's lost-connection retry, and never for a statement that a retry recovers.
+- A statement that fails inside a `QueryFailed` listener, on the same connection, raises no second event.
+- `listenForFailures()` registers a listener, as `listen()` does for `QueryExecuted`.
+- The event carries the SQL, the bindings, the connection and its name, the exception, and the read/write type. Its `time` is null.
+- The trait overrides `handleQueryException()` and `beforeExecuting()`. It therefore composes with a connection that overrides `run()` or `tryAgainIfCausedByLostConnection()`.
+- Its `beforeExecuting()` runs the event bridge's callback before every other `beforeExecuting` callback, so another callback's statement never opens a mirrored write in place of the model's own.
+
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
 
 Maintainers and reviewers: start at [docs/architecture.md](docs/architecture.md).
 
-Adopting a map in an application: read [docs/adopting-a-map.md](docs/adopting-a-map.md) first. It covers the views to redirect, the tests to change, and the lost-connection and queued-job trade-offs.
+Adopting a map in an application: read [docs/adopting-a-map.md](docs/adopting-a-map.md) first. It covers the connection class, the views to redirect, the tests to change, and the lost-connection and queued-job trade-offs.

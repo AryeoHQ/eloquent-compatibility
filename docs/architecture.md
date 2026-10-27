@@ -33,6 +33,7 @@ A write that skips model events, such as a query builder update, still reaches t
 | exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap`, `CompatibilityEventMirrorBypassed` | every error the package raises |
 | testing trait | Testing | `InteractsWithCompatibilityMaps` | records mirrored events for application tests |
 | provider | root | `Provider` | binds the singletons and releases failed writes |
+| failure event | Connections | `DispatchesQueryFailed`, `QueryFailed` | a trait the application's connection class must use, which raises an event for each failed statement |
 
 ```mermaid
 flowchart LR
@@ -47,9 +48,12 @@ flowchart LR
   Print --> Installer
   Bridge --> Database
   Check --> Database
+  Connection["DispatchesQueryFailed"] -->|QueryFailed| Bridge
 ```
 
 `Installer` resolves each map itself and never reads the registry. `CompileSql` takes a map from the registry and asks `Installer::statements()` for the statements it prints. `EventBridge::mirror()` registers the map it mirrors, so `CheckDrift` sees every mirrored map. Three namespaces carry a README of their own: [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Bridge](../src/Support/Database/Eloquent/Compatibility/Bridge/README.md).
+
+The Connections namespace holds a trait the application adds to its own connection class, `DispatchesQueryFailed`. `EventBridge::mirror()` listens for the trait's `QueryFailed`, so a failed write outside a transaction rolls back at once. The bridge refuses every mirrored write on a connection whose class does not use the trait, as [failure and rollback](flows/failure-and-rollback.md) describes.
 
 ## The life of a write
 
@@ -87,7 +91,7 @@ Read the code in this order. Each step answers one question.
 5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first.
 6. `Installer`, `InstallerAction` and `SqlFragments`: which statements does each Installer method run, in what order, and how does it raise a refusal?
 7. `CompatibilityWriteRefused`: how does a refusal become a PHP exception?
-8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
+8. `HasCompatibility`, `EventBridge`, `DispatchesQueryFailed` and `QueryFailed`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?
 10. `EventReplayer`: how does the bridge reproduce native model events, and how does it exclude listeners?
 11. `EventReplayer::states()`, `EventReplayer::transition()` and the private `EventBridge::transitions()`: how does a mirrored state change run its trigger?
