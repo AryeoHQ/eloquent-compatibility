@@ -6,6 +6,8 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class AffectedRecords
@@ -18,8 +20,7 @@ final readonly class AffectedRecords
     public function before(ConnectionInterface $connection, Model $model, Operation $operation): array
     {
         $records = $this->of($connection, $model, $operation, false);
-        $native = $this->native($connection, $model);
-        $this->lock($connection, $native === null ? $records : [...array_values($records), $native]);
+        $this->lock($connection, [...array_values($records), ...$this->lockedOnly($connection, $model, $operation)]);
         $newcomers = array_diff_key($this->of($connection, $model, $operation, false), $records);
         $this->lock($connection, $newcomers);
 
@@ -64,14 +65,9 @@ final readonly class AffectedRecords
                     continue;
                 }
 
-                $primaryForeignKey = $resolvedMap->primaryForeignKey($dependent);
-                $primaries = array_unique(array_filter(
-                    [$operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $primaryForeignKey), $this->loaded($model, $primaryForeignKey)],
-                    fn (null|int|string $value) => $value !== null,
-                ));
                 $previousKeys = [];
 
-                foreach ($primaries as $primary) {
+                foreach ($this->primaries($connection, $model, $operation, $resolvedMap, $dependent) as $primary) {
                     $previousKeys = [...$previousKeys, ...$keyTranslator->previousKeys($connection, $primary)];
                 }
             }
@@ -119,6 +115,39 @@ final readonly class AffectedRecords
                 [$record->keyValue],
             );
         }
+    }
+
+    /**
+     * @return list<AffectedRecord>
+     */
+    private function lockedOnly(ConnectionInterface $connection, Model $model, Operation $operation): array
+    {
+        $native = $this->native($connection, $model);
+        $records = $native === null ? [] : [$native];
+
+        foreach ($this->mirrorIndex->forModel($model::class) as $member) {
+            $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
+            $dependent = $resolvedMap->dependent($member->alias);
+
+            foreach ($dependent === null ? [] : $this->primaries($connection, $model, $operation, $resolvedMap, $dependent) as $primary) {
+                $records[] = $this->mirrorIndex->keyTranslator($member->map)->currentRecord((string) $resolvedMap->primaryCurrentModel->alias, $primary);
+            }
+        }
+
+        return $records;
+    }
+
+    /**
+     * @return list<int|string>
+     */
+    private function primaries(ConnectionInterface $connection, Model $model, Operation $operation, ResolvedMap $resolvedMap, DependentCurrentModel $dependent): array
+    {
+        $primaryForeignKey = $resolvedMap->primaryForeignKey($dependent);
+
+        return array_values(array_unique(array_filter(
+            [$operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table((string) $dependent->alias), $primaryForeignKey), $this->loaded($model, $primaryForeignKey)],
+            fn (null|int|string $value) => $value !== null,
+        )));
     }
 
     private function native(ConnectionInterface $connection, Model $model): null|AffectedRecord

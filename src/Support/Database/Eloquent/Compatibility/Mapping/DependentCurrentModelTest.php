@@ -77,6 +77,20 @@ final class DependentCurrentModelTest extends TestCase
     }
 
     #[Test]
+    public function a_dependent_row_that_becomes_readable_through_an_update_fills_an_empty_designation(): void
+    {
+        $gadget = $this->gadget();
+        $place = $this->place($gadget, '1 Child St', parent: $this->place($this->gadget(), 'Elsewhere'));
+        $this->assertNull($this->designation($gadget));
+
+        DB::table('gadget_places')->where('id', $place)->update(['parent_id' => null]);
+        DB::table('widgets')->where('gadget_id', $gadget)->update(['street' => '2 Readable St']);
+
+        $this->assertSame($place, $this->designation($gadget));
+        $this->assertSame(['2 Readable St'], DB::table('gadget_places')->where('gadget_id', $gadget)->pluck('street')->all());
+    }
+
+    #[Test]
     public function the_previous_model_reads_no_dependent_row_once_its_designated_row_is_no_longer_readable_and_reads_no_other(): void
     {
         [$gadget, $first, $lower] = $this->gadgetWithTwoRoots();

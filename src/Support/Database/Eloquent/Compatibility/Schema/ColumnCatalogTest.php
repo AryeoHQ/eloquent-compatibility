@@ -87,7 +87,7 @@ final class ColumnCatalogTest extends TestCase
         $this->assertEquals(
             [
                 'id' => new Column('integer', null, true, true, true),
-                'ticket' => new Column('integer', null, true, true, false),
+                'ticket' => new Column('integer', "nextval(pg_get_serial_sequence('public.numbered', 'ticket')::regclass)", true, true, false),
                 'name' => new Column('text', null, true),
                 'shout' => new Column('text', null, false, true, true),
             ],

@@ -31,7 +31,7 @@ The check reads only the registry. A map reaches it through `CompatibilityMaps::
 | `DriftCheck::OrphanCurrent` | `DriftQueries::orphanCurrents()` | a primary row that no retained row links |
 | `DriftCheck::MoreThanOnePrimary` | `DriftQueries::sharedPrimaries()` | a primary row that more than one retained row links |
 | `DriftCheck::RefusedState` | `DriftQueries::refusedStates()` | a row in a refused state that names `UnrepresentableState::checkedOn()` |
-| `DriftCheck::Designation` | `DriftQueries::brokenDesignations()` | a designation that names a missing row, or a row of another primary row |
+| `DriftCheck::Designation` | `DriftQueries::brokenDesignations()` | a designation that names a missing row or a row of another primary row, or an empty one whose record has a readable row |
 
 `DriftQueries::previousWithoutCurrent()` and `DriftQueries::brokenDesignations()` skip the records a hidden state covers, as the view does. A refused state checked only on previous-model updates has no check, and neither has a degraded state.
 
@@ -44,5 +44,6 @@ The backing value of each `DriftCheck` case is the label the table prints. `Chec
 - `CheckDriftTest::it_checks_only_the_compatibility_maps_it_is_given()`: the `--map` option.
 - `CheckDriftTest::it_fails_and_names_the_cause_when_no_compatibility_map_is_registered()`: an empty registry.
 - `DependentCurrentModelTest::the_check_names_a_designation_of_a_missing_row_or_of_a_row_of_another_record()`: the designation check.
+- `DriftQueriesTest::it_finds_an_empty_designation_whose_record_has_a_readable_row()`: an empty designation.
 - `ProviderTest::it_registers_the_divergence_check()`: the command's registration.
 - `DriftQueriesTest`: each of the five queries on its own, the hidden-state filter, and the order and limit of the report.

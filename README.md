@@ -109,7 +109,7 @@ The serialization has limits:
 - **A state checked on the primary current model's table is not serialized.** Two concurrent writes can both reach it. Enforce a rule that compares rows of that table with a unique or exclusion constraint. `compatibility:check` still reports a row in the state.
 - **A condition that compares rows of different records, or reads another table, can still race.**
 - **Under REPEATABLE READ, the check after the wait misses the row the other writer committed.** The serialization holds under READ COMMITTED, PostgreSQL's default.
-- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** PostgreSQL raises 40P01 for one of the two, as it does for the same pattern through the event bridge.
+- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** PostgreSQL raises 40P01 for one of the two. A write through the event bridge locks the primary row first and waits instead, unless the application locked the dependent row itself.
 
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.

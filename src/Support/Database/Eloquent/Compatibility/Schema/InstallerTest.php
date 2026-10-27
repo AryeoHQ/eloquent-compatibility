@@ -565,6 +565,33 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    public function it_keeps_every_grant_the_default_privileges_add_off_the_view_it_creates(string $method): void
+    {
+        $reader = $this->role('compatibility_reader');
+        DB::statement('alter default privileges in schema public grant select, update on tables to public');
+        DB::statement('alter default privileges in schema public grant delete on tables to '.SqlFragments::identifier($reader).' with grant option');
+
+        try {
+            if ($method === 'install') {
+                resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+                resolve(Installer::class)->install(new WidgetCompatibilityMap);
+            } else {
+                resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+            }
+        } finally {
+            DB::statement('alter default privileges in schema public revoke select, update on tables from public');
+            DB::statement('alter default privileges in schema public revoke delete on tables from '.SqlFragments::identifier($reader));
+        }
+
+        $this->assertSame(
+            ['public selects' => false, 'public updates' => false, 'reader deletes' => false],
+            ['public selects' => $this->viewPrivilege('public', 'SELECT'), 'public updates' => $this->viewPrivilege('public', 'UPDATE'), 'reader deletes' => $this->viewPrivilege($reader, 'DELETE')],
+        );
+    }
+
+    #[Test]
     public function it_copies_the_owners_privileges_to_the_view_when_the_retained_table_was_never_granted(): void
     {
         $owner = $this->role('compatibility_owner');

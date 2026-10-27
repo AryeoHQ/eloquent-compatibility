@@ -313,10 +313,42 @@ final class AffectedRecordsTest extends TestCase
         [$snapshots, $locks] = $this->locking(fn () => $this->affectedRecords->before(DB::connection(), GadgetPlace::query()->findOrFail($place), Operation::Update));
 
         $this->assertSame([
+            ['select 1 from "gadgets" where "id" = ? for update', [$gadget]],
             ['select 1 from "retained_widgets" where "id" = ? for update', [$widget->getKey()]],
             ['select 1 from "gadget_places" where "id" = ? for update', [$place]],
         ], $locks);
         $this->assertSame(['widgets#'.$widget->getKey()], array_keys($snapshots));
+    }
+
+    #[Test]
+    public function it_locks_every_primary_row_a_dependent_write_names_before_its_retained_rows_and_snapshots_none_of_them(): void
+    {
+        $first = $this->widget();
+        $second = Widget::query()->create(['title' => 'Second gadget'])->refresh();
+        [$gadget, $root] = $this->currentKeys($first);
+        $moved = GadgetPlace::query()->findOrFail($root);
+        $moved->setAttribute('gadget_id', $second->gadget_id);
+        $gadgets = [$gadget, (string) $second->gadget_id];
+        sort($gadgets);
+
+        [$inserted, $insertLocks] = $this->locking(fn () => $this->affectedRecords->before(DB::connection(), new GadgetPlace(['gadget_id' => $gadget, 'parent_id' => $root, 'street' => '2 Child St']), Operation::Insert));
+        [$updated, $updateLocks] = $this->locking(fn () => $this->affectedRecords->before(DB::connection(), $moved, Operation::Update));
+
+        $this->assertSame([
+            ['select 1 from "gadgets" where "id" = ? for update', [$gadget]],
+            ['select 1 from "retained_widgets" where "id" = ? for update', [$first->getKey()]],
+        ], $insertLocks);
+        $this->assertSame([
+            ['select 1 from "gadgets" where "id" = ? for update', [$gadgets[0]]],
+            ['select 1 from "gadgets" where "id" = ? for update', [$gadgets[1]]],
+            ['select 1 from "retained_widgets" where "id" = ? for update', [$first->getKey()]],
+            ['select 1 from "retained_widgets" where "id" = ? for update', [$second->getKey()]],
+            ['select 1 from "gadget_places" where "id" = ? for update', [$root]],
+        ], $updateLocks);
+        $this->assertSame(
+            [['widgets#'.$first->getKey()], $this->sorted(['widgets#'.$first->getKey() => RecordRole::Previous, 'widgets#'.$second->getKey() => RecordRole::Previous])],
+            [array_keys($inserted), $this->sorted(array_map(fn (RecordSnapshot $snapshot) => $snapshot->record->role, $updated))],
+        );
     }
 
     #[Test]

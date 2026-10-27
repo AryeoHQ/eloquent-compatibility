@@ -28,20 +28,43 @@ final class PendingMirroredWriteTest extends TestCase
 
     /**
      * @param  list<mixed>  $bindings
+     * @param  array<string, string>  $dirty
      */
     #[Test]
-    #[TestWith([Operation::Insert, 'insert into "widgets" ("id", "title") values (?, ?) returning "id"', [7, 'Blue gadget'], true])]
-    #[TestWith([Operation::Insert, 'update "widgets" set "title" = ? where "id" = ?', ['Blue gadget', 7], false])]
-    #[TestWith([Operation::Insert, 'delete from "widgets" where "id" = ?', [7], false])]
-    #[TestWith([Operation::Update, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], false])]
-    #[TestWith([Operation::Update, 'update "widgets" set "title" = ? where "id" = ?', ['Blue gadget', 7], true])]
-    #[TestWith([Operation::Update, 'delete from "widgets" where "id" = ?', [7], false])]
-    #[TestWith([Operation::Delete, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], false])]
-    #[TestWith([Operation::Delete, 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', ['2026-10-26 12:00:00', '2026-10-26 12:00:00', 7], true])]
-    #[TestWith([Operation::Delete, 'delete from "widgets" where "id" = ?', [7], true])]
-    public function it_expects_the_operation_of_its_model_event_and_a_soft_delete_for_a_delete(Operation $operation, string $sql, array $bindings, bool $expected): void
+    #[TestWith([Operation::Insert, 'insert into "widgets" ("id", "title") values (?, ?) returning "id"', [7, 'Blue gadget'], [], true])]
+    #[TestWith([Operation::Insert, 'update "widgets" set "title" = ? where "id" = ?', ['Renamed', 7], ['title' => 'Renamed'], false])]
+    #[TestWith([Operation::Insert, 'delete from "widgets" where "id" = ?', [7], [], false])]
+    #[TestWith([Operation::Update, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], [], false])]
+    #[TestWith([Operation::Update, 'update "widgets" set "title" = ? where "id" = ?', ['Renamed', 7], ['title' => 'Renamed'], true])]
+    #[TestWith([Operation::Update, 'delete from "widgets" where "id" = ?', [7], [], false])]
+    #[TestWith([Operation::Delete, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], [], false])]
+    #[TestWith([Operation::Delete, 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', ['2026-10-26 12:00:00', '2026-10-26 12:00:00', 7], ['deleted_at' => '2026-10-26 12:00:00', 'updated_at' => '2026-10-26 12:00:00'], true])]
+    #[TestWith([Operation::Delete, 'delete from "widgets" where "id" = ?', [7], [], true])]
+    public function it_expects_the_operation_of_its_model_event_and_a_soft_delete_for_a_delete(Operation $operation, string $sql, array $bindings, array $dirty, bool $expected): void
     {
-        $this->assertSame($expected, $this->pendingWrite($this->widget(), $operation)->expects($this->parsed($sql), $bindings));
+        $this->assertSame($expected, $this->pendingWrite($this->widget()->forceFill($dirty), $operation)->expects($this->parsed($sql), $bindings));
+    }
+
+    /**
+     * @param  array<string, string>  $dirty
+     */
+    #[Test]
+    #[TestWith([Operation::Update, ['title' => 'Renamed', 'updated_at' => '2026-10-26 12:00:00'], 'update "widgets" set "title" = ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([Operation::Update, ['title' => 'Renamed'], 'update "widgets" set "title" = ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([Operation::Update, ['title' => 'Renamed'], 'update "widgets" set "sku" = ? where "id" = ?', false])]
+    #[TestWith([Operation::Update, ['title' => 'Renamed'], 'update "widgets" set "sku" = ?, "title" = ? where "id" = ?', false])]
+    #[TestWith([Operation::Update, ['title' => 'Renamed', 'sku' => 'Touched'], 'update "widgets" set "title" = ? where "id" = ?', false])]
+    #[TestWith([Operation::Update, ['title' => 'Renamed'], 'update "widgets" set ("title") = row(?) where "id" = ?', false])]
+    #[TestWith([Operation::Delete, ['deleted_at' => '2026-10-26 12:00:00', 'updated_at' => '2026-10-26 12:00:00'], 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([Operation::Delete, ['title' => 'Renamed', 'deleted_at' => '2026-10-26 12:00:00'], 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([Operation::Delete, [], 'update "widgets" set "deleted_by" = ? where "id" = ?', false])]
+    #[TestWith([Operation::Delete, [], 'update "widgets" set "deleted_at" = ? where "id" = ?', false])]
+    #[TestWith([Operation::Delete, ['deleted_at' => '2026-10-26 12:00:00'], 'update "widgets" set "updated_at" = ? where "id" = ?', false])]
+    public function it_expects_an_update_that_sets_exactly_its_models_changes_and_a_soft_delete_that_sets_only_changed_columns_and_the_deleted_at_column(Operation $operation, array $dirty, string $sql, bool $expected): void
+    {
+        $bindings = [...array_fill(0, substr_count($sql, '?') - 1, 'Bound'), 7];
+
+        $this->assertSame($expected, $this->pendingWrite($this->widget()->forceFill($dirty), $operation)->expects($this->parsed($sql), $bindings));
     }
 
     /**
@@ -56,7 +79,7 @@ final class PendingMirroredWriteTest extends TestCase
     #[TestWith([Operation::Delete, 'delete from "widgets"', [], false])]
     public function it_expects_an_update_or_delete_only_when_the_statement_binds_its_models_key_for_saving(Operation $operation, string $sql, array $bindings, bool $expected): void
     {
-        $this->assertSame($expected, $this->pendingWrite($this->widget(), $operation)->expects($this->parsed($sql), $bindings));
+        $this->assertSame($expected, $this->pendingWrite($this->widget()->forceFill(['sku' => 'Touched']), $operation)->expects($this->parsed($sql), $bindings));
     }
 
     #[Test]
@@ -108,7 +131,7 @@ final class PendingMirroredWriteTest extends TestCase
     #[TestWith(['Legacy.Widgets', 'update "legacy"."Widgets" set "title" = ? where "id" = ?'])]
     public function it_expects_a_write_to_its_relation_whatever_the_schema_of_either_name(string $table, string $sql): void
     {
-        $this->assertTrue($this->pendingWrite($this->widget()->setTable($table), Operation::Update)->expects($this->parsed($sql), ['Renamed', 7]));
+        $this->assertTrue($this->pendingWrite($this->widget()->setTable($table)->forceFill(['title' => 'Renamed']), Operation::Update)->expects($this->parsed($sql), ['Renamed', 7]));
     }
 
     #[Test]

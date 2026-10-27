@@ -299,6 +299,46 @@ final class EventReplayerTest extends TestCase
     }
 
     #[Test]
+    public function it_accepts_a_listener_rewrite_of_a_json_column_that_only_reorders_the_keys_of_its_objects(): void
+    {
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->jsonb('specs')->nullable();
+        });
+        $id = $this->gadget(['specs' => '{"color": "blue", "parts": {"left": 1, "right": 2}}']);
+        $before = $this->row('gadgets', $id);
+        DB::table('gadgets')->where('id', $id)->update(['price_cents' => 1250]);
+        Event::listen('eloquent.updating: '.Gadget::class, function (Gadget $gadget): void {
+            $gadget->setAttribute('specs', '{"parts":{"right":2,"left":1},"color":"blue"}');
+        });
+
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $this->row('gadgets', $id), $this->source, 'pgsql');
+
+        $this->assertCount(1, $this->mirroredEvents());
+    }
+
+    #[Test]
+    #[TestWith(['{}', '[]'])]
+    #[TestWith(['[]', '{}'])]
+    #[TestWith(['{"parts": {}}', '{"parts": []}'])]
+    #[TestWith(['[{"parts": []}]', '[{"parts": {}}]'])]
+    public function it_refuses_a_listener_change_of_a_json_column_between_an_object_and_an_array(string $stored, string $changed): void
+    {
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->jsonb('specs')->nullable();
+        });
+        $id = $this->gadget(['specs' => $stored]);
+        $before = $this->row('gadgets', $id);
+        DB::table('gadgets')->where('id', $id)->update(['price_cents' => 1250]);
+        Event::listen('eloquent.updating: '.Gadget::class, function (Gadget $gadget) use ($changed): void {
+            $gadget->setAttribute('specs', $changed);
+        });
+
+        $refusal = $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $this->row('gadgets', $id), $this->source, 'pgsql'));
+
+        $this->assertStringEndsWith('changed specs', $refusal->refused);
+    }
+
+    #[Test]
     #[TestWith(['1', '001'])]
     #[TestWith(['1.50', '1.5'])]
     #[TestWith(['{"color": "blue"}', '{"color":"blue"}'])]

@@ -25,7 +25,7 @@ final readonly class Installer
             "select distinct rule.ev_class::regclass::text as name
              from pg_depend dependency join pg_rewrite rule on rule.oid = dependency.objid
              where dependency.classid = 'pg_rewrite'::regclass and dependency.refclassid = 'pg_class'::regclass
-               and dependency.refobjid = to_regclass(?) and rule.ev_class <> dependency.refobjid
+               and dependency.refobjid = to_regclass(quote_ident(current_schema()) || '.' || ?) and rule.ev_class <> dependency.refobjid
              order by 1",
             [SqlFragments::identifier((string) $resolvedMap->previousModel->table)],
         );
@@ -49,7 +49,7 @@ final readonly class Installer
             $grants = $this->viewGrants($resolvedMap);
             $this->apply($resolvedMap);
             $columns = array_map(fn (object $column) => (string) $column->name, $this->connection->select(
-                'select attname as name from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not attisdropped',
+                "select attname as name from pg_attribute where attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attnum > 0 and not attisdropped",
                 [SqlFragments::identifier($resolvedMap->previousModel->view)],
             ));
 
@@ -78,7 +78,7 @@ final readonly class Installer
     private function apply(ResolvedMap $resolvedMap): void
     {
         foreach (array_unique([(string) $resolvedMap->previousModel->table, ...array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))]) as $table) {
-            if ($this->connection->scalar('select relrowsecurity from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($table)]) === true) {
+            if ($this->connection->scalar("select relrowsecurity from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($table)]) === true) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has row-level security enabled, and the compatibility view and its SECURITY DEFINER triggers would bypass its policies; map only tables without row-level security");
             }
         }
@@ -116,6 +116,24 @@ final readonly class Installer
 
         foreach ($compiledSql->statements() as $statement) {
             $this->connection->unprepared($statement);
+        }
+
+        $this->revokeDefaultPrivileges($resolvedMap);
+    }
+
+    private function revokeDefaultPrivileges(ResolvedMap $resolvedMap): void
+    {
+        $view = (string) $this->relation($resolvedMap->previousModel->view);
+
+        $grantees = $this->connection->select(
+            "select distinct CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END as grantee
+             from pg_class relation, aclexplode(relation.relacl) privilege
+             where relation.oid = ?::regclass and privilege.grantee <> relation.relowner",
+            [$view],
+        );
+
+        foreach ($grantees as $grantee) {
+            $this->connection->unprepared('REVOKE ALL ON '.$view.' FROM '.$grantee->grantee);
         }
     }
 
@@ -155,14 +173,14 @@ final readonly class Installer
         $grants = $this->connection->select(
             "select privilege.privilege_type || ' ON ' || ? || ' TO ' || {$grantee} || {$option} as statement
              from pg_class relation, aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) privilege
-             where relation.oid = to_regclass(?) and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(?))
+             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?))
              union all
              select privilege.privilege_type || ' (' || quote_ident(table_column.attname) || ') ON ' || ? || ' TO ' || {$grantee} || {$option}
              from pg_attribute table_column
-             join pg_attribute view_column on view_column.attrelid = to_regclass(?) and view_column.attname = table_column.attname and not view_column.attisdropped,
+             join pg_attribute view_column on view_column.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and view_column.attname = table_column.attname and not view_column.attisdropped,
              aclexplode(table_column.attacl) privilege
-             where table_column.attrelid = to_regclass(?) and table_column.attnum > 0 and not table_column.attisdropped
-               and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(?))",
+             where table_column.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and table_column.attnum > 0 and not table_column.attisdropped
+               and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?))",
             [$view, $table, $view, $view, $view, $table, $view],
         );
 

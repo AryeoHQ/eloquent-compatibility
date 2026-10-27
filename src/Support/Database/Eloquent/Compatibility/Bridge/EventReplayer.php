@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use ReflectionProperty;
+use stdClass;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
@@ -390,10 +391,22 @@ final class EventReplayer
         }
 
         if ($model->hasCast($column, self::JSON_CASTS) || in_array($type, ['json', 'jsonb'], true)) {
-            return is_string($before) && is_string($after) && json_validate($before) && json_validate($after) && json_decode($before, true) === json_decode($after, true);
+            return is_string($before) && is_string($after) && json_validate($before) && json_validate($after) && $this->json(json_decode($before)) === $this->json(json_decode($after));
         }
 
         return false;
+    }
+
+    private function json(mixed $value): mixed
+    {
+        if ($value instanceof stdClass) {
+            $members = array_map($this->json(...), get_object_vars($value));
+            ksort($members, SORT_STRING);
+
+            return ['object' => $members];
+        }
+
+        return is_array($value) ? ['array' => array_map($this->json(...), $value)] : $value;
     }
 
     private function number(float|int|string $value): null|string

@@ -28,7 +28,7 @@ Every compiled function first refuses with CM001 when it fires on a relation oth
 3. `Compiler::lockPrimary()` locks the primary row with `FOR UPDATE`.
 4. `Compiler::loadPrevious()` locks the retained row and loads it into `previous_row`. A missing row refuses with CM001, and the hint names `compatibility:check`.
 5. Each refused state with `UnrepresentableState::checkedOnPreviousUpdate()` refuses with CM001 when its condition holds.
-6. `Compiler::conflict()` locks each dependent row the record reads with `FOR UPDATE`, through `ResolvedMap::locate()`. It then reads every attribute through the tables. A row that differs from `OLD` raises 40001. A dependent row it no longer finds is not a conflict.
+6. `Compiler::conflict()` locks each dependent row the record reads with `FOR UPDATE`, through `ResolvedMap::locate()`, into `key_<alias>`. It then reads every attribute through the tables. A row that differs from `OLD` raises 40001. A dependent row it no longer finds is not a conflict.
 7. `Compiler::applying()` sets the applying flag, `Setting::Applying`, to the map's name.
 8. `Compiler::updateTable()` updates the primary row when one of its attributes changed. Any row count other than one refuses with CM001.
 9. `Compiler::updateTable()` updates the retained row the same way, with no row count check.
@@ -41,11 +41,12 @@ An attribute whose type has no default btree equality operator, such as `json`, 
 
 ## A dependent row
 
-`Compiler::updateDependent()` first finds the dependent row the previous model reads, with the subquery from `ResolvedMap::locate()`. The view reads through the same subquery.
+`Compiler::updateDependent()` writes the dependent row `Compiler::conflict()` locked in step 6, by its key in `key_<alias>`. It selects no row of its own.
 
-- A row was found: the trigger updates it.
-- No row was found, and the designation names a row that still exists: the trigger refuses with CM001. That row is no longer readable, or belongs to another record.
-- No row was found, and the `DependentCurrentModel::createdWhen()` condition holds: the trigger inserts the row and designates it. Without `DependentCurrentModel::createdWhen()`, the condition is that one of the dependent's attributes is not null.
+- A row was locked: the trigger updates it.
+- No row was locked, but the subquery from `ResolvedMap::locate()` finds one now: the trigger raises 40001. Another transaction made that row readable after the lock, and the trigger never read it. [INV-5](../invariants.md) records the rule.
+- No row was locked, and the designation names a row that still exists: the trigger refuses with CM001. That row is no longer readable, or belongs to another record.
+- No row was locked, and the `DependentCurrentModel::createdWhen()` condition holds: the trigger inserts the row and designates it. Without `DependentCurrentModel::createdWhen()`, the condition is that one of the dependent's attributes is not null.
 - Otherwise the trigger refuses with CM001: the record has no such row, and the map does not create one.
 
 ## An insert
@@ -55,10 +56,12 @@ An attribute whose type has no default btree equality operator, such as `json`, 
 1. `Compiler::notNullChecks()` refuses a null for a `NOT NULL` mapped attribute.
 2. The trigger sets the applying flag.
 3. It inserts the primary row, with `PrimaryCurrentModel::fillWhenCreatedFromPrevious()` filling the columns no attribute writes.
-4. It inserts the retained row, linked to the primary row.
+4. It inserts the retained row, linked to the primary row. A read-only retained attribute over a column the database always generates stays out of the insert, so the table fills it.
 5. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds. A dependent with a designation is designated too.
 6. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads. [INV-40](../invariants.md) records the rule.
 7. It clears the applying flag, stores the retained key in `Setting::Created` and returns `NEW`.
+
+An omitted attribute arrives as NULL, unless its view column has a default. `Compiler::insertValues()` writes `COALESCE(<value>, <default>)` to a target column that is `NOT NULL` and has a catalog default. So that default fills it, in the primary, retained and dependent inserts and in the update trigger's create branch. A nullable column with a default stores NULL. [INV-46](../invariants.md) records the rule.
 
 ## A delete
 
@@ -72,7 +75,7 @@ The other trigger functions react to writes that do not come through the view. `
 
 - `Compiler::primaryInsertFunction()`: a new primary row gets a retained row, filled by `PreviousModel::fillWhenCreatedFromCurrent()`. The trigger stores the new retained key in `Setting::Created`.
 - `Compiler::primaryDeleteFunction()`: a deleted primary row takes its retained rows with it.
-- `Compiler::designateFunction()`: a new readable dependent row fills an empty designation on its primary row's retained rows.
+- `Compiler::designateFunction()`: a dependent row that an insert or an update makes readable fills an empty designation on its primary row's retained rows.
 - `Compiler::refuseFunction()`: a row that enters a refused state refuses with CM001. It never skips, so it holds for every writer, the view included.
 
 ## The refused-state lock
@@ -93,7 +96,7 @@ The lock has four limits:
 - **A state checked on the primary table takes no lock.** A primary row has no primary foreign key, and its condition always compares different records. Its check can race, and two writers can both commit the state. Enforce a cross-row rule on the primary table with a unique or exclusion constraint instead. `compatibility:check` still reports a row in the state. [0016](../decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records the decision.
 - **A condition that compares rows of different records can still race.** So can a condition that reads another table, whose writers take no lock.
 - **Under REPEATABLE READ, the check after the wait misses the committed row.** The snapshot stays fixed for the whole transaction.
-- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** The view writer holds the primary row `FOR UPDATE` and waits on the dependent row. The refuse function's `FOR KEY SHARE` then waits on the view writer, and PostgreSQL raises 40P01. A raw write and a write through the event bridge both deadlock on this pattern. [INV-1](../invariants.md) records the exception.
+- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** The view writer holds the primary row `FOR UPDATE` and waits on the dependent row. The refuse function's `FOR KEY SHARE` then waits on the view writer, and PostgreSQL raises 40P01. A raw write deadlocks on this pattern. A write through the event bridge locks the primary row first, so it deadlocks only when the application locked the dependent row itself. [INV-1](../invariants.md) records the exception.
 
 ## Writes the view cannot take
 
@@ -101,4 +104,4 @@ An upsert, an update with a limit and a truncate fail on the view. The error is 
 
 ## Tests
 
-`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` covers the primary row lock, with a view writer in a child process. `DependentCurrentModelTest` covers designation. `CompilerTest::it_refuses_a_write_through_the_view_whose_retained_row_is_gone()` and `CompilerTest::it_refuses_a_write_through_the_view_that_updates_no_primary_row()` cover a write that is missing a row. `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` cover the conflict check. `CompilerTest::it_compares_a_json_attribute_by_its_text_in_every_write_through_the_view()` covers a `json` attribute. `CompilerTest::it_returns_every_attribute_of_an_insert_through_the_view_as_the_view_reads_it()` covers `INSERT ... RETURNING`. `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()` covers the relation check.
+`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` covers the primary row lock, with a view writer in a child process. `DependentCurrentModelTest` covers designation. `CompilerTest::it_refuses_a_write_through_the_view_whose_retained_row_is_gone()` and `CompilerTest::it_refuses_a_write_through_the_view_that_updates_no_primary_row()` cover a write that is missing a row. `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` cover the conflict check. `CompilerTest::it_raises_a_serialization_failure_when_the_dependent_row_it_waited_on_stops_being_readable_and_another_becomes_readable()` covers a dependent row found only after the lock. `CompilerTest::it_writes_the_default_of_a_not_null_current_column_that_an_insert_through_the_view_leaves_empty()` covers the defaults an insert keeps. `CompilerTest::it_compares_a_json_attribute_by_its_text_in_every_write_through_the_view()` covers a `json` attribute. `CompilerTest::it_returns_every_attribute_of_an_insert_through_the_view_as_the_view_reads_it()` covers `INSERT ... RETURNING`. `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()` covers the relation check.

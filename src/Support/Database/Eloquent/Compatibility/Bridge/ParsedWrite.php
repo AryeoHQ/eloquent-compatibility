@@ -27,9 +27,9 @@ final readonly class ParsedWrite
             return null;
         }
 
-        $wherePlaceholders = self::wherePlaceholders($sql);
+        $tokens = self::tokens($sql);
 
-        if ($wherePlaceholders === null) {
+        if ($tokens === null) {
             return null;
         }
 
@@ -38,8 +38,12 @@ final readonly class ParsedWrite
         return new self(
             $operation,
             self::identifier($matches[2]),
-            $operation === Operation::Insert ? self::columns(substr($sql, strlen($matches[0]))) : null,
-            $wherePlaceholders,
+            match ($operation) {
+                Operation::Insert => self::columns(substr($sql, strlen($matches[0]))),
+                Operation::Update => self::setColumns($sql, $tokens, strlen($matches[0])),
+                Operation::Delete => null,
+            },
+            self::wherePlaceholders($sql, $tokens),
         );
     }
 
@@ -62,16 +66,57 @@ final readonly class ParsedWrite
     }
 
     /**
-     * @return null|array<string, list<int>>
+     * @return null|list<string>
      */
-    private static function wherePlaceholders(string $sql): null|array
+    private static function setColumns(string $sql, string $tokens, int $offset): null|array
     {
-        $tokens = self::tokens($sql);
-
-        if ($tokens === null) {
+        if (preg_match('/\G\s+set\s/i', $tokens, $set, 0, $offset) !== 1) {
             return null;
         }
 
+        $start = $offset + strlen($set[0]);
+        preg_match_all('/[()\[\],]|\b(?:from|where|returning)\b/i', $tokens, $marks, PREG_OFFSET_CAPTURE, $start);
+        $columns = [];
+        $depth = 0;
+
+        foreach ([...$marks[0], ['', strlen($tokens)]] as [$mark, $position]) {
+            if ($mark === '(' || $mark === '[') {
+                $depth++;
+
+                continue;
+            }
+
+            if ($mark === ')' || $mark === ']') {
+                $depth--;
+
+                continue;
+            }
+
+            if ($depth > 0) {
+                continue;
+            }
+
+            if (preg_match('/^\s*('.self::IDENTIFIER.')\s*=/i', substr($tokens, $start, $position - $start), $assignment, PREG_OFFSET_CAPTURE) !== 1) {
+                return null;
+            }
+
+            $columns[] = self::identifier(substr($sql, $start + $assignment[1][1], strlen($assignment[1][0])));
+
+            if ($mark !== ',') {
+                return $columns;
+            }
+
+            $start = $position + 1;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<string, list<int>>
+     */
+    private static function wherePlaceholders(string $sql, string $tokens): array
+    {
         if (preg_match('/\swhere\s/i', $tokens, $where, PREG_OFFSET_CAPTURE) !== 1) {
             return [];
         }

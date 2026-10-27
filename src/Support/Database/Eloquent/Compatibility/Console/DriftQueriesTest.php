@@ -134,6 +134,20 @@ final class DriftQueriesTest extends TestCase
     }
 
     #[Test]
+    public function it_finds_an_empty_designation_whose_record_has_a_readable_row(): void
+    {
+        $this->install($this->designated());
+        $emptied = $this->gadget();
+        $this->place($emptied);
+        $this->place($this->gadget(), $this->place($this->gadget()));
+        DB::table('retained_widgets')->where('gadget_id', $emptied)->update(['place_id' => null]);
+
+        $this->assertFindings([
+            [DriftCheck::Designation, 'retained_widgets#'.$this->retainedKey($emptied), 'retained_widgets.place_id', 'it names no gadget_places row, and the record has a readable one'],
+        ]);
+    }
+
+    #[Test]
     public function it_reports_the_checks_in_order_and_at_most_the_limit_of_each_lowest_key_first(): void
     {
         $this->install();

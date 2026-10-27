@@ -703,6 +703,52 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['updating', ModelEvent::Updated])]
+    #[TestWith(['deleting', ModelEvent::Trashed])]
+    public function it_mirrors_a_write_on_its_own_statement_and_not_on_a_later_listeners_write_to_the_same_record(string $event, ModelEvent $mirrored): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        Event::listen("eloquent.{$event}: ".Widget::class.'*', function (string $name, array $payload): void {
+            if ($payload[0] instanceof Widget) {
+                DB::table('widgets')->where('id', $payload[0]->getKey())->update(['sku' => 'Written by a listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $event === 'updating' ? $widget->update(['title' => 'Renamed']) : $widget->delete();
+
+        $this->assertMirrored(Gadget::class, $mirrored, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertSame('Written by a listener', DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+    }
+
+    #[Test]
+    public function it_mirrors_an_increment_whose_statement_also_sets_the_updated_at_column(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $this->recordMirroredEvents();
+
+        $widget->increment('latitude', 1.5);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === 49.0);
+    }
+
+    #[Test]
+    public function it_mirrors_the_soft_delete_of_a_model_that_holds_an_unsaved_change(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $widget->setAttribute('title', 'Never saved');
+        $this->recordMirroredEvents();
+
+        $widget->delete();
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Trashed, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertSame('Blue gadget', DB::table('gadgets')->where('id', $widget->gadget_id)->value('name'));
+    }
+
+    #[Test]
     public function it_mirrors_an_update_that_sets_a_raw_expression_holding_a_question_mark(): void
     {
         $this->mirror();

@@ -129,7 +129,7 @@ final class Compiler
         $previousColumns = [];
 
         foreach ($resolvedMap->attributes as $attribute) {
-            if ($attribute->retained) {
+            if ($attribute->retained && ! ($this->columnCatalog->of((string) $previous->table)[$attribute->column]->alwaysGenerated ?? false)) {
                 $previousColumns[$attribute->column] = $this->value($resolvedMap, $previousAlias, new TargetColumn($previousAlias, $attribute->column, 'NEW.'.SqlFragments::identifier($attribute->column)));
             }
         }
@@ -343,7 +343,7 @@ final class Compiler
         }
 
         foreach ($resolvedMap->designated() as $dependent) {
-            $triggers[] = $trigger($resolvedMap->designateFunctionName($dependent), 'AFTER INSERT ON '.SqlFragments::identifier($resolvedMap->table((string) $dependent->alias)));
+            $triggers[] = $trigger($resolvedMap->designateFunctionName($dependent), 'AFTER INSERT OR UPDATE ON '.SqlFragments::identifier($resolvedMap->table((string) $dependent->alias)));
         }
 
         return $triggers;
@@ -382,7 +382,7 @@ final class Compiler
         $table = $resolvedMap->table($alias);
         $refused = SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused a change to ".implode(', ', $columns)." on {$previous->view} record ")
             .' || OLD.'.SqlFragments::identifier((string) $previous->keyColumn).'::text';
-        $cases = [];
+        $cases = ['EXISTS (SELECT 1 '.$resolvedMap->locate($dependent, $primaryKey, 'previous_row').')' => $this->concurrentChange($resolvedMap)];
 
         if ($dependent->designationColumn !== null) {
             $designation = $previous->table.'.'.$dependent->designationColumn;
@@ -402,7 +402,6 @@ final class Compiler
         }
 
         return '  IF '.SqlFragments::changed($columns, $this->comparedAsText($resolvedMap, $assignments))." THEN\n"
-            .'    SELECT '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' INTO key_'.$alias.' '.$resolvedMap->locate($dependent, $primaryKey, 'previous_row').";\n"
             .'    IF key_'.$alias." IS NULL THEN\n"
             .$branches
             ."\n      ELSE\n        "
@@ -470,7 +469,9 @@ final class Compiler
 
         foreach ($resolvedMap->assignmentsTo($alias) as $assignment) {
             if (! $mappedOnly || ! $assignment->attribute->retained) {
-                $values[$assignment->targetColumn->column] = $this->value($resolvedMap, $alias, $assignment->targetColumn);
+                $value = $this->value($resolvedMap, $alias, $assignment->targetColumn);
+                $column = $this->columnCatalog->of($resolvedMap->table($alias))[$assignment->targetColumn->column];
+                $values[$assignment->targetColumn->column] = $column->notNull && $column->default !== null ? 'COALESCE('.$value.', '.$column->default.')' : $value;
             }
         }
 
@@ -590,13 +591,20 @@ final class Compiler
             .' WHERE '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = OLD.'.SqlFragments::identifier((string) $previous->keyColumn)
             .' AND ROW('.implode(', ', array_map($read, $resolvedMap->attributes)).')'
             .' IS DISTINCT FROM ROW('.implode(', ', array_map(fn (Attribute $attribute) => $this->compared($resolvedMap, $attribute, 'OLD.'.SqlFragments::identifier($attribute->column)), $resolvedMap->attributes)).")) THEN\n    "
-            .SqlFragments::raise(
-                SqlState::SerializationFailure,
-                SqlFragments::literal("Compatibility map '{$resolvedMap->name}' found a concurrent change to {$previous->view} record ")
-                    .' || OLD.'.SqlFragments::identifier((string) $previous->keyColumn).'::text || '.SqlFragments::literal(" since this statement's snapshot"),
-                "An INSTEAD OF trigger receives OLD from the statement's snapshot and cannot re-read the row, so writing would lose that change.",
-                "Retry the transaction, or write through the {$previous->model} model: the event bridge locks the record before its statement.",
-            )."\n  END IF;";
+            .$this->concurrentChange($resolvedMap)."\n  END IF;";
+    }
+
+    private function concurrentChange(ResolvedMap $resolvedMap): string
+    {
+        $previous = $resolvedMap->previousModel;
+
+        return SqlFragments::raise(
+            SqlState::SerializationFailure,
+            SqlFragments::literal("Compatibility map '{$resolvedMap->name}' found a concurrent change to {$previous->view} record ")
+                .' || OLD.'.SqlFragments::identifier((string) $previous->keyColumn).'::text || '.SqlFragments::literal(" since this statement's snapshot"),
+            "An INSTEAD OF trigger receives OLD from the statement's snapshot and cannot re-read the row, so writing would lose that change.",
+            "Retry the transaction, or write through the {$previous->model} model: the event bridge locks the record before its statement.",
+        );
     }
 
     private function loadPrevious(ResolvedMap $resolvedMap): string
@@ -696,6 +704,12 @@ final class Compiler
 
         if ($columns === []) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "the retained table {$table} does not exist");
+        }
+
+        foreach (array_unique(array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))) as $currentTable) {
+            if ($this->columnCatalog->of($currentTable) === []) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, "the current table {$currentTable} does not exist");
+            }
         }
 
         $designations = array_map(fn (DependentCurrentModel $dependent) => (string) $dependent->designationColumn, $resolvedMap->designated());

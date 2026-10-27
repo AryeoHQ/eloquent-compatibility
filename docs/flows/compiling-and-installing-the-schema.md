@@ -21,7 +21,7 @@ flowchart LR
 4. It opens one transaction with `Connection::transaction()`, which takes a savepoint inside a caller's transaction. Steps 5 to 8 run inside it.
 5. `Installer::apply()` refuses a retained or current table with row-level security, then compiles. A refusal or a compile error leaves the database unchanged. [INV-38](../invariants.md) records the refusal.
 6. `Installer::dropObjects()` drops every trigger whose name starts with the map's object prefix and whose table and function are in the current schema. It then drops every function with that prefix in the current schema.
-7. `Installer::apply()` runs each of `CompiledSql::statements()` with `Connection::unprepared()`.
+7. `Installer::apply()` runs each of `CompiledSql::statements()` with `Connection::unprepared()`. The private `Installer::revokeDefaultPrivileges()` then revokes every grant the default privileges gave the new view, except its owner's. [INV-48](../invariants.md) records why.
 8. `Installer::copyPrivileges()` copies the retained table's grants to the view, except the grants held by the view's owner. A retained table that was never granted copies its owner's default privileges, through `acldefault()`. Column grants follow only for columns the view also has.
 
 A failed statement rolls back the whole install, so it leaves nothing behind.
@@ -34,7 +34,7 @@ A failed statement rolls back the whole install, so it leaves nothing behind.
 
 So a recompile can drop, retype or reorder an attribute, which `CREATE OR REPLACE VIEW` cannot. [INV-41](../invariants.md) and [0022](../decisions/0022-a-recompile-replaces-the-view-and-refuses-its-dependents.md) record the rule. `Installer::uninstall()` drops the objects in one transaction, then the view when `Installer::relation()` finds it in the current schema. It leaves every table as it is. A failed recompile or uninstall therefore keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
 
-The schema scope lets one map name be installed in two schemas. Each install, recompile and uninstall changes only the objects in `current_schema()`. `Installer::dropObjects()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, and `Installer::relation()` through `quote_ident(current_schema())`. So a schema whose name needs quoting works too.
+The schema scope lets one map name be installed in two schemas. Each install, recompile and uninstall changes only the objects in `current_schema()`. `Installer::dropObjects()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, and `Installer::relation()` through `quote_ident(current_schema())`. So a schema whose name needs quoting works too. `ColumnCatalog::of()`, the row-level security check and every other lookup of a map table resolve it in that schema alone. A table found only further down the search path refuses at compile. [INV-47](../invariants.md) records the rule.
 
 ## Compiling
 
@@ -42,7 +42,7 @@ The `Compiler` constructor reads `current_schema()`, and each function pins its 
 
 `Compiler::validateColumns()` runs first and reads the catalog through `ColumnCatalog`. It refuses a map when:
 
-- the retained table does not exist;
+- the retained table, or a current table, does not exist in the current schema;
 - the retained table lacks the previous model's key, its primary foreign key or a designation column;
 - a retained attribute is not a column of the retained table;
 - an attribute writes the primary foreign key or a designation column of the retained table;
@@ -56,7 +56,7 @@ After it builds the functions, `Compiler::compile()` runs the private `Compiler:
 `CompiledSql::statements()` returns the statements in this order:
 
 1. The view, from `Compiler::view()`. It selects each attribute from the retained table joined to the primary current model's table. A retained attribute reads its own column. A mapped attribute is cast to its declared type, and a dependent's attribute reads through a subquery built by `ResolvedMap::locate()`. Each hidden state adds a `WHERE NOT` condition.
-2. One `ALTER VIEW ... ALTER COLUMN` per attribute, from `Compiler::defaults()`. An attribute with a default gets `SET DEFAULT`, and every other attribute gets `DROP DEFAULT`. The default is `Attribute::defaultsTo()`, or else the stored column's default on the retained or primary table. A dependent's column contributes none, and `ColumnCatalog::of()` reports no default for a generated column. A recompile therefore removes a default the map no longer declares.
+2. One `ALTER VIEW ... ALTER COLUMN` per attribute, from `Compiler::defaults()`. An attribute with a default gets `SET DEFAULT`, and every other attribute gets `DROP DEFAULT`. The default is `Attribute::defaultsTo()`, or else the stored column's default on the retained or primary table. A dependent's column contributes none, and `ColumnCatalog::of()` reports no default for a generated column. It reports a `GENERATED BY DEFAULT` identity's default as `nextval(pg_get_serial_sequence(...)::regclass)`, with the table's schema, so an insert that omits it takes the next value. A recompile therefore removes a default the map no longer declares.
 3. The five fixed trigger functions, one per `TriggerFunction` case: insert, update, delete, primary insert and primary delete. A `REVOKE EXECUTE ... FROM PUBLIC` follows each function, here and in the next two steps.
 4. One `refuse_<state>` function per refused state that names `UnrepresentableState::checkedOn()`. On a dependent's table or the retained table, it first locks the primary row and takes the refused-state lock. [Writing through the view](writing-through-the-view.md) describes the lock.
 5. One `designate_<alias>` function per dependent with `DependentCurrentModel::designatedBy()`.
@@ -70,7 +70,7 @@ compatibility__<name>__delete             INSTEAD OF DELETE                     
 compatibility__<name>__primary_insert     AFTER INSERT                          the primary current model's table
 compatibility__<name>__primary_delete     BEFORE DELETE                         the primary current model's table
 compatibility__<name>__refuse_<state>     BEFORE INSERT OR UPDATE               the table the state is checked on
-compatibility__<name>__designate_<alias>  AFTER INSERT                          the dependent's table
+compatibility__<name>__designate_<alias>  AFTER INSERT OR UPDATE                the dependent's table
 ```
 
 Each trigger shares its function's name. `Compiler::function()` writes every function as `SECURITY DEFINER` PL/pgSQL, quoted with the `$compatibility$` tag. Its first statement refuses with CM001 when `TG_RELID` names a relation other than the function's own or a partition of it. [INV-37](../invariants.md) records why. `Compiler::variables()` declares `previous_row`, `affected_rows` and one `key_<alias>` per current model.
@@ -91,6 +91,9 @@ Each trigger shares its function's name. `Compiler::function()` writes every fun
 - `InstallerTest::it_lets_no_other_role_execute_a_trigger_function_after_an_install_or_a_recompile()` and `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()`: the revoke and the relation check. `CompilerTest::it_runs_its_trigger_functions_on_the_partitions_of_a_partitioned_current_table()` pins a partitioned primary and dependent table.
 - `CompilerTest::it_refuses_a_not_null_column_without_a_default_that_an_insert_leaves_empty()` and `CompilerTest::it_counts_a_filled_default_identity_or_generated_column_as_filled_on_every_insert()`: the fill check.
 - `CompilerTest::it_refuses_a_writable_attribute_whose_column_the_database_always_generates()`, `CompilerTest::it_compiles_and_writes_a_writable_attribute_whose_column_is_a_default_identity()` and `InstallerTest::it_installs_and_recompiles_a_map_that_exposes_a_generated_column_read_only()`: the generated-column rule.
+- `CompilerTest::it_lets_the_table_number_an_identity_retained_key_that_an_insert_through_the_view_omits()`: an identity retained key, of either kind.
+- `CompilerTest::it_refuses_a_map_whose_current_table_is_outside_the_schema_it_installs_into()`: a table outside the current schema.
+- `InstallerTest::it_keeps_every_grant_the_default_privileges_add_off_the_view_it_creates()`: the revoke of default privileges, on an install and a recompile.
 - `InstallerTest::it_compiles_only_full_word_aliases_variables_and_object_names()`: the identifiers in the compiled SQL.
 - `ResolvedMapTest::it_refuses_an_attribute_the_tables_cannot_store()`, `DependentCurrentModelTest::it_refuses_a_designation_the_retained_table_does_not_have()` and `DependentCurrentModelTest::it_refuses_an_attribute_that_writes_the_designation()`: the compile-time refusals.
 - `CompilerTest::it_refuses_at_compile_time_a_map_the_tables_cannot_store()`: every compile-time refusal, the fill collision and the 63-character limit included.

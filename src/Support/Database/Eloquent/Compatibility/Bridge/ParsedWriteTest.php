@@ -105,9 +105,14 @@ final class ParsedWriteTest extends TestCase
     #[TestWith(['insert into "widgets" default values returning "id"', []])]
     #[TestWith(['INSERT INTO public.widgets (Title, "Odd ""Name""") VALUES (?, ?)', ['title', 'Odd "Name"']])]
     #[TestWith(['insert into "widgets" select * from "retained_widgets"', null])]
-    #[TestWith(['update "widgets" set "title" = ? where "id" = ?', null])]
+    #[TestWith(['update "widgets" set "title" = ?, "updated_at" = ? where "id" = ?', ['title', 'updated_at']])]
+    #[TestWith(['UPDATE public.widgets SET Title = lower(?), "Odd ""Name""" = coalesce("Odd ""Name""", ?) WHERE id = ?', ['title', 'Odd "Name"']])]
+    #[TestWith(['update "widgets" set "specs" = jsonb_set("specs", \'{a,b}\', ?), "tags" = ARRAY[1, 2] where "id" = ?', ['specs', 'tags']])]
+    #[TestWith(['update "widgets" set "count" = "count" + 1, "label" = \'from, where\' returning "id"', ['count', 'label']])]
+    #[TestWith(['update "widgets" set ("title", "sku") = (?, ?) where "id" = ?', null])]
+    #[TestWith(['update "widgets" where "id" = ?', null])]
     #[TestWith(['delete from "widgets" where "id" = ?', null])]
-    public function it_parses_the_columns_an_insert_names_and_none_for_another_write(string $sql, null|array $columns): void
+    public function it_parses_the_columns_an_insert_names_or_an_update_sets_and_none_for_a_delete(string $sql, null|array $columns): void
     {
         $this->assertSame($columns, ParsedWrite::of($sql)?->columns);
     }

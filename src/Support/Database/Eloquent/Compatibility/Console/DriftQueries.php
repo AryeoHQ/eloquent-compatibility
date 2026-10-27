@@ -130,15 +130,18 @@ final readonly class DriftQueries
             $alias = (string) $dependent->alias;
             $table = $resolvedMap->table($alias);
             $key = $alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias));
+            $designation = $previous->alias.'.'.SqlFragments::identifier((string) $dependent->designationColumn);
+            $dependentPrimaryForeignKey = $alias.'.'.SqlFragments::identifier($resolvedMap->primaryForeignKey($dependent));
 
             $rows = $this->connection->select(
-                'select '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' as key, '.$key.' is null as missing'
+                'select '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' as key, '.$designation.' is null as empty, '.$key.' is null as missing'
                 .' from '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
                 .' join '.SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
                 .' on '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = '.$primaryForeignKey
-                .' left join '.SqlFragments::identifier($table).' '.$alias.' on '.$key.' = '.$previous->alias.'.'.SqlFragments::identifier((string) $dependent->designationColumn)
-                .' where '.$previous->alias.'.'.SqlFragments::identifier((string) $dependent->designationColumn).' is not null'
-                .' and ('.$key.' is null or '.$alias.'.'.SqlFragments::identifier($resolvedMap->primaryForeignKey($dependent)).' is distinct from '.$primaryForeignKey.')'
+                .' left join '.SqlFragments::identifier($table).' '.$alias.' on '.$key.' = '.$designation
+                .' where (('.$designation.' is not null and ('.$key.' is null or '.$dependentPrimaryForeignKey.' is distinct from '.$primaryForeignKey.'))'
+                .' or ('.$designation.' is null and exists (select 1 from '.SqlFragments::identifier($table).' '.$alias
+                .' where '.$dependentPrimaryForeignKey.' = '.$primaryForeignKey.' and ('.$dependent->readableWhen.'))))'
                 .($hidden === [] ? '' : ' and not ('.implode(' or ', $hidden).')')
                 .' order by 1 limit ?',
                 [$limit],
@@ -150,9 +153,11 @@ final readonly class DriftQueries
                     DriftCheck::Designation,
                     $previous->table.'#'.$row->key,
                     $previous->table.'.'.$dependent->designationColumn,
-                    $row->missing
-                        ? "it names a {$table} row that does not exist"
-                        : "it names a {$table} row of another ".$resolvedMap->table($primary).' row',
+                    match (true) {
+                        $row->empty => "it names no {$table} row, and the record has a readable one",
+                        $row->missing => "it names a {$table} row that does not exist",
+                        default => "it names a {$table} row of another ".$resolvedMap->table($primary).' row',
+                    },
                 );
             }
         }

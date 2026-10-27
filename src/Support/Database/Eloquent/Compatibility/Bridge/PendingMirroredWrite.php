@@ -38,6 +38,10 @@ final class PendingMirroredWrite
             return $parsedWrite->columns === array_keys($this->source->getAttributes());
         }
 
+        if ($parsedWrite->operation === Operation::Update && ! $this->setsItsOwnChange($parsedWrite->columns ?? [])) {
+            return false;
+        }
+
         $key = $this->source->getRawOriginal($this->source->getKeyName()) ?? $this->source->getKey();
         $bindings = array_values($bindings);
 
@@ -45,5 +49,24 @@ final class PendingMirroredWrite
             $parsedWrite->wherePlaceholders[$this->source->getKeyName()] ?? [],
             fn (int $placeholder) => array_key_exists($placeholder, $bindings) && $bindings[$placeholder] === $key,
         );
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    private function setsItsOwnChange(array $columns): bool
+    {
+        $updatedAt = $this->source->usesTimestamps() ? $this->source->getUpdatedAtColumn() : null;
+        $touched = $updatedAt === null ? [] : [$updatedAt];
+        $set = array_values(array_unique([...$columns, ...$touched]));
+        $dirty = array_values(array_unique([...array_map(strval(...), array_keys($this->source->getDirty())), ...$touched]));
+        sort($set);
+        sort($dirty);
+
+        if ($this->operation === Operation::Update) {
+            return $columns !== [] && $set === $dirty;
+        }
+
+        return method_exists($this->source, 'getDeletedAtColumn') && in_array($this->source->getDeletedAtColumn(), $columns, true) && array_diff($set, $dirty) === [];
     }
 }
