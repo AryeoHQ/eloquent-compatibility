@@ -8,6 +8,8 @@ final readonly class ParsedWrite
 {
     private const string IDENTIFIER = '(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_]*)';
 
+    private const string NOT_A_PLACEHOLDER = '/(?<quoted>"(?:[^"]|"")*")|--[^\n]*|(?<comment>\/\*(?:[^\/*]|\*(?!\/)|\/(?!\*)|(?&comment))*\*\/)|(?<![\w$])[e]\'(?:[^\'\\\\]|\\\\.|\'\')*\'|\'(?:[^\']|\'\')*\'|(?<![\w$])\$(?<tag>(?:[a-z_\x80-\xff][\w\x80-\xff]*)?)\$.*?\$\k<tag>\$|\?\?/is';
+
     /**
      * @param  null|list<string>  $columns
      * @param  array<string, list<int>>  $wherePlaceholders
@@ -58,18 +60,29 @@ final readonly class ParsedWrite
      */
     private static function wherePlaceholders(string $sql): array
     {
-        if (preg_match('/\swhere\s/i', $sql, $where, PREG_OFFSET_CAPTURE) !== 1) {
+        $tokens = self::tokens($sql);
+
+        if (preg_match('/\swhere\s/i', $tokens, $where, PREG_OFFSET_CAPTURE) !== 1) {
             return [];
         }
 
-        preg_match_all('/(?:'.self::IDENTIFIER.'\.)?('.self::IDENTIFIER.')\s*=\s*\?/i', $sql, $equalities, PREG_SET_ORDER | PREG_OFFSET_CAPTURE, $where[0][1]);
+        preg_match_all('/(?:'.self::IDENTIFIER.'\.)?('.self::IDENTIFIER.')\s*=\s*\?/i', $tokens, $equalities, PREG_SET_ORDER | PREG_OFFSET_CAPTURE, $where[0][1]);
         $placeholders = [];
 
         foreach ($equalities as $equality) {
-            $placeholders[self::identifier($equality[1][0])][] = substr_count($sql, '?', 0, $equality[0][1] + strlen($equality[0][0]) - 1);
+            $placeholders[self::identifier(substr($sql, $equality[1][1], strlen($equality[1][0])))][] = substr_count($tokens, '?', 0, $equality[0][1] + strlen($equality[0][0]) - 1);
         }
 
         return $placeholders;
+    }
+
+    private static function tokens(string $sql): string
+    {
+        return (string) preg_replace_callback(
+            self::NOT_A_PLACEHOLDER,
+            fn (array $matches) => ($matches['quoted'] ?? '') !== '' ? '"'.str_repeat('x', strlen($matches[0]) - 2).'"' : str_repeat(' ', strlen($matches[0])),
+            $sql,
+        );
     }
 
     private static function identifier(string $identifier): string

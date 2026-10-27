@@ -703,6 +703,19 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_mirrors_an_update_that_sets_a_raw_expression_holding_a_question_mark(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => DB::raw("'Why?'")]);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertSame('Why?', DB::table('gadgets')->where('id', $widget->gadget_id)->value('name'));
+    }
+
+    #[Test]
     public function it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table(): void
     {
         $this->mirror();

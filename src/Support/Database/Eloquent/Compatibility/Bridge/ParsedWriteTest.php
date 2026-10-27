@@ -128,6 +128,29 @@ final class ParsedWriteTest extends TestCase
         $this->assertSame($placeholders, ParsedWrite::of($sql)?->wherePlaceholders);
     }
 
+    /**
+     * @param  array<string, list<int>>  $placeholders
+     */
+    #[Test]
+    #[TestWith(["update \"widgets\" set \"title\" = 'Why?', \"updated_at\" = ? where \"id\" = ?", ['id' => [1]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = 'It''s ?' where \"id\" = ?", ['id' => [0]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = ? where \"id\" = ? and \"sku\" <> '?'", ['id' => [1]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = E'It\\'s ?' where \"id\" = ?", ['id' => [0]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = e'\\\\' where \"id\" = ?", ['id' => [0]]])]
+    #[TestWith(['update "widgets" set "title" = $$Why? \'$$ where "id" = ?', ['id' => [0]]])]
+    #[TestWith(['update "widgets" set "title" = $why$Why? $$ $why$ where "id" = ?', ['id' => [0]]])]
+    #[TestWith(['update "widgets" set "Why?" = ? where "id" = ?', ['id' => [1]]])]
+    #[TestWith(['update "widgets" set "title" = ? where "a "" where id = ?" = ?', ['a " where id = ?' => [1]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = ? -- why?\nwhere \"id\" = ?", ['id' => [1]]])]
+    #[TestWith(['update "widgets" set "title" = ? /* why? /* where id = ? */ */ where "id" = ?', ['id' => [1]]])]
+    #[TestWith(['update "widgets" set "flags" = "flags" ?? ? where "id" = ?', ['id' => [1]]])]
+    #[TestWith(["update \"widgets\" set \"title\" = ' where id = ?' where \"sku\" = ?", ['sku' => [0]]])]
+    #[TestWith(["delete from \"widgets\" where \"title\" = 'id = ?'", []])]
+    public function it_counts_only_the_placeholders_outside_literals_identifiers_and_comments(string $sql, array $placeholders): void
+    {
+        $this->assertSame($placeholders, ParsedWrite::of($sql)?->wherePlaceholders);
+    }
+
     #[Test]
     public function it_parses_the_columns_of_the_insert_eloquent_emits_in_the_order_of_the_models_attributes(): void
     {
