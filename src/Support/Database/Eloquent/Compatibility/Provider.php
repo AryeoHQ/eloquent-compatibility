@@ -9,6 +9,7 @@ use Illuminate\Queue\Events\Looping;
 use Illuminate\Support\ServiceProvider;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
 use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
+use Support\Database\Eloquent\Compatibility\Console\CompileSql;
 
 class Provider extends ServiceProvider
 {
@@ -29,6 +30,6 @@ class Provider extends ServiceProvider
         $events->listen(Looping::class, $release);
         $this->app->terminating($release);
 
-        $this->commands([CheckDrift::class]);
+        $this->commands([CheckDrift::class, CompileSql::class]);
     }
 }

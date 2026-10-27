@@ -129,6 +129,16 @@ resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 
 `php artisan compatibility:check` names every record where the previous and current models disagree.
 
+`php artisan compatibility:sql` prints the statements the Installer runs for a registered compatibility map, so a reviewer or a database administrator can read them before a migration runs. It runs only catalog reads.
+
+```bash
+php artisan compatibility:sql widgets                          # install, to stdout
+php artisan compatibility:sql widgets --for=recompile          # or --for=uninstall
+php artisan compatibility:sql widgets --retained-table-is-currently=widgets --output=widgets.sql
+```
+
+`--retained-table-is-currently` compiles the map before the migration renames the retained table: the command reads the table's columns and grants from its current name. Before an install the view does not exist yet, so the command derives its grants from the retained table's grants and the map's attribute columns. The header comment names the map, the database and schema it read, the PostgreSQL version and the time. An invalid map, a missing table, or a map the Installer refuses exits non-zero with the reason.
+
 ### Refused states
 A refused state is a state one side can hold and the other cannot express, declared with `UnrepresentableState::refuse()`. Its `UnrepresentableState::checkedOn()` condition compiles to a trigger that refuses every insert or update reaching the state, whoever writes it. On a dependent current model's table or the retained table, that trigger serializes the writers of one record. So two concurrent writes to one record cannot both reach a state that compares the record's own rows.
 

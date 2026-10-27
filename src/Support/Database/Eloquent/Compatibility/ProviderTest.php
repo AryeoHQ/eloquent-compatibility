@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility;
 
 use Illuminate\Support\Env;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -54,5 +55,11 @@ class ProviderTest extends TestCase
         $this->artisan('compatibility:check', ['--map' => ['widgets']])
             ->expectsOutputToContain('No divergence in 1 compatibility map.')
             ->assertSuccessful();
+    }
+
+    #[Test]
+    public function it_registers_the_sql_command(): void
+    {
+        $this->assertArrayHasKey('compatibility:sql', Artisan::all());
     }
 }

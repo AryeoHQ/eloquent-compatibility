@@ -12,7 +12,7 @@ The package serves the previous model from a PostgreSQL view, the compatibility 
 
 The package has two halves, and both read one `ResolvedMap`.
 
-- **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view and its trigger functions, and `Installer` runs that SQL. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
+- **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view and its trigger functions, and `Installer` runs that SQL. `compatibility:sql` prints the same SQL without running it. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
 - **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again, and replays the events for each record that changed.
 
 A write that skips model events, such as a query builder update, still reaches the right tables through the triggers. Only the events are missing.
@@ -24,11 +24,12 @@ A write that skips model events, such as a query builder update, still reaches t
 | compatibility map | Contracts, Mapping | `CompatibilityMap` and the Mapping builders | the application's declaration |
 | resolved map | Mapping | `ResolvedMap::of()` | validates a map and answers every question about it |
 | registry | root | `CompatibilityMaps::register()`, `CompatibilityMaps::get()` | holds the application's maps by name |
-| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()` | reads the catalog, compiles SQL and installs it in one transaction |
+| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()`, `Installer::statements()` | reads the catalog, compiles SQL and installs it in one transaction |
 | model contract | Contracts, Provides | `Compatible`, `HasCompatibility` | marks each mapped model's own statement, and shows its model events to the event bridge |
 | PHPStan rules | Tooling\Database\Eloquent\Compatibility\PhpStan | `CompatibleMustUseHasCompatibility`, `HasCompatibilityMustImplementCompatible`, `HasCompatibilityMustOnlyBeOnModel`, `HasCompatibilityMustNotRedeclareWriteHooks` | report a model that breaks the model contract at analysis time |
 | event bridge | Bridge | `EventBridge::mirror()`, `EventBridge::withoutMirroring()` | mirrors model events across the two sides |
 | drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree |
+| SQL printer | Console | `compatibility:sql`, run by `CompileSql` | prints the statements an Installer method runs, and runs only catalog reads |
 | exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap`, `CompatibilityEventMirrorBypassed` | every error the package raises |
 | testing trait | Testing | `InteractsWithCompatibilityMaps` | records mirrored events for application tests |
 | provider | root | `Provider` | binds the singletons and releases failed writes |
@@ -42,11 +43,13 @@ flowchart LR
   Resolved --> Registry["CompatibilityMaps"]
   Registry --> Bridge["EventBridge"]
   Registry --> Check["CheckDrift"]
+  Registry --> Print["CompileSql"]
+  Print --> Installer
   Bridge --> Database
   Check --> Database
 ```
 
-`Installer` resolves each map itself and never reads the registry. `EventBridge::mirror()` registers the map it mirrors, so `CheckDrift` sees every mirrored map. Three namespaces carry a README of their own: [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Bridge](../src/Support/Database/Eloquent/Compatibility/Bridge/README.md).
+`Installer` resolves each map itself and never reads the registry. `CompileSql` takes a map from the registry and asks `Installer::statements()` for the statements it prints. `EventBridge::mirror()` registers the map it mirrors, so `CheckDrift` sees every mirrored map. Three namespaces carry a README of their own: [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Bridge](../src/Support/Database/Eloquent/Compatibility/Bridge/README.md).
 
 ## The life of a write
 
@@ -66,7 +69,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 The flows below take each step in depth:
 
 - [Declaring and registering a map](flows/declaring-and-registering-a-map.md)
-- [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md)
+- [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md), and printing its statements with `compatibility:sql`
 - [Writing through the view](flows/writing-through-the-view.md), the database side of steps 6 and 7
 - [Mirroring a write](flows/mirroring-a-write.md), the PHP side of steps 1 to 5 and 8 to 10
 - [Failure and rollback](flows/failure-and-rollback.md)
@@ -81,13 +84,14 @@ Read the code in this order. Each step answers one question.
 3. `CompatibilityMap`, `Attribute`, `DependentCurrentModel` and `UnrepresentableState`: what does each builder store?
 4. `ResolvedMap`: what does registration refuse, and how does a map locate a dependent row?
 5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first.
-6. `Installer` and `SqlFragments`: in what order does the SQL run, and how does it raise a refusal?
+6. `Installer`, `InstallerAction` and `SqlFragments`: which statements does each Installer method run, in what order, and how does it raise a refusal?
 7. `CompatibilityWriteRefused`: how does a refusal become a PHP exception?
 8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?
 10. `EventReplayer`: how does the bridge reproduce native model events, and how does it exclude listeners?
 11. `DriftQueries`: which five kinds of drift does the check find?
-12. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?
+12. `CompileSql`: how does a reviewer read the statements before a migration runs them?
+13. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?
 
 Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once. [Adopting a map](adopting-a-map.md) lists what changes for an application's code and tests once a model is mapped.
 

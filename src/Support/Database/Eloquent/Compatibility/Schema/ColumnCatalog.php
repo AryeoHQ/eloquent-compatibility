@@ -14,7 +14,14 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null) {}
+    /**
+     * @param  array<string, string>  $sources
+     */
+    public function __construct(
+        private readonly ConnectionInterface $connection,
+        private readonly null|string $searchPath = null,
+        private readonly array $sources = [],
+    ) {}
 
     /**
      * @return array<string, Column>
@@ -49,7 +56,7 @@ final class ColumnCatalog
     {
         return $this->connection->select(
             'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
-                    case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, table_relation.relname), table_column.attname)
+                    case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, ?::text), table_column.attname)
                          when table_column.attgenerated = \'\' then coalesce(pg_get_expr(column_default.adbin, column_default.adrelid), column_domain.inherited_default) end as "default",
                     table_column.attnotnull or column_domain.inherited_not_null as not_null,
                     table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
@@ -74,7 +81,7 @@ final class ColumnCatalog
              ) column_domain
              where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [SqlFragments::identifier($table)],
+            [$table, SqlFragments::identifier($this->source($table))],
         );
     }
 
@@ -93,6 +100,11 @@ final class ColumnCatalog
         } finally {
             $this->connection->rollBack();
         }
+    }
+
+    public function source(string $table): string
+    {
+        return $this->sources[$table] ?? $table;
     }
 
     public function type(string $table, string $column): null|string

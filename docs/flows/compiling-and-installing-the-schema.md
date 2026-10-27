@@ -1,50 +1,68 @@
 # Compiling and installing the schema
 
-This flow follows `Installer::install()` from a compatibility map to a compatibility view with its triggers. A migration calls it after it renames the previous model's table to the retained table.
+This flow follows `Installer::install()` from a compatibility map to a compatibility view with its triggers. A migration calls it after it renames the previous model's table to the retained table. It then follows `compatibility:sql`, which prints the same statements without running them.
 
 ```mermaid
 flowchart LR
-  Install["Installer::install()"] --> Resolve["ResolvedMap::of()"]
-  Resolve --> Compile["Compiler::compile()"]
+  Install["Installer::install()"] --> Statements["Installer::statements()"]
+  Print["CompileSql::handle()"] --> Statements
+  Statements --> Resolve["ResolvedMap::of()"]
+  Statements --> Compile["Compiler::compile()"]
   Compile --> Catalog["ColumnCatalog"]
-  Compile --> Sql["CompiledSql"]
-  Sql --> Drop["Installer::dropObjects()"]
-  Drop --> Run["run each statement"]
-  Run --> Grants["Installer::copyPrivileges()"]
+  Statements --> Drop["Installer::dropStatements()"]
+  Statements --> Grants["Installer::grantStatements()"]
+  Install --> Run["Installer::run()"]
+  Print --> Output["stdout or --output"]
 ```
 
 ## Installing
 
-An install resolves the map, checks the database, and then changes it in one transaction:
+An install lists its statements from catalog reads alone, and then runs them, all in one transaction:
 
-1. It resolves the map with `ResolvedMap::of()`.
-2. It refuses when a relation with the view's name already exists in the current schema. A relation of that name in a later schema on the search path does not count. The message points at `Installer::recompile()`.
-3. It refuses while another view or materialized view reads the retained table, and names each one. [INV-42](../invariants.md#inv-42-only-the-compatibility-view-reads-the-retained-table) records why, and [adopting a map](../adopting-a-map.md#before-the-install-views-on-the-old-table) how to redirect such a view.
-4. It opens one transaction with `Connection::transaction()`, which takes a savepoint inside a caller's transaction. Steps 5 to 8 run inside it.
-5. It refuses a retained or current table with row-level security, then compiles. A refusal or a compile error leaves the database unchanged. [INV-38](../invariants.md#inv-38-the-schema-refuses-a-table-with-row-level-security) records the refusal.
-6. It drops every trigger whose name starts with the map's object prefix, and whose table and function are in the current schema. It then drops every function with that prefix in the current schema.
-7. It runs each compiled statement with `Connection::unprepared()`. It then revokes every grant the default privileges gave the new view, except its owner's, as [INV-48](../invariants.md#inv-48-the-new-view-carries-no-grant-its-default-privileges-add) records.
-8. It copies the retained table's grants to the view, except the grants the view's owner holds. A retained table that was never granted copies its owner's default privileges, through `acldefault()`. Column grants follow only for columns the view also has.
+1. It opens one transaction with `Connection::transaction()`, which takes a savepoint inside a caller's transaction. Every later step runs inside it.
+2. It resolves the map with `ResolvedMap::of()`.
+3. It refuses when a relation with the view's name already exists in the current schema. A relation of that name in a later schema on the search path does not count. The message points at `Installer::recompile()`. [Before the rename](#before-the-rename) names the one exception.
+4. It refuses while another view or materialized view reads the retained table, and names each one. [INV-42](../invariants.md#inv-42-only-the-compatibility-view-reads-the-retained-table) records why, and [adopting a map](../adopting-a-map.md#before-the-install-views-on-the-old-table) how to redirect such a view.
+5. It refuses a retained or current table with row-level security, then compiles. [INV-38](../invariants.md#inv-38-the-schema-refuses-a-table-with-row-level-security) records the refusal.
+6. It lists a drop of every trigger whose name starts with the map's object prefix, and whose table and function are in the current schema. It then lists a drop of every function with that prefix in the current schema. The compiled statements follow the drops.
+7. It lists a revoke on the view for each grantee that the installing role's default privileges give a new table, in the current schema or in every schema. The view does not exist yet, so the grantees come from `pg_default_acl`. The role's own privileges stay, because it owns the view. So the view keeps no grant the default privileges add, as [INV-48](../invariants.md#inv-48-the-new-view-carries-no-grant-its-default-privileges-add) records.
+8. It lists the grants the view takes from the retained table: the table's grants, and its column grants on the map's attribute columns, which are the view's columns. It leaves out the grants of the installing role, which owns the view. A retained table that was never granted gives its owner's default privileges, through `acldefault()`.
+9. It runs each listed statement with `Connection::unprepared()`.
 
-A failed statement rolls back the whole install, so it leaves nothing behind. `Installer::apply()` runs steps 5 to 7, `Installer::dropObjects()` step 6, and `Installer::copyPrivileges()` step 8. No test pins that the copy skips the grants of the view's owner.
+`Installer::statements()` builds the list in steps 2 to 8, which change nothing, and the private `Installer::run()` runs it. So a refusal or a compile error throws before the first statement runs. A failed statement rolls back the whole install, so it leaves nothing behind.
 
 ## Recompiling and uninstalling
 
-A recompile replaces the installed map. It refuses no existing view, and copies no grants from the retained table. In its transaction, `Installer::recompile()`:
+A recompile replaces the installed map. It refuses no existing view, and copies no grants from the retained table. Its list:
 
-1. Saves the view's own grants. A view with no explicit grants saves its owner's default privileges.
-2. Runs steps 5 to 7 above. Before step 6, it refuses while another object depends on the view or uses its row type, and names each one. It also refuses a trigger or a rule on the view that is not the map's own. After step 6, it drops the view, without `CASCADE`.
-3. Grants the saved grants again. A column grant follows only when the new view still has that column.
+1. Saves the view's own grants, when the view exists in the current schema. A view with no explicit grants saves its owner's default privileges.
+2. Runs steps 5 to 7 above. After it compiles, it refuses while another object depends on the view or uses its row type, and names each one. It also refuses a trigger or a rule on the view that is not the map's own. It drops the view after the drops of step 6, without `CASCADE`, and before the compiled statements.
+3. Grants the saved grants again, after the compiled statements. A column grant follows only when the map still has an attribute of that name, because the map's attribute columns are the new view's columns.
 
 So a recompile can drop, retype or reorder an attribute, which `CREATE OR REPLACE VIEW` cannot. [INV-41](../invariants.md#inv-41-a-recompile-replaces-the-view-and-keeps-its-grants) and [0022](../decisions/0022-a-recompile-replaces-the-view-and-refuses-its-dependents.md) record the rule.
 
-An uninstall drops the objects in one transaction, then the view when it finds one in the current schema. It leaves every table as it is.
+An uninstall lists the drops of step 6, then a drop of the view when it finds one in the current schema. It leaves every table as it is.
 
-A failed recompile or uninstall keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
+Each of the three methods runs its list in one transaction, so a failed recompile or uninstall keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
 
 ## The current schema
 
-Each install, recompile and uninstall changes only the objects in `current_schema()`, so one map name can be installed in two schemas. `Installer::dropObjects()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, and the private `Installer::relation()` through `quote_ident(current_schema())`. So a schema whose name needs quoting works too. Every lookup of a map table, the catalog read and the row-level security check included, resolves in that schema alone. A table found only further down the search path refuses at compile, as [INV-47](../invariants.md#inv-47-a-maps-tables-resolve-in-the-current-schema-alone) records.
+Each install, recompile and uninstall changes only the objects in `current_schema()`, so one map name can be installed in two schemas. `Installer::dropStatements()` resolves that schema through `to_regnamespace(quote_ident(current_schema()))`, and the private `Installer::relation()` and `Installer::relationKind()` through `quote_ident(current_schema())`. So a schema whose name needs quoting works too. Every lookup of a map table, the catalog read and the row-level security check included, resolves in that schema alone. A table found only further down the search path refuses at compile, as [INV-47](../invariants.md#inv-47-a-maps-tables-resolve-in-the-current-schema-alone) records.
+
+## Printing the statements
+
+`php artisan compatibility:sql <map>` prints the statements an Installer method would run for a registered map, so a reviewer can read the SQL before a migration runs it. The command:
+
+1. Reads `--for` as an `InstallerAction`, `install` by default. Any other value exits non-zero and names the three values.
+2. Takes the map from the registry and asks `Installer::statements()` for that action's list. A refusal exits non-zero with its message: an unknown map, a missing retained table, an install over an existing relation, or any other refusal of the action. So the command refuses every map the Installer refuses, row-level security, readers of the retained table and dependents of the view included.
+3. Writes a header of `--` comment lines: the map and the action, the database, schema, search path, server version and role it read, and the time. For an install, the header says that the grants are derived, and that they leave out the grants of the role the command ran as.
+4. Writes each statement with a closing semicolon, and a blank line between two statements, to stdout or to the `--output` file. A file write that falls short exits non-zero.
+
+The command runs only catalog reads. Each Installer method runs exactly the list `Installer::statements()` returns, so the printed statements are the statements that method runs against the same catalog. [INV-26](../invariants.md#inv-26-the-printed-statements-are-the-statements-that-run) states the rule. A trigger, function or grant that changes between the print and the install changes what the install runs.
+
+### Before the rename
+
+A migration renames the previous model's table before it installs, and `--retained-table-is-currently=<name>` compiles before that rename. The Installer then reads the retained table under its current name: its columns, its grants, the views that read it and its row-level security. `ColumnCatalog::source()` gives the compiler that name, so the fill check and the text comparison read the columns there too. The table may still carry the view's name. The install then allows that relation when it is a table and the option names it, and a view of that name still refuses. The printed SQL names the retained table by its name after the rename, so it runs once the migration has renamed the table. That includes the default of a `GENERATED BY DEFAULT` identity, whose `pg_get_serial_sequence()` call names the table at insert time.
 
 ## Compiling
 

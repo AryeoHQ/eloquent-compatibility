@@ -21,10 +21,13 @@ final class Compiler
 
     private readonly string $schema;
 
-    public function __construct(ConnectionInterface $connection)
+    /**
+     * @param  array<string, string>  $sources
+     */
+    public function __construct(ConnectionInterface $connection, array $sources = [])
     {
         $this->schema = (string) $connection->scalar('select current_schema()');
-        $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath());
+        $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath(), $sources);
     }
 
     public function compile(CompatibilityMap|ResolvedMap $map): CompiledSql
@@ -726,7 +729,7 @@ final class Compiler
         $columns = $this->columnCatalog->of($table);
 
         if ($columns === []) {
-            throw InvalidCompatibilityMap::because($resolvedMap->name, "the retained table {$table} does not exist");
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the retained table {$this->columnCatalog->source($table)} does not exist");
         }
 
         foreach (array_unique(array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))) as $currentTable) {

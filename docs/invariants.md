@@ -102,9 +102,10 @@ An insert writes a dependent's link first, and its attributes and fills after. A
 **Code that must agree.**
 
 - `ResolvedMap::of()` checks the name. `ResolvedMap::objectPrefix()`, `ResolvedMap::functionName()`, `ResolvedMap::refuseFunctionName()` and `ResolvedMap::designateFunctionName()` build every name, through the private `ResolvedMap::object()`.
-- `Installer::dropObjects()` matches the prefix through `SqlFragments::like()`. It drops a trigger only when its table and its function are both in `current_schema()`, and a function only when it is in that schema. It names the schema through `to_regnamespace(quote_ident(current_schema()))`, so a schema whose name needs quoting resolves.
-- The private `Installer::relation()` looks the view up in that schema alone. `Installer::install()` refuses when it finds one, and `Installer::recompile()` and `Installer::uninstall()` act only when they find one.
+- The private `Installer::dropStatements()` matches the prefix through `SqlFragments::like()`. It drops a trigger only when its table and its function are both in `current_schema()`, and a function only when it is in that schema. It names the schema through `to_regnamespace(quote_ident(current_schema()))`, so a schema whose name needs quoting resolves.
+- The private `Installer::relationKind()` and `Installer::relation()` look the view up in that schema alone. `Installer::install()` refuses when the first finds one, and `Installer::recompile()` and `Installer::uninstall()` act on the view only when the second finds one.
 - `Compiler` creates every function in that same schema.
+
 
 ## INV-10: Reads and writes carry their types
 
@@ -235,7 +236,7 @@ A statement can also start while the write's own statement runs. A `beforeExecut
 
 **Why.** Each method drops the map's triggers before it creates or drops anything else, and a recompile drops the view too. A failure part way would leave a half-installed map, or a map without its triggers. A new primary row would then get no retained row. A concurrent writer waits on the dropped triggers' locks until the commit.
 
-**Code that must agree.** `Installer::install()` wraps `Installer::apply()` and `Installer::copyPrivileges()`. `Installer::recompile()` wraps the private `Installer::viewGrants()`, `Installer::apply()` and the grants it restores. `Installer::uninstall()` wraps `Installer::dropObjects()` and the `DROP VIEW`. The checks in `Installer::install()` for an existing view and for views that read the retained table stay outside, because each throws before any change. Every refusal in `Installer::apply()` throws inside the transaction, before its first change.
+**Code that must agree.** Each of the three methods passes its `InstallerAction` to the private `Installer::run()`. Inside one `Connection::transaction()`, `Installer::run()` asks `Installer::statements()` for the list and runs every statement on it. The catalog reads that build the list therefore see the catalog the statements change. Every refusal and every compile error throws while the list is built, before the first statement runs.
 
 ## INV-25: A delete through the previous model mirrors every row it removes
 
@@ -244,6 +245,22 @@ A statement can also start while the write's own statement runs. A `beforeExecut
 **Why.** The delete trigger removes every dependent row of the primary row, rows the view does not read included. Each removed row must raise its own delete events.
 
 **Code that must agree.** `Compiler::deleteFunction()` deletes by primary foreign key, and `KeyTranslator::dependentKeys()` selects by the same key. The private `AffectedRecords::removed()` turns those keys into records when the private `AffectedRecords::removes()` holds. `AffectedRecords::of()` calls it, and `AffectedRecords::before()` calls `AffectedRecords::of()` a second time under the locks, so it finds newcomers too. A change to which rows the trigger deletes must change `KeyTranslator::dependentKeys()` with it.
+
+## INV-26: The printed statements are the statements that run
+
+**Rule.** `Installer::install()`, `Installer::recompile()` and `Installer::uninstall()` each run exactly the list `Installer::statements()` returns for their action, in its order. `compatibility:sql` prints that list. Building it runs only catalog reads. Every refusal of an action throws while its list is built, so `compatibility:sql` refuses every map that action refuses.
+
+The list has this order. An install lists the drops of the map's prefixed triggers and functions, then the compiled statements, then a revoke on the view for each grantee its default privileges add, then the grants the view takes from the retained table. A recompile lists the drops, then a drop of the view when it exists, then the compiled statements, then the same revokes, then the view's saved grants. An uninstall lists the drops, then a drop of the view when it exists. The compiled statements carry a `REVOKE EXECUTE ... FROM PUBLIC` after each function, as [INV-37](#inv-37-a-trigger-function-runs-only-for-its-own-relation) requires.
+
+**Why.** A reviewer or a database administrator reads the printed SQL before a migration runs it. A statement that runs without being printed, or that runs in another form, would reach the database unread. A write while the list is built would change the database from a command that promises only to read it.
+
+**Code that must agree.**
+
+- Each Installer method passes its `InstallerAction` to the private `Installer::run()`, which runs the list `Installer::statements()` returns and nothing else. `CompileSql::handle()` prints that list with nothing added but the header comments and a semicolon after each statement.
+- The view does not exist before an install, so the private `Installer::grantStatements()` derives its grants from the retained table: its grants, and its column grants on the map's attribute columns, which are the view's columns. It leaves out the grants of `current_user`, which runs the install and so owns the view.
+- For the same reason, the private `Installer::revokeStatements()` reads the grantees from `pg_default_acl`, as [INV-48](#inv-48-the-new-view-carries-no-grant-its-default-privileges-add) describes.
+- Before a recompile, the private `Installer::viewGrants()` saves the view's grants. A column grant returns only for a column the map still has an attribute for, because the map's attribute columns are the new view's columns.
+- The refusals for row-level security, for views that read the retained table and for the view's dependents run while the list is built. So no statement may depend on a catalog read made after an earlier statement runs.
 
 ## INV-33: A pending mirrored write completes only on its own statement
 
@@ -331,7 +348,7 @@ PostgreSQL picks a function by its closest argument match, whatever its schema's
 
 **Why.** The view reads with its owner's rights, and the `SECURITY DEFINER` triggers write with them. A role granted the view would read and write past the table's policies, for example into another tenant's rows. The package cannot enforce a caller's policies yet.
 
-**Code that must agree.** The private `Installer::apply()`, before it compiles, for both callers.
+**Code that must agree.** The private `Installer::applyStatements()`, before it compiles, for both actions. With `--retained-table-is-currently`, it reads the retained table under that name.
 
 ## INV-39: Every insert fills each required column
 
@@ -355,7 +372,7 @@ PostgreSQL picks a function by its closest argument match, whatever its schema's
 
 **Why.** `CREATE OR REPLACE VIEW` cannot drop, retype or reorder a column. A dependent object would block the drop with a raw 2BP01 error, and `CASCADE` would drop that object silently. `DROP VIEW` drops a trigger or a rule on the view silently, even without `CASCADE`. [0022](decisions/0022-a-recompile-replaces-the-view-and-refuses-its-dependents.md) records the decision.
 
-**Code that must agree.** `Installer::recompile()`, the private `Installer::viewGrants()` and the private `Installer::apply()`. `Installer::apply()` reads `pg_depend` for normal dependencies on the view and its row type, and for automatic ones from a trigger or a rule. A trigger named with the map's object prefix is the map's own, as for `Installer::dropObjects()`. `Installer::viewGrants()` saves a view with no explicit grants as its owner's default privileges, through `acldefault()`. It saves no grant of the recompiling role, which owns the new view.
+**Code that must agree.** The private `Installer::recompileStatements()`, `Installer::viewGrants()` and `Installer::applyStatements()`. `Installer::applyStatements()` reads `pg_depend` for normal dependencies on the view and its row type, and for automatic ones from a trigger or a rule. A trigger named with the map's object prefix is the map's own, as for `Installer::dropStatements()`. `Installer::recompileStatements()` keeps a column grant when the map still has an attribute of that name, because the map's attribute columns are the new view's columns. `Installer::viewGrants()` saves a view with no explicit grants as its owner's default privileges, through `acldefault()`. It saves no grant of the recompiling role, which owns the new view.
 
 ## INV-42: Only the compatibility view reads the retained table
 
@@ -363,7 +380,7 @@ PostgreSQL picks a function by its closest argument match, whatever its schema's
 
 **Why.** A view on the old table follows its rename and keeps reading the retained table. It then misses every mapped attribute, and the triggers never see its writes. [Adopting a map](adopting-a-map.md#before-the-install-views-on-the-old-table) describes how to point such a view at the compatibility view.
 
-**Code that must agree.** `Installer::install()` finds the readers through `pg_depend` and `pg_rewrite`, before its transaction.
+**Code that must agree.** The private `Installer::installStatements()` finds the readers through `pg_depend` and `pg_rewrite`, before it lists any statement. With `--retained-table-is-currently`, it looks for the readers of the table under that name.
 
 ## INV-43: The event bridge refuses a Parental model
 
@@ -387,7 +404,7 @@ PostgreSQL picks a function by its closest argument match, whatever its schema's
 
 **Why.** `pg_attrdef` holds a generated column's expression. Reported as a default, it would reach `ALTER VIEW ... SET DEFAULT`, which PostgreSQL rejects, because a default cannot reference a column. So a map that exposes a generated column would fail to install or recompile. A write of a value to a generated column, or to a `GENERATED ALWAYS` identity, fails on every write through the view. So compile refuses the map instead.
 
-An insert that omits a `GENERATED BY DEFAULT` identity attribute takes the identity's next value. The catalog reports that column's default as `pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('<schema>.<table>', '<column>')::regclass)`. The table name carries its schema, because a view default runs on the writer's search path. A retained or primary attribute takes it as its view default, and [INV-46](#inv-46-an-insert-through-the-view-keeps-a-not-null-columns-default) fills every other insert target.
+An insert that omits a `GENERATED BY DEFAULT` identity attribute takes the identity's next value. The catalog reports that column's default as `pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('<schema>.<table>', '<column>')::regclass)`. The table name carries its schema, because a view default runs on the writer's search path. It is the map's table name, so a compile before the rename names the retained table as it is called after the rename. A retained or primary attribute takes it as its view default, and [INV-46](#inv-46-an-insert-through-the-view-keeps-a-not-null-columns-default) fills every other insert target.
 
 **Code that must agree.** `ColumnCatalog::of()` reads `attgenerated` and `attidentity` into `Column::$default`, `Column::$generated` and `Column::$alwaysGenerated`. `Compiler::validateColumns()` refuses, and `Compiler::defaults()` takes the identity's default. `Compiler::insertFunction()` skips a retained attribute whose column has `Column::$alwaysGenerated`, and the private `Compiler::insertAssignmentsTo()` skips such a read-only mapped attribute. `Column::needsAValue()` keeps counting every generated and identity column as filled, so [INV-39](#inv-39-every-insert-fills-each-required-column) still holds.
 
@@ -405,7 +422,7 @@ An insert that omits a `GENERATED BY DEFAULT` identity attribute takes the ident
 
 **Why.** Each compiled function pins its `search_path` to the current schema, and its relation check names that schema. A table found further down the search path would install without error. Its trigger would then land on the other schema's table, and every insert there would fail with 42P01. `Installer::uninstall()` and `Installer::recompile()` could not remove that trigger.
 
-**Code that must agree.** `ColumnCatalog::of()` and every `to_regclass()` on a map table in `Installer` name the table as `quote_ident(current_schema()) || '.' || <table>`. The private `Installer::relation()` does the same for the view. `Compiler::validateColumns()` refuses a retained or current table that `ColumnCatalog::of()` does not find. `EventReplayer::changed()` reads column types through `ColumnCatalog`, so it reads the current schema alone too.
+**Code that must agree.** `ColumnCatalog::of()` and every `to_regclass()` on a map table in `Installer` name the table as `quote_ident(current_schema()) || '.' || <table>`. The private `Installer::relation()` does the same for the view. Under `--retained-table-is-currently`, they name the retained table by its current name, in the current schema too. `Compiler::validateColumns()` refuses a retained or current table that `ColumnCatalog::of()` does not find. `EventReplayer::changed()` reads column types through `ColumnCatalog`, so it reads the current schema alone too.
 
 ## INV-48: The new view carries no grant its default privileges add
 
@@ -413,7 +430,7 @@ An insert that omits a `GENERATED BY DEFAULT` identity attribute takes the ident
 
 **Why.** PostgreSQL applies `ALTER DEFAULT PRIVILEGES` to every view a role creates. A recompile would otherwise give back access a revoke had removed, such as `SELECT` for `PUBLIC`. A default `UPDATE` or `DELETE` grant would also reach the tables through the `SECURITY DEFINER` triggers.
 
-**Code that must agree.** The private `Installer::revokeDefaultPrivileges()`, at the end of the private `Installer::apply()`, for both callers. It reads the grantees from `aclexplode()` of the view's ACL, and leaves the owner's own privileges as they are. `Installer::copyPrivileges()` and the restore in `Installer::recompile()` run after it.
+**Code that must agree.** The private `Installer::revokeStatements()`, which the private `Installer::applyStatements()` lists after `CompiledSql::statements()`, for both actions. The view does not exist yet, so it reads the grantees from `pg_default_acl`: the entries of `current_user`, which creates and so owns the view, for tables, in every schema and in the current schema. PostgreSQL merges both into a new view's ACL. It leaves the owner's own privileges as they are. `Installer::grantStatements()` and the saved grants of `Installer::recompileStatements()` follow it.
 
 ## INV-49: An insert through the view stores a read-only attribute
 

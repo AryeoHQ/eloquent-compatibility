@@ -30,6 +30,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
 - **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
+- **installer action**: install, recompile or uninstall, the three Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
 - **mapped attribute**: a previous model's attribute stored in a current model's table; see `Attribute::mapped()`.
