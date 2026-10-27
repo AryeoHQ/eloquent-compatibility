@@ -72,6 +72,18 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
+    public static function byTransition(string $map, Model $destination, string $state, Throwable $previous): self
+    {
+        $record = class_basename($destination).' '.self::key($destination);
+
+        return new self(
+            "Compatibility map '{$map}' refused this write, because it changes {$state} of {$record} in a way its state machine cannot replay",
+            'A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: '.rtrim($previous->getMessage(), '.').'.',
+            "Change {$state} to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on ".class_basename($destination).' itself.',
+            $previous,
+        );
+    }
+
     private static function key(Model $model): string
     {
         $key = $model->getKey();

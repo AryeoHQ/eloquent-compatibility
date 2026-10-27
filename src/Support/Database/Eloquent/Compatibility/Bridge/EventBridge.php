@@ -370,12 +370,12 @@ final class EventBridge
                 $entries[$id] ??= new RecordSnapshot($record, null);
             }
 
-            $after = $this->internally(fn () => $this->affectedRecords->snapshots(
-                $connection,
-                array_map(fn (RecordSnapshot $entry) => $entry->record, $entries),
-            ));
+            $records = array_map(fn (RecordSnapshot $entry) => $entry->record, $entries);
+            $after = $this->internally(fn () => $this->affectedRecords->snapshots($connection, $records));
 
-            $replay = function () use ($entries, $after, $pendingWrite, $connection): void {
+            $replay = function () use ($entries, $records, $after, $pendingWrite, $connection): void {
+                [$entries, $after] = $this->transitions($connection, $pendingWrite, $entries, $records, $after);
+
                 foreach ($entries as $id => $entry) {
                     $this->eventReplayer->replay($entry->record, $entry->row, $after[$id]->row ?? null, $pendingWrite->source, (string) $connection->getName());
                 }
@@ -393,6 +393,88 @@ final class EventBridge
         }
 
         $this->close($connection, $pendingWrite, true);
+    }
+
+    /**
+     * @param  array<string, RecordSnapshot>  $entries
+     * @param  array<string, AffectedRecord>  $records
+     * @param  array<string, RecordSnapshot>  $after
+     * @return array{array<string, RecordSnapshot>, array<string, RecordSnapshot>}
+     */
+    private function transitions(Connection $connection, PendingMirroredWrite $pendingWrite, array $entries, array $records, array $after): array
+    {
+        $states = [];
+
+        foreach ($entries as $id => $entry) {
+            $changed = $entry->record->role === RecordRole::Previous ? [] : $this->eventReplayer->states($entry->record, $entry->row, $after[$id]->row ?? null, (string) $connection->getName());
+
+            if ($changed !== []) {
+                $states[$id] = $changed;
+            }
+        }
+
+        if ($states === []) {
+            return [$entries, $after];
+        }
+
+        $native = $this->internally(fn () => $this->affectedRecords->native($connection, $pendingWrite->source));
+        $natives = $native === null ? [] : [$native->id() => $native];
+        $caller = $this->internally(fn () => $this->affectedRecords->snapshots($connection, $natives));
+
+        foreach ($states as $id => $changed) {
+            $this->eventReplayer->transition($entries[$id]->record, (array) $entries[$id]->row, (array) $after[$id]->row, (string) $connection->getName(), $changed);
+        }
+
+        $replayed = $this->internally(fn () => $this->affectedRecords->snapshots($connection, [...$records, ...$natives]));
+
+        foreach ($entries as $id => $entry) {
+            $entries[$id] = $entry->withRow($this->replayedBefore($connection, $entry->record, $entry->row, $after[$id]->row ?? null, $replayed[$id]->row));
+        }
+
+        if ($native !== null) {
+            $this->copy($native, $pendingWrite->source, $caller[$native->id()]->row, $replayed[$native->id()]->row);
+        }
+
+        return [$entries, array_diff_key($replayed, $natives)];
+    }
+
+    /**
+     * @param  null|array<string, mixed>  $before
+     * @param  null|array<string, mixed>  $after
+     * @param  null|array<string, mixed>  $replayed
+     * @return null|array<string, mixed>
+     */
+    private function replayedBefore(Connection $connection, AffectedRecord $record, null|array $before, null|array $after, null|array $replayed): null|array
+    {
+        if ($before === null || $after === null || $replayed === null) {
+            return $before;
+        }
+
+        $class = $record->model;
+        $changed = $this->eventReplayer->changed($record, (new $class)->setConnection((string) $connection->getName()), $after, $replayed);
+
+        return [...$before, ...array_intersect_key($replayed, array_flip($changed))];
+    }
+
+    /**
+     * @param  null|array<string, mixed>  $before
+     * @param  null|array<string, mixed>  $after
+     */
+    private function copy(AffectedRecord $record, Model $model, null|array $before, null|array $after): void
+    {
+        if ($before === null || $after === null) {
+            return;
+        }
+
+        $changes = array_intersect_key($after, array_flip($this->eventReplayer->changed($record, $model, $before, $after)));
+
+        if ($changes === []) {
+            return;
+        }
+
+        $attributes = [...$model->getAttributes(), ...$changes];
+        $model->setRawAttributes([...$model->getRawOriginal(), ...array_diff_key($changes, $model->getDirty())], true);
+        $model->setRawAttributes($attributes);
     }
 
     private function finish(Connection $connection, Model $model, ModelEvent $event): void

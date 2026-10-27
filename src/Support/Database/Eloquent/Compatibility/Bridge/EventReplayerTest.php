@@ -4,14 +4,19 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
@@ -21,17 +26,23 @@ use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
+use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid;
+use Support\Database\Eloquent\StateMachines\Triggers\Exceptions\Duplicate;
+use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\ArticleCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CastGadget;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
 use Tests\Fixtures\Support\Workbench\Journal;
+use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversClass(EventReplayer::class)]
 final class EventReplayerTest extends TestCase
@@ -445,6 +456,126 @@ final class EventReplayerTest extends TestCase
         $this->assertSame([ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], $this->sole()->events);
     }
 
+    #[Test]
+    public function it_finds_no_state_column_to_replay_on_a_model_that_casts_none_or_for_a_create_or_a_delete(): void
+    {
+        [$id, $before, $after] = $this->renamed();
+        $record = $this->gadgetRecord($id);
+
+        $this->assertSame([], $this->eventReplayer->states($record, $before, $after, 'pgsql'));
+        $this->assertSame([], $this->eventReplayer->states($record, null, $after, 'pgsql'));
+        $this->assertSame([], $this->eventReplayer->states($record, $before, null, 'pgsql'));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_finds_each_state_column_a_change_moves_in_the_order_the_model_casts_them(): void
+    {
+        [$record, $before] = $this->publication();
+
+        $this->assertSame([], $this->eventReplayer->states($record, $before, [...$before, 'title' => 'Renamed'], 'pgsql'));
+        $this->assertSame(['state'], $this->eventReplayer->states($record, $before, [...$before, 'state' => 'pending_review'], 'pgsql'));
+        $this->assertSame(['state', 'review'], $this->eventReplayer->states($record, $before, [...$before, 'review' => 'approved', 'state' => 'published'], 'pgsql'));
+        $this->assertSame([], $this->eventReplayer->states($record, null, $before, 'pgsql'));
+        $this->assertSame([], $this->eventReplayer->states($record, $before, null, 'pgsql'));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_finds_a_state_column_of_text_moved_to_a_value_that_reads_as_the_same_number_or_the_same_json(): void
+    {
+        [$record, $before] = $this->publication();
+
+        $this->assertSame(['state'], $this->eventReplayer->states($record, [...$before, 'state' => '1'], [...$before, 'state' => '01'], 'pgsql'));
+        $this->assertSame(['state'], $this->eventReplayer->states($record, [...$before, 'state' => '{"a":1}'], [...$before, 'state' => '{"a": 1}'], 'pgsql'));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_runs_the_trigger_of_a_stored_state_on_the_stored_row_with_the_source_state_and_lets_it_save_only_what_handle_changed(): void
+    {
+        $journal = $this->journal();
+        [$record, $before] = $this->publication();
+        $after = $this->stored($record, ['state' => 'published', 'title' => 'Renamed']);
+        $statements = [];
+        Event::listen(Transitioning::class, fn (Transitioning $event) => $this->seen[] = ['event' => 'before', 'state' => $event->publication->getAttributes()['state'] ?? null, 'original' => $event->publication->getRawOriginal('state'), 'title' => $event->publication->getAttribute('title'), 'connection' => $event->publication->getConnectionName()]);
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']);
+
+        $this->assertSame(['Publication '.json_encode($record->keyValue)], $journal->entries);
+        $this->assertSame([['event' => 'before', 'state' => 'draft', 'original' => 'draft', 'title' => 'Renamed', 'connection' => 'pgsql']], $this->seen);
+        $this->assertSame(['update "publications" set "published_at" = ?, "updated_at" = ? where "id" = ?'], array_values(array_filter($statements, fn (string $sql) => str_starts_with($sql, 'update'))));
+        $this->assertSame(['published', 'Renamed', true], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at') !== null]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_runs_the_trigger_of_each_moved_state_column_in_turn_through_its_own_column(): void
+    {
+        $journal = $this->journal();
+        [$record, $before] = $this->publication();
+        DB::table('placements')->insert(['id' => (string) Str::uuid(), 'publication_id' => $record->keyValue, 'slot' => 'side']);
+        $after = $this->stored($record, ['state' => 'published', 'review' => 'approved']);
+
+        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state', 'review']);
+
+        $this->assertSame(['Publication '.json_encode($record->keyValue)], $journal->entries);
+        $this->assertSame(['published', 'approved', true, 'front'], [DB::table('publications')->value('state'), DB::table('publications')->value('review'), DB::table('publications')->value('published_at') !== null, DB::table('placements')->value('slot')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_calls_a_trigger_whose_class_name_has_several_words_by_the_method_name_its_proxy_accepts(): void
+    {
+        [$record, $before] = $this->publication(['state' => 'featured', 'featured_at' => '2020-01-01 00:00:00']);
+        $after = $this->stored($record, ['state' => 'published']);
+
+        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']);
+
+        $this->assertSame(['published', null], [DB::table('publications')->value('state'), DB::table('publications')->value('featured_at')]);
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: bool, 2: null|string, 3: string, 4: class-string<Throwable>}>
+     */
+    public static function unreplayableChanges(): array
+    {
+        return [
+            'no matching transition' => ['published', false, 'draft', 'Invalid transition from [Published] to [Draft] on [Publication].', Invalid::class],
+            'two matching transitions' => ['archived', false, 'draft', 'Multiple [Draft] triggers defined on [Archived]', Duplicate::class],
+            'a blocked transition' => ['draft', true, 'published', 'Invalid transition from [Draft] to [Published] on [Publication].', Invalid::class],
+            'a trigger the container cannot build' => ['draft', false, 'archived', 'Unresolvable dependency resolving', BindingResolutionException::class],
+            'a state the enum has no case for' => ['draft', false, 'pending_review', "['pending_review'] is not a case of [PublicationState].", InvalidArgumentException::class],
+            'no state' => ['draft', false, null, '[NULL] is not a case of [PublicationState].', InvalidArgumentException::class],
+        ];
+    }
+
+    /**
+     * @param  class-string<Throwable>  $previous
+     */
+    #[DataProvider('unreplayableChanges')]
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_a_state_change_its_state_machine_cannot_run_a_trigger_for_before_handle_runs(string $stored, bool $locked, null|string $written, string $because, string $previous): void
+    {
+        $journal = $this->journal();
+        [$record, $before] = $this->publication(['state' => $stored, 'locked' => $locked]);
+        $after = $this->stored($record, ['state' => $written]);
+        Event::listen(Transitioning::class, fn () => $this->seen[] = ['event' => 'before']);
+
+        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']));
+
+        $this->assertStringContainsString("refused this write, because it changes state of Publication #{$record->keyValue}", $refusal->refused);
+        $this->assertStringContainsString($because, $refusal->because);
+        $this->assertInstanceOf($previous, $refusal->getPrevious());
+        $this->assertSame([], $journal->entries);
+        $this->assertSame([], $this->seen);
+        $this->assertSame([$written, null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
+    }
+
     /**
      * @param  list<ExcludedListener>  $excludedListeners
      */
@@ -454,6 +585,38 @@ final class EventReplayerTest extends TestCase
         $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap), new CompatibilityMapEventMirror(new WidgetCompatibilityMap, $excludedListeners));
         $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new AccountCompatibilityMap), new CompatibilityMapEventMirror(new AccountCompatibilityMap));
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
+    }
+
+    private function journal(): Journal
+    {
+        $journal = new Journal;
+        $this->app->instance(Journal::class, $journal);
+
+        return $journal;
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @return array{AffectedRecord, array<string, mixed>}
+     */
+    private function publication(array $attributes = []): array
+    {
+        $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new ArticleCompatibilityMap), new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $id = (string) Str::uuid();
+        DB::table('publications')->insert(['id' => $id, 'title' => 'Draft publication', ...$attributes]);
+
+        return [$this->mirrorIndex->keyTranslator('articles')->currentRecord('publication', $id), $this->row('publications', $id)];
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @return array<string, mixed>
+     */
+    private function stored(AffectedRecord $record, array $attributes): array
+    {
+        DB::table('publications')->where('id', $record->keyValue)->update($attributes);
+
+        return $this->row('publications', $record->keyValue);
     }
 
     /**

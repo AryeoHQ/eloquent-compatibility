@@ -112,6 +112,25 @@ final class CompatibilityWriteRefusedTest extends TestCase
         $this->assertStringContainsString("a 'created' listener of Gadget (new) changed name.", CompatibilityWriteRefused::byMirroredChange('widgets', new Gadget, ModelEvent::Created, ['name'])->getMessage());
     }
 
+    #[Test]
+    public function it_names_the_state_column_a_replay_could_not_change_and_keeps_the_replay_failure(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
+        $previous = new RuntimeException('Invalid transition from [Published] to [Draft] on [Gadget].');
+
+        $refusal = CompatibilityWriteRefused::byTransition('articles', $gadget, 'state', $previous);
+
+        $this->assertSame("Compatibility map 'articles' refused this write, because it changes state of Gadget #{$gadget->id} in a way its state machine cannot replay", $refusal->refused);
+        $this->assertSame('A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: Invalid transition from [Published] to [Draft] on [Gadget].', $refusal->because);
+        $this->assertSame('Change state to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on Gadget itself.', $refusal->instead);
+        $this->assertSame($previous, $refusal->getPrevious());
+
+        $unsaved = CompatibilityWriteRefused::byTransition('articles', new Gadget, 'review', new RuntimeException('Unresolvable dependency'));
+
+        $this->assertStringContainsString('because it changes review of Gadget (new) in a way', $unsaved->refused);
+        $this->assertStringEndsWith('the replay failed: Unresolvable dependency.', $unsaved->because);
+    }
+
     private function secondRootPlace(): QueryException
     {
         $gadget = Gadget::query()->create(['name' => 'Blue gadget']);

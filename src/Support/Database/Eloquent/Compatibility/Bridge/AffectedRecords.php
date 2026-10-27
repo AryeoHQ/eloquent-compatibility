@@ -162,7 +162,7 @@ final readonly class AffectedRecords
         )));
     }
 
-    private function native(ConnectionInterface $connection, Model $model): null|AffectedRecord
+    public function native(ConnectionInterface $connection, Model $model): null|AffectedRecord
     {
         foreach ($this->mirrorIndex->forModel($model::class) as $member) {
             $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);

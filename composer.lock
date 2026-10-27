@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "866b6dc09c38fcad61c72cbf100458d6",
+    "content-hash": "54f678c2417bdda7991a98ea541a7025",
     "packages": [
         {
             "name": "brick/math",
@@ -6035,26 +6035,232 @@
     ],
     "packages-dev": [
         {
-            "name": "aryeo/tooling-laravel",
-            "version": "0.0.41",
+            "name": "aryeo/actions",
+            "version": "0.0.24",
             "dist": {
                 "type": "zip",
-                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/tooling-laravel/tooling-laravel-0.0.41.zip",
-                "reference": "d31fa77ce196481820465f12b99f78999e37a27f"
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/actions/actions-0.0.24.zip",
+                "reference": "d2a4940f4ebbb8343e310d8265e017a27fe5deb4"
             },
             "require": {
+                "aryeo/tooling-laravel": "0.0.43",
+                "laravel/framework": "^12.0 || ^13",
+                "laravel/prompts": "^0.3",
+                "mockery/mockery": "^1.6",
+                "nikic/php-parser": "^5.6",
+                "php": "^8.5",
+                "phpstan/phpstan": "^2.1",
+                "symfony/console": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "brianium/paratest": "^7.15",
+                "orchestra/testbench": "^10.0.0||^9.0.0||^11",
+                "orchestra/testbench-core": "^10.0.0||^9.0.0||^11",
+                "phpunit/phpunit": "^12||^11||^13"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "Support\\Actions\\Providers\\Provider"
+                    ]
+                },
+                "tooling": {
+                    "phpstan": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/phpstan/rules.neon"
+                    },
+                    "rector": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/rector/rules.php"
+                    },
+                    "pint": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests"
+                            ]
+                        }
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Support\\": "src/Support/",
+                    "Tooling\\": "src/Tooling/"
+                },
+                "exclude-from-classmap": [
+                    "/src/**/*Test.php",
+                    "/src/**/*TestCases.php",
+                    "/tests/"
+                ]
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "Workbench\\App\\": "workbench/app/",
+                    "Tests\\": "tests/"
+                }
+            },
+            "scripts": {
+                "test": [
+                    "vendor/bin/phpunit"
+                ],
+                "test-coverage": [
+                    "vendor/bin/phpunit --coverage-html coverage"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Rob Fonseca",
+                    "email": "robfo@zillowgroup.com"
+                }
+            ],
+            "description": "An actions package.",
+            "homepage": "https://github.com/aryeohq/actions",
+            "keywords": [
+                "Aryeo",
+                "actions",
+                "laravel"
+            ]
+        },
+        {
+            "name": "aryeo/eloquent-state-machines",
+            "version": "0.0.36",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/AryeoHQ/eloquent-state-machines",
+                "reference": "f496e5636caf9aeb0bbdf49c2bf9bc27afe95284"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/AryeoHQ/eloquent-state-machines/zipball/f496e5636caf9aeb0bbdf49c2bf9bc27afe95284",
+                "reference": "f496e5636caf9aeb0bbdf49c2bf9bc27afe95284",
+                "shasum": ""
+            },
+            "require": {
+                "aryeo/actions": "0.0.24",
+                "laravel/framework": "12.x || ^13",
+                "laravel/prompts": "^0.3.7",
+                "nikic/php-parser": "^5.7",
+                "php": "^8.5",
+                "phpstan/phpdoc-parser": "^2.3",
+                "phpstan/phpstan": "^2.1",
+                "rector/rector": "^2.3",
+                "symfony/console": "^7.3 || ^8.0",
+                "symfony/finder": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "aryeo/tooling-laravel": "0.0.43",
+                "nesbot/carbon": "^3.10",
+                "orchestra/testbench": "^10.6 || ^11",
+                "orchestra/testbench-core": "^10.7 || ^11",
+                "pestphp/pest": "^4.1",
+                "phpunit/phpunit": "^12.4.1 || ^13",
+                "symplify/rule-doc-generator-contracts": "^11.2"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "Support\\Database\\Eloquent\\StateMachines\\Provider"
+                    ]
+                },
+                "tooling": {
+                    "rector": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/rector/rules.php",
+                        "configured_rules": "tooling/rector/configured-rules.php",
+                        "skip": "tooling/rector/skip.php"
+                    },
+                    "phpstan": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/phpstan/phpstan.neon"
+                    },
+                    "pint": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests",
+                                "tooling"
+                            ]
+                        }
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Support\\": "src/Support/",
+                    "Tooling\\": "src/Tooling/"
+                },
+                "exclude-from-classmap": [
+                    "*Test.php",
+                    "*TestCases.php",
+                    "/tests/"
+                ]
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "Workbench\\App\\": "workbench/app/",
+                    "Tests\\": "tests/"
+                }
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Justin Seliga",
+                    "email": "justinsel@zillowgroup.com"
+                }
+            ],
+            "description": "A state machine package for Eloquent.",
+            "time": "2026-10-28T03:55:21+00:00"
+        },
+        {
+            "name": "aryeo/tooling-laravel",
+            "version": "0.0.43",
+            "dist": {
+                "type": "zip",
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/tooling-laravel/tooling-laravel-0.0.43.zip",
+                "reference": "8a05a0e332df8ad27d31a80f9080d3e8d9f30151"
+            },
+            "require": {
+                "brick/varexporter": "^0.7",
                 "canvural/larastan-strict-rules": "^3.0",
                 "composer-plugin-api": "^2.0",
                 "composer/class-map-generator": "^1.4",
                 "composer/composer": "^2.0",
                 "ergebnis/phpstan-rules": "^2.12",
                 "larastan/larastan": "3.9.*",
-                "laravel/framework": "^12.36 || ^13",
+                "laravel/framework": "^12.36.1 || ^13",
                 "laravel/pint": "^1.25",
                 "laravel/prompts": "^0.3.13",
                 "nesbot/carbon": "^3.11",
                 "nikic/php-parser": "^5.6",
-                "php": "^8.4",
+                "php": "^8.5",
                 "phpstan/phpstan": "2.1.*",
                 "phpstan/phpstan-deprecation-rules": "^2.0",
                 "phpstan/phpstan-phpunit": "^2.0",
@@ -6125,6 +6331,9 @@
                     "php ./vendor/bin/testbench tooling:discover"
                 ]
             },
+            "license": [
+                "MIT"
+            ],
             "authors": [
                 {
                     "name": "Justin Seliga",
@@ -6225,6 +6434,55 @@
                 }
             ],
             "time": "2026-10-22T06:15:12+00:00"
+        },
+        {
+            "name": "brick/varexporter",
+            "version": "0.7.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/brick/varexporter.git",
+                "reference": "b3a50b8f630a9ed5015ea3e1f00479af261ed80d"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/brick/varexporter/zipball/b3a50b8f630a9ed5015ea3e1f00479af261ed80d",
+                "reference": "b3a50b8f630a9ed5015ea3e1f00479af261ed80d",
+                "shasum": ""
+            },
+            "require": {
+                "nikic/php-parser": "^5.0",
+                "php": "^8.2"
+            },
+            "require-dev": {
+                "php-coveralls/php-coveralls": "^2.2",
+                "phpunit/phpunit": "^11.0",
+                "vimeo/psalm": "6.14.3"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Brick\\VarExporter\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "A powerful alternative to var_export(), which can export closures and objects without __set_state()",
+            "keywords": [
+                "var_export"
+            ],
+            "support": {
+                "issues": "https://github.com/brick/varexporter/issues",
+                "source": "https://github.com/brick/varexporter/tree/0.7.0"
+            },
+            "funding": [
+                {
+                    "url": "https://github.com/BenMorel",
+                    "type": "github"
+                }
+            ],
+            "time": "2026-01-06T22:56:00+00:00"
         },
         {
             "name": "canvural/larastan-strict-rules",
@@ -8541,6 +8799,53 @@
                 "source": "https://github.com/phar-io/version/tree/3.2.1"
             },
             "time": "2022-02-21T01:04:05+00:00"
+        },
+        {
+            "name": "phpstan/phpdoc-parser",
+            "version": "2.3.9",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpstan/phpdoc-parser.git",
+                "reference": "2c122d2f890ae4b9e6ede898a9ac36b2c07e2a17"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpstan/phpdoc-parser/zipball/2c122d2f890ae4b9e6ede898a9ac36b2c07e2a17",
+                "reference": "2c122d2f890ae4b9e6ede898a9ac36b2c07e2a17",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.4 || ^8.0"
+            },
+            "require-dev": {
+                "doctrine/annotations": "^2.0",
+                "nikic/php-parser": "^5.3.0",
+                "php-parallel-lint/php-parallel-lint": "^1.2",
+                "phpstan/extension-installer": "^1.0",
+                "phpstan/phpstan": "^2.0",
+                "phpstan/phpstan-phpunit": "^2.0",
+                "phpstan/phpstan-strict-rules": "^2.0",
+                "phpunit/phpunit": "^9.6",
+                "symfony/process": "^5.2"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "PHPStan\\PhpDocParser\\": [
+                        "src/"
+                    ]
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "PHPDoc parser with support for nullable, intersection and generic types",
+            "support": {
+                "issues": "https://github.com/phpstan/phpdoc-parser/issues",
+                "source": "https://github.com/phpstan/phpdoc-parser/tree/2.3.9"
+            },
+            "time": "2026-10-27T22:32:31+00:00"
         },
         {
             "name": "phpstan/phpstan-deprecation-rules",

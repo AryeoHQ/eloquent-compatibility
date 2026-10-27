@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use BackedEnum;
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher as EventDispatcher;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
+use InvalidArgumentException;
 use ReflectionProperty;
 use stdClass;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
@@ -16,6 +19,11 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid;
+use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Transition;
+use Support\Database\Eloquent\StateMachines\Contracts\StateMachineable;
+use Support\Database\Eloquent\StateMachines\Triggers\Exceptions\Duplicate;
+use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
 use WeakMap;
 
 final class EventReplayer
@@ -73,6 +81,75 @@ final class EventReplayer
         } finally {
             $this->fired = $outer;
         }
+    }
+
+    /**
+     * @param  null|array<string, mixed>  $rowBefore
+     * @param  null|array<string, mixed>  $rowAfter
+     * @return list<string>
+     */
+    public function states(AffectedRecord $record, null|array $rowBefore, null|array $rowAfter, string $connectionName): array
+    {
+        if ($rowBefore === null || $rowAfter === null || ! method_exists(Trigger::class, 'withoutTransition')) { // @phpstan-ignore function.alreadyNarrowedType
+            return [];
+        }
+
+        $class = $record->model;
+        $model = (new $class)->setConnection($connectionName);
+        $casts = array_filter($model->getCasts(), fn (mixed $cast) => is_string($cast) && is_a($cast, StateMachineable::class, true));
+        $changed = $this->changed($record, $model, array_intersect_key($rowBefore, $casts), array_intersect_key($rowAfter, $casts));
+
+        return array_values(array_filter(array_map(strval(...), array_keys($casts)), fn (string $column) => in_array($column, $changed, true)));
+    }
+
+    /**
+     * @param  array<string, mixed>  $rowBefore
+     * @param  array<string, mixed>  $rowAfter
+     * @param  list<string>  $states
+     */
+    public function transition(AffectedRecord $record, array $rowBefore, array $rowAfter, string $connectionName, array $states): void
+    {
+        $class = $record->model;
+        $model = (new $class)->newInstance([], true);
+        $model->setConnection($connectionName);
+        $model->setRawAttributes([...$rowAfter, ...array_intersect_key($rowBefore, array_flip($states))], true);
+
+        foreach ($states as $state) {
+            $trigger = $this->trigger($record, $model, $state, $rowBefore[$state] ?? null, $rowAfter[$state] ?? null);
+
+            try {
+                $model->getAttribute($state)->{$trigger}()->withoutTransition()->now();
+            } catch (Invalid|BindingResolutionException $e) {
+                throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, $e);
+            }
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $before
+     * @param  array<string, mixed>  $after
+     * @return list<string>
+     */
+    public function changed(AffectedRecord $record, Model $model, array $before, array $after): array
+    {
+        $changed = [];
+        $columnCatalog = null;
+
+        foreach (array_unique([...array_keys($before), ...array_keys($after)]) as $column) {
+            $column = (string) $column;
+
+            if (($before[$column] ?? null) === ($after[$column] ?? null)) {
+                continue;
+            }
+
+            $columnCatalog ??= new ColumnCatalog($model->getConnection());
+
+            if (! $this->equivalent($model, $column, $columnCatalog->type($record->readFrom, $column), $before[$column] ?? null, $after[$column] ?? null)) {
+                $changed[] = $column;
+            }
+        }
+
+        return $changed;
     }
 
     /**
@@ -170,6 +247,35 @@ final class EventReplayer
         if (property_exists($model, 'forceDeleting')) {
             new ReflectionProperty($model, 'forceDeleting')->setValue($model, $forceDeleting);
         }
+    }
+
+    private function trigger(AffectedRecord $record, Model $model, string $state, mixed $before, mixed $after): string
+    {
+        $from = $this->state($model, $state, $before);
+        $to = $this->state($model, $state, $after);
+
+        if (! $from instanceof StateMachineable || ! $to instanceof StateMachineable) {
+            $cast = (string) ($model->getCasts()[$state] ?? '');
+
+            throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, new InvalidArgumentException(
+                '['.var_export($to instanceof StateMachineable ? $before : $after, true).'] is not a case of ['.class_basename($cast).'].',
+            ));
+        }
+
+        $transitions = $from->transitions()->filter(fn (Transition $transition) => $transition->to === $to);
+
+        if ($transitions->count() !== 1) {
+            throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, $transitions->isEmpty() ? new Invalid($model, $to, $state) : new Duplicate($to->name, $from));
+        }
+
+        return Str::camel(class_basename($transitions->sole()->using));
+    }
+
+    private function state(Model $model, string $state, mixed $value): null|BackedEnum
+    {
+        $cast = $model->getCasts()[$state] ?? null;
+
+        return is_string($cast) && is_a($cast, BackedEnum::class, true) && (is_int($value) || is_string($value)) ? $cast::tryFrom($value) : null;
     }
 
     private function ing(AffectedRecord $record, Model $model, ModelEvent $event): void
@@ -405,33 +511,6 @@ final class EventReplayer
         }
 
         return [null, ''];
-    }
-
-    /**
-     * @param  array<string, mixed>  $before
-     * @param  array<string, mixed>  $after
-     * @return list<string>
-     */
-    private function changed(AffectedRecord $record, Model $model, array $before, array $after): array
-    {
-        $changed = [];
-        $columnCatalog = null;
-
-        foreach (array_unique([...array_keys($before), ...array_keys($after)]) as $column) {
-            $column = (string) $column;
-
-            if (($before[$column] ?? null) === ($after[$column] ?? null)) {
-                continue;
-            }
-
-            $columnCatalog ??= new ColumnCatalog($model->getConnection());
-
-            if (! $this->equivalent($model, $column, $columnCatalog->type($record->readFrom, $column), $before[$column] ?? null, $after[$column] ?? null)) {
-                $changed[] = $column;
-            }
-        }
-
-        return $changed;
     }
 
     private function equivalent(Model $model, string $column, null|string $type, mixed $before, mixed $after): bool

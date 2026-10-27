@@ -7,6 +7,7 @@ require __DIR__.'/../vendor/autoload.php';
 $root = dirname(__DIR__);
 $package = 'Support\\Database\\Eloquent\\Compatibility\\';
 $external = [
+    'BindingResolutionException' => Illuminate\Contracts\Container\BindingResolutionException::class,
     'Connection' => Illuminate\Database\Connection::class,
     'Event' => Illuminate\Support\Facades\Event::class,
     'EventFake' => Illuminate\Support\Testing\Fakes\EventFake::class,
@@ -15,6 +16,22 @@ $external = [
     'QueryException' => Illuminate\Database\QueryException::class,
     'QueryExecuted' => Illuminate\Database\Events\QueryExecuted::class,
 ];
+$suggested = [
+    'aryeo/eloquent-state-machines' => [
+        'Invalid' => Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid::class,
+        'StateMachineable' => Support\Database\Eloquent\StateMachines\Contracts\StateMachineable::class,
+        'Trigger' => Support\Database\Eloquent\StateMachines\Triggers\Trigger::class,
+    ],
+];
+$absent = [];
+
+foreach ($suggested as $dependency => $allowlist) {
+    if (Composer\InstalledVersions::isInstalled($dependency)) {
+        $external = [...$external, ...$allowlist];
+    } else {
+        $absent = [...$absent, ...array_fill_keys(array_keys($allowlist), $dependency)];
+    }
+}
 
 $exists = fn (string $class): bool => class_exists($class) || interface_exists($class) || trait_exists($class);
 
@@ -48,7 +65,7 @@ foreach ([...$files($root.'/src', '*.php'), ...$files($root.'/tests', '*.php')] 
     }
 }
 
-$resolve = function (string $name) use ($classes, $external, $package, $exists): string {
+$resolve = function (string $name) use ($classes, $external, $absent, $package, $exists): null|string {
     if (str_starts_with($name, '\\')) {
         return $exists(substr($name, 1)) ? substr($name, 1) : throw new UnexpectedValueException('names no class that exists');
     }
@@ -71,6 +88,10 @@ $resolve = function (string $name) use ($classes, $external, $package, $exists):
 
     if ($declared !== []) {
         return $exists($declared[0]) ? $declared[0] : throw new UnexpectedValueException("is declared as {$declared[0]}, which the autoloader cannot load");
+    }
+
+    if (array_key_exists($name, $absent)) {
+        return null;
     }
 
     return $external[$name] ?? throw new UnexpectedValueException('names no package class, and the external allowlist in bin/check-doc-names.php does not list it');
@@ -96,6 +117,7 @@ $checkMember = function (string $class, string $member, bool $called): void {
 
 $problems = [];
 $names = 0;
+$unchecked = [];
 $links = 0;
 $invariants = 0;
 preg_match_all('/^## (INV-\d+):/m', (string) file_get_contents($root.'/docs/invariants.md'), $headings);
@@ -167,7 +189,9 @@ foreach ($documents as $document) {
                 try {
                     $class = $resolve($name);
 
-                    if ($member !== null) {
+                    if ($class === null) {
+                        $unchecked[$absent[$name]] = ($unchecked[$absent[$name]] ?? 0) + 1;
+                    } elseif ($member !== null) {
                         $checkMember($class, $member, $called);
                     }
                 } catch (UnexpectedValueException $e) {
@@ -205,9 +229,13 @@ fwrite($problems === [] ? STDOUT : STDERR, sprintf(
     count($problems),
     count($problems) === 1 ? 'problem' : 'problems',
     count($documents),
-    $names,
+    $names - array_sum($unchecked),
     $links,
     $invariants,
 ));
+
+foreach ($unchecked as $dependency => $count) {
+    fwrite(STDOUT, "{$count} names from {$dependency}, which is not installed, left unchecked.".PHP_EOL);
+}
 
 exit($problems === [] ? 0 : 1);
