@@ -17,7 +17,14 @@ final class ColumnTest extends TestCase
     {
         $column = new Column('character varying(255)', "'Draft'::character varying", true);
 
-        $this->assertSame(['character varying(255)', "'Draft'::character varying", true, false], [$column->type, $column->default, $column->notNull, $column->generated]);
+        $this->assertSame(['character varying(255)', "'Draft'::character varying", true, false, false], [$column->type, $column->default, $column->notNull, $column->generated, $column->alwaysGenerated]);
+    }
+
+    #[Test]
+    public function it_carries_whether_the_database_always_generates_its_value(): void
+    {
+        $this->assertSame([true, true], [(new Column('text', null, false, true, true))->generated, (new Column('text', null, false, true, true))->alwaysGenerated]);
+        $this->assertSame([true, false], [(new Column('integer', null, true, true))->generated, (new Column('integer', null, true, true))->alwaysGenerated]);
     }
 
     #[Test]

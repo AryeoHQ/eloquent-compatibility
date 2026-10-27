@@ -26,8 +26,9 @@ final class ColumnCatalog
         }
 
         $rows = $this->connection->select(
-            'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type, pg_get_expr(column_default.adbin, column_default.adrelid) as "default", table_column.attnotnull as not_null,
-                    table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated
+            'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type, case when table_column.attgenerated = \'\' then pg_get_expr(column_default.adbin, column_default.adrelid) end as "default", table_column.attnotnull as not_null,
+                    table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
+                    table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated
              from pg_attribute table_column
              left join pg_attrdef column_default on column_default.adrelid = table_column.attrelid and column_default.adnum = table_column.attnum
              where table_column.attrelid = to_regclass(?) and table_column.attnum > 0 and not table_column.attisdropped
@@ -43,6 +44,7 @@ final class ColumnCatalog
                 $row->default === null ? null : (string) $row->default,
                 $row->not_null === true,
                 $row->generated === true,
+                $row->always_generated === true,
             );
         }
 

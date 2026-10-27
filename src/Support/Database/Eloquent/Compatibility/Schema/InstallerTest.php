@@ -740,6 +740,26 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    public function it_installs_and_recompiles_a_map_that_exposes_a_generated_column_read_only(string $method): void
+    {
+        DB::statement('alter table gadgets add column shout text generated always as (upper(name)) stored');
+        $installer = resolve(Installer::class);
+        $map = $this->withAttributes([...(new WidgetCompatibilityMap)->attributes(), Attribute::mapped('shout')->asType('text')->storedAs('gadget', 'shout')->readOnlyBecause('The database generates it.')]);
+
+        if ($method === 'install') {
+            $installer->uninstall(new WidgetCompatibilityMap);
+        }
+
+        $installer->{$method}($map);
+        $id = $this->widget();
+
+        $this->assertNull(DB::scalar("select column_default from information_schema.columns where table_name = 'widgets' and column_name = 'shout'"));
+        $this->assertSame('BLUE GADGET', DB::table('widgets')->where('id', $id)->value('shout'));
+    }
+
+    #[Test]
     public function it_uninstalls_the_compatibility_view_and_leaves_the_current_models_untouched(): void
     {
         $this->widget();

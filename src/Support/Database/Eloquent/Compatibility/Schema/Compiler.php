@@ -719,6 +719,12 @@ final class Compiler
                 if ($targetColumn->alias === $previous->alias && in_array($targetColumn->column, $designations, true)) {
                     throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} writes the designation column {$targetColumn->column}; the compatibility map maintains it");
                 }
+
+                $targetTable = $resolvedMap->table($targetColumn->alias);
+
+                if ($this->columnCatalog->of($targetTable)[$targetColumn->column]->alwaysGenerated ?? false) {
+                    throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} writes {$targetTable}.{$targetColumn->column}, which the database always generates; declare it read-only");
+                }
             }
         }
 

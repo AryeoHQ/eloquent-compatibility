@@ -11,6 +11,7 @@ final readonly class Column
         public null|string $default,
         public bool $notNull,
         public bool $generated = false,
+        public bool $alwaysGenerated = false,
     ) {}
 
     public function needsAValue(): bool
