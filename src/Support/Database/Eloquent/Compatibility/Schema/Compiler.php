@@ -469,6 +469,7 @@ final class Compiler
 
         foreach ($resolvedMap->readOnlyAttributes() as $attribute) {
             if (! $attribute->retained && $attribute->alias === $alias && $attribute->storedAs !== null && $attribute->writesTo === []
+                && ! $resolvedMap->writes($alias, $attribute->storedAs)
                 && ! ($this->columnCatalog->of($resolvedMap->table($alias))[$attribute->storedAs]->alwaysGenerated ?? false)) {
                 $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, 'NEW.'.SqlFragments::identifier($attribute->column)));
             }

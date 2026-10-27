@@ -158,6 +158,42 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_two_read_only_attributes_stored_in_one_column_that_no_writable_attribute_owns(): void
+    {
+        $this->expectInvalidMap("read-only attributes 'title', 'label' are stored in gadget.name, which no writable attribute writes, so nothing says which value an insert through widgets stores", ['attributes' => [
+            Attribute::retained('id'),
+            Attribute::retained('gadget_id')->readOnlyBecause('Linked.'),
+            Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->readOnlyBecause('A gadget names it.'),
+            Attribute::mapped('label')->asType('text')->storedAs('gadget', 'name')->readOnlyBecause('A gadget names it.'),
+        ]]);
+    }
+
+    #[Test]
+    public function it_refuses_a_read_only_mapped_attribute_stored_in_the_column_of_a_read_only_retained_attribute(): void
+    {
+        $this->expectInvalidMap("read-only attributes 'uuid', 'public_id' are stored in widget.uuid, which no writable attribute writes", ['attributes' => [
+            Attribute::retained('id'),
+            Attribute::retained('gadget_id')->readOnlyBecause('Linked.'),
+            Attribute::retained('uuid')->readOnlyBecause('Partners hold it.'),
+            Attribute::mapped('public_id')->asType('uuid')->storedAs('widget', 'uuid')->readOnlyBecause('Partners hold it.'),
+        ]]);
+    }
+
+    #[Test]
+    public function it_accepts_read_only_attributes_stored_in_a_column_that_a_writable_attribute_owns(): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+            Attribute::retained('id'),
+            Attribute::retained('gadget_id')->readOnlyBecause('Linked.'),
+            Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name'),
+            Attribute::mapped('title_copy')->asType('text')->storedAs('gadget', 'name')->readOnlyBecause('A copy follows the title.'),
+            Attribute::mapped('label')->asType('text')->storedAs('gadget', 'name')->readOnlyBecause('A label follows the title.'),
+        ]]));
+
+        $this->assertSame(['gadget_id', 'title_copy', 'label'], array_map(fn (Attribute $attribute) => $attribute->column, $resolvedMap->readOnlyAttributes()));
+    }
+
+    #[Test]
     public function it_refuses_a_write_to_an_unknown_alias(): void
     {
         $this->expectInvalidMap("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', 'NEW.title')]]);

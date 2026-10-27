@@ -34,7 +34,7 @@ A map implements `CompatibilityMap`, whose six methods return builders. Every bu
 4. Each dependent declares its primary foreign key.
 5. Each alias is a lowercase identifier other than `new` and `old`, and not one of `ReservedWords::POSTGRESQL`. It names no variable the triggers declare: not one of `ResolvedMap::VARIABLES`, and nothing that starts with `key_`.
 6. `Attribute::resolve()` points each retained attribute at the previous model's alias. A retained attribute that is not read-only writes its own column.
-7. `ResolvedMap::validateAttributes()` checks each attribute: a unique identifier, `Attribute::asType()` on a mapped attribute, a read on a known alias, and a write or a read-only reason. Each stored column has one owner, and the previous model's key and primary foreign key are attributes.
+7. `ResolvedMap::validateAttributes()` checks each attribute: a unique identifier, `Attribute::asType()` on a mapped attribute, a read on a known alias, and a write or a read-only reason. Each stored column has one owner. Two read-only attributes stored in one column need a writable owner, and the previous model's key and primary foreign key are attributes.
 8. `ResolvedMap::validateUnrepresentableStates()` checks each state: a unique identifier, a check on every refused state, and a known alias.
 
 Every failure throws `InvalidCompatibilityMap`, whose message names the map. Checks that need the catalog wait for compile time; [compiling and installing the schema](compiling-and-installing-the-schema.md) lists them.

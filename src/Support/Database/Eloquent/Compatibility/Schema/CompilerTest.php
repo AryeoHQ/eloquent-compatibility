@@ -346,6 +346,23 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_stores_the_writable_attribute_when_a_read_only_attribute_is_stored_in_the_same_column(): void
+    {
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('title_copy')->asType('character varying(255)')->storedAs('gadget', 'name')->readOnlyBecause('A copy follows the title.'),
+        ]]));
+
+        $widget = Widget::query()->create(['title' => 'Lamp']);
+
+        $this->assertSame(['Lamp', 'Lamp', 'Lamp'], [DB::table('gadgets')->value('name'), ...array_values($widget->fresh()?->only(['title', 'title_copy']) ?? [])]);
+        $this->assertWriteRefused(fn () => $widget->update(['title_copy' => 'X']), 'refused a change to widgets.title_copy');
+        Widget::query()->sole()->update(['title' => 'Desk']);
+
+        $this->assertSame(['Desk', 'Desk'], array_values((array) DB::table('widgets')->sole(['title', 'title_copy'])));
+    }
+
+    #[Test]
     public function it_installs_an_object_name_of_exactly_63_characters_without_truncating_it(): void
     {
         $function = 'compatibility__widgets__refuse_a_state_name_of_thirty_two_chars';

@@ -61,7 +61,7 @@ An attribute whose type has no default btree equality operator, such as `json`, 
 6. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads. [INV-40](../invariants.md) records the rule.
 7. It clears the applying flag, stores the retained key in `Setting::Created` and returns `NEW`.
 
-Each insert also stores the value of a read-only attribute, retained or mapped, in its stored column. The private `Compiler::insertAssignmentsTo()` adds a read-only mapped attribute's `storedAs()` target, unless the database always generates that column. Only the update trigger refuses a change to it. [INV-49](../invariants.md) records the rule.
+Each insert also stores the value of a read-only attribute, retained or mapped, in its stored column. The private `Compiler::insertAssignmentsTo()` adds a read-only mapped attribute's `storedAs()` target, unless the database always generates that column. It also skips that target when a writable attribute writes the column, so the writable value is stored and both attributes read it. [INV-8](../invariants.md) records that rule. Only the update trigger refuses a change to it. [INV-49](../invariants.md) records the rule.
 
 An omitted attribute arrives as NULL, unless its view column has a default. `Compiler::insertValues()` writes `COALESCE(<value>, <default>)` to a target column that is `NOT NULL` and has a catalog default. So that default fills it, in the primary, retained and dependent inserts and in the update trigger's create branch. A nullable column with a default stores NULL. [INV-46](../invariants.md) records the rule.
 

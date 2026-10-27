@@ -162,6 +162,11 @@ final readonly class ResolvedMap
         return $assignments;
     }
 
+    public function writes(string $alias, string $column): bool
+    {
+        return array_any($this->assignmentsTo($alias), fn (Assignment $assignment) => $assignment->targetColumn->column === $column);
+    }
+
     /** @return list<Attribute> */
     public function readOnlyAttributes(): array
     {
@@ -263,6 +268,20 @@ final readonly class ResolvedMap
                 }
 
                 $targets[$target] = $attribute->column;
+            }
+        }
+
+        $readOnlyTargets = [];
+
+        foreach ($this->readOnlyAttributes() as $attribute) {
+            if ($attribute->storedAs !== null) {
+                $readOnlyTargets[$attribute->alias.'.'.$attribute->storedAs][] = $attribute->column;
+            }
+        }
+
+        foreach ($readOnlyTargets as $target => $readOnly) {
+            if (count($readOnly) > 1 && ! array_key_exists($target, $targets)) {
+                throw InvalidCompatibilityMap::because($this->name, "read-only attributes '".implode("', '", $readOnly)."' are stored in {$target}, which no writable attribute writes, so nothing says which value an insert through {$this->previousModel->view} stores");
             }
         }
 
