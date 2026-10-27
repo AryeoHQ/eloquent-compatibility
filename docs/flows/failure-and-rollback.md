@@ -4,10 +4,13 @@ This flow follows a write that fails: refused by the database, refused by a mirr
 
 ```mermaid
 flowchart TD
-  Begin["EventBridge::begin()"] --> Statement{"statement"}
+  Begin["EventBridge::begin()"] -->|throw before the statement| Nothing["nothing opened"]
+  Begin --> Open["EventBridge::open(), as the statement starts"]
+  Open --> Statement{"statement"}
   Statement -->|succeeds| Complete["EventBridge::complete()"]
   Complete -->|replay succeeds| Commit["commit, or release the savepoint"]
   Complete -->|replay throws| Rollback["roll back"]
+  Commit -->|commit fails| Rollback
   Statement -->|fails, level 0| Pending["pending until the next statement,<br/>the next bridged write, Looping or terminate"]
   Pending --> Rollback
   Statement -->|fails, inside a caller's transaction| Caller["the caller's transaction is aborted"]
@@ -23,33 +26,39 @@ The event bridge refuses in PHP. `EventReplayer::ing()` throws `CompatibilityWri
 
 ## A concurrent change
 
-`Compiler::conflict()` raises `SqlState::SerializationFailure`, which is 40001, not CM001. It fires when another transaction changed the record after the statement's snapshot and before the trigger's locks. The hint tells the caller to retry, or to write through the model, whose bridge locks the record before the statement. `CompatibilityWriteRefused::isRefusal()` does not recognise it.
+`Compiler::conflict()` raises `SqlState::SerializationFailure`, which is 40001, not CM001. It fires when another transaction changed the record after the statement's snapshot and before the trigger's locks. That includes a dependent row the record reads, which the trigger locks after the primary and retained rows. The hint tells the caller to retry, or to write through the model, whose bridge locks the record before the statement. `CompatibilityWriteRefused::isRefusal()` does not recognise it.
 
 ## A throw in PHP
 
-A throw while the bridge holds a pending write calls `EventBridge::close()` without a commit, then rethrows. That covers a lock or read that fails in `EventBridge::begin()`, and a mirrored listener that refuses or throws in `EventBridge::complete()`.
+A throw while the bridge holds an open pending write calls `EventBridge::close()` without a commit, then rethrows. That covers a lock or read that fails in the private `EventBridge::open()`, and a mirrored listener that refuses or throws in `EventBridge::complete()`.
+
+A throw after the beginning event and before the statement starts, such as a cast, the encrypter or a later listener, finds nothing to close. The bridge opens its transaction or savepoint only when the write's own statement starts, so no transaction and no lock outlives the write. [INV-34](../invariants.md) records the rule.
 
 - At level 0, `EventBridge::close()` rolls the connection back to the level the write began at.
 - In savepoint mode, it issues `ROLLBACK TO SAVEPOINT`, then `RELEASE SAVEPOINT`.
 
 In savepoint mode the replay runs inside `Connection::transaction()`. Laravel drops the `afterCommit` work a mirrored listener queued when that nested transaction rolls back.
 
+## A failed commit
+
+A `COMMIT` can fail after a successful replay, for example on a deferred constraint or a lost connection. Laravel then still counts the bridge's transaction. `EventBridge::close()` keeps the write until its commit finishes. When the commit fails, it rolls the connection back to the level the write began at, forgets the write and rethrows. The connection is then outside a transaction again. [INV-35](../invariants.md) records the rule.
+
 ## A failed statement at level 0
 
 A failed statement fires no `QueryExecuted`, so `EventBridge::complete()` never runs and the write stays pending. At level 0, PostgreSQL has aborted the bridge's own transaction. The first of four events closes it:
 
-1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` marks a level-0 write as started when its statement begins. A new statement while the write is still started means that statement failed. The callback rolls back before the new statement runs.
-2. **The next bridged write.** `EventBridge::begin()` calls `EventBridge::finishFailed()`. When the connection sits one level above the write, it runs `select 1`. A failure rolls back, and a success commits.
+1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` opens a write when its statement starts. A new statement while that write is still pending means its statement failed. The callback rolls back before the new statement runs.
+2. **The next bridged write.** `EventBridge::begin()` calls `EventBridge::finishFailed()`. When the connection sits one level above the write, it runs `select 1`. A failure rolls back, and a success commits. It reaps only a write whose statement started: an unstarted write holds no transaction, and may still be waiting for its statement.
 3. **A queue worker's next loop.** `Provider::boot()` calls `EventBridge::releaseFailed()` on each `Looping` event.
 4. **Application termination.** `Provider::boot()` calls `EventBridge::releaseFailed()` from the terminating callbacks too.
 
-`EventBridge::releaseFailed()` runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
+`EventBridge::releaseFailed()` forgets every pending write whose statement never started, then runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
 
 Until one of the four happens, `Connection::transactionLevel()` still reports 1. `EventBridgeOutsideTransactionTest` names this a declared limit. `EventBridge::finishFailed()` leaves the write alone when the connection's level no longer sits one above it.
 
 ## A failed statement inside a caller's transaction
 
-In savepoint mode, the bridge does nothing for a failed statement. The caller's transaction is aborted, as it is after any failed native statement, and the next query raises 25P02 until the caller rolls back. The next `EventBridge::finishFailed()` drops the pending write without a rollback.
+In savepoint mode, the bridge does nothing for a failed statement. The caller's transaction is aborted, as it is after any failed native statement, and the next query raises 25P02 until the caller rolls back. The next statement, or the next `EventBridge::finishFailed()`, drops the pending write without a rollback.
 
 A caller that wrapped the write in `Connection::transaction()` rolls back to its own savepoint, and its outer transaction stays usable.
 
@@ -62,4 +71,6 @@ A caller that wrapped the write in `Connection::transaction()` rolls back to its
 - `EventBridgeTest::it_rolls_back_the_whole_write_when_a_mirrored_listener_refuses()` and `EventBridgeTest::it_rolls_back_the_write_and_its_after_commit_work_when_a_mirrored_listener_throws()`: PHP failures in savepoint mode.
 - `InstallerTest::it_refuses_a_change_to_a_read_only_attribute_with_what_why_and_what_to_do()`: the three parts of a refusal.
 - `CompatibilityWriteRefusedTest`: `CompatibilityWriteRefused::isRefusal()`, `CompatibilityWriteRefused::fromQueryException()` and the two PHP refusals.
-- `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_lets_a_write_through_proceed_when_only_a_dependent_attribute_changed_after_the_statement_read_the_view()`: the 40001 conflict check.
+- `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()`, `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_lets_a_write_through_proceed_when_its_dependent_row_is_gone_after_the_statement_read_the_view()`: the 40001 conflict check.
+- `EventBridgeOutsideTransactionTest::it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement()`: a throw before the statement.
+- `EventBridgeOutsideTransactionTest::it_rolls_back_a_mirrored_write_whose_commit_fails_and_leaves_the_connection_outside_a_transaction()`: a failed commit.

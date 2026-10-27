@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -19,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
+use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
@@ -29,6 +32,8 @@ use Tests\TestCase;
 #[CoversClass(Compiler::class)]
 final class CompilerTest extends TestCase
 {
+    use InteractsWithCompatibilityMaps;
+
     private const string CONCURRENT_WRITER = <<<'PHP'
         $config = json_decode((string) getenv('CONCURRENT_CONNECTION'), true);
         $connection = new PDO("pgsql:host={$config['host']};port={$config['port']};dbname={$config['database']}", $config['username'], $config['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
@@ -213,6 +218,8 @@ final class CompilerTest extends TestCase
     #[TestWith(['dependent_fill_collision', 'place.street is set both by an attribute and by fillWhenCreatedFromPrevious()'])]
     #[TestWith(['long_refuse_function', 'the database object name compatibility__widgets__refuse_a_state_name_of_thirty_three_char exceeds 63 characters'])]
     #[TestWith(['long_designate_function', 'the database object name compatibility__widgets__designate_another_place_with_a_long_name exceeds 63 characters'])]
+    #[TestWith(['delimiter_in_fill', 'the SQL of trigger function compatibility__widgets__insert contains $compatibility$, which would end its body early; remove it from the map'])]
+    #[TestWith(['delimiter_in_condition', 'the SQL of trigger function compatibility__widgets__refuse_quoted contains $compatibility$, which would end its body early; remove it from the map'])]
     public function it_refuses_at_compile_time_a_map_the_tables_cannot_store(string $case, string $message): void
     {
         $this->assertThrows(fn () => $this->compiler()->compile($this->refusedMap($case)), InvalidCompatibilityMap::class, "Compatibility map 'widgets' is declared wrongly: {$message}");
@@ -272,20 +279,168 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
-    public function it_lets_a_write_through_proceed_when_only_a_dependent_attribute_changed_after_the_statement_read_the_view(): void
+    #[TestWith(["update gadget_places set street = 'Concurrent St'", "update widgets set street = 'Stale St' where id = %d", 'street', 'Concurrent St'])]
+    #[TestWith(["update gadget_places set street = 'Concurrent St'", "update widgets set sku = 'SKU-1' where id = %d", 'sku', null])]
+    #[TestWith(['update gadget_sites set latitude = 1', 'update widgets set latitude = 2 where id = %d', 'latitude', 1.0])]
+    public function it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view(string $concurrentChange, string $write, string $attribute, null|float|string $kept): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $id = $this->widget();
+
+        DB::beginTransaction();
+        DB::unprepared($concurrentChange);
+        $writer = $this->writeConcurrently(sprintf($write, $id));
+        DB::commit();
+        [$state, $error] = $this->failure($writer);
+
+        $this->assertSame('40001', $state);
+        $this->assertStringContainsString("ERROR:  Compatibility map 'widgets' found a concurrent change to widgets record {$id} since this statement's snapshot", $error);
+        $this->assertSame($kept, DB::table('widgets')->where('id', $id)->value($attribute));
+
+        DB::unprepared(sprintf($write, $id));
+
+        $this->assertNotSame($kept, DB::table('widgets')->where('id', $id)->value($attribute));
+    }
+
+    #[Test]
+    public function it_lets_a_write_through_proceed_when_its_dependent_row_is_gone_after_the_statement_read_the_view(): void
     {
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
         $id = $this->widget();
 
         DB::beginTransaction();
         DB::table('gadgets')->lockForUpdate()->sole();
-        DB::table('gadget_places')->update(['street' => 'Concurrent St']);
+        DB::table('gadget_places')->delete();
         $writer = $this->writeConcurrently("update widgets set sku = 'SKU-1' where id = {$id}");
         DB::commit();
         $result = $writer->wait();
 
         $this->assertTrue($result->successful(), $result->output().$result->errorOutput());
-        $this->assertSame(['SKU-1', 'Concurrent St'], [DB::table('widgets')->where('id', $id)->value('sku'), DB::table('widgets')->where('id', $id)->value('street')]);
+        $this->assertSame(['SKU-1', null], [DB::table('widgets')->where('id', $id)->value('sku'), DB::table('widgets')->where('id', $id)->value('street')]);
+    }
+
+    #[Test]
+    public function it_compares_a_json_attribute_by_its_text_in_every_write_through_the_view(): void
+    {
+        Schema::table('retained_widgets', function (Blueprint $table): void {
+            $table->json('settings')->nullable();
+            $table->json('shipped_settings')->nullable();
+        });
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->json('specs')->nullable();
+        });
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::retained('settings'),
+            Attribute::retained('shipped_settings')->readOnlyBecause('A widget keeps the settings it shipped with.'),
+            Attribute::mapped('specs')->asType('json')->storedAs('gadget', 'specs'),
+        ]]));
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'settings' => '{"a":1}', 'shipped_settings' => '{"b":2}', 'specs' => '{"c":3}']);
+
+        DB::table('widgets')->where('id', $id)->update(['sku' => 'SKU-1']);
+        DB::table('widgets')->where('id', $id)->update(['settings' => '{"a": 1}', 'specs' => '{"c": 3}']);
+
+        $this->assertSame(
+            ['SKU-1', '{"a": 1}', '{"b":2}', '{"c": 3}'],
+            [DB::table('retained_widgets')->value('sku'), DB::table('retained_widgets')->value('settings'), DB::table('retained_widgets')->value('shipped_settings'), DB::table('gadgets')->value('specs')],
+        );
+        $this->assertWriteRefused(fn () => DB::table('widgets')->where('id', $id)->update(['shipped_settings' => '{"b": 2}']), 'refused a change to widgets.shipped_settings');
+    }
+
+    #[Test]
+    public function it_returns_every_attribute_of_an_insert_through_the_view_as_the_view_reads_it(): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::unprepared("create function fill_sku() returns trigger language plpgsql as \$fill\$ begin NEW.sku := coalesce(NEW.sku, 'SKU-from-a-trigger'); return NEW; end \$fill\$");
+        DB::statement('create trigger fill_sku before insert on retained_widgets for each row execute function fill_sku()');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop function if exists fill_sku() cascade');
+        });
+
+        $returned = DB::selectOne("insert into widgets (title, price, street) values ('Blue gadget', '12.5', '1 Main St') returning *");
+
+        $this->assertEquals(DB::table('widgets')->sole(), $returned);
+        $this->assertSame(
+            ['Draft', 'SKU-from-a-trigger', DB::table('gadgets')->value('id'), '12.50', false],
+            [$returned->status, $returned->sku, $returned->gadget_id, $returned->price, $returned->is_archived],
+        );
+    }
+
+    #[Test]
+    #[TestWith(['insert'])]
+    #[TestWith(['update'])]
+    #[TestWith(['delete'])]
+    #[TestWith(['primary_insert'])]
+    #[TestWith(['primary_delete'])]
+    #[TestWith(['refuse_second_root_place'])]
+    public function it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own(string $function): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::statement('create table intruders (id uuid, gadget_id uuid)');
+        DB::statement("create trigger intruder before insert on intruders for each row execute function compatibility__widgets__{$function}()");
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop table if exists intruders');
+        });
+
+        $refusal = $this->assertWriteRefused(fn () => DB::table('intruders')->insert(['id' => DB::table('gadgets')->value('id')]));
+
+        $this->assertSame("Compatibility map 'widgets' refused to run compatibility__widgets__{$function} on public.intruders", $refusal->refused);
+    }
+
+    #[Test]
+    public function it_refuses_the_primary_delete_function_fired_on_another_table_before_it_deletes_a_retained_row(): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $this->widget();
+        DB::statement('create table intruders (id uuid)');
+        DB::statement('create trigger intruder before delete on intruders for each row execute function compatibility__widgets__primary_delete()');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop table if exists intruders');
+        });
+        DB::table('intruders')->insert(['id' => DB::table('gadgets')->value('id')]);
+
+        $this->assertWriteRefused(fn () => DB::table('intruders')->delete(), 'refused to run compatibility__widgets__primary_delete on public.intruders');
+
+        $this->assertSame([1, 1], [DB::table('retained_widgets')->count(), DB::table('intruders')->count()]);
+    }
+
+    /**
+     * @param  array<string, string>  $previousFills
+     */
+    #[Test]
+    #[TestWith(['alter table retained_widgets add column region text not null', [], 'retained_widgets.region is NOT NULL without a default, and a gadgets row created through its own model leaves it empty; fill it with fillWhenCreatedFromCurrent()'])]
+    #[TestWith(['alter table retained_widgets add column region text not null', ['region' => "'North'"], 'retained_widgets.region is NOT NULL without a default, and an insert through widgets leaves it empty; declare it as a retained attribute'])]
+    #[TestWith(['alter table gadgets add column code text not null', [], 'gadgets.code is NOT NULL without a default, and an insert through widgets leaves it empty; map an attribute to it or fill it with fillWhenCreatedFromPrevious()'])]
+    #[TestWith(['alter table gadget_places add column kind text not null', [], 'gadget_places.kind is NOT NULL without a default, and an insert through widgets leaves it empty; map an attribute to it or fill it with fillWhenCreatedFromPrevious()'])]
+    public function it_refuses_a_not_null_column_without_a_default_that_an_insert_leaves_empty(string $column, array $previousFills, string $message): void
+    {
+        DB::statement($column);
+        $previous = (new WidgetCompatibilityMap)->previousModel();
+        $map = $this->compatibilityMap(['previousModel' => $previous->fillWhenCreatedFromCurrent([...$previous->fillWhenCreatedFromCurrent, ...$previousFills])]);
+
+        $this->assertThrows(fn () => resolve(Installer::class)->install($map), InvalidCompatibilityMap::class, "Compatibility map 'widgets' is declared wrongly: {$message}");
+
+        $this->assertNull(DB::scalar("select to_regclass('widgets')"));
+    }
+
+    #[Test]
+    public function it_counts_a_filled_default_identity_or_generated_column_as_filled_on_every_insert(): void
+    {
+        DB::statement("alter table retained_widgets add column region text not null default 'North'");
+        DB::statement('alter table retained_widgets add column code text generated always as (upper(status)) stored');
+        DB::statement('alter table gadgets add column serial_number integer not null generated always as identity');
+        DB::statement('alter table gadget_places add column kind text not null');
+        resolve(Installer::class)->install($this->compatibilityMap(['dependentCurrentModels' => $this->dependents(place: fn (DependentCurrentModel $place) => $place->fillWhenCreatedFromPrevious(['kind' => "'Root'"]))]));
+
+        $this->widget();
+        DB::table('gadgets')->insert(['name' => 'Created through its own model']);
+
+        $this->assertSame(
+            [['North', 'DRAFT'], ['North', 'DRAFT']],
+            DB::table('retained_widgets')->orderBy('id')->get(['region', 'code'])->map(fn (object $row) => [$row->region, $row->code])->all(),
+        );
+        $this->assertSame([1, 2], DB::table('gadgets')->orderBy('serial_number')->pluck('serial_number')->all());
+        $this->assertSame('Root', DB::table('gadget_places')->value('kind'));
     }
 
     #[Test]
@@ -438,6 +593,11 @@ final class CompilerTest extends TestCase
             'missing_dependent_fill_column' => ['dependentCurrentModels' => $this->dependents(place: fn (DependentCurrentModel $place) => $place->fillWhenCreatedFromPrevious(['nope' => "'Filled'"]))],
             'primary_fill_collision' => ['primaryCurrentModel' => $gadget->fillWhenCreatedFromPrevious(['name' => "'Filled'"])],
             'dependent_fill_collision' => ['dependentCurrentModels' => $this->dependents(place: fn (DependentCurrentModel $place) => $place->fillWhenCreatedFromPrevious(['street' => "'Filled'"]))],
+            'delimiter_in_fill' => ['primaryCurrentModel' => $gadget->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, $compatibility$00000000-0000-0000-0000-000000000000$compatibility$::uuid)'])],
+            'delimiter_in_condition' => ['unrepresentableStates' => [
+                ...$widgets->unrepresentableStates(),
+                UnrepresentableState::refuse('quoted', 'a quoted street', 'Because.', 'Instead.')->checkedOn('place', 'place.street = $compatibility$Quoted$compatibility$'),
+            ]],
             'long_refuse_function' => ['unrepresentableStates' => [
                 ...$widgets->unrepresentableStates(),
                 UnrepresentableState::refuse('a_state_name_of_thirty_three_char', 'a state', 'Because.', 'Instead.')->checkedOn('place', 'false'),

@@ -14,7 +14,7 @@ flowchart LR
 
 `Provider::boot()` registers `CheckDrift`. `CheckDrift::handle()`:
 
-1. Takes the maps named by `--map`, through `CompatibilityMaps::get()`, or every registered map. An unknown name throws `InvalidCompatibilityMap`.
+1. Takes the maps named by `--map`, through `CompatibilityMaps::get()`, or every registered map. An unknown name throws `InvalidCompatibilityMap`. With no map at all, it prints that nothing was checked and why, and fails, so a missing registration never reads as a pass.
 2. Reads `--limit`, at least 1 and 100 by default, as the most records each check reports.
 3. Calls `DriftQueries::find()` for each map.
 4. Prints a table of findings and fails, or prints that it found no divergence and succeeds.
@@ -42,6 +42,7 @@ The backing value of each `DriftCheck` case is the label the table prints. `Chec
 - `CheckDriftTest::it_passes_when_every_record_has_its_previous_and_current_models()`: a clean map, with a hidden record.
 - `CheckDriftTest::it_names_the_record_and_the_attribute_of_each_divergence_made_by_hand()`: four of the five checks.
 - `CheckDriftTest::it_checks_only_the_compatibility_maps_it_is_given()`: the `--map` option.
+- `CheckDriftTest::it_fails_and_names_the_cause_when_no_compatibility_map_is_registered()`: an empty registry.
 - `DependentCurrentModelTest::the_check_names_a_designation_of_a_missing_row_or_of_a_row_of_another_record()`: the designation check.
 - `ProviderTest::it_registers_the_divergence_check()`: the command's registration.
 - `DriftQueriesTest`: each of the five queries on its own, the hidden-state filter, and the order and limit of the report.

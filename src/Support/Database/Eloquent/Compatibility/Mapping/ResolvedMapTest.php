@@ -85,6 +85,17 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['previous_row'])]
+    #[TestWith(['affected_rows'])]
+    #[TestWith(['created_key'])]
+    #[TestWith(['key_gadget'])]
+    #[TestWith(['key_anything'])]
+    public function it_refuses_an_alias_that_names_a_variable_the_compiled_triggers_declare(string $alias): void
+    {
+        $this->expectInvalidMap("alias '{$alias}' names a variable the compiled triggers declare", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs($alias)->primaryForeignKey('gadget_id')]]);
+    }
+
+    #[Test]
     public function it_refuses_a_dependent_current_model_with_no_primary_foreign_key(): void
     {
         $this->expectInvalidMap("dependent current model 'place' says no primaryForeignKey()", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs('place')]]);

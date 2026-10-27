@@ -1,0 +1,48 @@
+# Adopting a map
+
+This page is for the pull request that adds a compatibility map to an application. It lists what changes for the application's code and tests once a model is mapped. Each section names the change, why it happens, and what the pull request does about it.
+
+## Before the install: views on the old table
+
+A view on the old table follows the table's rename, so it keeps reading the retained table. It then misses every mapped attribute, and the triggers never see its writes. `Installer::install()` refuses while another view or materialized view reads the retained table, and names each one. [INV-42](invariants.md) records the rule.
+
+Redirect each such view in the migration that installs the map:
+
+1. Drop the view after the rename, and before `Installer::install()`.
+2. Install the map.
+3. Create the view again over the compatibility view, which now has the old table's name.
+
+A view over the compatibility view blocks a later recompile in the same way. `Installer::recompile()` drops the compatibility view and creates it again, so it refuses while another object depends on it. A migration that recompiles drops those objects first and creates them again after. [INV-41](invariants.md) records that rule.
+
+## What the install refuses
+
+The install checks the tables before it changes anything, and each refusal is an `InvalidCompatibilityMap`:
+
+- **Row-level security.** The view and its `SECURITY DEFINER` triggers would bypass the table's policies, so a table with row-level security cannot be mapped yet. See [INV-38](invariants.md).
+- **A required column nothing fills.** Every `NOT NULL` column without a default needs a value on each insert path. Fill a retained column with `PreviousModel::fillWhenCreatedFromCurrent()`, and a current column with an attribute or `PrimaryCurrentModel::fillWhenCreatedFromPrevious()`. See [INV-39](invariants.md).
+- **A Parental model.** `EventBridge::mirror()` refuses a class that uses Parental's HasChildren trait, because its children fire their events under their own class names. See [INV-43](invariants.md).
+
+## Tests that fake every event
+
+Once a model is mapped, a test that writes it under `Event::fake()` or `Event::fakeExcept()` throws `CompatibilityEventMirrorBypassed`. The fake swallows the beginning event the bridge listens for, so the other side's events never run and the test proves nothing about them. The guard stays on by default, because it is what stops silently lost mirrored events. [INV-21](invariants.md) records it.
+
+The pull request that adds each map moves every test it touches to one of two forms:
+
+- `Event::fake()` given a list of only the events the test asserts, which leaves the model events alone.
+- `EventBridge::withoutMirroring()` around the write, or `InteractsWithCompatibilityMaps::withoutEventMirroring()` in a test, which switches the mirror off on purpose.
+
+## Tests at transaction level 0
+
+`Illuminate\Foundation\Testing\RefreshDatabase` wraps each test in a transaction. Inside it, the bridge always works in savepoint mode, so a suite that uses only that trait never runs the level-0 path. That path opens the bridge's own transaction, commits it, and releases it after a failed statement. Production web requests and queue jobs usually take it.
+
+Add a test class per map that uses `Illuminate\Foundation\Testing\DatabaseTruncation`, or that turns off the test transaction, and write through both sides outside a transaction. `EventBridgeOutsideTransactionTest` in this package shows the shape: its `connectionsToTransact()` returns no connection.
+
+## A lost connection is not retried at level 0
+
+At transaction level 0, Laravel reconnects and retries a statement once when the connection drops. The bridge opens its own transaction when a mapped write's statement starts. The statement then runs at level 1, where `Connection::handleQueryException()` rethrows instead of retrying. A mapped write that used to survive a dropped connection now fails, and so do the bridge's own reads. A connection class that hands non-idempotent writes to that retry loses it for mapped writes. [0021](decisions/0021-a-mapped-write-at-level-0-gives-up-the-lost-connection-retry.md) records the trade-off.
+
+## Jobs dispatched by mirrored listeners
+
+At level 0, the bridge replays the other side's events before it commits its transaction, while it still holds the records' row locks. A queue connection with `after_commit` set to false pushes a job at once. A worker can then pick the job up before the row it reads has committed, and read the old row or wait on the lock.
+
+Make each job a mirrored listener dispatches run after the commit: call `afterCommit()` on the dispatch, or implement `Illuminate\Contracts\Queue\ShouldQueueAfterCommit` on the job. Inside a caller's transaction, the job then waits for the caller's commit too.

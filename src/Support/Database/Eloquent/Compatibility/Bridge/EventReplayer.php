@@ -13,10 +13,17 @@ use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use WeakMap;
 
 final class EventReplayer
 {
+    private const array NUMBER_CASTS = ['int', 'integer', 'real', 'float', 'double', 'decimal'];
+
+    private const array NUMBER_TYPES = ['smallint', 'integer', 'bigint', 'real', 'double precision'];
+
+    private const array JSON_CASTS = ['array', 'json', 'json:unicode', 'object', 'collection'];
+
     /** @var WeakMap<Model, true> */
     private WeakMap $replaying;
 
@@ -180,7 +187,7 @@ final class EventReplayer
             throw CompatibilityWriteRefused::byMirroredListener($record->map, $model, $event);
         }
 
-        $changed = $this->changed($attributes, $model->getAttributes());
+        $changed = $this->changed($record, $model, $attributes, $model->getAttributes());
 
         if ($changed !== []) {
             throw CompatibilityWriteRefused::byMirroredChange($record->map, $model, $event, $changed);
@@ -240,7 +247,7 @@ final class EventReplayer
         $this->excluded[$subject] = new Exclusion($modelEvent, $excludedListeners);
 
         try {
-            return $halt ? $real->until($event, $payload) : $real->dispatch($event, $payload);
+            return $halt ? $dispatcher->until($event, $payload) : $dispatcher->dispatch($event, $payload);
         } finally {
             unset($this->excluded[$subject]);
             $this->unmask($real, $masked);
@@ -348,33 +355,42 @@ final class EventReplayer
      * @param  array<string, mixed>  $after
      * @return list<string>
      */
-    private function changed(array $before, array $after): array
+    private function changed(AffectedRecord $record, Model $model, array $before, array $after): array
     {
         $changed = [];
+        $columnCatalog = null;
 
         foreach (array_unique([...array_keys($before), ...array_keys($after)]) as $column) {
-            if (! $this->equivalent($before[$column] ?? null, $after[$column] ?? null)) {
-                $changed[] = (string) $column;
+            $column = (string) $column;
+
+            if (($before[$column] ?? null) === ($after[$column] ?? null)) {
+                continue;
+            }
+
+            $columnCatalog ??= new ColumnCatalog($model->getConnection());
+
+            if (! $this->equivalent($model, $column, $columnCatalog->type($record->readFrom, $column), $before[$column] ?? null, $after[$column] ?? null)) {
+                $changed[] = $column;
             }
         }
 
         return $changed;
     }
 
-    private function equivalent(mixed $before, mixed $after): bool
+    private function equivalent(Model $model, string $column, null|string $type, mixed $before, mixed $after): bool
     {
-        if ($before === $after) {
-            return true;
-        }
+        if ($model->hasCast($column, self::NUMBER_CASTS) || in_array($type, self::NUMBER_TYPES, true) || str_starts_with((string) $type, 'numeric')) {
+            if (! is_numeric($before) || ! is_numeric($after)) {
+                return false;
+            }
 
-        if (is_numeric($before) && is_numeric($after)) {
             $number = $this->number($before);
 
             return $number !== null && $number === $this->number($after);
         }
 
-        if (is_string($before) && is_string($after) && json_validate($before) && json_validate($after)) {
-            return json_decode($before, true) === json_decode($after, true);
+        if ($model->hasCast($column, self::JSON_CASTS) || in_array($type, ['json', 'jsonb'], true)) {
+            return is_string($before) && is_string($after) && json_validate($before) && json_validate($after) && json_decode($before, true) === json_decode($after, true);
         }
 
         return false;

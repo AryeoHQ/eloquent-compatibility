@@ -23,11 +23,15 @@ final class SqlFragments
 
     /**
      * @param  list<string>  $columns
+     * @param  list<string>  $comparedAsText
      */
-    public static function changed(array $columns): string
+    public static function changed(array $columns, array $comparedAsText = []): string
     {
-        $new = implode(', ', array_map(fn (string $column) => 'NEW.'.self::identifier($column), $columns));
-        $old = implode(', ', array_map(fn (string $column) => 'OLD.'.self::identifier($column), $columns));
+        $operand = fn (string $row, string $column) => in_array($column, $comparedAsText, true)
+            ? '('.$row.'.'.self::identifier($column).')::text'
+            : $row.'.'.self::identifier($column);
+        $new = implode(', ', array_map(fn (string $column) => $operand('NEW', $column), $columns));
+        $old = implode(', ', array_map(fn (string $column) => $operand('OLD', $column), $columns));
 
         return "ROW({$new}) IS DISTINCT FROM ROW({$old})";
     }

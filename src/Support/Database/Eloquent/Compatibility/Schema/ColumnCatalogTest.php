@@ -80,6 +80,41 @@ final class ColumnCatalogTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_an_identity_or_generated_column_as_generated(): void
+    {
+        DB::statement('create table numbered (id integer generated always as identity, name text not null, shout text generated always as (upper(name)) stored)');
+
+        $this->assertEquals(
+            ['id' => new Column('integer', null, true, true), 'name' => new Column('text', null, true), 'shout' => new Column('text', 'upper(name)', false, true)],
+            (new ColumnCatalog(DB::connection()))->of('numbered'),
+        );
+    }
+
+    #[Test]
+    #[TestWith(['json', false])]
+    #[TestWith(['xml', false])]
+    #[TestWith(['point', false])]
+    #[TestWith(['json_settings', false])]
+    #[TestWith(['jsonb', true])]
+    #[TestWith(['text', true])]
+    #[TestWith(['character varying(255)', true])]
+    #[TestWith(['numeric(24,12)', true])]
+    #[TestWith(['timestamp(0) without time zone', true])]
+    #[TestWith(['uuid', true])]
+    #[TestWith(['integer[]', true])]
+    #[TestWith(['int4range', true])]
+    #[TestWith(['widget_status', true])]
+    #[TestWith(['widget_label', true])]
+    public function it_tells_whether_a_type_has_a_default_btree_equality_operator(string $type, bool $equatable): void
+    {
+        DB::statement('create domain json_settings as json');
+        DB::statement("create type widget_status as enum ('Draft', 'Live')");
+        DB::statement('create domain widget_label as character varying(40)');
+
+        $this->assertSame($equatable, (new ColumnCatalog(DB::connection()))->equatable($type));
+    }
+
+    #[Test]
     public function it_reads_the_catalog_once_for_each_table(): void
     {
         $columnCatalog = new ColumnCatalog(DB::connection());

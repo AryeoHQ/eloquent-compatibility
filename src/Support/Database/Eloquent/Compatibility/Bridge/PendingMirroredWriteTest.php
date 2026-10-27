@@ -14,31 +14,83 @@ use Tests\TestCase;
 final class PendingMirroredWriteTest extends TestCase
 {
     #[Test]
-    public function it_starts_pending_with_no_statement_sent_and_no_snapshot_of_the_write_it_was_given(): void
+    public function it_starts_pending_with_no_statement_sent_no_transaction_and_no_snapshot_of_the_write_it_was_given(): void
     {
         $widget = new Widget;
 
-        $pendingWrite = new PendingMirroredWrite($widget, Operation::Update, 1, 'compatibility_1');
+        $pendingWrite = new PendingMirroredWrite($widget, Operation::Update);
 
         $this->assertSame(
-            ['pending' => true, 'statementSent' => false, 'snapshotsBefore' => [], 'source' => $widget, 'operation' => Operation::Update, 'transactionLevel' => 1, 'savepoint' => 'compatibility_1'],
+            ['pending' => true, 'statementSent' => false, 'snapshotsBefore' => [], 'transactionLevel' => 0, 'savepoint' => null, 'source' => $widget, 'operation' => Operation::Update],
             get_object_vars($pendingWrite),
         );
     }
 
+    /**
+     * @param  list<mixed>  $bindings
+     */
     #[Test]
-    #[TestWith([Operation::Insert, 'insert into "widgets" ("title") values (?) returning "id"', true])]
-    #[TestWith([Operation::Insert, 'update "widgets" set "title" = ? where "id" = ?', false])]
-    #[TestWith([Operation::Insert, 'delete from "widgets" where "id" = ?', false])]
-    #[TestWith([Operation::Update, 'insert into "widgets" ("title") values (?) returning "id"', false])]
-    #[TestWith([Operation::Update, 'update "widgets" set "title" = ? where "id" = ?', true])]
-    #[TestWith([Operation::Update, 'delete from "widgets" where "id" = ?', false])]
-    #[TestWith([Operation::Delete, 'insert into "widgets" ("title") values (?) returning "id"', false])]
-    #[TestWith([Operation::Delete, 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', true])]
-    #[TestWith([Operation::Delete, 'delete from "widgets" where "id" = ?', true])]
-    public function it_expects_the_operation_of_its_model_event_and_a_soft_delete_for_a_delete(Operation $operation, string $sql, bool $expected): void
+    #[TestWith([Operation::Insert, 'insert into "widgets" ("id", "title") values (?, ?) returning "id"', [7, 'Blue gadget'], true])]
+    #[TestWith([Operation::Insert, 'update "widgets" set "title" = ? where "id" = ?', ['Blue gadget', 7], false])]
+    #[TestWith([Operation::Insert, 'delete from "widgets" where "id" = ?', [7], false])]
+    #[TestWith([Operation::Update, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], false])]
+    #[TestWith([Operation::Update, 'update "widgets" set "title" = ? where "id" = ?', ['Blue gadget', 7], true])]
+    #[TestWith([Operation::Update, 'delete from "widgets" where "id" = ?', [7], false])]
+    #[TestWith([Operation::Delete, 'insert into "widgets" ("title") values (?) returning "id"', ['Blue gadget'], false])]
+    #[TestWith([Operation::Delete, 'update "widgets" set "deleted_at" = ?, "updated_at" = ? where "id" = ?', ['2026-10-26 12:00:00', '2026-10-26 12:00:00', 7], true])]
+    #[TestWith([Operation::Delete, 'delete from "widgets" where "id" = ?', [7], true])]
+    public function it_expects_the_operation_of_its_model_event_and_a_soft_delete_for_a_delete(Operation $operation, string $sql, array $bindings, bool $expected): void
     {
-        $this->assertSame($expected, $this->pendingWrite(new Widget, $operation)->expects($this->parsed($sql)));
+        $this->assertSame($expected, $this->pendingWrite($this->widget(), $operation)->expects($this->parsed($sql), $bindings));
+    }
+
+    /**
+     * @param  list<mixed>  $bindings
+     */
+    #[Test]
+    #[TestWith([Operation::Update, 'update "widgets" set "sku" = ?, "updated_at" = ? where "widgets"."id" = ? and "widgets"."deleted_at" is null', ['Touched', '2026-10-26 12:00:00', 8], false])]
+    #[TestWith([Operation::Update, 'update "widgets" set "sku" = ?, "updated_at" = ? where "widgets"."id" = ? and "widgets"."deleted_at" is null', ['Touched', '2026-10-26 12:00:00', 7], true])]
+    #[TestWith([Operation::Update, 'update "widgets" set "sku" = ? where "id" = ?', ['Touched', '7'], false])]
+    #[TestWith([Operation::Update, 'update "widgets" set "sku" = ? where "tenant_id" = ? and "id" = ?', ['Touched', 3, 7], true])]
+    #[TestWith([Operation::Delete, 'delete from "widgets" where "id" = ?', [8], false])]
+    #[TestWith([Operation::Delete, 'delete from "widgets"', [], false])]
+    public function it_expects_an_update_or_delete_only_when_the_statement_binds_its_models_key_for_saving(Operation $operation, string $sql, array $bindings, bool $expected): void
+    {
+        $this->assertSame($expected, $this->pendingWrite($this->widget(), $operation)->expects($this->parsed($sql), $bindings));
+    }
+
+    #[Test]
+    public function it_expects_an_update_that_binds_the_key_the_model_was_loaded_with_after_the_key_changes(): void
+    {
+        $widget = $this->widget();
+        $widget->setAttribute('id', 9);
+
+        $this->assertSame(
+            [true, false],
+            [
+                $this->pendingWrite($widget, Operation::Update)->expects($this->parsed('update "widgets" set "id" = ? where "id" = ?'), [9, 7]),
+                $this->pendingWrite($widget, Operation::Update)->expects($this->parsed('update "widgets" set "id" = ? where "id" = ?'), [7, 9]),
+            ],
+        );
+    }
+
+    #[Test]
+    #[TestWith(['insert into "widgets" ("title", "price") values (?, ?) returning "id"', true])]
+    #[TestWith(['insert into "widgets" ("title") values (?) returning "id"', false])]
+    #[TestWith(['insert into "widgets" ("price", "title") values (?, ?) returning "id"', false])]
+    #[TestWith(['insert into "widgets" ("title", "price", "sku") values (?, ?, ?) returning "id"', false])]
+    #[TestWith(['insert into "widgets" default values returning "id"', false])]
+    public function it_expects_an_insert_only_when_it_names_the_columns_of_its_models_attributes(string $sql, bool $expected): void
+    {
+        $widget = new Widget(['title' => 'Blue gadget', 'price' => '12.50']);
+
+        $this->assertSame($expected, $this->pendingWrite($widget, Operation::Insert)->expects($this->parsed($sql), ['Blue gadget', '12.50']));
+    }
+
+    #[Test]
+    public function it_expects_an_insert_of_default_values_for_a_model_without_attributes(): void
+    {
+        $this->assertTrue($this->pendingWrite(new Widget, Operation::Insert)->expects($this->parsed('insert into "widgets" default values returning "id"'), []));
     }
 
     #[Test]
@@ -47,29 +99,38 @@ final class PendingMirroredWriteTest extends TestCase
     #[TestWith(['update "widgets_archive" set "title" = ? where "id" = ?'])]
     public function it_expects_no_write_to_another_relation(string $sql): void
     {
-        $this->assertFalse($this->pendingWrite(new Widget, Operation::Update)->expects($this->parsed($sql)));
+        $this->assertFalse($this->pendingWrite($this->widget(), Operation::Update)->expects($this->parsed($sql), ['Renamed', 7]));
     }
 
     #[Test]
-    #[TestWith(['public.widgets', 'update "widgets" set "title" = ?'])]
-    #[TestWith(['widgets', 'update "public"."widgets" set "title" = ?'])]
-    #[TestWith(['Legacy.Widgets', 'update "legacy"."Widgets" set "title" = ?'])]
+    #[TestWith(['public.widgets', 'update "widgets" set "title" = ? where "id" = ?'])]
+    #[TestWith(['widgets', 'update "public"."widgets" set "title" = ? where "id" = ?'])]
+    #[TestWith(['Legacy.Widgets', 'update "legacy"."Widgets" set "title" = ? where "id" = ?'])]
     public function it_expects_a_write_to_its_relation_whatever_the_schema_of_either_name(string $table, string $sql): void
     {
-        $this->assertTrue($this->pendingWrite((new Widget)->setTable($table), Operation::Update)->expects($this->parsed($sql)));
+        $this->assertTrue($this->pendingWrite($this->widget()->setTable($table), Operation::Update)->expects($this->parsed($sql), ['Renamed', 7]));
     }
 
     #[Test]
-    #[TestWith(['Widgets', 'update "widgets" set "title" = ?'])]
-    #[TestWith(['widgets', 'update "Widgets" set "title" = ?'])]
+    #[TestWith(['Widgets', 'update "widgets" set "title" = ? where "id" = ?'])]
+    #[TestWith(['widgets', 'update "Widgets" set "title" = ? where "id" = ?'])]
     public function it_expects_no_write_to_a_relation_whose_quoted_name_differs_in_case(string $table, string $sql): void
     {
-        $this->assertFalse($this->pendingWrite((new Widget)->setTable($table), Operation::Update)->expects($this->parsed($sql)));
+        $this->assertFalse($this->pendingWrite($this->widget()->setTable($table), Operation::Update)->expects($this->parsed($sql), ['Renamed', 7]));
+    }
+
+    private function widget(): Widget
+    {
+        $widget = (new Widget)->forceFill(['id' => 7, 'title' => 'Blue gadget']);
+        $widget->syncOriginal();
+        $widget->exists = true;
+
+        return $widget;
     }
 
     private function pendingWrite(Widget $widget, Operation $operation): PendingMirroredWrite
     {
-        return new PendingMirroredWrite($widget, $operation, 0, null);
+        return new PendingMirroredWrite($widget, $operation);
     }
 
     private function parsed(string $sql): ParsedWrite

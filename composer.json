@@ -5,12 +5,11 @@
     "license": "MIT",
     "autoload": {
         "psr-4": {
-            "Support\\": "src/Support/",
-            "Tooling\\": "src/Tooling/"
+            "Support\\": "src/Support/"
         },
         "exclude-from-classmap": [
-            "*Test.php",
-            "*TestCases.php",
+            "**/*Test.php",
+            "**/*TestCases.php",
             "/tests/"
         ]
     },

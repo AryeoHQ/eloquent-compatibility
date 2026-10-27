@@ -1,6 +1,6 @@
 # Bridge
 
-This namespace is the PHP half of the package. `EventBridge` raises the other side's Eloquent model events for each write through a model. It locks the records a write can change, waits for the statement, reads the records again and replays their events. It stores no data.
+This namespace is the PHP half of the package. `EventBridge` raises the other side's Eloquent model events for each write through a model. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again and replays their events. It stores no data.
 
 Entry points:
 
@@ -13,4 +13,4 @@ The other classes serve `EventBridge`. `AffectedRecords` and `KeyTranslator` fin
 
 Flows: [mirroring a write](../../../../../../docs/flows/mirroring-a-write.md) and [failure and rollback](../../../../../../docs/flows/failure-and-rollback.md).
 
-[Invariants](../../../../../../docs/invariants.md) held here: INV-1, INV-6, INV-15 to INV-21 and INV-25.
+[Invariants](../../../../../../docs/invariants.md) held here: INV-1, INV-6, INV-15 to INV-21, INV-25, INV-33 to INV-35 and INV-43.

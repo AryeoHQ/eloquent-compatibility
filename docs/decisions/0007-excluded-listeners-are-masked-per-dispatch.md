@@ -11,5 +11,5 @@ Some listeners must not run for writes through the other side, such as a journal
 ## Consequences
 
 - A native write inside a mirrored listener still runs the excluded listener.
-- The masking works through a decorating dispatcher, and acts on the real dispatcher behind an `EventFake`.
+- The masking works through a decorating dispatcher, and acts on the real dispatcher behind an `EventFake`. The dispatch itself goes through the model's dispatcher, the fake included, so a faked event is recorded and runs no listener.
 - Only a listener named by a class string, or by a class or object and a method, can be excluded. A closure cannot.

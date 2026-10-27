@@ -11,13 +11,15 @@ sequenceDiagram
   Client->>View: UPDATE
   View->>Trigger: INSTEAD OF UPDATE, once per row
   Trigger->>Trigger: refusals (CM001)
-  Trigger->>Tables: lock the primary row, then the retained row
+  Trigger->>Tables: lock the primary row, the retained row, then the dependent rows
   Trigger->>Trigger: conflict check (40001)
   Trigger->>Tables: write each changed attribute to its owner
   Trigger-->>Client: RETURN NEW
 ```
 
 ## An update
+
+Every compiled function first refuses with CM001 when it fires on a relation other than its own, and `PUBLIC` holds no `EXECUTE` on it. [INV-37](../invariants.md) records why.
 
 `Compiler::updateFunction()` builds the update trigger's body. It runs once per row, in this order:
 
@@ -26,7 +28,7 @@ sequenceDiagram
 3. `Compiler::lockPrimary()` locks the primary row with `FOR UPDATE`.
 4. `Compiler::loadPrevious()` locks the retained row and loads it into `previous_row`. A missing row refuses with CM001, and the hint names `compatibility:check`.
 5. Each refused state with `UnrepresentableState::checkedOnPreviousUpdate()` refuses with CM001 when its condition holds.
-6. `Compiler::conflict()` reads every attribute the primary and retained rows hold, through the tables. A row that differs from `OLD` raises 40001.
+6. `Compiler::conflict()` locks each dependent row the record reads with `FOR UPDATE`, through `ResolvedMap::locate()`. It then reads every attribute through the tables. A row that differs from `OLD` raises 40001. A dependent row it no longer finds is not a conflict.
 7. `Compiler::applying()` sets the applying flag, `Setting::Applying`, to the map's name.
 8. `Compiler::updateTable()` updates the primary row when one of its attributes changed. Any row count other than one refuses with CM001.
 9. `Compiler::updateTable()` updates the retained row the same way, with no row count check.
@@ -34,6 +36,8 @@ sequenceDiagram
 11. The trigger clears the applying flag and returns `NEW`.
 
 `Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. `Compiler::value()` casts each written value to the column's type in the catalog.
+
+An attribute whose type has no default btree equality operator, such as `json`, has no `=` to compare with. Every comparison above casts it to text first: the read-only check, `SqlFragments::changed()`, the `CASE WHEN` and the conflict check. A whitespace or key-order change the caller wrote therefore counts as a change. [INV-36](../invariants.md) records the rule.
 
 ## A dependent row
 
@@ -51,9 +55,10 @@ sequenceDiagram
 1. `Compiler::notNullChecks()` refuses a null for a `NOT NULL` mapped attribute.
 2. The trigger sets the applying flag.
 3. It inserts the primary row, with `PrimaryCurrentModel::fillWhenCreatedFromPrevious()` filling the columns no attribute writes.
-4. It inserts the retained row, linked to the primary row, and sets `NEW`'s key from it.
+4. It inserts the retained row, linked to the primary row.
 5. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds. A dependent with a designation is designated too.
-6. It clears the applying flag, stores the retained key in `Setting::Created` and returns `NEW`.
+6. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads. [INV-40](../invariants.md) records the rule.
+7. It clears the applying flag, stores the retained key in `Setting::Created` and returns `NEW`.
 
 ## A delete
 
@@ -96,4 +101,4 @@ An upsert, an update with a limit and a truncate fail on the view. The error is 
 
 ## Tests
 
-`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` covers the primary row lock, with a view writer in a child process. `DependentCurrentModelTest` covers designation. `CompilerTest::it_refuses_a_write_through_the_view_whose_retained_row_is_gone()` and `CompilerTest::it_refuses_a_write_through_the_view_that_updates_no_primary_row()` cover a write that is missing a row. `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` covers the conflict check.
+`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` covers the primary row lock, with a view writer in a child process. `DependentCurrentModelTest` covers designation. `CompilerTest::it_refuses_a_write_through_the_view_whose_retained_row_is_gone()` and `CompilerTest::it_refuses_a_write_through_the_view_that_updates_no_primary_row()` cover a write that is missing a row. `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` cover the conflict check. `CompilerTest::it_compares_a_json_attribute_by_its_text_in_every_write_through_the_view()` covers a `json` attribute. `CompilerTest::it_returns_every_attribute_of_an_insert_through_the_view_as_the_view_reads_it()` covers `INSERT ... RETURNING`. `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()` covers the relation check.

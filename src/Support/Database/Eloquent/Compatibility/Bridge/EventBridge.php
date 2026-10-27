@@ -19,6 +19,8 @@ use WeakMap;
 
 final class EventBridge
 {
+    private const string PARENTAL = 'Tightenco\Parental\HasChildren';
+
     private readonly MirrorIndex $mirrorIndex;
 
     private readonly AffectedRecords $affectedRecords;
@@ -60,6 +62,12 @@ final class EventBridge
 
         if (array_key_exists($resolvedMap->name, $this->mirrored)) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, 'its event mirror is registered twice');
+        }
+
+        foreach ([(string) $resolvedMap->previousModel->model, ...array_keys($resolvedMap->currentModels())] as $model) {
+            if (in_array(self::PARENTAL, class_uses_recursive($model), true)) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} uses ".self::PARENTAL.', so its child classes fire model events under their own names and the event bridge would mirror none of their writes; leave Parental models out of compatibility maps');
+            }
         }
 
         if ($this->mirrored === []) {
@@ -104,7 +112,7 @@ final class EventBridge
 
         $pendingWrite = $this->top($query->connectionName);
 
-        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->expects($parsedWrite)) {
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->statementSent && $pendingWrite->expects($parsedWrite, $query->bindings)) {
             $this->complete($query->connection, $pendingWrite);
 
             return;
@@ -115,10 +123,11 @@ final class EventBridge
 
     public function releaseFailed(): void
     {
-        foreach ($this->pendingWrites as $pendingWrites) {
+        foreach ($this->pendingWrites as $name => $pendingWrites) {
             $pendingWrite = $pendingWrites[0] ?? null;
 
             if ($pendingWrite !== null) {
+                $this->pendingWrites[$name] = array_values(array_filter($pendingWrites, fn (PendingMirroredWrite $open) => $open->statementSent));
                 $this->finishFailed($pendingWrite->source->getConnection());
             }
         }
@@ -156,8 +165,15 @@ final class EventBridge
         $connection = $model->getConnection();
         $this->watch($connection);
         $this->finishFailed($connection);
+        $this->pendingWrites[$connection->getName()][] = new PendingMirroredWrite($model, $operation);
+    }
+
+    private function open(Connection $connection, PendingMirroredWrite $pendingWrite): void
+    {
         $level = $connection->transactionLevel();
-        $pendingWrite = new PendingMirroredWrite($model, $operation, $level, $level > 0 ? 'compatibility_'.++$this->savepoints : null);
+        $pendingWrite->statementSent = true;
+        $pendingWrite->transactionLevel = $level;
+        $pendingWrite->savepoint = $level > 0 ? 'compatibility_'.++$this->savepoints : null;
 
         $this->internally(function () use ($connection, $pendingWrite): void {
             if ($pendingWrite->savepoint === null) {
@@ -168,14 +184,12 @@ final class EventBridge
         });
 
         try {
-            $pendingWrite->snapshotsBefore = $this->internally(fn () => $this->affectedRecords->before($connection, $model, $operation));
+            $pendingWrite->snapshotsBefore = $this->internally(fn () => $this->affectedRecords->before($connection, $pendingWrite->source, $pendingWrite->operation));
         } catch (Throwable $e) {
             $this->close($connection, $pendingWrite, false);
 
             throw $e;
         }
-
-        $this->pendingWrites[$connection->getName()][] = $pendingWrite;
     }
 
     private function watch(Connection $connection): void
@@ -192,18 +206,25 @@ final class EventBridge
 
             $pendingWrite = $this->top($connection->getName());
 
-            if ($pendingWrite === null || ! $pendingWrite->pending || $pendingWrite->savepoint !== null) {
+            if ($pendingWrite === null || ! $pendingWrite->pending) {
                 return;
             }
 
             if ($pendingWrite->statementSent) {
-                $this->close($connection, $pendingWrite, false);
+                if ($pendingWrite->savepoint === null) {
+                    $this->close($connection, $pendingWrite, false);
+                } else {
+                    $this->forget($connection, $pendingWrite);
+                }
 
                 return;
             }
 
             $parsedWrite = ParsedWrite::of($query);
-            $pendingWrite->statementSent = $parsedWrite !== null && $pendingWrite->expects($parsedWrite);
+
+            if ($parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
+                $this->open($connection, $pendingWrite);
+            }
         });
     }
 
@@ -248,14 +269,20 @@ final class EventBridge
         $connection = $model->getConnection();
         $pendingWrite = $this->top($connection->getName());
 
-        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->source === $model) {
+        if ($pendingWrite === null || ! $pendingWrite->pending || $pendingWrite->source !== $model) {
+            return;
+        }
+
+        if ($pendingWrite->statementSent) {
             $this->close($connection, $pendingWrite, true);
+        } else {
+            $this->forget($connection, $pendingWrite);
         }
     }
 
     private function finishFailed(Connection $connection): void
     {
-        while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending) {
+        while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending && $pendingWrite->statementSent) {
             if ($pendingWrite->savepoint !== null) {
                 $this->forget($connection, $pendingWrite);
 
@@ -288,25 +315,37 @@ final class EventBridge
 
     private function close(Connection $connection, PendingMirroredWrite $pendingWrite, bool $commit): void
     {
-        $this->forget($connection, $pendingWrite);
+        try {
+            $this->internally(function () use ($connection, $pendingWrite, $commit): void {
+                if ($pendingWrite->savepoint !== null) {
+                    if (! $commit) {
+                        $connection->unprepared('ROLLBACK TO SAVEPOINT '.$pendingWrite->savepoint);
+                    }
 
-        $this->internally(function () use ($connection, $pendingWrite, $commit): void {
-            if ($pendingWrite->savepoint !== null) {
-                if (! $commit) {
-                    $connection->unprepared('ROLLBACK TO SAVEPOINT '.$pendingWrite->savepoint);
+                    $connection->unprepared('RELEASE SAVEPOINT '.$pendingWrite->savepoint);
+
+                    return;
                 }
 
-                $connection->unprepared('RELEASE SAVEPOINT '.$pendingWrite->savepoint);
-
-                return;
+                if ($commit) {
+                    $connection->commit();
+                } else {
+                    $connection->rollBack($pendingWrite->transactionLevel);
+                }
+            });
+        } catch (Throwable $e) {
+            try {
+                if ($pendingWrite->savepoint === null && $connection->transactionLevel() > $pendingWrite->transactionLevel) {
+                    $this->internally(fn () => $connection->rollBack($pendingWrite->transactionLevel));
+                }
+            } finally {
+                $this->forget($connection, $pendingWrite);
             }
 
-            if ($commit) {
-                $connection->commit();
-            } else {
-                $connection->rollBack($pendingWrite->transactionLevel);
-            }
-        });
+            throw $e;
+        }
+
+        $this->forget($connection, $pendingWrite);
     }
 
     private function guard(ParsedWrite $parsedWrite): void

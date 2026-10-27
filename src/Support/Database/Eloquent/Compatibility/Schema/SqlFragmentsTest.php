@@ -85,6 +85,23 @@ final class SqlFragmentsTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['{"a":1}', '{"a":1}', false])]
+    #[TestWith(['{"a":1}', '{"a": 1}', true])]
+    #[TestWith(['{"a":1,"b":2}', '{"b":2,"a":1}', true])]
+    #[TestWith([null, '{"a":1}', true])]
+    public function it_tells_whether_a_column_compared_as_text_changed_by_its_text(null|string $old, string $new, bool $changed): void
+    {
+        DB::statement('create table "Changes" ("Status" text, "the settings" json, changed boolean)');
+        DB::unprepared('create function record_change() returns trigger language plpgsql as $record$ begin NEW.changed := '.SqlFragments::changed(['Status', 'the settings'], ['the settings']).'; return NEW; end $record$');
+        DB::statement('create trigger record_change before update on "Changes" for each row execute function record_change()');
+        DB::table('Changes')->insert(['Status' => 'Draft', 'the settings' => $old]);
+
+        DB::table('Changes')->update(['the settings' => $new]);
+
+        $this->assertSame($changed, DB::table('Changes')->value('changed'));
+    }
+
+    #[Test]
     public function it_refuses_with_a_message_expression_and_a_quoted_detail_and_hint_that_php_reads_back(): void
     {
         $message = SqlFragments::literal("Compatibility map 'widgets' refused record ").' || 7::text';

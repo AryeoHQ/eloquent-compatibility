@@ -13,7 +13,7 @@ The package serves the previous model from a PostgreSQL view, the compatibility 
 The package has two halves, and both read one `ResolvedMap`.
 
 - **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view and its trigger functions, and `Installer` runs that SQL. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
-- **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. It locks the records a write can change, waits for the statement, reads the records again, and replays the events for each record that changed.
+- **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again, and replays the events for each record that changed.
 
 A write that skips model events, such as a query builder update, still reaches the right tables through the triggers. Only the events are missing.
 
@@ -50,14 +50,14 @@ flowchart LR
 
 Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php). `Widget` is the previous model and `Gadget` its primary current model.
 
-1. Eloquent fires `updating` on the widget, and `EventBridge::begin()` records a `PendingMirroredWrite`.
-2. The bridge opens a transaction, or a savepoint when the caller already holds one.
-3. `AffectedRecords::before()` asks `AffectedRecords::of()` for every record the write can change: the gadget, its place and its site.
-4. `AffectedRecords::before()` locks those records and the widget's retained row in the triggers' order. `AffectedRecords::snapshots()` then reads each one.
-5. Eloquent sends `update "widgets" set ...` to the compatibility view.
-6. The view's update trigger checks every refusal, locks the gadget row and the retained row, and runs the conflict check.
+1. Eloquent fires `updating` on the widget, and `EventBridge::begin()` records a `PendingMirroredWrite`. It opens nothing yet.
+2. Eloquent sends `update "widgets" set ... where "id" = ?`. Before it runs, the bridge's `beforeExecuting` callback matches it to the pending write by the widget's key.
+3. The bridge opens a transaction, or a savepoint when the caller already holds one.
+4. `AffectedRecords::before()` asks `AffectedRecords::of()` for every record the write can change: the gadget, its place and its site.
+5. `AffectedRecords::before()` locks those records and the widget's retained row in the triggers' order. `AffectedRecords::snapshots()` then reads each one.
+6. The statement reaches the compatibility view. The view's update trigger checks every refusal, locks the gadget row, the retained row and the dependent rows, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
-8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which matches the statement to the pending write.
+8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which matches the statement to the pending write again.
 9. `EventBridge::complete()` reads each record again, and `EventReplayer::replay()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
 10. The bridge commits or releases its savepoint, and Eloquent fires the widget's own `updated` and `saved`.
 
@@ -65,8 +65,8 @@ The flows below take each step in depth:
 
 - [Declaring and registering a map](flows/declaring-and-registering-a-map.md)
 - [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md)
-- [Writing through the view](flows/writing-through-the-view.md), the database side of steps 5 to 7
-- [Mirroring a write](flows/mirroring-a-write.md), the PHP side of steps 1 to 4 and 8 to 10
+- [Writing through the view](flows/writing-through-the-view.md), the database side of steps 6 and 7
+- [Mirroring a write](flows/mirroring-a-write.md), the PHP side of steps 1 to 5 and 8 to 10
 - [Failure and rollback](flows/failure-and-rollback.md)
 - [Checking for drift](flows/checking-for-drift.md)
 
@@ -87,7 +87,7 @@ Read the code in this order. Each step answers one question.
 11. `DriftQueries`: which five kinds of drift does the check find?
 12. `InstallerTest`, `EventBridgeTest`, `EventBridgeOutsideTransactionTest` and `DependentCurrentModelTest`: what does each write do, end to end?
 
-Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once.
+Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once. [Adopting a map](adopting-a-map.md) lists what changes for an application's code and tests once a model is mapped.
 
 ## Keeping these docs true
 

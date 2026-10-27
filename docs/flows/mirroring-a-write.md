@@ -10,6 +10,7 @@ sequenceDiagram
   participant Database as PostgreSQL
   participant Replayer as EventReplayer
   Widget->>Bridge: updating
+  Widget->>Bridge: beforeExecuting, UPDATE widgets
   Bridge->>Database: BEGIN, or SAVEPOINT
   Bridge->>Records: find, lock and read the affected records
   Widget->>Database: UPDATE widgets
@@ -30,12 +31,20 @@ The bridge listens on the beginning events through a wildcard and acts only on t
 `EventBridge::begin()` returns at once inside `EventBridge::withoutMirroring()`, and for an instance the `EventReplayer` is replaying. Otherwise it:
 
 1. Adds a `Connection::beforeExecuting()` callback, once per connection, through `EventBridge::watch()`.
-2. Closes any pending write a failed statement left behind, through `EventBridge::finishFailed()`.
-3. Opens a transaction at transaction level 0. Above it, it issues `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count.
-4. Calls `AffectedRecords::before()`, which finds the affected records, locks them, and reads each into a `RecordSnapshot`. The next two sections describe it.
-5. Pushes the `PendingMirroredWrite` onto the connection's stack.
+2. Closes any pending write a failed statement left behind, through `EventBridge::finishFailed()`. It closes only a write whose statement started.
+3. Pushes a `PendingMirroredWrite` onto the connection's stack. It opens nothing yet.
 
-A throw in step 4 rolls the transaction or savepoint back and rethrows.
+## Opening at the statement
+
+The `beforeExecuting` callback sees each statement the connection runs, before it runs. When the top pending write's statement has not started, and `PendingMirroredWrite::expects()` accepts this statement, the callback calls the private `EventBridge::open()`. It:
+
+1. Sets `PendingMirroredWrite::$statementSent`.
+2. Opens a transaction at transaction level 0. Above it, it issues `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count.
+3. Calls `AffectedRecords::before()`, which finds the affected records, locks them, and reads each into a `RecordSnapshot`. The next two sections describe it.
+
+A throw in step 3 rolls the transaction or savepoint back and rethrows, so the statement never runs. A throw between the beginning event and the statement, such as a cast or a later listener, opens nothing at all. [INV-34](../invariants.md) records the rule.
+
+A listener on the beginning event can write another mapped model. That write begins, opens, completes and closes on top of the stack, before the outer write's statement starts. `EventBridge::finishFailed()` leaves the outer write alone, because its statement has not started.
 
 ## Finding the affected records
 
@@ -68,9 +77,16 @@ No dependent row another transaction inserts escapes step 2. An insert that has 
 
 ## Matching the statement
 
-`EventBridge::handleQuery()` receives every `QueryExecuted`. `ParsedWrite::of()` reads the operation and the relation from the head of the SQL: `insert into`, `update` or `delete from`. It drops a schema qualifier. A quoted name stays whole and keeps its case, and a doubled quote inside it becomes one quote. An unquoted name folds to lowercase, as PostgreSQL folds it. The write completes the top pending write when that write is still pending and `PendingMirroredWrite::expects()` accepts it.
+`ParsedWrite::of()` reads the operation and the relation from the head of the SQL: `insert into`, `update` or `delete from`. It drops a schema qualifier. A quoted name stays whole and keeps its case, and a doubled quote inside it becomes one quote. An unquoted name folds to lowercase, as PostgreSQL folds it. For an insert it also reads the column list into `ParsedWrite::$columns`, or no columns for `default values`. After `where`, it records the placeholder of each column compared with `=` in `ParsedWrite::$wherePlaceholders`.
 
-`PendingMirroredWrite::expects()` compares the relation exactly with the model's table, less any schema qualifier, then asks `Operation::accepts()`. Laravel quotes every part of the table name, so PostgreSQL resolves it to that exact string. A delete accepts an `UPDATE`, because a soft delete sends one. A write that completes nothing goes to `EventBridge::guard()`.
+`PendingMirroredWrite::expects()` compares the relation exactly with the model's table, less any schema qualifier, then asks `Operation::accepts()`. Laravel quotes every part of the table name, so PostgreSQL resolves it to that exact string. A delete accepts an `UPDATE`, because a soft delete sends one. It then ties the statement to the model:
+
+- An insert must name the model's attributes as its columns, in their order, as Eloquent sends them.
+- An update or a delete must bind the model's save key at a placeholder its `WHERE` clause compares with the key column. The save key is the raw original key, or else the current key.
+
+So a listener that writes the same table, after the bridge's own listener, no longer claims the pending write. [INV-33](../invariants.md) records the rule and its limits.
+
+`EventBridge::handleQuery()` receives every `QueryExecuted`. The write completes the top pending write when that write's statement started, it is still pending, and `PendingMirroredWrite::expects()` accepts it. A write that completes nothing goes to `EventBridge::guard()`.
 
 ## Completing
 
@@ -80,7 +96,7 @@ No dependent row another transaction inserts escapes step 2. An insert that has 
 2. Adds the records `AffectedRecords::of()` finds after the write, such as the current records of a new previous record. These have no row from before.
 3. Reads every record again, without locks.
 4. Calls `EventReplayer::replay()` for each record, with its row from before and after.
-5. Commits at level 0, or releases its savepoint.
+5. Commits at level 0, or releases its savepoint, through `EventBridge::close()`. A failed commit rolls back to the write's level and rethrows; [failure and rollback](failure-and-rollback.md) describes it.
 
 In savepoint mode, step 4 runs inside `Connection::transaction()`, a Laravel nested transaction. Work a mirrored listener queues with `afterCommit` then rolls back with a failed replay. A throw in steps 2 to 4 rolls back and rethrows.
 
@@ -98,7 +114,7 @@ In savepoint mode, step 4 runs inside `Connection::transaction()`, a Laravel nes
 
 For a soft-deleting model, `EventReplayer::deleted()` sets the model's `forceDeleting` property as a native force delete does. It is false for forceDeleting, true for deleting and deleted, and false again for forceDeleted. So `isForceDeleting()` reports to a mirrored listener what it reports to a native one.
 
-Each `-ing` event can stop the write. A listener that returns false raises `CompatibilityWriteRefused::byMirroredListener()`. A listener that changes an attribute raises `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::equivalent()` compares numbers and JSON strings by value. It compares two numbers by their exact decimal value, never through a float, so `'47.600000000000'` equals `47.6` and differs from `'47.600000000000001'`. A number it cannot parse, such as INF or NAN, equals only an identical value. The `-ed` events cannot stop anything.
+Each `-ing` event can stop the write. A listener that returns false raises `CompatibilityWriteRefused::byMirroredListener()`. A listener that changes an attribute raises `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::equivalent()` compares by the attribute's cast, or else by its column type. A numeric cast or column compares two numbers by their exact decimal value, never through a float, so `'47.600000000000'` equals `47.6` and differs from `'47.600000000000001'`. A number it cannot parse, such as INF or NAN, equals only an identical value. A JSON cast or a `json` or `jsonb` column compares the decoded JSON. Every other attribute compares exactly, so a text column's `'1'` and `'001'` differ. The `-ed` events cannot stop anything.
 
 A class in the model's `$dispatchesEvents` fires before the string event, as Eloquent does it. After the events, `EventReplayer::replay()` dispatches `RecordMirrored` with the map, the source model, the mirrored instance, the events and both rows.
 
@@ -106,11 +122,11 @@ A class in the model's `$dispatchesEvents` fires before the string event, as Elo
 
 `EventMirror::excludedListeners()` lists the listeners to skip for mirrored events. `ExcludedListener::matches()` compares a listener's class, its method when one is named, and the event.
 
-For a dispatch with exclusions, `EventReplayer::mask()` swaps the event's listeners for wrappers from `EventReplayer::guard()`. A wrapper skips its listener only when the payload's subject is the instance under replay. An `Exclusion`, held per subject, records what to skip. `EventReplayer::unmask()` restores the listeners after the dispatch. A native write inside a mirrored listener has another subject, so the excluded listener runs for it. The masking acts on the real dispatcher behind an `EventFake`. `EventReplayer::identify()` names a listener only when it is a class string, or an array of a class or object and a method name. A closure or an invokable object cannot be excluded.
+For a dispatch with exclusions, `EventReplayer::mask()` swaps the event's listeners for wrappers from `EventReplayer::guard()`. A wrapper skips its listener only when the payload's subject is the instance under replay. An `Exclusion`, held per subject, records what to skip. `EventReplayer::unmask()` restores the listeners after the dispatch. A native write inside a mirrored listener has another subject, so the excluded listener runs for it. The masking acts on the real dispatcher behind an `EventFake`, and the dispatch goes through the fake. So a faked event is recorded, and runs no listener. `EventReplayer::identify()` names a listener only when it is a class string, or an array of a class or object and a method name. A closure or an invokable object cannot be excluded.
 
 ## Finishing, re-entry and fakes
 
-`EventBridge::finish()` runs on the source model's finishing events. It commits the top pending write when that write is still pending and belongs to the model. That closes a write whose statement the bridge never matched.
+`EventBridge::finish()` runs on the source model's finishing events, when the top pending write is still pending and belongs to the model. When that write's statement started, it commits it. That closes a write whose `QueryExecuted` the bridge never matched. When the statement never started, it forgets the write. Eloquent then sent no statement, for example for an update a listener left with nothing to change.
 
 A replayed instance never begins a pending write. A native write inside a mirrored listener begins its own, on top of the stack. Its transaction level is above 0, so it takes a savepoint.
 
@@ -124,6 +140,8 @@ A replayed instance never begins a pending write. A native write inside a mirror
 
 `EventBridgeTest` covers the events of each kind of write, refusals and excluded listeners. It also covers fakes, quiet and bulk writes, maps that share a current table, re-entry and the caller's transaction. Its tests named for a model loaded without its mapped key or primary foreign key cover `AffectedRecords::originalKey()`. Each runs with `Model::preventAccessingMissingAttributes()` off and on. `EventBridgeTest::it_raises_the_previous_model_events_of_both_primary_records_when_a_dependent_loaded_without_its_primary_foreign_key_moves()` covers a primary foreign key assigned but never loaded. `EventBridgeTest::it_raises_the_force_delete_events_of_every_dependent_row_a_previous_model_force_delete_removes()` covers the removed dependent rows. `EventBridgeTest::it_lets_a_raw_write_through_after_a_faked_write_with_the_mirror_off()` covers the guard's count while the mirror is off. `EventBridgeTest::it_raises_the_previous_model_events_of_a_write_to_a_current_table_whose_quoted_name_keeps_its_case_and_a_hyphen()` covers a quoted relation end to end.
 
+`EventBridgeTest::it_mirrors_a_write_on_its_own_statement_and_not_on_a_later_listeners_write_to_the_same_table()` and `EventBridgeTest::it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table()` cover a listener that writes the same table. `EventBridgeTest::it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_inside_a_callers_transaction()` and `EventBridgeOutsideTransactionTest::it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_outside_a_transaction()` cover a nested write. `EventBridgeOutsideTransactionTest::it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement()` covers a throw before the statement. `EventBridgeTest::it_refuses_to_mirror_a_map_that_names_a_model_whose_children_fire_events_under_their_own_classes()` covers the Parental refusal, and `EventBridgeTest::it_records_a_faked_mirrored_event_and_runs_none_of_its_listeners_when_the_map_excludes_a_listener()` a faked event.
+
 Three tests write from a second connection. `EventBridgeOutsideTransactionTest::it_raises_the_force_delete_events_of_a_dependent_row_committed_before_the_primary_record_is_locked()` covers a newcomer of a delete. `EventBridgeOutsideTransactionTest::it_raises_the_update_events_of_a_readable_dependent_row_committed_before_the_primary_record_is_locked()` covers a newcomer of an update. `EventBridgeOutsideTransactionTest::it_locks_the_own_record_of_a_model_loaded_without_its_mapped_key_before_the_statement()` covers the model's own-row lock, in both strict modes. `DependentCurrentModelTest::a_previous_model_write_mirrors_only_the_designated_dependent_row()` covers the dependent row the bridge mirrors.
 
-Each class also has its own colocated test. `AffectedRecordsTest` covers the records `AffectedRecords::of()` finds for each role, the lock order through `AffectedRecords::before()`, a newcomer's lock, and `AffectedRecords::snapshots()`. `KeyTranslatorTest` covers each key translation, and `MirrorIndexTest` covers each lookup. `EventReplayerTest` covers the events of each change, the refusals, `EventReplayer::isReplaying()` and the excluded listeners. `ParsedWriteTest` covers the SQL forms and the quoted names, and `PendingMirroredWriteTest` covers `PendingMirroredWrite::expects()`.
+Each class also has its own colocated test. `AffectedRecordsTest` covers the records `AffectedRecords::of()` finds for each role, the lock order through `AffectedRecords::before()`, a newcomer's lock, and `AffectedRecords::snapshots()`. `KeyTranslatorTest` covers each key translation, and `MirrorIndexTest` covers each lookup. `EventReplayerTest` covers the events of each change, the refusals, `EventReplayer::isReplaying()` and the excluded listeners. `ParsedWriteTest` covers the SQL forms, the quoted names, an insert's columns and the `WHERE` placeholders. `PendingMirroredWriteTest` covers `PendingMirroredWrite::expects()`.

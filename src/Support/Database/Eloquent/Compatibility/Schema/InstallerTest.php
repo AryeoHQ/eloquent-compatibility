@@ -12,9 +12,13 @@ use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
+use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
+use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
@@ -29,7 +33,7 @@ final class InstallerTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
 
-    private const array KEYWORDS = ['as', 'for', 'join', 'left', 'limit', 'on', 'order', 'returning', 'set', 'where'];
+    private const array KEYWORDS = ['as', 'create', 'for', 'join', 'left', 'limit', 'on', 'order', 'returning', 'set', 'where'];
 
     private const string CONCURRENT_WRITER = <<<'PHP'
         $config = json_decode((string) getenv('CONCURRENT_CONNECTION'), true);
@@ -393,13 +397,162 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_keeps_the_installed_compatibility_map_when_a_recompile_fails(): void
     {
-        $retyped = new WidgetCompatibilityMap(['title' => Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')]);
+        $broken = new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo('no_such_function()')]);
 
-        $this->assertThrows(fn () => resolve(Installer::class)->recompile($retyped), QueryException::class, 'cannot change data type of view column');
+        $this->assertThrows(fn () => resolve(Installer::class)->recompile($broken), QueryException::class, 'no_such_function');
 
         DB::table('gadgets')->insert(['name' => 'After a failed recompile']);
 
         $this->assertSame(1, DB::table('retained_widgets')->count());
+        $this->assertSame('After a failed recompile', DB::table('widgets')->value('title'));
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    #[Test]
+    #[TestWith(['removed', ['id', 'uuid', 'sku', 'status', 'title', 'price', 'delivered_at', 'is_archived', 'street', 'gadget_id', 'created_at', 'updated_at', 'deleted_at'], 'character varying(255)'])]
+    #[TestWith(['retyped', ['id', 'uuid', 'sku', 'status', 'title', 'price', 'delivered_at', 'is_archived', 'street', 'latitude', 'gadget_id', 'created_at', 'updated_at', 'deleted_at'], 'text'])]
+    #[TestWith(['reordered', ['id', 'uuid', 'status', 'sku', 'title', 'price', 'delivered_at', 'is_archived', 'street', 'latitude', 'gadget_id', 'created_at', 'updated_at', 'deleted_at'], 'character varying(255)'])]
+    public function it_recompiles_a_map_that_removes_retypes_or_reorders_an_attribute(string $change, array $columns, string $titleType): void
+    {
+        $id = $this->widget();
+        $attributes = array_column(array_map(fn (Attribute $attribute) => [$attribute->column, $attribute], (new WidgetCompatibilityMap)->attributes()), 1, 0);
+        $changed = match ($change) {
+            'removed' => array_values(array_filter($attributes, fn (Attribute $attribute) => $attribute->column !== 'latitude')),
+            'retyped' => array_values([...$attributes, 'title' => Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')]),
+            'reordered' => array_values([...array_slice($attributes, 0, 2), 'status' => $attributes['status'], 'sku' => $attributes['sku'], ...array_slice($attributes, 4)]),
+            default => [],
+        };
+
+        resolve(Installer::class)->recompile($this->withAttributes($changed));
+
+        $this->assertSame($columns, array_column($this->viewColumns(), 'name'));
+        $this->assertSame($titleType, array_column($this->viewColumns(), 'type', 'name')['title']);
+        DB::table('widgets')->where('id', $id)->update(['title' => 'After the recompile']);
+        $this->assertSame('After the recompile', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_keeps_every_grant_on_the_view_when_it_recompiles_the_view_anew(): void
+    {
+        $reader = $this->role('compatibility_reader');
+        $editor = $this->role('compatibility_editor');
+        DB::statement('grant select on widgets to '.SqlFragments::identifier($reader).' with grant option');
+        DB::statement('grant update (sku, title) on widgets to '.SqlFragments::identifier($editor));
+
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap(['title' => Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')]));
+
+        $this->assertSame(
+            ['reader selects with grant option' => true, 'editor updates sku' => true, 'editor updates title' => true, 'editor updates status' => false],
+            [
+                'reader selects with grant option' => $this->viewPrivilege($reader, 'SELECT WITH GRANT OPTION'),
+                'editor updates sku' => $this->viewPrivilege($editor, 'UPDATE', 'sku'),
+                'editor updates title' => $this->viewPrivilege($editor, 'UPDATE', 'title'),
+                'editor updates status' => $this->viewPrivilege($editor, 'UPDATE', 'status'),
+            ],
+        );
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_while_another_object_depends_on_the_view_and_names_it(): void
+    {
+        DB::statement('create view widget_titles as select title from widgets');
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->recompile(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: recompile() cannot replace the compatibility view widgets while other objects depend on it: widget_titles; drop them first and create them again after the recompile",
+        );
+
+        DB::statement('drop view widget_titles');
+        DB::table('gadgets')->insert(['name' => 'After a refused recompile']);
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+    }
+
+    #[Test]
+    public function it_refuses_to_install_while_another_view_reads_the_retained_table_and_names_it(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('create view widget_skus as select sku from retained_widgets');
+        DB::statement('create materialized view widget_statuses as select status from retained_widgets');
+
+        try {
+            $this->assertThrows(
+                fn () => resolve(Installer::class)->install(new WidgetCompatibilityMap),
+                InvalidCompatibilityMap::class,
+                "Compatibility map 'widgets' is declared wrongly: install() cannot serve retained_widgets through the compatibility view while other views read it directly: widget_skus, widget_statuses; drop them first and create them again over the compatibility view after the install",
+            );
+
+            $this->assertNull(DB::scalar("select to_regclass('widgets')"));
+        } finally {
+            DB::statement('drop view widget_skus');
+            DB::statement('drop materialized view widget_statuses');
+        }
+    }
+
+    #[Test]
+    #[TestWith(['retained_widgets', 'install'])]
+    #[TestWith(['retained_widgets', 'recompile'])]
+    #[TestWith(['gadgets', 'install'])]
+    #[TestWith(['gadget_places', 'recompile'])]
+    #[TestWith(['gadget_sites', 'install'])]
+    public function it_refuses_to_install_or_recompile_over_a_table_with_row_level_security(string $table, string $action): void
+    {
+        if ($action === 'install') {
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        }
+
+        DB::statement("alter table {$table} enable row level security");
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->{$action}(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$table} has row-level security enabled, and the compatibility view and its SECURITY DEFINER triggers would bypass its policies",
+        );
+    }
+
+    #[Test]
+    public function it_lets_no_other_role_execute_a_trigger_function_after_an_install_or_a_recompile(): void
+    {
+        $intruder = $this->role('compatibility_intruder');
+        $executable = fn () => (int) DB::scalar(
+            "select count(*) from pg_proc where proname like 'compatibility\\_\\_widgets\\_\\_%' and (has_function_privilege('public', oid, 'execute') or has_function_privilege(?, oid, 'execute'))",
+            [$intruder],
+        );
+        $installed = $executable();
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+
+        $this->assertSame([0, 0], [$installed, $executable()]);
+
+        DB::statement('set role '.SqlFragments::identifier($intruder));
+
+        try {
+            DB::statement('create temporary table intruders (id uuid)');
+            $this->assertThrows(
+                fn () => DB::statement('create trigger intruder before delete on intruders for each row execute function compatibility__widgets__primary_delete()'),
+                QueryException::class,
+                'permission denied for function compatibility__widgets__primary_delete',
+            );
+        } finally {
+            DB::statement('reset role');
+            DB::statement('drop table if exists pg_temp.intruders');
+        }
+    }
+
+    #[Test]
+    public function it_copies_the_owners_privileges_to_the_view_when_the_retained_table_was_never_granted(): void
+    {
+        $owner = $this->role('compatibility_owner');
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('alter table retained_widgets owner to '.SqlFragments::identifier($owner));
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $this->assertSame(
+            ['select' => true, 'insert' => true, 'update' => true, 'delete' => true],
+            ['select' => $this->viewPrivilege($owner, 'SELECT'), 'insert' => $this->viewPrivilege($owner, 'INSERT'), 'update' => $this->viewPrivilege($owner, 'UPDATE'), 'delete' => $this->viewPrivilege($owner, 'DELETE')],
+        );
     }
 
     #[Test]
@@ -677,6 +830,63 @@ final class InstallerTest extends TestCase
     private function widget(): int
     {
         return DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'price' => '12.50', 'street' => '1 Main St', 'latitude' => 47.5]);
+    }
+
+    /**
+     * @return list<array{name: string, type: string}>
+     */
+    private function viewColumns(): array
+    {
+        $columns = DB::select(
+            "select view_column.attname as name, format_type(view_column.atttypid, view_column.atttypmod) as type
+             from pg_attribute view_column where view_column.attrelid = 'widgets'::regclass and view_column.attnum > 0 and not view_column.attisdropped order by view_column.attnum",
+        );
+
+        return array_map(fn (object $column) => ['name' => (string) $column->name, 'type' => (string) $column->type], $columns);
+    }
+
+    /**
+     * @param  list<Attribute>  $attributes
+     */
+    private function withAttributes(array $attributes): CompatibilityMap
+    {
+        return new readonly class(new WidgetCompatibilityMap, $attributes) implements CompatibilityMap
+        {
+            /**
+             * @param  list<Attribute>  $attributes
+             */
+            public function __construct(private WidgetCompatibilityMap $base, private array $attributes) {}
+
+            public function name(): string
+            {
+                return $this->base->name();
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return $this->base->previousModel();
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return $this->base->primaryCurrentModel();
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return $this->base->dependentCurrentModels();
+            }
+
+            public function attributes(): array
+            {
+                return $this->attributes;
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return $this->base->unrepresentableStates();
+            }
+        };
     }
 
     private function role(string $name): string

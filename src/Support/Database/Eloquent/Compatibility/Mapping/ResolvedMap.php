@@ -14,6 +14,8 @@ final readonly class ResolvedMap
 {
     private const string IDENTIFIER = '/^[a-z_][a-z0-9_]*$/';
 
+    private const array VARIABLES = ['previous_row', 'affected_rows', 'created_key'];
+
     /**
      * @param  list<DependentCurrentModel>  $dependentCurrentModels
      * @param  list<Attribute>  $attributes
@@ -77,6 +79,10 @@ final readonly class ResolvedMap
 
             if (in_array($alias, ReservedWords::POSTGRESQL, true)) {
                 throw InvalidCompatibilityMap::because($name, "alias '{$alias}' is a reserved PostgreSQL word");
+            }
+
+            if (in_array($alias, self::VARIABLES, true) || str_starts_with($alias, 'key_')) {
+                throw InvalidCompatibilityMap::because($name, "alias '{$alias}' names a variable the compiled triggers declare; choose another alias");
             }
         }
 

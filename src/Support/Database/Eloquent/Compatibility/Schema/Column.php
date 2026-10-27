@@ -10,5 +10,11 @@ final readonly class Column
         public string $type,
         public null|string $default,
         public bool $notNull,
+        public bool $generated = false,
     ) {}
+
+    public function needsAValue(): bool
+    {
+        return $this->notNull && $this->default === null && ! $this->generated;
+    }
 }

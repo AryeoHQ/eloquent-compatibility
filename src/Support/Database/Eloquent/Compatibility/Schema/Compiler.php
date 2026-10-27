@@ -33,26 +33,34 @@ final class Compiler
         $this->validateColumns($resolvedMap);
 
         $functions = [
-            $this->insertFunction($resolvedMap),
-            $this->updateFunction($resolvedMap),
-            $this->deleteFunction($resolvedMap),
-            $this->primaryInsertFunction($resolvedMap),
-            $this->primaryDeleteFunction($resolvedMap),
+            $resolvedMap->functionName(TriggerFunction::Insert) => $this->insertFunction($resolvedMap),
+            $resolvedMap->functionName(TriggerFunction::Update) => $this->updateFunction($resolvedMap),
+            $resolvedMap->functionName(TriggerFunction::Delete) => $this->deleteFunction($resolvedMap),
+            $resolvedMap->functionName(TriggerFunction::PrimaryInsert) => $this->primaryInsertFunction($resolvedMap),
+            $resolvedMap->functionName(TriggerFunction::PrimaryDelete) => $this->primaryDeleteFunction($resolvedMap),
         ];
 
         foreach ($resolvedMap->unrepresentableStates(UnrepresentableStateKind::Refuse) as $state) {
             if ($state->checkedOn !== null) {
-                $functions[] = $this->refuseFunction($resolvedMap, $state);
+                $functions[$resolvedMap->refuseFunctionName($state)] = $this->refuseFunction($resolvedMap, $state);
             }
         }
 
         foreach ($resolvedMap->designated() as $dependent) {
-            $functions[] = $this->designateFunction($resolvedMap, $dependent);
+            $functions[$resolvedMap->designateFunctionName($dependent)] = $this->designateFunction($resolvedMap, $dependent);
+        }
+
+        $this->validateFills($resolvedMap);
+        $statements = [];
+
+        foreach ($functions as $name => $function) {
+            $statements[] = $function;
+            $statements[] = 'REVOKE EXECUTE ON FUNCTION '.SqlFragments::identifier($name).'() FROM PUBLIC';
         }
 
         return new CompiledSql(
             [$this->view($resolvedMap), ...$this->defaults($resolvedMap)],
-            $functions,
+            $statements,
             $this->triggers($resolvedMap),
         );
     }
@@ -137,7 +145,6 @@ final class Compiler
             $this->applying($resolvedMap),
             '  '.$this->insert($resolvedMap->table($primaryAlias), $this->insertValues($resolvedMap, $primaryAlias, $primary->fillWhenCreatedFromPrevious), $resolvedMap->keyColumn($primaryAlias), $primaryKey),
             '  '.$this->insert((string) $previous->table, $previousColumns, '*', 'previous_row'),
-            '  NEW.'.SqlFragments::identifier((string) $previous->keyColumn).' := previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).';',
         ];
 
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
@@ -153,11 +160,17 @@ final class Compiler
                 ."\n  END IF;";
         }
 
+        $body[] = '  SELECT '.implode(', ', array_map(fn (Attribute $attribute) => $this->read($resolvedMap, $attribute), $resolvedMap->attributes))
+            ."\n    INTO ".implode(', ', array_map(fn (Attribute $attribute) => 'NEW.'.SqlFragments::identifier($attribute->column), $resolvedMap->attributes))
+            ."\n    FROM ".SqlFragments::identifier((string) $previous->table).' '.$previousAlias
+            .' JOIN '.SqlFragments::identifier($resolvedMap->table($primaryAlias)).' '.$primaryAlias
+            .' ON '.$primaryAlias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primaryAlias)).' = '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
+            .' WHERE '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).';';
         $body[] = $this->applying($resolvedMap, false);
         $body[] = '  PERFORM set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).'::text, true);';
         $body[] = '  RETURN NEW;';
 
-        return $this->function($resolvedMap->functionName(TriggerFunction::Insert), $this->variables($resolvedMap), $body);
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Insert), $previous->view, $this->variables($resolvedMap), $body);
     }
 
     private function updateFunction(ResolvedMap $resolvedMap): string
@@ -168,7 +181,7 @@ final class Compiler
         $body = [];
 
         foreach ($resolvedMap->readOnlyAttributes() as $attribute) {
-            $body[] = '  IF NEW.'.SqlFragments::identifier($attribute->column).' IS DISTINCT FROM OLD.'.SqlFragments::identifier($attribute->column)." THEN\n    "
+            $body[] = '  IF '.$this->compared($resolvedMap, $attribute, 'NEW.'.SqlFragments::identifier($attribute->column)).' IS DISTINCT FROM '.$this->compared($resolvedMap, $attribute, 'OLD.'.SqlFragments::identifier($attribute->column))." THEN\n    "
                 .SqlFragments::refuse(
                     SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused a change to {$previous->view}.{$attribute->column} on record ").$record,
                     (string) $attribute->readOnlyBecause,
@@ -204,7 +217,7 @@ final class Compiler
         $body[] = $this->applying($resolvedMap, false);
         $body[] = '  RETURN NEW;';
 
-        return $this->function($resolvedMap->functionName(TriggerFunction::Update), $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')));
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')));
     }
 
     private function deleteFunction(ResolvedMap $resolvedMap): string
@@ -229,7 +242,7 @@ final class Compiler
         $body[] = $this->applying($resolvedMap, false);
         $body[] = '  RETURN OLD;';
 
-        return $this->function($resolvedMap->functionName(TriggerFunction::Delete), $this->variables($resolvedMap), $body);
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Delete), $previous->view, $this->variables($resolvedMap), $body);
     }
 
     private function primaryInsertFunction(ResolvedMap $resolvedMap): string
@@ -242,7 +255,7 @@ final class Compiler
             $values[$column] = $this->value($resolvedMap, $previousAlias, new TargetColumn($previousAlias, $column, $expression));
         }
 
-        return $this->function($resolvedMap->functionName(TriggerFunction::PrimaryInsert), '  created_key '.SqlFragments::identifier((string) $previous->table).'.'.SqlFragments::identifier((string) $previous->keyColumn)."%TYPE;\n", [
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::PrimaryInsert), $resolvedMap->table((string) $resolvedMap->primaryCurrentModel->alias), '  created_key '.SqlFragments::identifier((string) $previous->table).'.'.SqlFragments::identifier((string) $previous->keyColumn)."%TYPE;\n", [
             $this->skipWhileApplying($resolvedMap, 'NEW'),
             '  '.$this->insert((string) $previous->table, $values, (string) $previous->keyColumn, 'created_key'),
             '  PERFORM set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', created_key::text, true);',
@@ -256,7 +269,7 @@ final class Compiler
         $previous = $resolvedMap->previousModel;
         $designation = SqlFragments::identifier((string) $dependent->designationColumn);
 
-        return $this->function($resolvedMap->designateFunctionName($dependent), '', [
+        return $this->function($resolvedMap, $resolvedMap->designateFunctionName($dependent), $resolvedMap->table($alias), '', [
             $this->skipWhileApplying($resolvedMap, 'NEW'),
             '  IF EXISTS (SELECT 1 FROM (SELECT NEW.*) AS '.$alias.' WHERE COALESCE(('.$dependent->readableWhen.'), false)) THEN'."\n    "
                 .'UPDATE '.SqlFragments::identifier((string) $previous->table).' SET '.$designation.' = NEW.'.SqlFragments::identifier($resolvedMap->keyColumn($alias))
@@ -269,7 +282,7 @@ final class Compiler
     {
         $previous = $resolvedMap->previousModel;
 
-        return $this->function($resolvedMap->functionName(TriggerFunction::PrimaryDelete), '', [
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::PrimaryDelete), $resolvedMap->table((string) $resolvedMap->primaryCurrentModel->alias), '', [
             $this->skipWhileApplying($resolvedMap, 'OLD'),
             '  DELETE FROM '.SqlFragments::identifier((string) $previous->table)
                 .' WHERE '.SqlFragments::identifier((string) $previous->primaryForeignKey).' = OLD.'.SqlFragments::identifier($resolvedMap->keyColumn((string) $resolvedMap->primaryCurrentModel->alias)).';',
@@ -294,7 +307,7 @@ final class Compiler
                 .', NEW.'.SqlFragments::identifier($primaryForeignKey).'), 0));',
         ];
 
-        return $this->function($resolvedMap->refuseFunctionName($state), '', [
+        return $this->function($resolvedMap, $resolvedMap->refuseFunctionName($state), $resolvedMap->table($alias), '', [
             ...$serialize,
             '  IF EXISTS (SELECT 1 FROM (SELECT NEW.*) AS '.$alias.' WHERE COALESCE(('.$state->checkCondition.'), false)) THEN'."\n    "
                 .SqlFragments::refuse(
@@ -344,7 +357,7 @@ final class Compiler
             return '';
         }
 
-        $statement = '  IF '.SqlFragments::changed($this->attributeColumns($assignments))." THEN\n    "
+        $statement = '  IF '.SqlFragments::changed($this->attributeColumns($assignments), $this->comparedAsText($resolvedMap, $assignments))." THEN\n    "
             .$this->update($resolvedMap, $alias, $assignments, $key);
 
         if ($mustExist) {
@@ -388,7 +401,7 @@ final class Compiler
             $branches .= ($branches === '' ? '      IF ' : "\n      ELSIF ").$condition." THEN\n        ".$statement;
         }
 
-        return '  IF '.SqlFragments::changed($columns)." THEN\n"
+        return '  IF '.SqlFragments::changed($columns, $this->comparedAsText($resolvedMap, $assignments))." THEN\n"
             .'    SELECT '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' INTO key_'.$alias.' '.$resolvedMap->locate($dependent, $primaryKey, 'previous_row').";\n"
             .'    IF key_'.$alias." IS NULL THEN\n"
             .$branches
@@ -421,8 +434,8 @@ final class Compiler
     private function update(ResolvedMap $resolvedMap, string $alias, array $assignments, string $key): string
     {
         $sets = array_map(
-            fn (Assignment $assignment) => SqlFragments::identifier($assignment->targetColumn->column).' = CASE WHEN NEW.'.SqlFragments::identifier($assignment->attribute->column)
-                .' IS DISTINCT FROM OLD.'.SqlFragments::identifier($assignment->attribute->column)
+            fn (Assignment $assignment) => SqlFragments::identifier($assignment->targetColumn->column).' = CASE WHEN '.$this->compared($resolvedMap, $assignment->attribute, 'NEW.'.SqlFragments::identifier($assignment->attribute->column))
+                .' IS DISTINCT FROM '.$this->compared($resolvedMap, $assignment->attribute, 'OLD.'.SqlFragments::identifier($assignment->attribute->column))
                 .' THEN '.$this->value($resolvedMap, $alias, $assignment->targetColumn)
                 .' ELSE '.$alias.'.'.SqlFragments::identifier($assignment->targetColumn->column).' END',
             $assignments,
@@ -550,14 +563,33 @@ final class Compiler
     {
         $previous = $resolvedMap->previousModel;
         $primary = (string) $resolvedMap->primaryCurrentModel->alias;
-        $attributes = array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $resolvedMap->dependent((string) $attribute->alias) === null));
+        $locks = [];
+        $joins = '';
 
-        return '  IF EXISTS (SELECT 1 FROM '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+        foreach ($resolvedMap->dependentCurrentModels as $dependent) {
+            $alias = (string) $dependent->alias;
+            $key = $alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias));
+            $locks[] = '  SELECT '.$key.' INTO key_'.$alias.' '.$resolvedMap->locate($dependent, 'key_'.$primary, 'previous_row').' FOR UPDATE;';
+            $joins .= ' LEFT JOIN '.SqlFragments::identifier($resolvedMap->table($alias)).' '.$alias.' ON '.$key.' = key_'.$alias;
+        }
+
+        $read = function (Attribute $attribute) use ($resolvedMap): string {
+            $dependent = $resolvedMap->dependent((string) $attribute->alias);
+            $expression = $dependent === null
+                ? $this->read($resolvedMap, $attribute)
+                : 'CASE WHEN key_'.$dependent->alias.' IS NULL THEN OLD.'.SqlFragments::identifier($attribute->column).' ELSE CAST(('.$attribute->readAs.') AS '.$attribute->type.') END';
+
+            return $this->compared($resolvedMap, $attribute, $expression);
+        };
+
+        return implode("\n", $locks).($locks === [] ? '' : "\n")
+            .'  IF EXISTS (SELECT 1 FROM '.SqlFragments::identifier((string) $previous->table).' '.$previous->alias
             .' JOIN '.SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
             .' ON '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
+            .$joins
             .' WHERE '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = OLD.'.SqlFragments::identifier((string) $previous->keyColumn)
-            .' AND ROW('.implode(', ', array_map(fn (Attribute $attribute) => $this->read($resolvedMap, $attribute), $attributes)).')'
-            .' IS DISTINCT FROM ROW('.implode(', ', array_map(fn (Attribute $attribute) => 'OLD.'.SqlFragments::identifier($attribute->column), $attributes)).")) THEN\n    "
+            .' AND ROW('.implode(', ', array_map($read, $resolvedMap->attributes)).')'
+            .' IS DISTINCT FROM ROW('.implode(', ', array_map(fn (Attribute $attribute) => $this->compared($resolvedMap, $attribute, 'OLD.'.SqlFragments::identifier($attribute->column)), $resolvedMap->attributes)).")) THEN\n    "
             .SqlFragments::raise(
                 SqlState::SerializationFailure,
                 SqlFragments::literal("Compatibility map '{$resolvedMap->name}' found a concurrent change to {$previous->view} record ")
@@ -614,12 +646,46 @@ final class Compiler
     /**
      * @param  list<string>  $body
      */
-    private function function(string $name, string $variables, array $body): string
+    private function function(ResolvedMap $resolvedMap, string $name, string $relation, string $variables, array $body): string
     {
+        $owner = SqlFragments::identifier($this->schema).'.'.SqlFragments::identifier($relation);
+        $guard = '  IF TG_RELID <> '.SqlFragments::literal($owner)."::regclass THEN\n    "
+            .SqlFragments::refuse(
+                SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused to run {$name} on ").' || TG_TABLE_SCHEMA || '.SqlFragments::literal('.').' || TG_TABLE_NAME',
+                "{$name} belongs to {$this->schema}.{$relation}, and only the compatibility map's own trigger on it may run it.",
+                "Attach no trigger of your own to {$name}.",
+            )."\n  END IF;";
+        $definition = ($variables === '' ? '' : "DECLARE\n".$variables)."BEGIN\n".implode("\n", [$guard, ...$body])."\nEND;\n";
+
+        if (str_contains($definition, '$compatibility$')) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the SQL of trigger function {$name} contains \$compatibility\$, which would end its body early; remove it from the map's expressions");
+        }
+
         return 'CREATE OR REPLACE FUNCTION '.SqlFragments::identifier($name).'() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '.SqlFragments::identifier($this->schema)
-            .", pg_temp AS \$compatibility\$\n"
-            .($variables === '' ? '' : "DECLARE\n".$variables)
-            ."BEGIN\n".implode("\n", $body)."\nEND;\n\$compatibility\$";
+            .", pg_temp AS \$compatibility\$\n".$definition.'$compatibility$';
+    }
+
+    private function compared(ResolvedMap $resolvedMap, Attribute $attribute, string $expression): string
+    {
+        return $this->comparesAsText($resolvedMap, $attribute) ? '('.$expression.')::text' : $expression;
+    }
+
+    private function comparesAsText(ResolvedMap $resolvedMap, Attribute $attribute): bool
+    {
+        $type = $attribute->retained ? $this->columnCatalog->type((string) $resolvedMap->previousModel->table, $attribute->column) : $attribute->type;
+
+        return $type !== null && ! $this->columnCatalog->equatable($type);
+    }
+
+    /**
+     * @param  list<Assignment>  $assignments
+     * @return list<string>
+     */
+    private function comparedAsText(ResolvedMap $resolvedMap, array $assignments): array
+    {
+        $assignments = array_filter($assignments, fn (Assignment $assignment) => $this->comparesAsText($resolvedMap, $assignment->attribute));
+
+        return $this->attributeColumns(array_values($assignments));
     }
 
     private function validateColumns(ResolvedMap $resolvedMap): void
@@ -661,6 +727,41 @@ final class Compiler
 
             if ($this->columnCatalog->type($dependentTable, $resolvedMap->primaryForeignKey($dependent)) === null) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, $dependentTable.' has no column '.$resolvedMap->primaryForeignKey($dependent));
+            }
+        }
+    }
+
+    private function validateFills(ResolvedMap $resolvedMap): void
+    {
+        $previous = $resolvedMap->previousModel;
+        $previousAlias = (string) $previous->alias;
+        $primary = $resolvedMap->primaryCurrentModel;
+        $primaryTable = $resolvedMap->table((string) $primary->alias);
+        $throughView = "an insert through {$previous->view} leaves it empty; ";
+        $targets = fn (string $alias) => array_map(fn (Assignment $assignment) => $assignment->targetColumn->column, $resolvedMap->assignmentsTo($alias));
+        $retained = array_map(fn (Attribute $attribute) => $attribute->column, array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->retained));
+
+        $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...array_keys($previous->fillWhenCreatedFromCurrent)], "a {$primaryTable} row created through its own model leaves it empty; fill it with fillWhenCreatedFromCurrent()");
+        $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...$retained, ...$targets($previousAlias)], $throughView.'declare it as a retained attribute');
+        $this->refuseEmpty($resolvedMap, $primaryTable, [...$targets((string) $primary->alias), ...array_keys($primary->fillWhenCreatedFromPrevious)], $throughView.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
+
+        foreach ($resolvedMap->dependentCurrentModels as $dependent) {
+            $alias = (string) $dependent->alias;
+
+            if ($resolvedMap->assignmentsTo($alias) !== [] || $dependent->fillWhenCreatedFromPrevious !== []) {
+                $this->refuseEmpty($resolvedMap, $resolvedMap->table($alias), [$resolvedMap->primaryForeignKey($dependent), ...$targets($alias), ...array_keys($dependent->fillWhenCreatedFromPrevious)], $throughView.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>  $filled
+     */
+    private function refuseEmpty(ResolvedMap $resolvedMap, string $table, array $filled, string $problem): void
+    {
+        foreach ($this->columnCatalog->of($table) as $name => $column) {
+            if ($column->needsAValue() && ! in_array($name, $filled, true)) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table}.{$name} is NOT NULL without a default, and {$problem}");
             }
         }
     }

@@ -16,6 +16,8 @@ use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
@@ -677,6 +679,104 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['updating', ModelEvent::Updated])]
+    #[TestWith(['deleting', ModelEvent::Trashed])]
+    public function it_mirrors_a_write_on_its_own_statement_and_not_on_a_later_listeners_write_to_the_same_table(string $event, ModelEvent $mirrored): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $other = Widget::query()->create(['title' => 'Other gadget'])->refresh();
+        Event::listen("eloquent.{$event}: ".Widget::class.'*', function (string $name, array $payload) use ($other): void {
+            if ($payload[0] instanceof Widget && $payload[0]->isNot($other)) {
+                Widget::query()->whereKey($other->getKey())->update(['sku' => $payload[0]->getKey()]);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $event === 'updating' ? $widget->update(['title' => 'Renamed']) : $widget->delete();
+
+        $this->assertMirrored(Gadget::class, $mirrored, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertSame((string) $widget->getKey(), DB::table('retained_widgets')->where('id', $other->getKey())->value('sku'));
+    }
+
+    #[Test]
+    public function it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table(): void
+    {
+        $this->mirror();
+        Event::listen('eloquent.creating: '.Widget::class.'*', function (string $name, array $payload): void {
+            if ($payload[0] instanceof Widget && $payload[0]->getAttribute('title') === 'Blue gadget') {
+                DB::table('widgets')->insert(['title' => 'Inserted by a listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $this->widget();
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getAttribute('name') === 'Blue gadget');
+        $this->assertCount(1, array_filter($this->mirroredEvents(), fn (RecordMirrored $event) => $event->destination instanceof Gadget));
+        $this->assertSame(2, DB::table('gadgets')->count());
+    }
+
+    #[Test]
+    public function it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_inside_a_callers_transaction(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        $other = Widget::query()->create(['title' => 'Other gadget']);
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($other): void {
+            if ($payload[0] instanceof Widget && $payload[0]->isNot($other)) {
+                $other->update(['title' => 'Renamed by a listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed by a listener');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_records_a_faked_mirrored_event_and_runs_none_of_its_listeners_when_the_map_excludes_a_listener(): void
+    {
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
+        $journal = new Journal;
+        $this->app->instance(Journal::class, $journal);
+        Event::listen('eloquent.updated: '.Gadget::class, [Journal::class, 'handle']);
+        $this->watch(Gadget::class, 'updated', fn () => []);
+        $widget = $this->widget();
+        Event::fake(['eloquent.updated: '.Gadget::class]);
+
+        $widget->update(['title' => 'Faked']);
+
+        Event::assertDispatched('eloquent.updated: '.Gadget::class, 1);
+        $this->assertSame([[], []], [$this->seen, $journal->entries]);
+    }
+
+    #[Test]
+    #[TestWith(['previous'])]
+    #[TestWith(['primary'])]
+    #[TestWith(['dependent'])]
+    public function it_refuses_to_mirror_a_map_that_names_a_model_whose_children_fire_events_under_their_own_classes(string $role): void
+    {
+        require_once dirname(__DIR__, 6).'/tests/Fixtures/Tightenco/Parental/HasChildren.php';
+        /** @var class-string<Model> $parental */
+        $parental = eval('return (new class extends \Illuminate\Database\Eloquent\Model { use \Tightenco\Parental\HasChildren; protected $table = "gadgets"; })::class;'); // @phpstan-ignore ergebnis.noEval
+        $map = match ($role) {
+            'previous' => $this->respelled($parental, Gadget::class),
+            'primary' => $this->respelled(Widget::class, $parental),
+            default => $this->respelled(Widget::class, Gadget::class, [DependentCurrentModel::for($parental)->aliasedAs('parental')->primaryForeignKey('id')]),
+        };
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($map)),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$parental} uses Tightenco\\Parental\\HasChildren, so its child classes fire model events under their own names and the event bridge would mirror none of their writes",
+        );
+    }
+
+    #[Test]
     public function it_leaves_the_callers_transaction_usable_after_a_database_refusal(): void
     {
         $this->mirror();
@@ -700,16 +800,18 @@ final class EventBridgeTest extends TestCase
     /**
      * @param  class-string<Model>  $previous
      * @param  class-string<Model>  $primary
+     * @param  list<DependentCurrentModel>  $dependents
      */
-    private function respelled(string $previous, string $primary): CompatibilityMap
+    private function respelled(string $previous, string $primary, array $dependents = []): CompatibilityMap
     {
-        return new readonly class(new WidgetCompatibilityMap, $previous, $primary) implements CompatibilityMap
+        return new readonly class(new WidgetCompatibilityMap, $previous, $primary, $dependents) implements CompatibilityMap
         {
             /**
              * @param  class-string<Model>  $previous
              * @param  class-string<Model>  $primary
+             * @param  list<DependentCurrentModel>  $dependents
              */
-            public function __construct(private WidgetCompatibilityMap $base, private string $previous, private string $primary) {}
+            public function __construct(private WidgetCompatibilityMap $base, private string $previous, private string $primary, private array $dependents) {}
 
             public function name(): string
             {
@@ -730,7 +832,7 @@ final class EventBridgeTest extends TestCase
 
             public function dependentCurrentModels(): array
             {
-                return $this->base->dependentCurrentModels();
+                return [...$this->base->dependentCurrentModels(), ...$this->dependents];
             }
 
             public function attributes(): array

@@ -13,9 +13,11 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use PDOException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
@@ -220,6 +222,66 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertSame('55P03', $this->concurrentOutcome);
         $this->assertNull(DB::table('retained_widgets')->value('sku'));
         $this->assertSame('Loaded without its id', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        $other = Widget::query()->create(['title' => 'Other gadget']);
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($other): void {
+            if ($payload[0] instanceof Widget && $payload[0]->isNot($other)) {
+                $other->update(['title' => 'Renamed by a listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed by a listener');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[Test]
+    #[TestWith(['updating'])]
+    #[TestWith(['saving'])]
+    public function it_opens_no_transaction_and_takes_no_lock_when_a_listener_throws_before_the_statement(string $event): void
+    {
+        $widget = $this->widget()->refresh();
+        Event::listen("eloquent.{$event}: ".Widget::class.'*', function (): void {
+            throw new RuntimeException('Thrown before the statement.');
+        });
+
+        $this->assertThrows(fn () => $widget->update(['title' => 'Never written']), RuntimeException::class, 'Thrown before the statement.');
+
+        $this->assertSame(0, DB::transactionLevel());
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+        $concurrent = DB::connection('concurrent');
+        $concurrent->statement("set lock_timeout = '200ms'");
+        $locked = $concurrent->transaction(fn () => $concurrent->table('gadgets')->where('id', $widget->gadget_id)->lockForUpdate()->value('name'));
+        $this->assertSame('Blue gadget', $locked);
+    }
+
+    #[Test]
+    public function it_rolls_back_a_mirrored_write_whose_commit_fails_and_leaves_the_connection_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        DB::unprepared("create function refuse_at_commit() returns trigger language plpgsql as \$refuse\$ begin if NEW.name = 'Refused at commit' then raise exception 'refused at commit'; end if; return NEW; end \$refuse\$");
+        DB::statement('create constraint trigger refuse_at_commit after update on gadgets deferrable initially deferred for each row execute function refuse_at_commit()');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop function if exists refuse_at_commit() cascade');
+        });
+
+        $this->assertThrows(fn () => $widget->update(['title' => 'Refused at commit']), PDOException::class, 'refused at commit');
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+        $this->recordMirroredEvents();
+        $widget->refresh()->update(['title' => 'After a failed commit']);
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'After a failed commit');
+        $this->assertSame(0, DB::transactionLevel());
     }
 
     /**

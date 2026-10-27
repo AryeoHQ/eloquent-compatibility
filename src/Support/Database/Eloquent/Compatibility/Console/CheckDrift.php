@@ -20,6 +20,12 @@ final class CheckDrift extends Command
     {
         $names = array_values(array_filter((array) $this->option('map'), is_string(...)));
         $maps = $names === [] ? $compatibilityMaps->all() : array_map($compatibilityMaps->get(...), $names);
+        if ($maps === []) {
+            $this->components->error('No compatibility map is registered, so nothing was checked. Mirror each map with EventBridge::mirror() in a service provider, or register it with CompatibilityMaps::register().');
+
+            return self::FAILURE;
+        }
+
         $limit = max(1, (int) $this->option('limit'));
         $findings = array_merge(...array_map(fn (ResolvedMap $map) => $driftQueries->find($map, $limit), $maps));
 

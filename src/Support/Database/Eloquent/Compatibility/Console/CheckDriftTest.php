@@ -87,6 +87,17 @@ final class CheckDriftTest extends TestCase
         $this->artisan('compatibility:check')->assertFailed();
     }
 
+    #[Test]
+    public function it_fails_and_names_the_cause_when_no_compatibility_map_is_registered(): void
+    {
+        $this->app->instance(CompatibilityMaps::class, new CompatibilityMaps);
+
+        $this->artisan('compatibility:check')
+            ->expectsOutputToContain('No compatibility map is registered, so nothing was checked.')
+            ->doesntExpectOutputToContain('No divergence')
+            ->assertFailed();
+    }
+
     private function widget(): int
     {
         return DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'street' => '1 Main St']);

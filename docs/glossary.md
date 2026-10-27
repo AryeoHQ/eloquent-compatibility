@@ -8,11 +8,11 @@ Each term has one meaning across the code and these docs.
 - **applying flag**: the transaction-local setting `Setting::Applying`, which the view's triggers set to the map's name around their writes.
 - **assignment**: one attribute paired with one column it writes; an `Assignment`.
 - **beginning event**: a creating, updating or deleting model event, on which the event bridge begins a pending mirrored write; see `ModelEvent::beginning()`.
-- **column catalog**: the cached reader of each table's column types, defaults and `NOT NULL` flags; `ColumnCatalog`.
+- **column catalog**: the cached reader of each table's column types, defaults, `NOT NULL` and generated flags, and of whether a type has a btree equality; `ColumnCatalog`.
 - **compatibility map**: the class that declares how a previous model maps onto its current models; it implements `CompatibilityMap`.
 - **compatibility view**: the PostgreSQL view, named after the previous model's old table, that serves the previous model.
 - **compiled SQL**: the view, function and trigger statements a map compiles to; `CompiledSql`.
-- **conflict check**: the update trigger's second read, which raises 40001 when the record changed after the statement's snapshot.
+- **conflict check**: the update trigger's second read of every attribute, after it locks the dependent rows, which raises 40001 when the record changed after the statement's snapshot.
 - **created key**: the retained key of a record just created, which the triggers store in `Setting::Created` for the event bridge.
 - **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model. A map names each current model class once.
 - **degrade**: an unrepresentable state the map documents and lets through; no code reads it.
@@ -34,8 +34,8 @@ Each term has one meaning across the code and these docs.
 - **mirrored map**: a resolved map with its event mirror and key translator; a `MirroredMap`.
 - **native write**: a write a model makes itself, as opposed to the events the event bridge replays for it.
 - **object prefix**: `compatibility__<name>__`, which starts the name of every trigger and function of a map; see `ResolvedMap::objectPrefix()`.
-- **parsed write**: the operation and relation read from the head of a SQL statement; a `ParsedWrite`.
-- **pending mirrored write**: a write the event bridge has begun and not yet closed; a `PendingMirroredWrite`.
+- **parsed write**: the operation and relation read from the head of a SQL statement, with an insert's columns and the placeholders its `WHERE` clause compares; a `ParsedWrite`.
+- **pending mirrored write**: a write the event bridge has begun and not yet closed; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts; see `PendingMirroredWrite::$statementSent`.
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.
@@ -48,6 +48,7 @@ Each term has one meaning across the code and these docs.
 - **resolved map**: the checked, immutable form of a compatibility map that every part reads; `ResolvedMap`.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
+- **save key**: the key value Eloquent binds in a model's own update or delete, its raw original key or else its current key. A pending write completes only on a statement that binds it.
 - **savepoint mode**: how the event bridge works inside a caller's transaction, in a `compatibility_<n>` savepoint.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.

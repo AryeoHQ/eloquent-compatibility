@@ -11,6 +11,6 @@ After taking its locks, the update trigger reads the record again through the ta
 ## Consequences
 
 - A caller's retry logic for serialization failures covers this case.
-- The check compares the attributes the primary and retained rows hold. Dependent attributes are left out.
+- The check compares every attribute. The pre-adoption review of PR #1, thread 4382407394, found that leaving dependent attributes out let a stale write through the view overwrite a dependent row. The trigger now locks each dependent row the record reads, after the primary and retained rows, and compares it too. A dependent row it no longer finds is not a conflict.
 - A write through a model does not meet the check, because the event bridge locks the record before its statement. See [0003](0003-the-bridge-locks-before-the-statement.md).
-- `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` pins the check. `CompilerTest::it_lets_a_write_through_proceed_when_only_a_dependent_attribute_changed_after_the_statement_read_the_view()` pins that dependent attributes are left out.
+- `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` pin the check. `CompilerTest::it_lets_a_write_through_proceed_when_its_dependent_row_is_gone_after_the_statement_read_the_view()` pins that a missing dependent row is not a conflict.

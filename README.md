@@ -115,3 +115,5 @@ The serialization has limits:
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
 
 Maintainers and reviewers: start at [docs/architecture.md](docs/architecture.md).
+
+Adopting a map in an application: read [docs/adopting-a-map.md](docs/adopting-a-map.md) first. It covers the views to redirect, the tests to change, and the lost-connection and queued-job trade-offs.

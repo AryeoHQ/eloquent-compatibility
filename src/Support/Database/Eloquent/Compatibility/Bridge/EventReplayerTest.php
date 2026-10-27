@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -20,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\CastGadget;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
@@ -268,7 +272,7 @@ final class EventReplayerTest extends TestCase
     }
 
     #[Test]
-    public function it_accepts_a_listener_rewrite_to_the_same_number_or_the_same_json(): void
+    public function it_accepts_a_listener_rewrite_to_the_same_number_in_a_numeric_column_or_the_same_json_in_a_json_column(): void
     {
         [$id, $before, $after] = $this->movedSite();
         Event::listen('eloquent.saving: '.GadgetSite::class, function (GadgetSite $site): void {
@@ -278,17 +282,74 @@ final class EventReplayerTest extends TestCase
 
         $this->eventReplayer->replay($this->mirrorIndex->keyTranslator('widgets')->currentRecord('site', $id), $before, $after, $this->source, 'pgsql');
 
-        $gadget = $this->gadget(['name' => '{"color": "blue"}']);
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->jsonb('specs')->nullable();
+        });
+        $gadget = $this->gadget(['specs' => '{"color": "blue"}']);
         $before = $this->row('gadgets', $gadget);
         DB::table('gadgets')->where('id', $gadget)->update(['price_cents' => 1250]);
         Event::listen('eloquent.updating: '.Gadget::class, function (Gadget $gadget): void {
-            $gadget->setAttribute('name', '{"color":"blue"}');
+            $gadget->setAttribute('specs', '{"color":"blue"}');
             $gadget->setAttribute('price_cents', '1250');
         });
 
         $this->eventReplayer->replay($this->gadgetRecord($gadget), $before, $this->row('gadgets', $gadget), $this->source, 'pgsql');
 
         $this->assertCount(2, $this->mirroredEvents());
+    }
+
+    #[Test]
+    #[TestWith(['1', '001'])]
+    #[TestWith(['1.50', '1.5'])]
+    #[TestWith(['{"color": "blue"}', '{"color":"blue"}'])]
+    public function it_refuses_a_listener_change_to_a_text_column_that_reads_as_the_same_number_or_json(string $stored, string $changed): void
+    {
+        $id = $this->gadget(['name' => $stored]);
+        $before = $this->row('gadgets', $id);
+        DB::table('gadgets')->where('id', $id)->update(['price_cents' => 1250]);
+        Event::listen('eloquent.updating: '.Gadget::class, function (Gadget $gadget) use ($changed): void {
+            $gadget->setAttribute('name', $changed);
+        });
+
+        $refusal = $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $this->row('gadgets', $id), $this->source, 'pgsql'));
+
+        $this->assertStringEndsWith('changed name', $refusal->refused);
+    }
+
+    #[Test]
+    public function it_accepts_a_listener_rewrite_to_the_same_value_of_a_text_column_cast_to_a_number_or_to_json(): void
+    {
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->string('code')->nullable();
+        });
+        $id = $this->gadget(['name' => '{"color": "blue"}', 'code' => '001']);
+        $before = $this->row('gadgets', $id);
+        DB::table('gadgets')->where('id', $id)->update(['price_cents' => 1250]);
+        Event::listen('eloquent.updating: '.CastGadget::class, function (CastGadget $gadget): void {
+            $gadget->setAttribute('name', ['color' => 'blue']);
+            $gadget->setAttribute('code', 1);
+        });
+
+        $this->eventReplayer->replay(new AffectedRecord('widgets', CastGadget::class, 'gadgets', 'gadgets', 'id', $id, RecordRole::Primary), $before, $this->row('gadgets', $id), $this->source, 'pgsql');
+
+        $this->assertSame([ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved], $this->sole()->events);
+    }
+
+    #[Test]
+    public function it_records_a_faked_event_without_running_its_listeners_when_the_map_excludes_a_listener(): void
+    {
+        $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
+        $journal = new Journal;
+        $this->app->instance(Journal::class, $journal);
+        Event::listen('eloquent.updated: '.Gadget::class, [Journal::class, 'handle']);
+        $this->watch(Gadget::class, 'updated', fn () => []);
+        [$id, $before, $after] = $this->renamed();
+        Event::fake(['eloquent.updated: '.Gadget::class]);
+
+        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
+
+        Event::assertDispatched('eloquent.updated: '.Gadget::class, 1);
+        $this->assertSame([[], []], [$this->seen, $journal->entries]);
     }
 
     #[Test]
