@@ -8,8 +8,10 @@ use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresMethod;
@@ -20,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
@@ -654,6 +657,16 @@ final class EventBridgeTest extends TestCase
         $this->assertSame(1, DB::transactionLevel());
     }
 
+    private function mirrorWithSettings(): void
+    {
+        Schema::table('retained_widgets', function (Blueprint $table): void {
+            $table->jsonb('settings')->default('{}');
+        });
+        $map = new WidgetCompatibilityMap(['sku' => Attribute::retained('settings')]);
+        resolve(Installer::class)->recompile($map);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($map));
+    }
+
     /**
      * @param  class-string<Model>  $previous
      * @param  class-string<Model>  $primary
@@ -779,6 +792,49 @@ final class EventBridgeTest extends TestCase
         $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
         $this->assertSame('Blue gadget', DB::table('gadgets')->where('id', $widget->gadget_id)->value('name'));
         $this->assertSame($extra['sku'] ?? null, DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    /**
+     * @param  array<string, mixed>  $extra
+     */
+    #[Test]
+    #[TestWith(['increment', ['widgets.status' => 'Counted'], 49.0, 'Counted', '{}'])]
+    #[TestWith(['decrement', ['widgets.status' => 'Counted'], 46.0, 'Counted', '{}'])]
+    #[TestWith(['increment', ['settings->active' => true], 49.0, 'Draft', '{"active": true}'])]
+    #[TestWith(['decrement', ['settings->active' => true], 46.0, 'Draft', '{"active": true}'])]
+    public function it_mirrors_an_increment_or_decrement_whose_extra_names_a_qualified_column_or_a_json_path(string $method, array $extra, float $latitude, string $status, string $settings): void
+    {
+        $this->mirrorWithSettings();
+        $widget = $this->widget()->refresh();
+        $this->recordMirroredEvents();
+
+        $widget->{$method}('latitude', 1.5, $extra);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
+        $this->assertSame([$status, $settings], array_values((array) DB::table('retained_widgets')->where('id', $widget->getKey())->first(['status', 'settings'])));
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    /**
+     * @param  array<string, mixed>  $extra
+     */
+    #[RequiresMethod(Model::class, 'incrementOrDecrementEach')]
+    #[Test]
+    #[TestWith(['incrementEach', ['widgets.status' => 'Counted'], 49.0, 'Counted', '{}'])]
+    #[TestWith(['decrementEach', ['widgets.status' => 'Counted'], 46.0, 'Counted', '{}'])]
+    #[TestWith(['incrementEach', ['settings->active' => true], 49.0, 'Draft', '{"active": true}'])]
+    #[TestWith(['decrementEach', ['settings->active' => true], 46.0, 'Draft', '{"active": true}'])]
+    public function it_mirrors_an_increment_or_decrement_of_each_column_whose_extra_names_a_qualified_column_or_a_json_path(string $method, array $extra, float $latitude, string $status, string $settings): void
+    {
+        $this->mirrorWithSettings();
+        $widget = $this->widget()->refresh();
+        $this->recordMirroredEvents();
+
+        $widget->{$method}(['latitude' => 1.5], $extra);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
+        $this->assertSame([$status, $settings], array_values((array) DB::table('retained_widgets')->where('id', $widget->getKey())->first(['status', 'settings'])));
         $this->assertSame(1, DB::transactionLevel());
     }
 

@@ -8,6 +8,7 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
@@ -268,12 +269,24 @@ final class EventBridge
     private function incrementColumns(string $method, array $arguments): null|array
     {
         $columns = match ($method) {
-            'incrementOrDecrement' => [$arguments[0] ?? null, ...array_keys((array) ($arguments[2] ?? []))],
-            'incrementOrDecrementEach' => [...array_keys((array) ($arguments[0] ?? [])), ...array_keys((array) ($arguments[1] ?? []))],
+            'incrementOrDecrement' => [$arguments[0] ?? null, ...$this->extraColumns((array) ($arguments[2] ?? []))],
+            'incrementOrDecrementEach' => [...array_keys((array) ($arguments[0] ?? [])), ...$this->extraColumns((array) ($arguments[1] ?? []))],
             default => null,
         };
 
         return $columns === null ? null : array_values(array_filter($columns, is_string(...)));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $extra
+     * @return list<string>
+     */
+    private function extraColumns(array $extra): array
+    {
+        return array_map(
+            fn (string $key) => Str::before(Str::afterLast($key, '.'), '->'),
+            array_values(array_filter(array_keys($extra), is_string(...))),
+        );
     }
 
     private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void
