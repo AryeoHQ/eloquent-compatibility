@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Validation\ValidationException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
@@ -732,6 +733,95 @@ final class EventBridgeTest extends TestCase
         $widget->increment('latitude', 1.5);
 
         $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === 49.0);
+    }
+
+    /**
+     * @param  array<string, string>  $extra
+     */
+    #[Test]
+    #[TestWith(['increment', [], 49.0])]
+    #[TestWith(['increment', ['sku' => 'Counted'], 49.0])]
+    #[TestWith(['decrement', [], 46.0])]
+    #[TestWith(['decrement', ['sku' => 'Counted'], 46.0])]
+    public function it_mirrors_an_increment_or_decrement_of_a_model_that_holds_an_unsaved_change(string $method, array $extra, float $latitude): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $widget->setAttribute('title', 'Never saved');
+        $this->recordMirroredEvents();
+
+        $widget->{$method}('latitude', 1.5, $extra);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
+        $this->assertSame('Blue gadget', DB::table('gadgets')->where('id', $widget->gadget_id)->value('name'));
+        $this->assertSame($extra['sku'] ?? null, DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    /**
+     * @param  array<string, string>  $extra
+     */
+    #[RequiresMethod(Model::class, 'incrementOrDecrementEach')]
+    #[Test]
+    #[TestWith(['incrementEach', [], 49.0])]
+    #[TestWith(['incrementEach', ['sku' => 'Counted'], 49.0])]
+    #[TestWith(['decrementEach', [], 46.0])]
+    #[TestWith(['decrementEach', ['sku' => 'Counted'], 46.0])]
+    public function it_mirrors_an_increment_or_decrement_of_each_column_of_a_model_that_holds_an_unsaved_change(string $method, array $extra, float $latitude): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $widget->setAttribute('title', 'Never saved');
+        $this->recordMirroredEvents();
+
+        $widget->{$method}(['latitude' => 1.5], $extra);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
+        $this->assertSame('Blue gadget', DB::table('gadgets')->where('id', $widget->gadget_id)->value('name'));
+        $this->assertSame($extra['sku'] ?? null, DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    #[Test]
+    #[TestWith([['sku' => 'Written by a listener'], 49.0])]
+    #[TestWith([['latitude' => 1.0], 2.5])]
+    #[TestWith([['latitude' => 1.0, 'title' => 'Never saved'], 2.5])]
+    public function it_mirrors_an_increment_on_its_own_statement_and_not_on_a_later_listeners_write_to_the_same_record(array $values, float $latitude): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $widget->setAttribute('title', 'Never saved');
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($values): void {
+            if ($payload[0] instanceof Widget) {
+                DB::table('widgets')->where('id', $payload[0]->getKey())->update($values);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->increment('latitude', 1.5);
+
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site, RecordMirrored $event) => (float) $site->getAttribute('latitude') === $latitude && (float) ($event->rowBefore['latitude'] ?? null) === $latitude - 1.5);
+    }
+
+    #[Test]
+    public function it_mirrors_a_save_on_its_own_statement_and_not_on_a_later_listeners_write_of_a_subset_of_its_changes(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload): void {
+            if ($payload[0] instanceof Widget) {
+                DB::table('widgets')->where('id', $payload[0]->getKey())->update(['latitude' => 1.0]);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed', 'latitude' => 2.0]);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site, RecordMirrored $event) => (float) $site->getAttribute('latitude') === 2.0 && (float) ($event->rowBefore['latitude'] ?? null) === 1.0);
     }
 
     #[Test]

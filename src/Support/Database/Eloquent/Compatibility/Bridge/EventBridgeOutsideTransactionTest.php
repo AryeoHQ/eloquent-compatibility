@@ -15,6 +15,7 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PDOException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use RuntimeException;
@@ -26,6 +27,7 @@ use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMa
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
+use Tests\Fixtures\Support\Workbench\GadgetSite;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -224,6 +226,41 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertSame('Loaded without its id', DB::table('gadgets')->value('name'));
     }
 
+    /**
+     * @param  array<string, string>  $extra
+     */
+    #[Test]
+    #[TestWith(['increment', [], 49.0])]
+    #[TestWith(['increment', ['sku' => 'Counted'], 49.0])]
+    #[TestWith(['decrement', [], 46.0])]
+    #[TestWith(['decrement', ['sku' => 'Counted'], 46.0])]
+    public function it_locks_and_mirrors_an_increment_or_decrement_of_a_model_that_holds_an_unsaved_change_outside_a_transaction(string $method, array $extra, float $latitude): void
+    {
+        $widget = $this->locatedWidget();
+
+        $widget->{$method}('latitude', 1.5, $extra);
+
+        $this->assertLockedAndMirrored($widget, $extra, $latitude);
+    }
+
+    /**
+     * @param  array<string, string>  $extra
+     */
+    #[RequiresMethod(Model::class, 'incrementOrDecrementEach')]
+    #[Test]
+    #[TestWith(['incrementEach', [], 49.0])]
+    #[TestWith(['incrementEach', ['sku' => 'Counted'], 49.0])]
+    #[TestWith(['decrementEach', [], 46.0])]
+    #[TestWith(['decrementEach', ['sku' => 'Counted'], 46.0])]
+    public function it_locks_and_mirrors_an_increment_or_decrement_of_each_column_of_a_model_that_holds_an_unsaved_change_outside_a_transaction(string $method, array $extra, float $latitude): void
+    {
+        $widget = $this->locatedWidget();
+
+        $widget->{$method}(['latitude' => 1.5], $extra);
+
+        $this->assertLockedAndMirrored($widget, $extra, $latitude);
+    }
+
     #[Test]
     public function it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_outside_a_transaction(): void
     {
@@ -336,6 +373,31 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     private function widget(): Widget
     {
         return Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St']);
+    }
+
+    private function locatedWidget(): Widget
+    {
+        $widget = Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St', 'latitude' => 47.5])->refresh();
+        $widget->setAttribute('title', 'Never saved');
+        $this->recordMirroredEvents();
+        $this->concurrently(
+            fn (string $query) => str_starts_with($query, 'update "widgets"'),
+            fn (Connection $concurrent) => $concurrent->table('retained_widgets')->where('id', $widget->getKey())->update(['sku' => 'Concurrent']),
+        );
+
+        return $widget;
+    }
+
+    /**
+     * @param  array<string, string>  $extra
+     */
+    private function assertLockedAndMirrored(Widget $widget, array $extra, float $latitude): void
+    {
+        $this->assertSame('55P03', $this->concurrentOutcome);
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site) => (float) $site->getAttribute('latitude') === $latitude);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame($extra['sku'] ?? null, DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
     }
 
     private function refuseUuidChange(Widget $widget): void

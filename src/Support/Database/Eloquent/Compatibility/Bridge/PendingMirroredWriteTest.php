@@ -21,7 +21,7 @@ final class PendingMirroredWriteTest extends TestCase
         $pendingWrite = new PendingMirroredWrite($widget, Operation::Update);
 
         $this->assertSame(
-            ['pending' => true, 'statementSent' => false, 'snapshotsBefore' => [], 'transactionLevel' => 0, 'savepoint' => null, 'source' => $widget, 'operation' => Operation::Update],
+            ['pending' => true, 'statementSent' => false, 'snapshotsBefore' => [], 'transactionLevel' => 0, 'savepoint' => null, 'incrementColumns' => null, 'source' => $widget, 'operation' => Operation::Update],
             get_object_vars($pendingWrite),
         );
     }
@@ -65,6 +65,41 @@ final class PendingMirroredWriteTest extends TestCase
         $bindings = [...array_fill(0, substr_count($sql, '?') - 1, 'Bound'), 7];
 
         $this->assertSame($expected, $this->pendingWrite($this->widget()->forceFill($dirty), $operation)->expects($this->parsed($sql), $bindings));
+    }
+
+    /**
+     * @param  list<string>  $incrementColumns
+     */
+    #[Test]
+    #[TestWith([['latitude'], 'update "widgets" set "latitude" = "latitude" + ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([['latitude', 'sku'], 'update "widgets" set "latitude" = "latitude" + ?, "sku" = ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([['latitude', 'updated_at'], 'update "widgets" set "latitude" = "latitude" + ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([['latitude', 'price'], 'update "widgets" set "latitude" = "latitude" + ?, "price" = "price" + ?, "updated_at" = ? where "id" = ?', true])]
+    #[TestWith([['latitude'], 'update "widgets" set "latitude" = ? where "id" = ?', false])]
+    #[TestWith([['latitude'], 'update "widgets" set "sku" = ?, "updated_at" = ? where "id" = ?', false])]
+    #[TestWith([['latitude'], 'update "widgets" set "latitude" = "latitude" + ?, "title" = ?, "updated_at" = ? where "id" = ?', false])]
+    #[TestWith([['latitude', 'sku'], 'update "widgets" set "latitude" = "latitude" + ?, "updated_at" = ? where "id" = ?', false])]
+    public function it_expects_an_increment_that_sets_exactly_its_columns_and_the_updated_at_column_whatever_else_its_model_changed(array $incrementColumns, string $sql, bool $expected): void
+    {
+        $pendingWrite = $this->pendingWrite($this->widget()->forceFill(['title' => 'Never saved', 'latitude' => 49.0]), Operation::Update);
+        $pendingWrite->incrementColumns = $incrementColumns;
+        $bindings = [...array_fill(0, substr_count($sql, '?') - 1, 'Bound'), 7];
+
+        $this->assertSame($expected, $pendingWrite->expects($this->parsed($sql), $bindings));
+    }
+
+    #[Test]
+    #[TestWith(['update "widgets" set "latitude" = "latitude" + ? where "id" = ?', true])]
+    #[TestWith(['update "widgets" set "latitude" = "latitude" + ?, "updated_at" = ? where "id" = ?', false])]
+    public function it_expects_an_increment_of_a_model_without_timestamps_to_set_only_its_columns(string $sql, bool $expected): void
+    {
+        $widget = $this->widget()->forceFill(['title' => 'Never saved', 'latitude' => 49.0]);
+        $widget->timestamps = false;
+        $pendingWrite = $this->pendingWrite($widget, Operation::Update);
+        $pendingWrite->incrementColumns = ['latitude'];
+        $bindings = [...array_fill(0, substr_count($sql, '?') - 1, 'Bound'), 7];
+
+        $this->assertSame($expected, $pendingWrite->expects($this->parsed($sql), $bindings));
     }
 
     /**

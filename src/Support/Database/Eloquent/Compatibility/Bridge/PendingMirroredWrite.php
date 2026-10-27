@@ -20,6 +20,9 @@ final class PendingMirroredWrite
 
     public null|string $savepoint = null;
 
+    /** @var null|list<string> */
+    public null|array $incrementColumns = null;
+
     public function __construct(
         public readonly Model $source,
         public readonly Operation $operation,
@@ -62,6 +65,15 @@ final class PendingMirroredWrite
         $dirty = array_values(array_unique([...array_map(strval(...), array_keys($this->source->getDirty())), ...$touched]));
         sort($set);
         sort($dirty);
+
+        if ($this->operation === Operation::Update && $this->incrementColumns !== null) {
+            $sent = array_values(array_unique($columns));
+            $incremented = array_values(array_unique([...$this->incrementColumns, ...$touched]));
+            sort($sent);
+            sort($incremented);
+
+            return $sent === $incremented;
+        }
 
         if ($this->operation === Operation::Update) {
             return $columns !== [] && $set === $dirty;

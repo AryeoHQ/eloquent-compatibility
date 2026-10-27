@@ -240,10 +240,30 @@ final class EventBridge
 
     private function inProgress(PendingMirroredWrite $pendingWrite): bool
     {
-        return array_any(
-            debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT | DEBUG_BACKTRACE_IGNORE_ARGS),
-            fn (array $frame) => ($frame['object'] ?? null) === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true),
-        );
+        foreach (debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT) as $frame) {
+            if (($frame['object'] ?? null) === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true)) {
+                $pendingWrite->incrementColumns = $this->incrementColumns($frame['function'], $frame['args'] ?? []);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $arguments
+     * @return null|list<string>
+     */
+    private function incrementColumns(string $method, array $arguments): null|array
+    {
+        $columns = match ($method) {
+            'incrementOrDecrement' => [$arguments[0] ?? null, ...array_keys((array) ($arguments[2] ?? []))],
+            'incrementOrDecrementEach' => [...array_keys((array) ($arguments[0] ?? [])), ...array_keys((array) ($arguments[1] ?? []))],
+            default => null,
+        };
+
+        return $columns === null ? null : array_values(array_filter($columns, is_string(...)));
     }
 
     private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void
