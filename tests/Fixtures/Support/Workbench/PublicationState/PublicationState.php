@@ -11,8 +11,10 @@ use Support\Database\Eloquent\StateMachines\Provides\ManagesState;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Credit;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Grade;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Release;
@@ -21,12 +23,15 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Tag;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdraw;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal;
 
 /**
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish publish()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive archive(string $reason)
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature feature()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdraw withdraw(string $reason)
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished returnToPublished()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore restore()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reopen reopen()
@@ -36,6 +41,9 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal;
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve reserve()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Release release()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal\Release release()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Tag tag(string ...$tags)
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Credit credit(string $author, string $Author)
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Grade grade(null|\Tests\Fixtures\Support\Workbench\ReviewState\ReviewState $review)
  */
 enum PublicationState: string implements StateMachineable
 {
@@ -48,10 +56,14 @@ enum PublicationState: string implements StateMachineable
     #[Transition(to: self::Pinned, using: Pin::class)]
     #[Transition(to: self::Embargoed, using: Embargo::class)]
     #[Transition(to: self::Reserved, using: Reserve::class)]
+    #[Transition(to: self::Tagged, using: Tag::class)]
+    #[Transition(to: self::Credited, using: Credit::class)]
+    #[Transition(to: self::Graded, using: Grade::class)]
     case Draft = 'draft';
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]
     #[Transition(to: self::Featured, using: Feature::class)]
+    #[Transition(to: self::Archived, using: Withdraw::class)]
     case Published = 'published';
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]
@@ -76,4 +88,13 @@ enum PublicationState: string implements StateMachineable
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]
     case Reserved = 'reserved';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Tagged = 'tagged';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Credited = 'credited';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Graded = 'graded';
 }

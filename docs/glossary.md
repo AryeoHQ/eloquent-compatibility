@@ -64,5 +64,6 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **taken write**: the armed write that the event bridge's first `beforeExecuting` callback takes for its statement, and its last opens in the same call; see `EventBridge::startStatement()`.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
 - **transition replay**: the event bridge running the state machine trigger of a state change made through the other side, with `Trigger::withoutTransition()` so that the trigger does not store the state again; see `EventReplayer::transition()`.
+- **trigger argument**: a constructor argument of a state machine trigger that a current model declares for a transition replay, as one closure per argument name; see `PrimaryCurrentModel::triggerArguments()` and `DependentCurrentModel::triggerArguments()`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.
 - **unrepresentable state**: a state one side can hold and the other cannot express; an `UnrepresentableState`.

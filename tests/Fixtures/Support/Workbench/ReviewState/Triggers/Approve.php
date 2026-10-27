@@ -14,6 +14,8 @@ final class Approve extends Trigger
     #[Target]
     public readonly Publication $publication;
 
+    public function __construct(public readonly string $by = 'the editor') {}
+
     public function handle(): void
     {
         Placement::query()->where('publication_id', $this->publication->getKey())->firstOrFail()->update(['slot' => 'front']);

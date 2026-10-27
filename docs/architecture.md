@@ -94,7 +94,7 @@ Read the code in this order. Each step answers one question.
 8. `HasCompatibility`, `EventBridge`, `DispatchesQueryFailed` and `QueryFailed`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?
 10. `EventReplayer`: how does the bridge reproduce native model events, and how does it exclude listeners?
-11. `EventReplayer::states()`, `EventReplayer::transition()` and the private `EventBridge::transitions()`: how does a mirrored state change run its trigger?
+11. `EventReplayer::states()`, `EventReplayer::transition()` and the private `EventBridge::transitions()`: how does a mirrored state change run its trigger, and with which arguments?
 12. `DriftQueries`: which five kinds of drift does the check find?
 13. `CompileSql`: how does a reviewer read the statements before a migration runs them?
 14. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?

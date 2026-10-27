@@ -485,7 +485,7 @@ final class EventBridge
         $caller = $this->internally(fn () => $this->affectedRecords->snapshots($connection, $natives));
 
         foreach ($states as $id => $changed) {
-            $this->eventReplayer->transition($entries[$id]->record, (array) $entries[$id]->row, (array) $after[$id]->row, (string) $connection->getName(), $changed);
+            $this->eventReplayer->transition($entries[$id]->record, (array) $entries[$id]->row, (array) $after[$id]->row, (string) $connection->getName(), $changed, $pendingWrite->source);
         }
 
         $replayed = $this->internally(fn () => $this->affectedRecords->snapshots($connection, [...$records, ...$natives]));

@@ -80,7 +80,19 @@ final class CompatibilityWriteRefused extends CompatibilityException
         return new self(
             "Compatibility map '{$map}' refused this write, because it changes {$written}, stored as {$state} of {$record}, in a way its state machine cannot replay",
             'A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: '.rtrim($previous->getMessage(), '.').'.',
-            "Change {$written} to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on ".class_basename($destination).' itself.',
+            "Change {$written} to a state the stored state has a #[Transition] to, whose trigger allows the change and receives in the map's triggerArguments() every constructor argument the container cannot resolve, or run the trigger on ".class_basename($destination).' itself.',
+            $previous,
+        );
+    }
+
+    public static function byTriggerArgument(string $map, Model $destination, string $trigger, string $argument, Throwable $previous): self
+    {
+        $record = class_basename($destination).' '.self::key($destination);
+
+        return new self(
+            "Compatibility map '{$map}' refused this write, because its triggerArguments() closure for argument '{$argument}' of {$trigger} threw for {$record}",
+            'The event bridge builds the declared arguments of a state change\'s trigger before it calls the trigger, so the trigger cannot run without them: '.rtrim($previous->getMessage(), '.').'.',
+            "Fix the closure for '{$argument}' in the map's triggerArguments() for {$trigger}, so that it returns a value for this write, or run the trigger on ".class_basename($destination).' itself.',
             $previous,
         );
     }

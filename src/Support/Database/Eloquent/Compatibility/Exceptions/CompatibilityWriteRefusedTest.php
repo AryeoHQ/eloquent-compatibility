@@ -14,6 +14,7 @@ use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Tests\Fixtures\Support\Workbench\Article;
 use Tests\Fixtures\Support\Workbench\Gadget;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
@@ -123,13 +124,32 @@ final class CompatibilityWriteRefusedTest extends TestCase
 
         $this->assertSame("Compatibility map 'articles' refused this write, because it changes status of Article, stored as state of Gadget #{$gadget->id}, in a way its state machine cannot replay", $refusal->refused);
         $this->assertSame('A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: Invalid transition from [Published] to [Draft] on [Gadget].', $refusal->because);
-        $this->assertSame('Change status of Article to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on Gadget itself.', $refusal->instead);
+        $this->assertSame("Change status of Article to a state the stored state has a #[Transition] to, whose trigger allows the change and receives in the map's triggerArguments() every constructor argument the container cannot resolve, or run the trigger on Gadget itself.", $refusal->instead);
         $this->assertSame($previous, $refusal->getPrevious());
 
         $unsaved = CompatibilityWriteRefused::byTransition('articles', new Gadget, 'review', Article::class, 'review_status', new RuntimeException('Unresolvable dependency'));
 
         $this->assertStringContainsString('because it changes review_status of Article, stored as review of Gadget (new), in a way', $unsaved->refused);
         $this->assertStringEndsWith('the replay failed: Unresolvable dependency.', $unsaved->because);
+    }
+
+    #[Test]
+    public function it_names_the_trigger_argument_whose_closure_threw_and_keeps_the_closure_failure(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
+        $previous = new RuntimeException('No reason.');
+
+        $refusal = CompatibilityWriteRefused::byTriggerArgument('bulletins', $gadget, Archive::class, 'reason', $previous);
+
+        $this->assertSame("Compatibility map 'bulletins' refused this write, because its triggerArguments() closure for argument 'reason' of ".Archive::class." threw for Gadget #{$gadget->id}", $refusal->refused);
+        $this->assertSame('The event bridge builds the declared arguments of a state change\'s trigger before it calls the trigger, so the trigger cannot run without them: No reason.', $refusal->because);
+        $this->assertSame("Fix the closure for 'reason' in the map's triggerArguments() for ".Archive::class.', so that it returns a value for this write, or run the trigger on Gadget itself.', $refusal->instead);
+        $this->assertSame($previous, $refusal->getPrevious());
+
+        $unsaved = CompatibilityWriteRefused::byTriggerArgument('bulletins', new Gadget, Archive::class, 'until', new RuntimeException('No date'));
+
+        $this->assertStringEndsWith("for argument 'until' of ".Archive::class.' threw for Gadget (new)', $unsaved->refused);
+        $this->assertStringEndsWith('the trigger cannot run without them: No date.', $unsaved->because);
     }
 
     private function secondRootPlace(): QueryException

@@ -4,16 +4,29 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Closure;
 use Illuminate\Database\Eloquent\Model;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Compiler;
+use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
+use Tests\Fixtures\Support\Workbench\BulletinCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
+use Tests\Fixtures\Support\Workbench\Journal;
+use Tests\Fixtures\Support\Workbench\Placement;
+use Tests\Fixtures\Support\Workbench\Publication;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Credit;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Grade;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Tag;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -269,6 +282,113 @@ final class ResolvedMapTest extends TestCase
             InvalidCompatibilityMap::class,
             $message,
         );
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_accepts_trigger_arguments_named_in_any_case_and_keeps_the_last_call_for_a_trigger(): void
+    {
+        $publication = PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')
+            ->triggerArguments(Archive::class, ['until' => fn () => 'later'])
+            ->triggerArguments(Archive::class, ['REASON' => fn () => 'retired']);
+
+        $resolvedMap = ResolvedMap::of(new BulletinCompatibilityMap(publication: $publication));
+
+        $this->assertSame(['REASON'], array_keys($resolvedMap->triggerArguments(Publication::class, Archive::class)));
+        $this->assertSame([], $resolvedMap->triggerArguments(Placement::class, Archive::class));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_trigger_arguments_for_a_class_no_transition_of_the_current_model_uses(): void
+    {
+        $this->expectInvalidTriggerArguments(Journal::class." is not the trigger of a #[Transition] on a state machine that current model 'publication' casts a column to", Journal::class, ['reason' => fn () => 'retired']);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_trigger_arguments_on_a_current_model_that_casts_no_column_to_the_trigger_s_state_machine(): void
+    {
+        $this->assertThrows(
+            fn () => ResolvedMap::of(new BulletinCompatibilityMap(placement: DependentCurrentModel::for(Placement::class)->aliasedAs('placement')->primaryForeignKey('publication_id')->triggerArguments(Archive::class, ['reason' => fn () => 'retired']))),
+            InvalidCompatibilityMap::class,
+            Archive::class." is not the trigger of a #[Transition] on a state machine that current model 'placement' casts a column to",
+        );
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_a_trigger_argument_the_constructor_does_not_declare(): void
+    {
+        $this->expectInvalidTriggerArguments("triggerArguments() of current model 'publication' passes 'until', which is not a constructor parameter of ".Archive::class, Archive::class, ['reason' => fn () => 'retired', 'until' => fn () => 'later']);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_two_trigger_argument_names_that_differ_only_in_case(): void
+    {
+        $this->expectInvalidTriggerArguments("triggerArguments() of current model 'publication' passes 'reason' more than once for ".Archive::class.', in names that differ only in case', Archive::class, ['reason' => fn () => 'retired', 'Reason' => fn () => 'withdrawn']);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_trigger_arguments_that_leave_out_a_parameter_the_container_cannot_resolve(): void
+    {
+        $this->expectInvalidTriggerArguments(Archive::class." requires constructor parameter 'reason', which the container cannot resolve, and triggerArguments() of current model 'publication' does not pass it", Archive::class, []);
+    }
+
+    /**
+     * @param  class-string  $trigger
+     */
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    #[TestWith([Schedule::class])]
+    #[TestWith([Pin::class])]
+    public function it_refuses_trigger_arguments_that_leave_out_a_model_parameter_the_container_would_build_without_attributes(string $trigger): void
+    {
+        $this->expectInvalidTriggerArguments($trigger." requires constructor parameter 'placement', which the container cannot resolve, and triggerArguments() of current model 'publication' does not pass it", $trigger, []);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_trigger_arguments_that_leave_out_an_enum_parameter_nullable_or_not(): void
+    {
+        $this->expectInvalidTriggerArguments(Grade::class." requires constructor parameter 'review', which the container cannot resolve, and triggerArguments() of current model 'publication' does not pass it", Grade::class, []);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_a_trigger_argument_for_a_variadic_parameter(): void
+    {
+        $this->expectInvalidTriggerArguments("triggerArguments() of current model 'publication' passes 'tags', a variadic constructor parameter of ".Tag::class.', which would take the value as a single element', Tag::class, ['tags' => fn () => ['news']]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_trigger_arguments_for_a_constructor_whose_parameter_names_differ_only_in_case(): void
+    {
+        $this->expectInvalidTriggerArguments(Credit::class." takes constructor parameters 'author' and 'Author', whose names differ only in case, so triggerArguments() of current model 'publication' cannot tell them apart", Credit::class, ['author' => fn () => 'Ada']);
+    }
+
+    #[Test]
+    public function it_refuses_trigger_arguments_without_eloquent_state_machines(): void
+    {
+        if (method_exists(Trigger::class, 'withoutTransition')) { // @phpstan-ignore function.alreadyNarrowedType
+            $this->markTestSkipped('aryeo/eloquent-state-machines is installed.');
+        }
+
+        $this->expectInvalidTriggerArguments("current model 'publication' declares triggerArguments(), which needs aryeo/eloquent-state-machines", Archive::class, ['reason' => fn () => 'retired']);
+    }
+
+    /**
+     * @param  class-string  $trigger
+     * @param  array<string, Closure>  $arguments
+     */
+    private function expectInvalidTriggerArguments(string $message, string $trigger, array $arguments): void
+    {
+        $publication = PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments($trigger, $arguments);
+
+        $this->assertThrows(fn () => ResolvedMap::of(new BulletinCompatibilityMap(publication: $publication)), InvalidCompatibilityMap::class, $message);
     }
 
     /**

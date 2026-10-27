@@ -15,9 +15,13 @@ final readonly class BulletinCompatibilityMap implements CompatibilityMap
 {
     /**
      * @param  class-string<Model>  $bulletin
-     * @param  class-string<Publication>  $publication
+     * @param  class-string<Publication>|PrimaryCurrentModel  $publication
      */
-    public function __construct(private string $bulletin = Bulletin::class, private string $publication = Publication::class) {}
+    public function __construct(
+        private string $bulletin = Bulletin::class,
+        private string|PrimaryCurrentModel $publication = Publication::class,
+        private null|DependentCurrentModel $placement = null,
+    ) {}
 
     public function name(): string
     {
@@ -35,13 +39,13 @@ final readonly class BulletinCompatibilityMap implements CompatibilityMap
 
     public function primaryCurrentModel(): PrimaryCurrentModel
     {
-        return PrimaryCurrentModel::for($this->publication)->aliasedAs('publication');
+        return $this->publication instanceof PrimaryCurrentModel ? $this->publication : PrimaryCurrentModel::for($this->publication)->aliasedAs('publication');
     }
 
     public function dependentCurrentModels(): array
     {
         return [
-            DependentCurrentModel::for(Placement::class)
+            $this->placement ?? DependentCurrentModel::for(Placement::class)
                 ->aliasedAs('placement')
                 ->primaryForeignKey('publication_id'),
         ];
