@@ -221,7 +221,9 @@ final class EventBridge
                     continue;
                 }
 
-                if (! $this->inProgress($pendingWrite)) {
+                $dispatcherFrames = $this->dispatcherFramesSinceItsWrite($pendingWrite);
+
+                if ($dispatcherFrames === null) {
                     $this->forget($connection, $pendingWrite);
 
                     continue;
@@ -229,7 +231,7 @@ final class EventBridge
 
                 $parsedWrite = ParsedWrite::of($query);
 
-                if ($parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
+                if ($dispatcherFrames === 0 && $parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
                     $this->open($connection, $pendingWrite);
                 }
 
@@ -238,17 +240,25 @@ final class EventBridge
         });
     }
 
-    private function inProgress(PendingMirroredWrite $pendingWrite): bool
+    private function dispatcherFramesSinceItsWrite(PendingMirroredWrite $pendingWrite): null|int
     {
+        $dispatcherFrames = 0;
+
         foreach (debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT) as $frame) {
-            if (($frame['object'] ?? null) === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true)) {
+            $object = $frame['object'] ?? null;
+
+            if ($object === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true)) {
                 $pendingWrite->incrementColumns = $this->incrementColumns($frame['function'], $frame['args'] ?? []);
 
-                return true;
+                return $dispatcherFrames;
+            }
+
+            if ($object instanceof Dispatcher) {
+                $dispatcherFrames++;
             }
         }
 
-        return false;
+        return null;
     }
 
     /**

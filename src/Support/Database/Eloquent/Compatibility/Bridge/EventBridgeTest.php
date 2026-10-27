@@ -789,6 +789,7 @@ final class EventBridgeTest extends TestCase
     #[TestWith([['sku' => 'Written by a listener'], 49.0])]
     #[TestWith([['latitude' => 1.0], 2.5])]
     #[TestWith([['latitude' => 1.0, 'title' => 'Never saved'], 2.5])]
+    #[TestWith([['latitude' => 1.0, 'updated_at' => '2026-01-01 00:00:00+00'], 2.5])]
     public function it_mirrors_an_increment_on_its_own_statement_and_not_on_a_later_listeners_write_to_the_same_record(array $values, float $latitude): void
     {
         $this->mirror();
@@ -806,14 +807,19 @@ final class EventBridgeTest extends TestCase
         $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site, RecordMirrored $event) => (float) $site->getAttribute('latitude') === $latitude && (float) ($event->rowBefore['latitude'] ?? null) === $latitude - 1.5);
     }
 
+    /**
+     * @param  array<string, mixed>  $values
+     */
     #[Test]
-    public function it_mirrors_a_save_on_its_own_statement_and_not_on_a_later_listeners_write_of_a_subset_of_its_changes(): void
+    #[TestWith([['latitude' => 1.0]])]
+    #[TestWith([['title' => 'Written by a listener', 'latitude' => 1.0]])]
+    public function it_mirrors_a_save_on_its_own_statement_and_not_on_a_later_listeners_write_of_some_or_all_of_its_changes(array $values): void
     {
         $this->mirror();
         $widget = $this->widget()->refresh();
-        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload): void {
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($values): void {
             if ($payload[0] instanceof Widget) {
-                DB::table('widgets')->where('id', $payload[0]->getKey())->update(['latitude' => 1.0]);
+                DB::table('widgets')->where('id', $payload[0]->getKey())->update($values);
             }
         });
         $this->recordMirroredEvents();
@@ -865,12 +871,14 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
-    public function it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table(): void
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table(bool $sameColumns): void
     {
         $this->mirror();
-        Event::listen('eloquent.creating: '.Widget::class.'*', function (string $name, array $payload): void {
+        Event::listen('eloquent.creating: '.Widget::class.'*', function (string $name, array $payload) use ($sameColumns): void {
             if ($payload[0] instanceof Widget && $payload[0]->getAttribute('title') === 'Blue gadget') {
-                DB::table('widgets')->insert(['title' => 'Inserted by a listener']);
+                DB::table('widgets')->insert($sameColumns ? [...$payload[0]->getAttributes(), 'title' => 'Inserted by a listener'] : ['title' => 'Inserted by a listener']);
             }
         });
         $this->recordMirroredEvents();

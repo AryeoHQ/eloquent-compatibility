@@ -261,6 +261,29 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertLockedAndMirrored($widget, $extra, $latitude);
     }
 
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    #[Test]
+    #[TestWith(['increment', ['latitude' => 1.0, 'updated_at' => '2026-01-01 00:00:00+00']])]
+    #[TestWith(['update', ['title' => 'Written by a listener', 'latitude' => 1.0]])]
+    public function it_locks_and_mirrors_a_write_on_its_own_statement_and_not_on_a_listeners_update_of_the_same_columns_outside_a_transaction(string $method, array $values): void
+    {
+        $widget = $this->locatedWidget(2);
+        Event::listen('eloquent.updating: '.Widget::class.'*', function (string $name, array $payload) use ($values): void {
+            if ($payload[0] instanceof Widget) {
+                DB::table('widgets')->where('id', $payload[0]->getKey())->update($values);
+            }
+        });
+
+        $method === 'increment' ? $widget->increment('latitude', 1.5) : $widget->update(['latitude' => 2.5]);
+
+        $this->assertSame('55P03', $this->concurrentOutcome);
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site, RecordMirrored $event) => (float) $site->getAttribute('latitude') === 2.5 && (float) ($event->rowBefore['latitude'] ?? null) === 1.0);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertNull(DB::table('retained_widgets')->where('id', $widget->getKey())->value('sku'));
+    }
+
     #[Test]
     public function it_mirrors_both_writes_when_a_beginning_listener_writes_another_mapped_model_outside_a_transaction(): void
     {
@@ -375,13 +398,16 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         return Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St']);
     }
 
-    private function locatedWidget(): Widget
+    private function locatedWidget(int $update = 1): Widget
     {
         $widget = Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St', 'latitude' => 47.5])->refresh();
         $widget->setAttribute('title', 'Never saved');
         $this->recordMirroredEvents();
+        $updates = 0;
         $this->concurrently(
-            fn (string $query) => str_starts_with($query, 'update "widgets"'),
+            function (string $query) use ($update, &$updates): bool {
+                return str_starts_with($query, 'update "widgets"') && ++$updates === $update;
+            },
             fn (Connection $concurrent) => $concurrent->table('retained_widgets')->where('id', $widget->getKey())->update(['sku' => 'Concurrent']),
         );
 
