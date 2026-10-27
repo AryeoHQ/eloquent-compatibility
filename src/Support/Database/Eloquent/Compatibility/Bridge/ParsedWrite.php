@@ -75,11 +75,15 @@ final readonly class ParsedWrite
         }
 
         $start = $offset + strlen($set[0]);
-        preg_match_all('/[()\[\],]|\b(?:from|where|returning)\b/i', $tokens, $marks, PREG_OFFSET_CAPTURE, $start);
+        preg_match_all('/[()\[\],]|\bdistinct\s++from\b|\b(?:from|where|returning)\b/i', $tokens, $marks, PREG_OFFSET_CAPTURE, $start);
         $columns = [];
         $depth = 0;
 
         foreach ([...$marks[0], ['', strlen($tokens)]] as [$mark, $position]) {
+            if (stripos($mark, 'distinct') === 0) {
+                continue;
+            }
+
             if ($mark === '(' || $mark === '[') {
                 $depth++;
 

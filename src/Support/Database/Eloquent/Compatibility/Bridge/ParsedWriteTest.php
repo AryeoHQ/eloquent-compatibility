@@ -118,6 +118,24 @@ final class ParsedWriteTest extends TestCase
     }
 
     /**
+     * @param  list<string>  $columns
+     */
+    #[Test]
+    #[TestWith(['update "gadgets" set "archived" = "price_cents" is distinct from 0, "name" = ? where "id" = ?', ['archived', 'name']])]
+    #[TestWith(['update "gadgets" set "name" = ?, "archived" = "price_cents" IS NOT DISTINCT FROM 0 where "id" = ?', ['name', 'archived']])]
+    #[TestWith(['update "gadgets" set "archived" = "price_cents" Is Not Distinct From ?, "name" = ? returning "id"', ['archived', 'name']])]
+    #[TestWith(["update \"gadgets\" set \"archived\" = \"price_cents\" is distinct\n\tfrom 0, \"name\" = ? where \"id\" = ?", ['archived', 'name']])]
+    #[TestWith(['update "gadgets" set "archived" = "price_cents" is distinct /* from where */ from 0, "name" = ? where "id" = ?', ['archived', 'name']])]
+    #[TestWith(["update \"gadgets\" set \"archived\" = \"price_cents\" is not distinct -- from\nfrom 0, \"name\" = ? where \"id\" = ?", ['archived', 'name']])]
+    #[TestWith(['update "gadgets" set "archived" = "price_cents" is distinct from 0, "name" = ? from "widgets" where "widgets"."gadget_id" = "gadgets"."id"', ['archived', 'name']])]
+    #[TestWith(['update "gadgets" set "name" = ? from "widgets" where "widgets"."gadget_id" = "gadgets"."id"', ['name']])]
+    #[TestWith(['update "gadgets" set "name" = "distinct" from "widgets", "price_cents" = ?', ['name']])]
+    public function it_parses_an_is_distinct_from_inside_a_set_expression_and_ends_the_set_list_at_any_other_from(string $sql, array $columns): void
+    {
+        $this->assertSame($columns, ParsedWrite::of($sql)?->columns);
+    }
+
+    /**
      * @param  array<string, list<int>>  $placeholders
      */
     #[Test]

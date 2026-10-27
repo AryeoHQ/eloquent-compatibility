@@ -928,6 +928,19 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_mirrors_a_save_that_sets_a_raw_is_distinct_from_expression_beside_another_attribute(): void
+    {
+        $this->mirror();
+        $widget = $this->widget()->refresh();
+        $this->recordMirroredEvents();
+
+        $widget->fill(['is_archived' => DB::raw('"price" IS DISTINCT FROM \'0\''), 'street' => '2 Main St'])->save();
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getKey() === $widget->gadget_id);
+        $this->assertEquals(['street' => '2 Main St', 'is_archived' => true], (array) DB::table('widgets')->where('id', $widget->id)->first(['street', 'is_archived']));
+    }
+
+    #[Test]
     #[TestWith([false])]
     #[TestWith([true])]
     public function it_mirrors_a_create_on_its_own_insert_and_not_on_a_later_listeners_insert_into_the_same_table(bool $sameColumns): void
