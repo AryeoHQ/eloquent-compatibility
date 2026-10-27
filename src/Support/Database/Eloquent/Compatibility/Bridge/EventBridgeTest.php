@@ -600,6 +600,7 @@ final class EventBridgeTest extends TestCase
     #[Test]
     public function it_raises_the_events_of_every_previous_model_over_one_current_record(): void
     {
+        $this->freezeSecond();
         resolve(Installer::class)->install(new AccountCompatibilityMap);
         resolve(Installer::class)->install(new ProfileCompatibilityMap);
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new AccountCompatibilityMap));
