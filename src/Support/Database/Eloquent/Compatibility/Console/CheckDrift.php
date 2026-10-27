@@ -28,6 +28,7 @@ final class CheckDrift extends Command
 
         $limit = max(1, (int) $this->option('limit'));
         $findings = array_merge(...array_map(fn (ResolvedMap $map) => $driftQueries->find($map, $limit), $maps));
+        $this->warnOfUnguardedColumnTriggers(array_merge(...array_map($driftQueries->unguardedColumnTriggers(...), $maps)));
 
         if ($findings === []) {
             $this->components->info('No divergence in '.count($maps).' compatibility '.str('map')->plural(count($maps)).'.');
@@ -43,5 +44,22 @@ final class CheckDrift extends Command
         $this->components->error(count($findings).' divergent '.str('record')->plural(count($findings)).' found.');
 
         return self::FAILURE;
+    }
+
+    /**
+     * @param  list<UnguardedColumnTrigger>  $triggers
+     */
+    private function warnOfUnguardedColumnTriggers(array $triggers): void
+    {
+        if ($triggers === []) {
+            return;
+        }
+
+        $this->components->warn(count($triggers).' unguarded UPDATE OF '.str('trigger')->plural(count($triggers)).' found. Each fires on every update through a compatibility view that writes its table, whether or not its columns changed.');
+        $this->table(
+            ['Map', 'Table', 'Trigger', 'Columns'],
+            array_map(fn (UnguardedColumnTrigger $trigger) => [$trigger->map, $trigger->table, $trigger->trigger, implode(', ', $trigger->columns)], $triggers),
+        );
+        $this->line('Guard each one with WHEN (OLD.<column> IS DISTINCT FROM NEW.<column>) for every column it names.');
     }
 }

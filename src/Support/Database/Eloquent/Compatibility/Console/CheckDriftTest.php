@@ -74,6 +74,34 @@ final class CheckDriftTest extends TestCase
     }
 
     #[Test]
+    public function it_warns_of_each_unguarded_update_of_trigger_on_a_mapped_column_and_still_passes(): void
+    {
+        $this->widget();
+        DB::unprepared(<<<'SQL'
+            create function audit_write() returns trigger language plpgsql as $$ begin return new; end $$;
+            create trigger audit_price after update of price_cents, archived on gadgets for each row execute function audit_write();
+            create trigger audit_name after update of name on gadgets for each row when (old.name is distinct from new.name) execute function audit_write();
+            create trigger compatibility__widgets__audit after update of name on gadgets for each row execute function audit_write();
+            create trigger audit_parent after update of parent_id on gadget_places for each row execute function audit_write();
+            create trigger audit_street after insert or update of street on gadget_places for each row execute function audit_write();
+            create trigger audit_place after update on gadget_places for each row execute function audit_write();
+            create trigger audit_sku after update of sku, status on retained_widgets for each row execute function audit_write();
+            create trigger audit_slot after update of place_id on retained_widgets for each row execute function audit_write();
+            SQL);
+
+        $this->artisan('compatibility:check', ['--map' => ['widgets']])
+            ->expectsOutputToContain('3 unguarded UPDATE OF triggers found. Each fires on every update through a compatibility view that writes its table, whether or not its columns changed.')
+            ->expectsTable(['Map', 'Table', 'Trigger', 'Columns'], [
+                ['widgets', 'gadgets', 'audit_price', 'price_cents, archived'],
+                ['widgets', 'gadget_places', 'audit_street', 'street'],
+                ['widgets', 'retained_widgets', 'audit_sku', 'sku, status'],
+            ])
+            ->expectsOutputToContain('Guard each one with WHEN (OLD.<column> IS DISTINCT FROM NEW.<column>) for every column it names.')
+            ->expectsOutputToContain('No divergence in 1 compatibility map.')
+            ->assertSuccessful();
+    }
+
+    #[Test]
     public function it_checks_only_the_compatibility_maps_it_is_given(): void
     {
         resolve(Installer::class)->install(new AccountCompatibilityMap);

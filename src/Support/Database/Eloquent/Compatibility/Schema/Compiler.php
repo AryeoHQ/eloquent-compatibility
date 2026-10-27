@@ -136,26 +136,27 @@ final class Compiler
 
         $previousColumns = [
             ...$previousColumns,
-            ...$this->insertValues($resolvedMap, $previousAlias, [], true),
+            ...$this->insertValues($resolvedMap, $previousAlias, $this->insertAssignmentsTo($resolvedMap, $previousAlias), [], true),
             (string) $previous->primaryForeignKey => $primaryKey,
         ];
 
         $body = [
             ...$this->notNullChecks($resolvedMap, true),
             $this->applying($resolvedMap),
-            '  '.$this->insert($resolvedMap->table($primaryAlias), $this->insertValues($resolvedMap, $primaryAlias, $primary->fillWhenCreatedFromPrevious), $resolvedMap->keyColumn($primaryAlias), $primaryKey),
+            '  '.$this->insert($resolvedMap->table($primaryAlias), $this->insertValues($resolvedMap, $primaryAlias, $this->insertAssignmentsTo($resolvedMap, $primaryAlias), $primary->fillWhenCreatedFromPrevious), $resolvedMap->keyColumn($primaryAlias), $primaryKey),
             '  '.$this->insert((string) $previous->table, $previousColumns, '*', 'previous_row'),
         ];
 
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
+            $assignments = $this->insertAssignmentsTo($resolvedMap, $alias);
 
-            if ($resolvedMap->assignmentsTo($alias) === [] && $dependent->fillWhenCreatedFromPrevious === []) {
+            if ($assignments === [] && $dependent->fillWhenCreatedFromPrevious === []) {
                 continue;
             }
 
-            $body[] = '  IF ('.$this->createdWhen($resolvedMap, $dependent).") THEN\n    "
-                .$this->insert($resolvedMap->table($alias), $this->dependentValues($resolvedMap, $dependent, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
+            $body[] = '  IF ('.$this->createdWhen($dependent, $assignments).") THEN\n    "
+                .$this->insert($resolvedMap->table($alias), $this->dependentValues($resolvedMap, $dependent, $assignments, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
                 .$this->designate($resolvedMap, $dependent, 'previous_row.'.SqlFragments::identifier((string) $previous->keyColumn), "\n    ")
                 ."\n  END IF;";
         }
@@ -393,7 +394,7 @@ final class Compiler
             );
         }
 
-        $cases['('.$this->createdWhen($resolvedMap, $dependent).')'] = $this->insert($table, $this->dependentValues($resolvedMap, $dependent, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
+        $cases['('.$this->createdWhen($dependent, $assignments).')'] = $this->insert($table, $this->dependentValues($resolvedMap, $dependent, $assignments, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
             .$this->designate($resolvedMap, $dependent, 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn), "\n        ");
         $branches = '';
 
@@ -460,14 +461,32 @@ final class Compiler
     }
 
     /**
+     * @return list<Assignment>
+     */
+    private function insertAssignmentsTo(ResolvedMap $resolvedMap, string $alias): array
+    {
+        $assignments = $resolvedMap->assignmentsTo($alias);
+
+        foreach ($resolvedMap->readOnlyAttributes() as $attribute) {
+            if (! $attribute->retained && $attribute->alias === $alias && $attribute->storedAs !== null && $attribute->writesTo === []
+                && ! ($this->columnCatalog->of($resolvedMap->table($alias))[$attribute->storedAs]->alwaysGenerated ?? false)) {
+                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, 'NEW.'.SqlFragments::identifier($attribute->column)));
+            }
+        }
+
+        return $assignments;
+    }
+
+    /**
+     * @param  list<Assignment>  $assignments
      * @param  array<string, string>  $extra
      * @return array<string, string>
      */
-    private function insertValues(ResolvedMap $resolvedMap, string $alias, array $extra, bool $mappedOnly = false): array
+    private function insertValues(ResolvedMap $resolvedMap, string $alias, array $assignments, array $extra, bool $mappedOnly = false): array
     {
         $values = [];
 
-        foreach ($resolvedMap->assignmentsTo($alias) as $assignment) {
+        foreach ($assignments as $assignment) {
             if (! $mappedOnly || ! $assignment->attribute->retained) {
                 $value = $this->value($resolvedMap, $alias, $assignment->targetColumn);
                 $column = $this->columnCatalog->of($resolvedMap->table($alias))[$assignment->targetColumn->column];
@@ -487,20 +506,24 @@ final class Compiler
     }
 
     /**
+     * @param  list<Assignment>  $assignments
      * @return array<string, string>
      */
-    private function dependentValues(ResolvedMap $resolvedMap, DependentCurrentModel $dependent, string $primaryKey): array
+    private function dependentValues(ResolvedMap $resolvedMap, DependentCurrentModel $dependent, array $assignments, string $primaryKey): array
     {
-        return [$resolvedMap->primaryForeignKey($dependent) => $primaryKey, ...$this->insertValues($resolvedMap, (string) $dependent->alias, $dependent->fillWhenCreatedFromPrevious)];
+        return [$resolvedMap->primaryForeignKey($dependent) => $primaryKey, ...$this->insertValues($resolvedMap, (string) $dependent->alias, $assignments, $dependent->fillWhenCreatedFromPrevious)];
     }
 
-    private function createdWhen(ResolvedMap $resolvedMap, DependentCurrentModel $dependent): string
+    /**
+     * @param  list<Assignment>  $assignments
+     */
+    private function createdWhen(DependentCurrentModel $dependent, array $assignments): string
     {
         if ($dependent->createdWhen !== null) {
             return $dependent->createdWhen;
         }
 
-        $columns = $this->attributeColumns($resolvedMap->assignmentsTo((string) $dependent->alias));
+        $columns = $this->attributeColumns($assignments);
 
         return $columns === []
             ? 'true'
@@ -758,7 +781,7 @@ final class Compiler
         $primary = $resolvedMap->primaryCurrentModel;
         $primaryTable = $resolvedMap->table((string) $primary->alias);
         $throughView = "an insert through {$previous->view} leaves it empty; ";
-        $targets = fn (string $alias) => array_map(fn (Assignment $assignment) => $assignment->targetColumn->column, $resolvedMap->assignmentsTo($alias));
+        $targets = fn (string $alias) => array_map(fn (Assignment $assignment) => $assignment->targetColumn->column, $this->insertAssignmentsTo($resolvedMap, $alias));
         $retained = array_map(fn (Attribute $attribute) => $attribute->column, array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->retained));
 
         $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...array_keys($previous->fillWhenCreatedFromCurrent)], "a {$primaryTable} row created through its own model leaves it empty; fill it with fillWhenCreatedFromCurrent()");
@@ -768,7 +791,7 @@ final class Compiler
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
 
-            if ($resolvedMap->assignmentsTo($alias) !== [] || $dependent->fillWhenCreatedFromPrevious !== []) {
+            if ($this->insertAssignmentsTo($resolvedMap, $alias) !== [] || $dependent->fillWhenCreatedFromPrevious !== []) {
                 $this->refuseEmpty($resolvedMap, $resolvedMap->table($alias), [$resolvedMap->primaryForeignKey($dependent), ...$targets($alias), ...array_keys($dependent->fillWhenCreatedFromPrevious)], $throughView.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
             }
         }

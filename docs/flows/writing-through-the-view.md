@@ -35,7 +35,7 @@ Every compiled function first refuses with CM001 when it fires on a relation oth
 10. `Compiler::updateDependent()` handles each dependent whose attributes changed, as the next section describes.
 11. The trigger clears the applying flag and returns `NEW`.
 
-`Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. `Compiler::value()` casts each written value to the column's type in the catalog.
+`Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. It still sits in the `SET` list, so an `UPDATE OF` trigger on it fires. [INV-7](../invariants.md) records the rule. `Compiler::value()` casts each written value to the column's type in the catalog.
 
 An attribute whose type has no default btree equality operator, such as `json`, has no `=` to compare with. Every comparison above casts it to text first: the read-only check, `SqlFragments::changed()`, the `CASE WHEN` and the conflict check. A whitespace or key-order change the caller wrote therefore counts as a change. [INV-36](../invariants.md) records the rule.
 
@@ -60,6 +60,8 @@ An attribute whose type has no default btree equality operator, such as `json`, 
 5. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds. A dependent with a designation is designated too.
 6. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads. [INV-40](../invariants.md) records the rule.
 7. It clears the applying flag, stores the retained key in `Setting::Created` and returns `NEW`.
+
+Each insert also stores the value of a read-only attribute, retained or mapped, in its stored column. The private `Compiler::insertAssignmentsTo()` adds a read-only mapped attribute's `storedAs()` target, unless the database always generates that column. Only the update trigger refuses a change to it. [INV-49](../invariants.md) records the rule.
 
 An omitted attribute arrives as NULL, unless its view column has a default. `Compiler::insertValues()` writes `COALESCE(<value>, <default>)` to a target column that is `NOT NULL` and has a catalog default. So that default fills it, in the primary, retained and dependent inserts and in the update trigger's create branch. A nullable column with a default stores NULL. [INV-46](../invariants.md) records the rule.
 

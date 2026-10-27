@@ -26,6 +26,7 @@ use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Tables;
+use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
@@ -316,6 +317,32 @@ final class CompilerTest extends TestCase
             DB::table('gadget_sites')->orderBy('latitude')->get()->map(fn (object $site) => [$site->latitude, $site->longitude, $site->label])->all(),
         );
         $this->assertSame([0, 0], DB::table('gadgets')->pluck('weight_grams')->all());
+    }
+
+    #[Test]
+    public function it_stores_a_read_only_mapped_attribute_on_an_insert_through_the_view_and_still_refuses_a_change_to_it(): void
+    {
+        DB::statement('alter table gadgets add column grade integer not null default 3');
+        DB::statement('alter table gadgets add column serial_number integer generated always as identity');
+        DB::statement('alter table gadget_places add column kind text not null');
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap(['created_at' => Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->readOnlyBecause('A widget keeps the time it was created.')]))->attributes(),
+            Attribute::mapped('grade')->asType('integer')->storedAs('gadget', 'grade')->readOnlyBecause('Grading assigns it.'),
+            Attribute::mapped('serial_number')->asType('integer')->storedAs('gadget', 'serial_number')->readOnlyBecause('The database numbers it.'),
+            Attribute::mapped('longitude')->asType('numeric(24,12)')->storedAs('site', 'longitude')->readOnlyBecause('A survey sets it.'),
+            Attribute::mapped('kind')->asType('text')->storedAs('place', 'kind')->readOnlyBecause('A place keeps its kind.'),
+        ]]));
+
+        $widget = Widget::query()->create(['title' => 'Stamped', 'grade' => 5, 'latitude' => 1.5, 'longitude' => 2.5, 'street' => '1 Main St', 'kind' => 'Root']);
+        DB::table('widgets')->insert(['title' => 'Defaulted']);
+
+        $this->assertSame(
+            [[$widget->getAttributes()['created_at'], 5, 1], [null, 3, 2]],
+            DB::table('gadgets')->orderBy('serial_number')->get([DB::raw("to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created"), 'grade', 'serial_number'])->map(fn (object $gadget) => [$gadget->created, $gadget->grade, $gadget->serial_number])->all(),
+        );
+        $this->assertSame(['2.500000000000', 'Root'], [DB::table('gadget_sites')->value('longitude'), DB::table('gadget_places')->sole()->kind]);
+        $this->assertWriteRefused(fn () => $widget->update(['grade' => 6]), 'refused a change to widgets.grade');
+        $this->assertWriteRefused(fn () => $widget->update(['created_at' => '2020-01-01 00:00:00']), 'refused a change to widgets.created_at');
     }
 
     #[Test]

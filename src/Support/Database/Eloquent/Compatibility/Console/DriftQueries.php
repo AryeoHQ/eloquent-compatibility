@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Illuminate\Database\ConnectionInterface;
+use Support\Database\Eloquent\Compatibility\Mapping\Assignment;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableStateKind;
@@ -26,6 +27,49 @@ final readonly class DriftQueries
             ...$this->refusedStates($resolvedMap, $limit),
             ...$this->brokenDesignations($resolvedMap, $limit),
         ];
+    }
+
+    /**
+     * @return list<UnguardedColumnTrigger>
+     */
+    public function unguardedColumnTriggers(ResolvedMap $resolvedMap): array
+    {
+        $columnsByTable = [];
+
+        foreach ([...$resolvedMap->currentModels(), (string) $resolvedMap->previousModel->alias] as $alias) {
+            $columnsByTable[$resolvedMap->table($alias)] = [
+                ...$columnsByTable[$resolvedMap->table($alias)] ?? [],
+                ...array_map(fn (Assignment $assignment) => $assignment->targetColumn->column, $resolvedMap->assignmentsTo($alias)),
+            ];
+        }
+
+        $triggers = [];
+
+        foreach ($columnsByTable as $table => $columns) {
+            $columns = array_values(array_unique($columns));
+
+            if ($columns === []) {
+                continue;
+            }
+
+            $rows = $this->connection->select(
+                'select table_trigger.tgname as name, json_agg(table_column.attname order by table_column.attnum) as columns'
+                .' from pg_trigger table_trigger'
+                .' join pg_attribute table_column on table_column.attrelid = table_trigger.tgrelid and table_column.attnum = any (table_trigger.tgattr::int2[])'
+                ." where table_trigger.tgrelid = to_regclass(quote_ident(current_schema()) || '.' || ?)"
+                .' and not table_trigger.tgisinternal and table_trigger.tgqual is null'
+                .' and table_trigger.tgname not like '.SqlFragments::like('compatibility__')
+                .' and table_column.attname::text in ('.implode(', ', array_fill(0, count($columns), '?')).')'
+                .' group by table_trigger.tgname order by 1',
+                [SqlFragments::identifier($table), ...$columns],
+            );
+
+            foreach ($rows as $row) {
+                $triggers[] = new UnguardedColumnTrigger($resolvedMap->name, $table, (string) $row->name, array_map(strval(...), (array) json_decode((string) $row->columns, true)));
+            }
+        }
+
+        return $triggers;
     }
 
     /**
