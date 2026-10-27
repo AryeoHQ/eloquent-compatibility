@@ -8,8 +8,8 @@
             "Support\\": "src/Support/"
         },
         "exclude-from-classmap": [
-            "**/*Test.php",
-            "**/*TestCases.php",
+            "src/**/*Test.php",
+            "src/**/*TestCases.php",
             "/tests/"
         ]
     },
