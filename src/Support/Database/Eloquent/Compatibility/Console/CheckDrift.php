@@ -1,0 +1,65 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Console;
+
+use Illuminate\Console\Command;
+use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
+
+final class CheckDrift extends Command
+{
+    protected $signature = 'compatibility:check
+        {--map=* : Check only the named compatibility maps}
+        {--limit=100 : Report at most this many records per check}';
+
+    protected $description = 'Name every record and attribute where the previous and current models of a compatibility map disagree.';
+
+    public function handle(CompatibilityMaps $compatibilityMaps, DriftQueries $driftQueries): int
+    {
+        $names = array_values(array_filter((array) $this->option('map'), is_string(...)));
+        $maps = $names === [] ? $compatibilityMaps->all() : array_map($compatibilityMaps->get(...), $names);
+        if ($maps === []) {
+            $this->components->error('No compatibility map is registered, so nothing was checked. Mirror each map with EventBridge::mirror() in a service provider, or register it with CompatibilityMaps::register().');
+
+            return self::FAILURE;
+        }
+
+        $limit = max(1, (int) $this->option('limit'));
+        $findings = array_merge(...array_map(fn (ResolvedMap $map) => $driftQueries->find($map, $limit), $maps));
+        $this->warnOfUnguardedColumnTriggers(array_merge(...array_map($driftQueries->unguardedColumnTriggers(...), $maps)));
+
+        if ($findings === []) {
+            $this->components->info('No divergence in '.count($maps).' compatibility '.str('map')->plural(count($maps)).'.');
+
+            return self::SUCCESS;
+        }
+
+        $this->table(
+            ['Map', 'Check', 'Record', 'Attribute', 'Detail'],
+            array_map(fn (DriftFinding $finding) => [$finding->map, $finding->check->value, $finding->recordId, $finding->attribute, $finding->detail], $findings),
+        );
+
+        $this->components->error(count($findings).' divergent '.str('record')->plural(count($findings)).' found.');
+
+        return self::FAILURE;
+    }
+
+    /**
+     * @param  list<UnguardedColumnTrigger>  $triggers
+     */
+    private function warnOfUnguardedColumnTriggers(array $triggers): void
+    {
+        if ($triggers === []) {
+            return;
+        }
+
+        $this->components->warn(count($triggers).' unguarded UPDATE OF '.str('trigger')->plural(count($triggers)).' found. Each fires on every update through a compatibility view that writes its table, whether or not its columns changed.');
+        $this->table(
+            ['Map', 'Table', 'Trigger', 'Columns'],
+            array_map(fn (UnguardedColumnTrigger $trigger) => [$trigger->map, $trigger->table, $trigger->trigger, implode(', ', $trigger->columns)], $triggers),
+        );
+        $this->line('Guard each one with WHEN (OLD.<column> IS DISTINCT FROM NEW.<column>) for every column it names.');
+    }
+}

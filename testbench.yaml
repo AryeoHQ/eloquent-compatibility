@@ -1,0 +1,2 @@
+env:
+  - QUEUE_CONNECTION=sync

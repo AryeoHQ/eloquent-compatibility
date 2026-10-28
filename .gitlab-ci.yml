@@ -1,0 +1,73 @@
+# Tests aryeo/eloquent-compatibility and publishes it to the Artifactory Composer repository.
+#
+# Branches run the tests and the code style, static analysis and dependency checks. A
+# semver tag push (e.g. 0.0.1) runs the same checks, then packages the tagged source and
+# publishes it.
+#
+# The job scripts come from the shared template.
+include:
+  - project: vendor-platform/ci_cd/gitlab-ci-templates
+    ref: main
+    file: php-composer-package.yml
+
+stages:
+  - test
+  - package
+  - publish
+
+default:
+  tags:
+    - build
+  interruptible: true
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+tests:
+  stage: test
+  extends: .php-tests
+  services:
+    - name: postgres:$POSTGRES_VERSION
+      alias: postgres
+  variables:
+    POSTGRES_DB: testing
+    POSTGRES_PASSWORD: secret
+    DB_CONNECTION: pgsql
+    DB_HOST: postgres
+  parallel:
+    matrix:
+      - POSTGRES_VERSION: ["14", "16", "18"]
+        COMPOSER_REQUIRE:
+          - "laravel/framework:12.* orchestra/testbench:10.*"
+          - "laravel/framework:13.* orchestra/testbench:11.*"
+
+code-style:
+  stage: test
+  extends: .php-code-style
+
+static-analysis:
+  stage: test
+  extends: .php-static-analysis
+
+dependency-analysis:
+  stage: test
+  extends: .php-dependency-analysis
+
+package:
+  stage: package
+  extends: .package
+  needs: [tests, code-style, static-analysis, dependency-analysis]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v?\d+\.\d+\.\d+$/
+
+publish:
+  stage: publish
+  extends: .publish
+  needs: [package]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v?\d+\.\d+\.\d+$/

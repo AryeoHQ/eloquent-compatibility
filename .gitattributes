@@ -1,0 +1,13 @@
+# Exclude test files and dev-only configuration from dist archives.
+# Consumers installing via `composer require` (which uses dist/zip by default)
+# will not receive these files.
+
+*Test.php        export-ignore
+*TestCases.php   export-ignore
+
+/tests           export-ignore
+/phpunit.xml     export-ignore
+/testbench.yaml  export-ignore
+
+/.gitattributes  export-ignore
+/.gitignore      export-ignore

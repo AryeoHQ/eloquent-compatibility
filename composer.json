@@ -1,0 +1,78 @@
+{
+    "name": "aryeo/eloquent-compatibility",
+    "description": "Serve a previous Eloquent model as a PostgreSQL view over its current models' tables",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Support\\": "src/Support/",
+            "Tooling\\": "src/Tooling/"
+        },
+        "exclude-from-classmap": [
+            "src/**/*Test.php",
+            "src/**/*TestCases.php",
+            "/tests/"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Workbench\\App\\": "workbench/app/",
+            "Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "stable",
+    "repositories": {
+        "artifactory": {
+            "type": "composer",
+            "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/",
+            "only": ["aryeo/*", "zillow/*"]
+        }
+    },
+    "require": {
+        "php": "^8.4",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*",
+        "laravel/framework": "12.x || ^13",
+        "nikic/php-parser": "^5.7",
+        "phpstan/phpstan": "^2.1"
+    },
+    "require-dev": {
+        "aryeo/tooling-laravel": "0.0.41",
+        "brianium/paratest": "^7.14",
+        "orchestra/testbench": "^10.6 || ^11",
+        "orchestra/testbench-core": "^10.7 || ^11",
+        "phpunit/phpunit": "^12.4.1 || ^13"
+    },
+    "config": {
+        "allow-plugins": {
+            "aryeo/tooling-laravel": true
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Support\\Database\\Eloquent\\Compatibility\\Provider"
+            ]
+        },
+        "tooling": {
+            "phpstan": {
+                "rules": "tooling/phpstan/rules.neon",
+                "config": {
+                    "paths": [
+                        "src",
+                        "bin"
+                    ]
+                }
+            },
+            "pint": {
+                "config": {
+                    "paths": [
+                        "src",
+                        "tests",
+                        "bin"
+                    ]
+                }
+            }
+        }
+    }
+}
