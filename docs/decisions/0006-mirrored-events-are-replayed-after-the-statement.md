@@ -12,5 +12,5 @@ After the statement succeeds, the bridge reads each affected record again and `E
 
 - Listeners on the other side see the state the database stored, including values the triggers computed.
 - A mirrored listener's change has nowhere to go, so `CompatibilityWriteRefused::byMirroredChange()` refuses it. See [INV-15](../invariants.md).
-- The mirrored instance is not the caller's instance, and the replayer never begins a pending write for it.
+- The mirrored instance is not the caller's instance, and the replayer never begins a pending mirrored write for it.
 - Writes that fire no model events are stored correctly, and mirror nothing.

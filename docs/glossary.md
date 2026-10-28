@@ -1,26 +1,26 @@
 # Glossary
 
-Each term has one meaning across the code and these docs.
+Each term has one meaning across the code and these docs. Where the context leaves no doubt, a document shortens a term to its last word. So the bridge is the event bridge, and the view is the compatibility view. The map is the compatibility map, and the write is a pending mirrored write.
 
-- **affected record**: a row a write can change, with its map, model, the relation it reads from, the table it locks, its key and its role; an `AffectedRecord`.
+- **affected record**: a row a write can change, with its map, model, key, role, the relation it reads from and the table it locks; an `AffectedRecord`.
 - **alias**: the lowercase name a map gives the previous model and each current model, used in the compiled SQL and in attribute declarations.
 - **aliased table**: the table and key column an alias resolves to; an `AliasedTable`.
 - **applying flag**: the setting `Setting::Applying`, which each of the view's triggers holds at the map's name while it runs, and restores when it returns.
 - **armed write**: the claimed pending mirrored write that the connection's next `INSERT`, `UPDATE` or `DELETE` opens; one per connection, see `EventBridge::markOwnStatement()`.
 - **assignment**: one attribute paired with one column it writes; an `Assignment`.
-- **beginning event**: a creating, updating or deleting model event, at whose start the event bridge begins a pending mirrored write; see `ModelEvent::beginning()`. A dispatch that returns false forgets the write.
+- **beginning event**: a creating, updating or deleting model event. At its start the event bridge begins a pending mirrored write, and a dispatch that returns false forgets it; see `ModelEvent::beginning()`.
 - **claimed**: said of a pending mirrored write that its model's own write method has marked; see `PendingMirroredWrite::$claimed`.
 - **column catalog**: the cached reader of each table's column types, defaults, `NOT NULL` and generated flags, and of whether a type has a btree equality; `ColumnCatalog`.
 - **compatibility map**: the class that declares how a previous model maps onto its current models; it implements `CompatibilityMap`.
 - **compatibility view**: the PostgreSQL view, named after the previous model's old table, that serves the previous model.
 - **compiled SQL**: the view, function and trigger statements a map compiles to; `CompiledSql`.
-- **conflict check**: the update trigger's second read of every attribute, after it locks the dependent rows, which raises 40001 when the record changed after the statement's snapshot.
+- **conflict check**: the update trigger's second read of every attribute, after it locks the dependent rows. It raises 40001 when the record changed after the statement's snapshot.
 - **created key**: the retained key of a record just created, which the triggers store in `Setting::Created` for the event bridge.
 - **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model. A map names each current model class once.
 - **degrade**: an unrepresentable state the map documents and lets through; no code reads it.
 - **dependent current model**: a current model whose rows link the primary current model's row by a primary foreign key; `DependentCurrentModel`.
 - **designation**: a retained column that names the one dependent row the previous model reads; see `DependentCurrentModel::designatedBy()`.
-- **dispatch depth**: how many model event dispatches of mirrored models are in progress, which the event bridge counts around each one; see `PendingMirroredWrite::$depth`. A write's own events share its depth, and a listener's write runs deeper.
+- **dispatch depth**: how many model event dispatches of mirrored models are in progress; see `PendingMirroredWrite::$depth`. A write's own events share its depth, and a listener's write runs deeper.
 - **drift**: a record whose previous and current models disagree, which `compatibility:check` reports as a `DriftFinding`.
 - **drift check**: one of the five queries in `DriftQueries`, labelled by a `DriftCheck` case.
 - **event bridge**: the singleton that raises the other side's model events for each write through a model; `EventBridge`.
@@ -28,27 +28,30 @@ Each term has one meaning across the code and these docs.
 - **event replayer**: the part of the event bridge that raises one record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the event bridge skips for mirrored events; `ExcludedListener`.
 - **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
-- **finishing event**: a created, saved, updated or deleted model event, which the event bridge pairs with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` lists saved, updated and deleted.
+- **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
 - **mapped attribute**: a previous model's attribute stored in a current model's table; see `Attribute::mapped()`.
 - **mirror index**: the event bridge's index of mirrored maps by model class and by current table; `MirrorIndex`.
+- **mirrored event**: a model event the event replayer raises for a record that a write through the other side changed.
+- **mirrored listener**: a listener while it runs for a mirrored event.
 - **mirrored map**: a resolved map with its event mirror and key translator; a `MirroredMap`.
-- **model contract**: what every model of a mirrored map carries, the interface `Compatible` and the trait `HasCompatibility`, which marks its own statement and shows the event bridge its model events.
+- **model contract**: what every model of a mirrored map carries, the interface `Compatible` and the trait `HasCompatibility`. The trait marks the model's own statement and shows the event bridge its model events.
 - **native write**: a write a model makes itself, as opposed to the events the event bridge replays for it.
+- **newcomer**: an affected record the event bridge finds only on its second pass, under its first locks.
 - **object prefix**: `compatibility__<name>__`, which starts the name of every trigger and function of a map; see `ResolvedMap::objectPrefix()`.
 - **own statement**: the statement a model's own write method sends, which `HasCompatibility` marks for the event bridge; see `EventBridge::markOwnStatement()`.
-- **pending mirrored write**: a write the event bridge has begun and not yet forgotten; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts, see `PendingMirroredWrite::$statementSent`. A completed write leaves at once.
+- **pending mirrored write**: a write the event bridge has begun and not yet forgotten; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts; see `PendingMirroredWrite::$statementSent`. A completed write leaves at once.
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.
 - **readable condition**: the SQL condition a dependent row meets for the previous model to read it; see `DependentCurrentModel::readableWhen()`.
 - **record role**: whether an affected record is primary, previous or dependent, which sets its lock order; `RecordRole`.
-- **record snapshot**: an affected record with its row at one moment; a `RecordSnapshot`.
+- **record snapshot**: an affected record with its row at one moment, as the event bridge read it; a `RecordSnapshot`. The statement's snapshot is a different thing: the committed data PostgreSQL shows a statement.
 - **refusal**: a write the package rejects, raised as CM001 in SQL and as `CompatibilityWriteRefused` in PHP.
 - **refuse**: an unrepresentable state that refuses every write reaching it; see `UnrepresentableState::refuse()`.
-- **refused-state lock**: the transaction-scoped advisory lock a refuse function on a dependent's table or the retained table takes, keyed on the function and the row's primary foreign key. The function takes `FOR KEY SHARE` on the primary row first; see `Compiler::refuseFunction()`.
+- **refused-state lock**: the transaction-scoped advisory lock that a refuse function on a dependent's table or the retained table takes. Its key is the function and the row's primary foreign key. The function takes `FOR KEY SHARE` on the primary row first; see `Compiler::refuseFunction()`.
 - **resolved map**: the checked, immutable form of a compatibility map that every part reads; `ResolvedMap`.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.

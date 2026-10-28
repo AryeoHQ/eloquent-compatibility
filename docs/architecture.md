@@ -1,12 +1,12 @@
 # Architecture
 
-This page is for reviewers and maintainers of the package. It names the parts, follows one write through them, and suggests a reading order. The user documentation lives on the PHP Archetype standards site, on the eloquent-compatibility package pages. Its Architecture page explains why the package stores each value once and which designs it declines. This page does not repeat that.
+This page is for reviewers and maintainers of the package. It names the parts, follows one write through them, and suggests a reading order. The user documentation lives on the PHP Archetype standards site, on the eloquent-compatibility package pages. Its Architecture page explains why the package stores each value once and which designs it declines, so this page does not repeat that.
 
 ## The problem
 
 An application replaces one Eloquent model with several, and existing code still reads and writes the old model's table. The package calls the old model the previous model, and the new models its current models. A compatibility map is one class that declares how each attribute of the previous model maps onto the current models.
 
-The package serves the previous model from a PostgreSQL view, the compatibility view, which takes the old table's name. The old table, renamed, becomes the retained table. Each value lives in one table: a retained attribute in the retained table, a mapped attribute in the current model's table that owns it.
+The package serves the previous model from a PostgreSQL view, the compatibility view, which takes the old table's name. The old table, renamed, becomes the retained table. Each value lives in one table: a retained attribute in the retained table, and a mapped attribute in the current model's table that owns it.
 
 ## The two halves
 
@@ -52,16 +52,16 @@ flowchart LR
 
 Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php). `Widget` is the previous model and `Gadget` its primary current model.
 
-1. Eloquent fires `updating` on the widget through `HasCompatibility::fireModelEvent()`. Before any listener runs, `EventBridge::begin()` records a `PendingMirroredWrite`. It opens nothing yet.
-2. `Widget` uses `HasCompatibility`, so `HasCompatibility::setKeysForSaveQuery()` hands the widget's save query to `EventBridge::markOwnStatement()`. The bridge claims the pending write, and arms it when the query runs. Eloquent then sends `update "widgets" set ... where "id" = ?`, and the bridge's `beforeExecuting` callback opens the armed write on it.
-3. The bridge opens a transaction, or a savepoint when the caller already holds one.
-4. `AffectedRecords::before()` asks `AffectedRecords::of()` for every record the write can change: the gadget, its place and its site.
-5. `AffectedRecords::before()` locks those records and the widget's retained row in the triggers' order. `AffectedRecords::snapshots()` then reads each one.
-6. The statement reaches the compatibility view. The view's update trigger checks every refusal, locks the gadget row, the retained row and the dependent rows, and runs the conflict check.
+1. Eloquent fires `updating` on the widget. Before any listener runs, the event bridge records a pending mirrored write. It opens nothing yet.
+2. The widget's save query passes through `HasCompatibility::setKeysForSaveQuery()`, which marks it as the widget's own statement. The bridge claims the write, and arms it when the query runs.
+3. Eloquent sends `update "widgets" set ... where "id" = ?`. Just before it runs, the bridge opens the armed write: a transaction, or a savepoint when the caller already holds a transaction.
+4. The bridge finds every record the write can change: the gadget, its place and its site.
+5. It locks those records and the widget's retained row in the triggers' order, then reads each one.
+6. The statement reaches the compatibility view. The update trigger checks every refusal, locks the gadget row, the retained row and the dependent rows, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
-8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which completes the open write. It compares the event's SQL and bindings with the statement it opened on, and parses no SQL.
-9. `EventBridge::complete()` reads each record again, and `EventReplayer::replay()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
-10. The bridge commits or releases its savepoint and forgets the write. Eloquent then fires the widget's own `updated` and `saved`, and `EventBridge::finish()` finds no write of the widget left at their dispatch depth.
+8. `QueryExecuted` reaches the bridge, which completes the open write. It knows the statement by the SQL and bindings it recorded at the open, and parses no SQL.
+9. The bridge reads each record again, and replays the gadget's `saving`, `updating`, `updated` and `saved` events.
+10. The bridge commits or releases its savepoint, and forgets the write. Eloquent then fires the widget's own `updated` and `saved`, and the bridge finds no write of the widget left at their dispatch depth.
 
 The flows below take each step in depth:
 
@@ -79,21 +79,21 @@ Read the code in this order. Each step answers one question.
 1. [README.md](../README.md): what does a map look like, and how does an application install and mirror it?
 2. [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php) and [Tables](../tests/Fixtures/Support/Workbench/Tables.php): which builders does a real map use, over which tables?
 3. `CompatibilityMap`, `Attribute`, `DependentCurrentModel` and `UnrepresentableState`: what does each builder store?
-4. `ResolvedMap`: what does registration refuse, and how is a dependent row located?
+4. `ResolvedMap`: what does registration refuse, and how does a map locate a dependent row?
 5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first.
-6. `Installer` and `SqlFragments`: in what order does the SQL run, and how is a refusal raised?
+6. `Installer` and `SqlFragments`: in what order does the SQL run, and how does it raise a refusal?
 7. `CompatibilityWriteRefused`: how does a refusal become a PHP exception?
-8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events, and when does a pending write begin, complete, finish and fail?
-9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order are they locked?
-10. `EventReplayer`: how are native model events reproduced, and how are listeners excluded?
+8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
+9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?
+10. `EventReplayer`: how does the bridge reproduce native model events, and how does it exclude listeners?
 11. `DriftQueries`: which five kinds of drift does the check find?
-12. `InstallerTest`, `EventBridgeTest`, `EventBridgeOutsideTransactionTest`, `HasCompatibilityTest` and `DependentCurrentModelTest`: what does each write do, end to end?
+12. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?
 
 Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once. [Adopting a map](adopting-a-map.md) lists what changes for an application's code and tests once a model is mapped.
 
 ## Keeping these docs true
 
-These docs name classes and methods, never line numbers. CI runs [check-doc-names.php](../bin/check-doc-names.php) in the static-analysis job. It reads `README.md`, every page under `docs/` and every `README.md` under `src/`. It fails when:
+These docs name classes and methods, never line numbers. CI runs [check-doc-names.php](../bin/check-doc-names.php) in the static-analysis job, over `README.md`, every page under `docs/` and every `README.md` under `src/`. It fails when:
 
 - a backticked class name, or a backticked method, case, constant or property on a class, names nothing in the code;
 - a page cites a line, such as `Compiler.php` followed by a colon and a number;

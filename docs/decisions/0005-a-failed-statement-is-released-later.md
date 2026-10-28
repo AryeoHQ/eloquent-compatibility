@@ -17,7 +17,7 @@ Each of the first three runs `select 1` before it closes the write, and closes i
 
 ## Consequences
 
-- Until one of these happens, `Connection::transactionLevel()` reports 1. A test names this a declared limit.
+- Until one of these happens, `Connection::transactionLevel()` reports 1. That is a declared limit.
 - A queued job that fails this way is recorded as failed, and its worker's connection is clean for the next job.
 - A statement can start while the write's own statement runs, from a later `beforeExecuting` callback or from a `QueryExecuted` listener registered before the bridge's. Its `select 1` succeeds, so the bridge leaves the write open, and the write completes on its own `QueryExecuted`.
 - Only `EventBridge::releaseFailed()` commits a healthy write. A `QueryExecuted` listener registered before the bridge's that throws therefore leaves its statement's write open, unmirrored, until `Looping` or termination.

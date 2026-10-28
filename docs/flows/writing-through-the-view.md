@@ -1,6 +1,6 @@
 # Writing through the view
 
-This flow follows a write after it reaches PostgreSQL. The triggers do the same work for every client: an Eloquent model, the query builder or raw SQL. The SQL comes from `Compiler`, so each step names the method that builds it. The example is `update "widgets" set "title" = ? where "id" = ?` on the workbench map.
+This flow follows a write after it reaches PostgreSQL. The triggers do the same work for every client: an Eloquent model, the query builder or raw SQL. `Compiler` builds all the SQL this page describes. The example is `update "widgets" set "title" = ? where "id" = ?` on the workbench map.
 
 ```mermaid
 sequenceDiagram
@@ -17,70 +17,73 @@ sequenceDiagram
   Trigger-->>Client: RETURN NEW
 ```
 
+## What every function does first
+
+Every compiled function refuses with CM001 when it fires on a relation other than its own, and `PUBLIC` holds no `EXECUTE` on it. It calls each built-in function through `pg_catalog`. [INV-37](../invariants.md#inv-37-a-trigger-function-runs-only-for-its-own-relation) records why.
+
+The insert, update and delete functions hold the applying flag at the map's name while they run. PostgreSQL restores the earlier value when the function returns, so a nested write through another map's view leaves this map's name in place. [INV-3](../invariants.md#inv-3-the-views-own-writes-skip-this-maps-current-side-triggers) records the rule.
+
 ## An update
 
-Every compiled function first refuses with CM001 when it fires on a relation other than its own, and `PUBLIC` holds no `EXECUTE` on it. It calls each built-in function through `pg_catalog`. [INV-37](../invariants.md) records why.
+The update trigger runs once per row. `Compiler::updateFunction()` builds its body, which runs in this order:
 
-The insert, update and delete functions hold the applying flag, `Setting::Applying`, at the map's name while they run. `Compiler::function()` gives each of them a `SET` clause for it. PostgreSQL restores the earlier value when the function returns, so a nested write through another map's view leaves this map's name in place. [INV-3](../invariants.md) records the rule.
-
-`Compiler::updateFunction()` builds the update trigger's body. It runs once per row, in this order:
-
-1. Each read-only attribute refuses a change with CM001. `Attribute::readOnlyBecause()` supplies the reason.
-2. `Compiler::notNullChecks()` refuses a null for a mapped attribute whose same-named retained column is `NOT NULL`.
-3. `Compiler::lockPrimary()` locks the primary row with `FOR UPDATE`.
-4. `Compiler::loadPrevious()` locks the retained row and loads it into `previous_row`. A missing row refuses with CM001, and the hint names `compatibility:check`.
+1. Each read-only attribute refuses a change with CM001, with the reason from `Attribute::readOnlyBecause()`.
+2. A mapped attribute whose same-named retained column is `NOT NULL` refuses a null.
+3. The trigger locks the primary row with `FOR UPDATE`.
+4. It locks the retained row and loads it into `previous_row`. A missing row refuses with CM001, and the hint names `compatibility:check`.
 5. Each refused state with `UnrepresentableState::checkedOnPreviousUpdate()` refuses with CM001 when its condition holds.
-6. `Compiler::conflict()` locks each dependent row the record reads with `FOR UPDATE`, through `ResolvedMap::locate()`, into `key_<alias>`. It then reads every attribute through the tables. A row that differs from `OLD` raises 40001. A dependent row it no longer finds is not a conflict.
-7. `Compiler::updateTable()` updates the primary row when one of its attributes changed. Any row count other than one refuses with CM001.
-8. `Compiler::updateTable()` updates the retained row the same way, with no row count check.
-9. `Compiler::updateDependent()` handles each dependent whose attributes changed, as the next section describes.
-10. The trigger returns `NEW`.
+6. The conflict check locks each dependent row the record reads with `FOR UPDATE`, into `key_<alias>`. It then reads every attribute through the tables. A row that differs from `OLD` raises 40001. A dependent row it no longer finds is not a conflict.
+7. It updates the primary row when one of its attributes changed. Any row count other than one refuses with CM001.
+8. It updates the retained row the same way, with no row count check.
+9. It writes each dependent whose attributes changed, as the next section describes.
+10. It returns `NEW`.
 
-`Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. It still sits in the `SET` list, so an `UPDATE OF` trigger on it fires. [INV-7](../invariants.md) records the rule. `Compiler::value()` casts each written value to the column's type in the catalog.
+`Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. It still sits in the `SET` list, so an `UPDATE OF` trigger on it fires, as [INV-7](../invariants.md#inv-7-the-update-trigger-writes-only-what-changed) records. Each written value is cast to the column's type in the catalog.
 
-An attribute whose type has no default btree equality operator, such as `json`, has no `=` to compare with. Every comparison above casts it to text first: the read-only check, `SqlFragments::changed()`, the `CASE WHEN` and the conflict check. A whitespace or key-order change the caller wrote therefore counts as a change. [INV-36](../invariants.md) records the rule.
+An attribute whose type has no default btree equality operator, such as `json`, has no `=` to compare with. Every comparison above casts it to text first: the read-only check, the change test, the `CASE WHEN` and the conflict check. A whitespace or key-order change the caller wrote therefore counts as a change. [INV-36](../invariants.md#inv-36-an-attribute-without-a-btree-equality-compares-as-text) records the rule.
 
 ## A dependent row
 
-`Compiler::updateDependent()` writes the dependent row `Compiler::conflict()` locked in step 6, by its key in `key_<alias>`. It selects no row of its own.
+The trigger writes only the dependent row the conflict check locked in step 6, by its key in `key_<alias>`. `Compiler::updateDependent()` selects no row of its own. What it does depends on that lock:
 
 - A row was locked: the trigger updates it.
-- No row was locked, but the subquery from `ResolvedMap::locate()` finds one now: the trigger raises 40001. Another transaction made that row readable after the lock, and the trigger never read it. [INV-5](../invariants.md) records the rule.
+- No row was locked, but the subquery from `ResolvedMap::locate()` finds one now: the trigger raises 40001. Another transaction made that row readable after the lock, and the trigger never read it. [INV-5](../invariants.md#inv-5-a-concurrent-change-raises-40001) records the rule.
 - No row was locked, and the designation names a row that still exists: the trigger refuses with CM001. That row is no longer readable, or belongs to another record.
-- No row was locked, and the `DependentCurrentModel::createdWhen()` condition holds: the trigger inserts the row and designates it. Without `DependentCurrentModel::createdWhen()`, the condition is that one of the dependent's attributes is not null.
+- No row was locked, and the `DependentCurrentModel::createdWhen()` condition holds: the trigger inserts the row and designates it. Without a declared condition, the condition is that one of the dependent's attributes is not null.
 - Otherwise the trigger refuses with CM001: the record has no such row, and the map does not create one.
 
 ## An insert
 
-`Compiler::insertFunction()` builds the insert trigger. It takes no locks.
+The insert trigger takes no locks. `Compiler::insertFunction()` builds it:
 
-1. `Compiler::notNullChecks()` refuses a null for a `NOT NULL` mapped attribute.
-2. The trigger inserts the primary row, with `PrimaryCurrentModel::fillWhenCreatedFromPrevious()` filling the columns no attribute writes.
+1. A `NOT NULL` mapped attribute refuses a null.
+2. The trigger inserts the primary row, and `PrimaryCurrentModel::fillWhenCreatedFromPrevious()` fills the columns no attribute writes.
 3. It inserts the retained row, linked to the primary row. A read-only retained attribute over a column the database always generates stays out of the insert, so the table fills it.
-4. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds, linked to the primary row. A dependent with a designation is designated too.
-5. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads. [INV-40](../invariants.md) records the rule.
-6. It stores the retained key in `Setting::Created` and returns `NEW`.
+4. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds, linked to the primary row, and designates it where the dependent has a designation.
+5. It reads every attribute back into `NEW` from the stored rows, as the view reads it. So `INSERT ... RETURNING` reports defaults, fills, values other triggers set and formatted reads, as [INV-40](../invariants.md#inv-40-an-insert-through-the-view-returns-the-row-as-the-view-reads-it) records.
+6. It stores the retained key as the created key in `Setting::Created`, and returns `NEW`.
 
-Neither an attribute nor a fill sets a link. Registration refuses an attribute that stores a dependent's primary foreign key, and a fill of any primary foreign key or designation column. Compile refuses a writable attribute over the retained table's primary foreign key or a designation column. [INV-8](../invariants.md) records the rule.
+The map maintains every link itself, so neither an attribute nor a fill sets one, as [INV-8](../invariants.md#inv-8-each-stored-column-has-one-owner) records. Registration refuses an attribute that stores a dependent's primary foreign key, and a fill of any primary foreign key or designation column. Compile refuses a writable attribute over the retained table's primary foreign key or a designation column.
 
-Each insert also stores the value of a read-only attribute, retained or mapped, in its stored column. The private `Compiler::insertAssignmentsTo()` adds a read-only mapped attribute's `storedAs()` target, unless the database always generates that column. It also skips that target when a writable attribute writes the column, so the writable value is stored and both attributes read it. [INV-8](../invariants.md) records that rule. Only the update trigger refuses a change to it. [INV-49](../invariants.md) records the rule.
+Each insert stores a read-only attribute's value too, retained or mapped, in its stored column. Only the update trigger refuses a change to it. A read-only mapped attribute stays out of the insert when the database always generates its column, or when a writable attribute writes the same column. In the second case the writable value is stored, and both attributes read it. [INV-49](../invariants.md#inv-49-an-insert-through-the-view-stores-a-read-only-attribute) records the rule.
 
-An omitted attribute arrives as NULL, unless its view column has a default. `Compiler::insertValues()` writes `COALESCE(<value>, <default>)` to a target column that is `NOT NULL` and has a catalog default. So that default fills it, in the primary, retained and dependent inserts and in the update trigger's create branch. A nullable column with a default stores NULL. [INV-46](../invariants.md) records the rule.
+An omitted attribute arrives as NULL, unless its view column has a default. A target column that is `NOT NULL` and has a catalog default receives `COALESCE(<value>, <default>)`, so that default fills it. That holds in the primary, retained and dependent inserts, and in the update trigger's create branch. A nullable column with a default stores NULL. [INV-46](../invariants.md#inv-46-an-insert-through-the-view-keeps-a-not-null-columns-default) records the rule.
 
 ## A delete
 
-`Compiler::deleteFunction()` locks the primary row, then loads and locks the retained row. It deletes the retained row, then every dependent row of the primary row in reverse declaration order, then the primary row.
+The delete trigger locks the primary row, then loads and locks the retained row. It deletes the retained row, then every dependent row of the primary row in reverse declaration order, then the primary row. `Compiler::deleteFunction()` builds it.
 
 A soft delete is an Eloquent `UPDATE` of `deleted_at`. The workbench map stores `deleted_at` on the gadget, so the update trigger writes it like any other attribute.
 
 ## Writes on the current side
 
-The other trigger functions react to writes that do not come through the view. `Compiler::skipWhileApplying()` makes three of them return early while the applying flag holds this map's name. So the view's own writes fire none of this map's current-side reactions.
+The other trigger functions react to writes that do not come through the view. Three of them return early while the applying flag holds this map's name, so the view's own writes fire none of this map's current-side reactions:
 
-- `Compiler::primaryInsertFunction()`: a new primary row gets a retained row, filled by `PreviousModel::fillWhenCreatedFromCurrent()`. The trigger stores the new retained key in `Setting::Created`.
-- `Compiler::primaryDeleteFunction()`: a deleted primary row takes its retained rows with it.
-- `Compiler::designateFunction()`: a dependent row that an insert or an update makes readable fills an empty designation on its primary row's retained rows.
-- `Compiler::refuseFunction()`: a row that enters a refused state refuses with CM001. It never skips, so it holds for every writer, the view included.
+- **Primary insert**: a new primary row gets a retained row, filled by `PreviousModel::fillWhenCreatedFromCurrent()`. The trigger stores the new retained key as the created key.
+- **Primary delete**: a deleted primary row takes its retained rows with it.
+- **Designate**: a dependent row that an insert or an update makes readable fills an empty designation on its primary row's retained rows.
+
+The refuse function is the fourth. A row that enters a refused state refuses with CM001. It never skips, so it holds for every writer, the view included.
 
 ## The refused-state lock
 
@@ -91,27 +94,27 @@ PERFORM 1 FROM "<primary table>" WHERE "<primary key>" = NEW."<primary foreign k
 PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(pg_catalog.concat('<refuse function>:', NEW."<primary foreign key>"), 0));
 ```
 
-The primary row lock comes first, so the refused-state lock joins the order of [INV-1](../invariants.md). A view writer holds the primary row `FOR UPDATE` before it writes a dependent row. A dependent writer then waits on the primary row before it holds the advisory lock, and the two cannot deadlock on it. Both a dependent's primary foreign key and the retained table's name the primary row.
+The primary row lock comes first, so the refused-state lock joins the order of [INV-1](../invariants.md#inv-1-locks-follow-one-order). A view writer holds the primary row `FOR UPDATE` before it writes a dependent row. A dependent writer then waits on the primary row before it holds the advisory lock, so the two cannot deadlock on it. A dependent's primary foreign key and the retained table's both name the primary row.
 
-The advisory lock's key joins the refuse function's name, from `ResolvedMap::refuseFunctionName()`, with the row's primary foreign key. A dependent uses `ResolvedMap::primaryForeignKey()`, and the retained table uses the previous model's primary foreign key. So two writers of one record's rows check the state one after the other. `concat` turns a null key into an empty string, so every row with a null key shares one lock. `Compiler::function()` declares no volatility, so each function is VOLATILE. Under READ COMMITTED, the check after the wait therefore takes a new snapshot and sees the committed row.
+The advisory lock's key joins the refuse function's name with the row's primary foreign key. A dependent uses its own primary foreign key, and the retained table uses the previous model's. So two writers of one record's rows check the state one after the other. `concat` turns a null key into an empty string, so every row with a null key shares one lock. `Compiler::function()` declares no volatility, so each function is VOLATILE. Under READ COMMITTED, the check after the wait therefore takes a new snapshot and sees the committed row.
 
 The lock has four limits:
 
-- **A state checked on the primary table takes no lock.** A primary row has no primary foreign key, and its condition always compares different records. Its check can race, and two writers can both commit the state. Enforce a cross-row rule on the primary table with a unique or exclusion constraint instead. `compatibility:check` still reports a row in the state. [0016](../decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records the decision.
+- **A state checked on the primary table takes no lock.** A primary row has no primary foreign key, and its condition always compares different records. So its check can race, and two writers can both commit the state. Enforce a cross-row rule on the primary table with a unique or exclusion constraint instead. `compatibility:check` still reports a row in the state. [0016](../decisions/0016-a-refused-state-on-the-primary-table-is-not-serialized.md) records the decision.
 - **A condition that compares rows of different records can still race.** So can a condition that reads another table, whose writers take no lock.
 - **Under REPEATABLE READ, the check after the wait misses the committed row.** The snapshot stays fixed for the whole transaction.
-- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** The view writer holds the primary row `FOR UPDATE` and waits on the dependent row. The refuse function's `FOR KEY SHARE` then waits on the view writer, and PostgreSQL raises 40P01. A raw write deadlocks on this pattern. A write through the event bridge locks the primary row first, so it deadlocks only when the application locked the dependent row itself. [INV-1](../invariants.md) records the exception.
+- **A writer that locks a dependent row and then updates it can deadlock a concurrent write through the view.** The view writer holds the primary row `FOR UPDATE` and waits on the dependent row. The refuse function's `FOR KEY SHARE` then waits on the view writer, and PostgreSQL raises 40P01. A raw write deadlocks on this pattern. A write through the event bridge locks the primary row first, so it deadlocks only when the application locked the dependent row itself. [INV-1](../invariants.md#inv-1-locks-follow-one-order) records the exception.
 
-## Other statements that reach the triggers
+## Other statements through the view
 
 An `UPDATE ... FROM` fires the update trigger once per joined row, and each firing writes the values of its own row. A record that joins two rows fires the trigger twice. The second firing finds the record changed since its `OLD` row, and raises 40001.
 
 A simple view over the compatibility view takes writes too. PostgreSQL rewrites each write onto the compatibility view, so its triggers fire and their refusals hold. `information_schema.views` still reports the outer view as not updatable.
 
+A `FOR UPDATE` read through the view succeeds. It locks the primary row and then the retained row, the two relations in the view's `FROM` list, in that list's order. So it waits on the primary row before it holds the retained row, as [INV-1](../invariants.md#inv-1-locks-follow-one-order) requires. It cannot deadlock a bridged write or a write through the view. The view reads each dependent through a scalar subquery, so the read locks no dependent row.
+
 ## Writes the view cannot take
 
-An upsert, an update with a limit and a truncate fail on the view. The error is PostgreSQL's own, and `CompatibilityWriteRefused::isRefusal()` does not recognise it. An `INSERT ... ON CONFLICT DO NOTHING`, which `insertOrIgnore()` and `saveOrIgnore()` send, reaches the insert trigger. The clause does not reach the trigger's own inserts, so a conflict there raises 23505 where the old table skipped the row. `EventBridgeOutsideTransactionTest::it_raises_a_unique_violation_for_an_insert_or_ignore_through_the_view_that_conflicts()` and `EventBridgeOutsideTransactionTest::it_raises_a_unique_violation_for_a_save_or_ignore_through_the_view_that_conflicts()` pin it. A `FOR UPDATE` read through the view succeeds. It locks the primary row and then the retained row, the two relations in the view's `FROM` list, in that list's order. So it waits on the primary row before it holds the retained row, as [INV-1](../invariants.md) requires, and cannot deadlock a bridged write or a write through the view. The view reads each dependent through a scalar subquery, so the read locks no dependent row.
+An upsert, an update with a limit and a truncate fail on the view. The error is PostgreSQL's own, and `CompatibilityWriteRefused::isRefusal()` does not recognise it.
 
-## Tests
-
-`InstallerTest` covers each write through the view: inserts, updates, deletes and soft deletes. It also covers refusals, hidden states, the current-side triggers and two maps over one primary table. `InstallerTest::it_makes_a_concurrent_write_wait_for_the_refused_state_check_of_the_same_record()` covers the refused-state lock on a second connection. `InstallerTest::it_does_not_deadlock_a_write_through_the_view_against_a_writer_holding_the_refused_state_lock()` covers the primary row lock, with a view writer in a child process. `InstallerTest::it_does_not_deadlock_a_lock_through_the_view_against_an_update_through_the_view_that_holds_the_primary_row()` covers the order of a `FOR UPDATE` read, with the read in a child process. `DependentCurrentModelTest` covers designation. `CompilerTest::it_refuses_a_write_through_the_view_whose_retained_row_is_gone()` and `CompilerTest::it_refuses_a_write_through_the_view_that_updates_no_primary_row()` cover a write that is missing a row. `CompilerTest::it_raises_a_serialization_failure_when_a_primary_or_retained_attribute_changed_after_the_statement_read_the_view()` and `CompilerTest::it_raises_a_serialization_failure_when_a_dependent_attribute_changed_after_the_statement_read_the_view()` cover the conflict check. `CompilerTest::it_raises_a_serialization_failure_when_the_dependent_row_it_waited_on_stops_being_readable_and_another_becomes_readable()` covers a dependent row found only after the lock. `CompilerTest::it_writes_the_default_of_a_not_null_current_column_that_an_insert_through_the_view_leaves_empty()` covers the defaults an insert keeps. `CompilerTest::it_compares_a_json_attribute_by_its_text_in_every_write_through_the_view()` covers a `json` attribute. `CompilerTest::it_returns_every_attribute_of_an_insert_through_the_view_as_the_view_reads_it()` covers `INSERT ... RETURNING`. `CompilerTest::it_refuses_to_run_a_trigger_function_fired_on_any_relation_but_its_own()` covers the relation check. `CompilerTest::it_calls_no_function_of_the_installation_schema_that_takes_the_name_of_a_built_in_function()` covers the qualified built-in calls. `InstallerTest::it_keeps_one_retained_row_per_primary_row_when_a_trigger_inside_a_write_through_the_view_writes_through_another_compatibility_view()` covers a nested write through a second view. `InstallerTest::it_writes_each_joined_row_with_its_own_values_through_an_update_from_values()` and `InstallerTest::it_raises_a_serialization_failure_when_an_update_from_values_joins_one_record_twice()` cover `UPDATE ... FROM`. `InstallerTest::it_writes_the_current_tables_through_a_simple_view_over_the_compatibility_view()` covers a view over the view. `InstallerTest::it_locks_the_retained_and_primary_rows_and_no_dependent_row_through_the_compatibility_view()` covers the rows a `FOR UPDATE` read locks, from a second connection.
+An `INSERT ... ON CONFLICT DO NOTHING`, which `insertOrIgnore()` and `saveOrIgnore()` send, reaches the insert trigger. The clause does not reach the trigger's own inserts, so a conflict there raises 23505 where the old table skipped the row. [Adopting a map](../adopting-a-map.md#an-ignored-insert-raises-on-a-conflict) describes what an application does about it.

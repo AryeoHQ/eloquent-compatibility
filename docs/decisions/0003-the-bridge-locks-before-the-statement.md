@@ -6,7 +6,7 @@ The update trigger raises 40001 when the record changed after the statement's sn
 
 ## Decision
 
-When a write's own statement starts, the private `EventBridge::open()` locks every affected record with `FOR UPDATE`, then reads it. It runs in the `Connection::beforeExecuting()` callback, so the locks come just before the statement and never without it. [INV-34](../invariants.md) records that rule. `AffectedRecords::before()` locks in the triggers' order, through the private `AffectedRecords::lock()`: primary rows, then retained rows, then dependent rows. `AffectedRecords::snapshots()` only reads.
+When a write's own statement starts, the bridge locks every affected record with `FOR UPDATE`, then reads it. It does so in a `Connection::beforeExecuting()` callback, so the locks come just before the statement and never without it, as [INV-34](../invariants.md#inv-34-a-pending-mirrored-write-opens-at-its-statement) records. The locks follow the triggers' order: primary rows, then retained rows, then dependent rows. The reads take no lock. `AffectedRecords::before()` does both.
 
 ## Consequences
 

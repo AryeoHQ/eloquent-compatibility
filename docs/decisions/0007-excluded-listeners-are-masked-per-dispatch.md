@@ -6,7 +6,7 @@ Some listeners must not run for writes through the other side, such as a journal
 
 ## Decision
 
-`EventReplayer::mask()` swaps an event's listeners for wrappers for the length of one dispatch, then `EventReplayer::unmask()` restores them. A wrapper skips its listener only when the payload's subject is the instance under replay, recorded in an `Exclusion`. The private `EventReplayer::maskWildcards()` and `EventReplayer::unmaskWildcards()` do the same for each wildcard registration that matches the event, such as `eloquent.updated: *`.
+For the length of one dispatch, the replayer swaps an event's listeners for wrappers, then restores them, through `EventReplayer::mask()` and `EventReplayer::unmask()`. A wrapper skips its listener only when the payload's subject is the instance under replay, recorded in an `Exclusion`. The private `EventReplayer::maskWildcards()` and `EventReplayer::unmaskWildcards()` do the same for each wildcard registration that matches the event, such as `eloquent.updated: *`.
 
 ## Consequences
 

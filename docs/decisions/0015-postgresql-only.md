@@ -11,5 +11,5 @@ The package supports PostgreSQL only, and the suite runs on PostgreSQL 14, 16 an
 ## Consequences
 
 - A run that selects SQLite fails at once, instead of passing against the wrong database.
-- `ProviderTest::it_connects_to_the_postgresql_major_version_postgres_version_names()` checks that the server's major version is the one `POSTGRES_VERSION` names.
+- A test checks that the server's major version is the one `POSTGRES_VERSION` names.
 - Every database feature must work on PostgreSQL 14.

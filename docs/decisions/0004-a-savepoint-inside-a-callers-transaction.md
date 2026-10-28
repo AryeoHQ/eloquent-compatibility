@@ -6,7 +6,7 @@ A write through a model and the events the bridge replays for it must commit or 
 
 ## Decision
 
-When a write's statement starts, the private `EventBridge::open()` checks the transaction level. At level 0, it opens a Laravel transaction and commits it after the replay. Inside a caller's transaction, it issues a raw `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count. The replay then runs inside `Connection::transaction()`.
+When a write's statement starts, the bridge checks the transaction level, in the private `EventBridge::open()`. At level 0, it opens a Laravel transaction and commits it after the replay. Inside a caller's transaction, it issues a raw `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count. The replay then runs inside `Connection::transaction()`.
 
 ## Consequences
 

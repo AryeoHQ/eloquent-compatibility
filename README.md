@@ -84,19 +84,20 @@ final class Widget extends Model implements Compatible
 }
 ```
 
-The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. It also hands the bridge every model event through `fireModelEvent()`. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()`, `getAttributesForInsert()` or `fireModelEvent()`.
+The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. It also hands the bridge every model event. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()`, `getAttributesForInsert()` or `fireModelEvent()`. [Adopting a map](docs/adopting-a-map.md#mark-each-mapped-model) describes the models that cannot carry the mark.
 
 ### PHPStan rules
-The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An application that runs `tooling:phpstan:analyze` loads them, so it finds a model that breaks the contract before `EventBridge::mirror()` refuses that model at boot:
+The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An application that runs `tooling:phpstan:analyze` loads them, so it finds a model that breaks the contract before `EventBridge::mirror()` refuses it at boot:
 
 - `CompatibleMustUseHasCompatibility`: a model that implements `Compatible` uses `HasCompatibility`.
 - `HasCompatibilityMustImplementCompatible`: a model that uses `HasCompatibility` implements `Compatible`.
 - `HasCompatibilityMustOnlyBeOnModel`: only a `Model` subclass implements `Compatible` or uses `HasCompatibility`.
 - `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, resolves `setKeysForSaveQuery()`, `getAttributesForInsert()` and `fireModelEvent()` to the trait's own methods. A declaration in the class or a parent fails, and so does a method another trait brings in.
 
-The rules skip anonymous classes. `EventBridge::mirror()` still checks those at boot.
+The rules skip anonymous classes, which `EventBridge::mirror()` still checks at boot.
 
-A migration installs the compatibility view and its triggers. A service provider registers an event mirror, a class that implements `Contracts\EventMirror` and names the map, so each side's model events fire for writes through the other:
+### Install and mirror
+A migration installs the compatibility view and its triggers. A service provider registers an event mirror, so each side's model events fire for writes through the other. An event mirror implements `Contracts\EventMirror` and names the map:
 
 ```php
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
@@ -129,7 +130,7 @@ resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 `php artisan compatibility:check` names every record where the previous and current models disagree.
 
 ### Refused states
-`UnrepresentableState::refuse()` declares a state one side can hold and the other cannot express. Its `UnrepresentableState::checkedOn()` condition compiles to a trigger that refuses every insert or update reaching the state, whoever writes it. On a dependent current model's table or the retained table, that trigger serializes the writers of one record. So two concurrent writes to one record cannot both reach a state that compares the record's own rows.
+A refused state is a state one side can hold and the other cannot express, declared with `UnrepresentableState::refuse()`. Its `UnrepresentableState::checkedOn()` condition compiles to a trigger that refuses every insert or update reaching the state, whoever writes it. On a dependent current model's table or the retained table, that trigger serializes the writers of one record. So two concurrent writes to one record cannot both reach a state that compares the record's own rows.
 
 The serialization has limits:
 
