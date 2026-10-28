@@ -143,6 +143,7 @@ final class EventBridge
         if ($query === null) {
             $this->arm($connection, $pendingWrite);
         } else {
+            // Armed when the query runs: SoftDeletes::runSoftDelete() sets attributes after setKeysForSaveQuery().
             $query->beforeQuery(fn () => $this->arm($connection, $pendingWrite));
         }
     }
@@ -218,6 +219,7 @@ final class EventBridge
         $this->watch($connection);
         $this->finishFailed($connection);
         unset($this->armed[(string) $connection->getName()]);
+        // Only a save fires saving first; an increment fires no saved, so its write must leave at updated.
         $saves = $operation !== Operation::Delete && $this->takeSaving($model);
         $lastEvent = match (true) {
             $operation === Operation::Delete => ModelEvent::Deleted,
