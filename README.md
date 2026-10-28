@@ -69,6 +69,21 @@ final class WidgetCompatibilityMap implements CompatibilityMap
 }
 ```
 
+Every model the map names, the previous model and each current model, implements `Contracts\Compatible` and uses `Provides\HasCompatibility`:
+
+```php
+use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Provides\HasCompatibility;
+
+final class Widget extends Model implements Compatible
+{
+    use HasCompatibility;
+}
+```
+
+The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()` or `getAttributesForInsert()`.
+
 A migration installs the compatibility view and its triggers. A service provider registers an event mirror, a class that implements `Contracts\EventMirror` and names the map, so each side's model events fire for writes through the other:
 
 ```php

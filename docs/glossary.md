@@ -6,8 +6,10 @@ Each term has one meaning across the code and these docs.
 - **alias**: the lowercase name a map gives the previous model and each current model, used in the compiled SQL and in attribute declarations.
 - **aliased table**: the table and key column an alias resolves to; an `AliasedTable`.
 - **applying flag**: the transaction-local setting `Setting::Applying`, which the view's triggers set to the map's name around their writes.
+- **armed write**: the claimed pending mirrored write that the connection's next `INSERT`, `UPDATE` or `DELETE` opens; one per connection, see `EventBridge::markOwnStatement()`.
 - **assignment**: one attribute paired with one column it writes; an `Assignment`.
 - **beginning event**: a creating, updating or deleting model event, on which the event bridge begins a pending mirrored write; see `ModelEvent::beginning()`.
+- **claimed**: said of a pending mirrored write that its model's own write method has marked; see `PendingMirroredWrite::$claimed`.
 - **column catalog**: the cached reader of each table's column types, defaults, `NOT NULL` and generated flags, and of whether a type has a btree equality; `ColumnCatalog`.
 - **compatibility map**: the class that declares how a previous model maps onto its current models; it implements `CompatibilityMap`.
 - **compatibility view**: the PostgreSQL view, named after the previous model's old table, that serves the previous model.
@@ -25,17 +27,19 @@ Each term has one meaning across the code and these docs.
 - **event replayer**: the part of the event bridge that raises one record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the event bridge skips for mirrored events; `ExcludedListener`.
 - **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
-- **finishing event**: a saved, updated or deleted model event, on which the event bridge finishes a pending mirrored write; see `ModelEvent::finishing()`.
+- **finishing event**: a created, saved, updated or deleted model event, which the event bridge pairs with the pending mirrored write it belongs to. `ModelEvent::finishing()` lists the three on which a write can end.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
+- **last finishing event**: the finishing event at which the event bridge forgets a pending mirrored write; see `PendingMirroredWrite::$lastEvent`. It is saved for an insert or a save, updated for an increment or a decrement, and deleted for a delete.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
 - **mapped attribute**: a previous model's attribute stored in a current model's table; see `Attribute::mapped()`.
-- **mirror index**: the event bridge's index of mirrored maps by model class, table and relation; `MirrorIndex`.
+- **mirror index**: the event bridge's index of mirrored maps by model class and by current table; `MirrorIndex`.
 - **mirrored map**: a resolved map with its event mirror and key translator; a `MirroredMap`.
+- **model contract**: what every model of a mirrored map carries, the interface `Compatible` and the trait `HasCompatibility`, which marks its own statement.
 - **native write**: a write a model makes itself, as opposed to the events the event bridge replays for it.
 - **object prefix**: `compatibility__<name>__`, which starts the name of every trigger and function of a map; see `ResolvedMap::objectPrefix()`.
-- **parsed write**: the operation and relation read from the head of a SQL statement, with an insert's columns and the placeholders its `WHERE` clause compares; a `ParsedWrite`.
-- **pending mirrored write**: a write the event bridge has begun and not yet closed; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts; see `PendingMirroredWrite::$statementSent`.
+- **own statement**: the statement a model's own write method sends, which `HasCompatibility` marks for the event bridge; see `EventBridge::markOwnStatement()`.
+- **pending mirrored write**: a write the event bridge has begun and not yet forgotten; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts, see `PendingMirroredWrite::$statementSent`. It keeps a completed write until the write's last finishing event.
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.
@@ -48,7 +52,6 @@ Each term has one meaning across the code and these docs.
 - **resolved map**: the checked, immutable form of a compatibility map that every part reads; `ResolvedMap`.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
-- **save key**: the key value Eloquent binds in a model's own update or delete, its raw original key or else its current key. A pending write completes only on a statement that binds it.
 - **savepoint mode**: how the event bridge works inside a caller's transaction, in a `compatibility_<n>` savepoint.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.

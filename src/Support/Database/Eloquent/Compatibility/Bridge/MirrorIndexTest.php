@@ -89,28 +89,6 @@ final class MirrorIndexTest extends TestCase
         $this->assertSame([], $this->mirrorIndex->forRelation('retained_widgets'));
     }
 
-    #[Test]
-    public function it_lists_the_model_classes_over_a_relation_once(): void
-    {
-        $this->addAll();
-
-        $this->assertSame([Person::class], $this->mirrorIndex->modelsOf('people'));
-        $this->assertSame([Widget::class], $this->mirrorIndex->modelsOf('widgets'));
-        $this->assertSame([GadgetPlace::class], $this->mirrorIndex->modelsOf('gadget_places'));
-        $this->assertSame([], $this->mirrorIndex->modelsOf('retained_widgets'));
-    }
-
-    #[Test]
-    public function it_lists_the_maps_over_a_relation_once(): void
-    {
-        $this->addAll();
-
-        $this->assertSame(['accounts', 'profiles'], $this->mirrorIndex->mapsOf('people'));
-        $this->assertSame(['profiles'], $this->mirrorIndex->mapsOf('profiles'));
-        $this->assertSame(['widgets'], $this->mirrorIndex->mapsOf('gadgets'));
-        $this->assertSame([], $this->mirrorIndex->mapsOf('retained_profiles'));
-    }
-
     /**
      * @return list<string>
      */

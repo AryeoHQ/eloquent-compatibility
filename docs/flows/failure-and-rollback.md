@@ -41,18 +41,18 @@ In savepoint mode the replay runs inside `Connection::transaction()`. Laravel dr
 
 ## A failed commit
 
-A `COMMIT` can fail after a successful replay, for example on a deferred constraint or a lost connection. Laravel then still counts the bridge's transaction. `EventBridge::close()` keeps the write until its commit finishes. When the commit fails, it rolls the connection back to the level the write began at, forgets the write and rethrows. The connection is then outside a transaction again. [INV-35](../invariants.md) records the rule.
+A `COMMIT` can fail after a successful replay, for example on a deferred constraint or a lost connection. Laravel then still counts the bridge's transaction. The private `EventBridge::endTransaction()` keeps the write until its commit finishes. When the commit fails, it rolls the connection back to the level the write began at, forgets the write and rethrows. The connection is then outside a transaction again. [INV-35](../invariants.md) records the rule.
 
 ## A failed statement at level 0
 
 A failed statement fires no `QueryExecuted`, so `EventBridge::complete()` never runs and the write stays pending. At level 0, PostgreSQL has aborted the bridge's own transaction. The first of four events closes it:
 
-1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` opens a write when its statement starts. A new statement while that write is still pending means its statement failed. The callback rolls back before the new statement runs. It then tests the write below against the new statement, so an outer write whose listener caught the failure still opens.
+1. **The next statement on the connection.** The `beforeExecuting` callback from `EventBridge::watch()` opens a write when its statement starts. A new statement while that write is still pending means its statement failed. The callback rolls back before the new statement runs. It then opens the armed write, so an outer write whose listener caught the failure still opens on its own statement.
 2. **The next bridged write.** `EventBridge::begin()` calls `EventBridge::finishFailed()`. When the connection sits one level above the write, it runs `select 1`. A failure rolls back, and a success commits. It reaps only a write whose statement started: an unstarted write holds no transaction, and may still be waiting for its statement.
 3. **A queue worker's next loop.** `Provider::boot()` calls `EventBridge::releaseFailed()` on each `Looping` event.
 4. **Application termination.** `Provider::boot()` calls `EventBridge::releaseFailed()` from the terminating callbacks too.
 
-`EventBridge::releaseFailed()` forgets every pending write whose statement never started, then runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
+`EventBridge::releaseFailed()` forgets every write that holds no transaction: one whose statement never started, and one that completed. It then runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
 
 Until one of the four happens, `Connection::transactionLevel()` still reports 1. `EventBridgeOutsideTransactionTest` names this a declared limit. `EventBridge::finishFailed()` leaves the write alone when the connection's level no longer sits one above it.
 

@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
@@ -20,6 +21,7 @@ use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
@@ -29,11 +31,13 @@ use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Provides\HasCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
+use Tests\Fixtures\Support\Workbench\CompatibleModel;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetItem;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
@@ -1064,6 +1068,116 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['previous', 'neither'])]
+    #[TestWith(['primary', 'interface'])]
+    #[TestWith(['dependent', 'trait'])]
+    public function it_refuses_to_mirror_a_map_that_names_a_model_without_the_interface_and_the_trait_that_mark_its_own_statement(string $role, string $has): void
+    {
+        $model = match ($has) {
+            'neither' => (new class extends Model
+            {
+                protected $table = 'gadgets';
+            })::class,
+            'interface' => (new class extends Model implements Compatible
+            {
+                protected $table = 'gadgets';
+            })::class,
+            default => eval('return (new class extends \Illuminate\Database\Eloquent\Model { use \\'.HasCompatibility::class.'; protected $table = "gadgets"; })::class;'), // @phpstan-ignore ergebnis.noEval
+        };
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming($role, $model))),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$model} does not implement ".Compatible::class.' and use '.HasCompatibility::class.", so the event bridge cannot tell the model's own statement from a listener's and would mirror none of its writes; implement the interface and use the trait in the model.",
+        );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+    }
+
+    #[Test]
+    #[TestWith(['previous', 'setKeysForSaveQuery', 'class'])]
+    #[TestWith(['primary', 'setKeysForSaveQuery', 'subclass'])]
+    #[TestWith(['dependent', 'getAttributesForInsert', 'class'])]
+    #[TestWith(['previous', 'getAttributesForInsert', 'subclass'])]
+    public function it_refuses_to_mirror_a_map_whose_model_redeclares_a_method_the_trait_marks_its_own_statement_from(string $role, string $method, string $declaredIn): void
+    {
+        $model = match ([$method, $declaredIn]) {
+            ['setKeysForSaveQuery', 'class'] => (new class extends Model implements Compatible
+            {
+                use HasCompatibility;
+
+                protected $table = 'gadgets';
+
+                /**
+                 * @param  Builder<static>  $query
+                 * @return Builder<static>
+                 */
+                protected function setKeysForSaveQuery($query)
+                {
+                    parent::setKeysForSaveQuery($query);
+
+                    return $query;
+                }
+            })::class,
+            ['setKeysForSaveQuery', 'subclass'] => (new class extends CompatibleModel
+            {
+                /**
+                 * @param  Builder<static>  $query
+                 * @return Builder<static>
+                 */
+                protected function setKeysForSaveQuery($query)
+                {
+                    parent::setKeysForSaveQuery($query);
+
+                    return $query;
+                }
+            })::class,
+            ['getAttributesForInsert', 'class'] => (new class extends Model implements Compatible
+            {
+                use HasCompatibility;
+
+                protected $table = 'gadgets';
+
+                /**
+                 * @return array<string, mixed>
+                 */
+                protected function getAttributesForInsert()
+                {
+                    return parent::getAttributesForInsert();
+                }
+            })::class,
+            default => (new class extends CompatibleModel
+            {
+                /**
+                 * @return array<string, mixed>
+                 */
+                protected function getAttributesForInsert()
+                {
+                    return parent::getAttributesForInsert();
+                }
+            })::class,
+        };
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming($role, $model))),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$model} resolves {$method}() to {$model}::{$method}(), not to the method of ".HasCompatibility::class.', so its own statement carries no mark and the event bridge would mirror none of its writes; remove that declaration.',
+        );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+    }
+
+    #[Test]
+    public function it_mirrors_a_map_whose_model_inherits_the_trait_from_the_class_it_extends(): void
+    {
+        $model = (new class extends CompatibleModel {})::class;
+
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming('dependent', $model)));
+
+        $this->assertSame(['widgets'], array_map(fn (ResolvedMap $resolvedMap) => $resolvedMap->name, resolve(CompatibilityMaps::class)->all()));
+    }
+
+    #[Test]
     public function it_keeps_the_mirrored_map_registered_when_a_second_mirror_of_its_name_is_refused(): void
     {
         $this->mirror();
@@ -1101,6 +1215,18 @@ final class EventBridgeTest extends TestCase
     private function mirror(array $excludedListeners = []): void
     {
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new WidgetCompatibilityMap, $excludedListeners));
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    private function naming(string $role, string $model): CompatibilityMap
+    {
+        return match ($role) {
+            'previous' => $this->respelled($model, Gadget::class),
+            'primary' => $this->respelled(Widget::class, $model),
+            default => $this->respelled(Widget::class, Gadget::class, [DependentCurrentModel::for($model)->aliasedAs('named')->primaryForeignKey('id')]),
+        };
     }
 
     /**

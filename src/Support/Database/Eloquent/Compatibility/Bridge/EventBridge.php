@@ -8,22 +8,24 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
+use ReflectionMethod;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Provides\HasCompatibility;
 use Throwable;
 use WeakMap;
 
 final class EventBridge
 {
     private const string PARENTAL = 'Tightenco\Parental\HasChildren';
-
-    private const array WRITING_METHODS = ['performInsert', 'performInsertOrIgnore', 'performUpdate', 'incrementOrDecrement', 'incrementOrDecrementEach', 'delete'];
 
     private readonly MirrorIndex $mirrorIndex;
 
@@ -34,11 +36,14 @@ final class EventBridge
     /** @var array<string, list<PendingMirroredWrite>> */
     private array $pendingWrites = [];
 
+    /** @var array<string, PendingMirroredWrite> */
+    private array $armed = [];
+
     /** @var array<string, true> */
     private array $mirrored = [];
 
-    /** @var WeakMap<EventFake, array<string, int>> */
-    private WeakMap $faked;
+    /** @var WeakMap<Model, int> */
+    private WeakMap $saving;
 
     /** @var WeakMap<Connection, true> */
     private WeakMap $watched;
@@ -56,7 +61,7 @@ final class EventBridge
         $this->mirrorIndex = new MirrorIndex;
         $this->affectedRecords = new AffectedRecords($this->mirrorIndex);
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
-        $this->faked = new WeakMap;
+        $this->saving = new WeakMap;
         $this->watched = new WeakMap;
     }
 
@@ -72,6 +77,19 @@ final class EventBridge
         foreach ([(string) $resolvedMap->previousModel->model, ...array_keys($resolvedMap->currentModels())] as $model) {
             if (in_array(self::PARENTAL, class_uses_recursive($model), true)) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} uses ".self::PARENTAL.', so its child classes fire model events under their own names and the event bridge would mirror none of their writes; leave Parental models out of compatibility maps');
+            }
+
+            if (! is_subclass_of($model, Compatible::class) || ! in_array(HasCompatibility::class, class_uses_recursive($model), true)) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} does not implement ".Compatible::class.' and use '.HasCompatibility::class.", so the event bridge cannot tell the model's own statement from a listener's and would mirror none of its writes; implement the interface and use the trait in the model");
+            }
+
+            foreach (['setKeysForSaveQuery', 'getAttributesForInsert'] as $method) {
+                $resolved = new ReflectionMethod($model, $method);
+                $marking = new ReflectionMethod(HasCompatibility::class, $method);
+
+                if ($resolved->getFileName() !== $marking->getFileName() || $resolved->getStartLine() !== $marking->getStartLine()) {
+                    throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} resolves {$method}() to {$resolved->getDeclaringClass()->getName()}::{$method}(), not to the method of ".HasCompatibility::class.', so its own statement carries no mark and the event bridge would mirror none of its writes; remove that declaration');
+                }
             }
         }
 
@@ -105,36 +123,53 @@ final class EventBridge
         }
     }
 
+    public function markOwnStatement(Model&Compatible $model, null|Builder $query = null): void
+    {
+        if ($this->disabled > 0) {
+            return;
+        }
+
+        $connection = $model->getConnection();
+        $pendingWrite = $this->unclaimed($connection, $model);
+
+        if ($pendingWrite === null) {
+            $this->guard($model);
+
+            return;
+        }
+
+        $pendingWrite->claimed = true;
+
+        if ($query === null) {
+            $this->arm($connection, $pendingWrite);
+        } else {
+            $query->beforeQuery(fn () => $this->arm($connection, $pendingWrite));
+        }
+    }
+
     public function handleQuery(QueryExecuted $query): void
     {
         if ($this->internal > 0) {
             return;
         }
 
-        $parsedWrite = ParsedWrite::of($query->sql);
-
-        if ($parsedWrite === null) {
-            return;
-        }
-
         $pendingWrite = $this->top($query->connectionName);
 
-        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->statementSent && $pendingWrite->expects($parsedWrite, $query->bindings)) {
+        if ($pendingWrite !== null && $pendingWrite->pending && $pendingWrite->statementSent) {
             $this->complete($query->connection, $pendingWrite);
-
-            return;
         }
-
-        $this->guard($parsedWrite);
     }
 
     public function releaseFailed(): void
     {
+        $this->armed = [];
+        $this->saving = new WeakMap;
+
         foreach ($this->pendingWrites as $name => $pendingWrites) {
             $pendingWrite = $pendingWrites[0] ?? null;
 
             if ($pendingWrite !== null) {
-                $this->pendingWrites[$name] = array_values(array_filter($pendingWrites, fn (PendingMirroredWrite $open) => $open->statementSent));
+                $this->pendingWrites[$name] = array_values(array_filter($pendingWrites, fn (PendingMirroredWrite $open) => $open->pending && $open->statementSent));
                 $this->finishFailed($pendingWrite->source->getConnection());
             }
         }
@@ -145,6 +180,16 @@ final class EventBridge
      */
     private function listen(string $model): void
     {
+        $saving = ModelEvent::Saving->for($model);
+
+        $this->events->listen($saving.'*', function (string $fired, array $payload) use ($saving): void {
+            $target = $payload[0] ?? null;
+
+            if ($fired === $saving && $target instanceof Model && $this->disabled === 0 && ! $this->eventReplayer->isReplaying($target)) {
+                $this->saving[$target] = ($this->saving[$target] ?? 0) + 1;
+            }
+        });
+
         foreach (ModelEvent::beginning() as $event) {
             $name = $event->for($model);
             $operation = $event->operation();
@@ -158,8 +203,8 @@ final class EventBridge
             });
         }
 
-        foreach (ModelEvent::finishing() as $event) {
-            $this->events->listen($event->for($model), $this->finish(...));
+        foreach ([ModelEvent::Created, ...ModelEvent::finishing()] as $event) {
+            $this->events->listen($event->for($model), fn (Model $target) => $this->finish($target, $event));
         }
     }
 
@@ -172,7 +217,49 @@ final class EventBridge
         $connection = $model->getConnection();
         $this->watch($connection);
         $this->finishFailed($connection);
-        $this->pendingWrites[$connection->getName()][] = new PendingMirroredWrite($model, $operation);
+        unset($this->armed[(string) $connection->getName()]);
+        $saves = $operation !== Operation::Delete && $this->takeSaving($model);
+        $lastEvent = match (true) {
+            $operation === Operation::Delete => ModelEvent::Deleted,
+            $operation === Operation::Insert || $saves => ModelEvent::Saved,
+            default => ModelEvent::Updated,
+        };
+        $this->pendingWrites[$connection->getName()][] = new PendingMirroredWrite($model, $operation, Model::getEventDispatcher(), $lastEvent);
+    }
+
+    private function takeSaving(Model $model): bool
+    {
+        $saving = $this->saving[$model] ?? 0;
+
+        if ($saving === 0) {
+            return false;
+        }
+
+        $this->saving[$model] = $saving - 1;
+
+        return true;
+    }
+
+    private function unclaimed(Connection $connection, Model $model): null|PendingMirroredWrite
+    {
+        $dispatcher = Model::getEventDispatcher();
+
+        foreach (array_reverse($this->pendingWrites[(string) $connection->getName()] ?? []) as $pendingWrite) {
+            if ($pendingWrite->source === $model && ! $pendingWrite->claimed && $pendingWrite->dispatcher === $dispatcher) {
+                return $pendingWrite;
+            }
+        }
+
+        return null;
+    }
+
+    private function arm(Connection $connection, PendingMirroredWrite $pendingWrite): void
+    {
+        $name = (string) $connection->getName();
+
+        if ($pendingWrite->pending && ! $pendingWrite->statementSent && in_array($pendingWrite, $this->pendingWrites[$name] ?? [], true)) {
+            $this->armed[$name] = $pendingWrite;
+        }
     }
 
     private function open(Connection $connection, PendingMirroredWrite $pendingWrite): void
@@ -211,82 +298,36 @@ final class EventBridge
                 return;
             }
 
-            while (($pendingWrite = $this->top($connection->getName())) !== null && $pendingWrite->pending) {
-                if ($pendingWrite->statementSent) {
+            $name = (string) $connection->getName();
+            $armed = $this->writes($query) ? $this->armed[$name] ?? null : null;
+
+            if ($armed !== null) {
+                unset($this->armed[$name]);
+            }
+
+            while (($pendingWrite = $this->top($name)) !== null && $pendingWrite !== $armed) {
+                if ($pendingWrite->pending && $pendingWrite->statementSent) {
                     if ($pendingWrite->savepoint === null) {
                         $this->close($connection, $pendingWrite, false);
                     } else {
                         $this->forget($connection, $pendingWrite);
                     }
-
-                    continue;
-                }
-
-                $dispatcherFrames = $this->dispatcherFramesSinceItsWrite($pendingWrite);
-
-                if ($dispatcherFrames === null) {
+                } elseif ($armed !== null) {
                     $this->forget($connection, $pendingWrite);
-
-                    continue;
+                } else {
+                    return;
                 }
+            }
 
-                $parsedWrite = ParsedWrite::of($query);
-
-                if ($dispatcherFrames === 0 && $parsedWrite !== null && $pendingWrite->expects($parsedWrite, $bindings)) {
-                    $this->open($connection, $pendingWrite);
-                }
-
-                return;
+            if ($armed !== null && $this->top($name) === $armed) {
+                $this->open($connection, $armed);
             }
         });
     }
 
-    private function dispatcherFramesSinceItsWrite(PendingMirroredWrite $pendingWrite): null|int
+    private function writes(string $query): bool
     {
-        $dispatcherFrames = 0;
-
-        foreach (debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT) as $frame) {
-            $object = $frame['object'] ?? null;
-
-            if ($object === $pendingWrite->source && in_array($frame['function'], self::WRITING_METHODS, true)) {
-                $pendingWrite->incrementColumns = $this->incrementColumns($frame['function'], $frame['args'] ?? []);
-
-                return $dispatcherFrames;
-            }
-
-            if ($object instanceof Dispatcher) {
-                $dispatcherFrames++;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $arguments
-     * @return null|list<string>
-     */
-    private function incrementColumns(string $method, array $arguments): null|array
-    {
-        $columns = match ($method) {
-            'incrementOrDecrement' => [$arguments[0] ?? null, ...$this->extraColumns((array) ($arguments[2] ?? []))],
-            'incrementOrDecrementEach' => [...array_keys((array) ($arguments[0] ?? [])), ...$this->extraColumns((array) ($arguments[1] ?? []))],
-            default => null,
-        };
-
-        return $columns === null ? null : array_values(array_filter($columns, is_string(...)));
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $extra
-     * @return list<string>
-     */
-    private function extraColumns(array $extra): array
-    {
-        return array_map(
-            fn (string $key) => Str::before(Str::afterLast($key, '.'), '->'),
-            array_values(array_filter(array_keys($extra), is_string(...))),
-        );
+        return preg_match('/^\s*(?:insert|update|delete)\b/i', $query) === 1;
     }
 
     private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void
@@ -322,23 +363,52 @@ final class EventBridge
             throw $e;
         }
 
-        $this->close($connection, $pendingWrite, true);
+        $this->endTransaction($connection, $pendingWrite, true);
     }
 
-    private function finish(Model $model): void
+    private function finish(Model $model, ModelEvent $event): void
     {
-        $connection = $model->getConnection();
-        $pendingWrite = $this->top($connection->getName());
-
-        if ($pendingWrite === null || ! $pendingWrite->pending || $pendingWrite->source !== $model) {
+        if ($this->disabled > 0) {
             return;
         }
 
-        if ($pendingWrite->statementSent) {
-            $this->close($connection, $pendingWrite, true);
-        } else {
+        $connection = $model->getConnection();
+        $pendingWrite = $this->paired($connection, $model, $event);
+
+        if ($pendingWrite === null) {
+            return;
+        }
+
+        if (! $pendingWrite->claimed && $event !== ModelEvent::Saved) {
+            $this->forget($connection, $pendingWrite);
+
+            throw CompatibilityEventMirrorBypassed::byUnmarkedStatement($model::class, $event, $this->maps($model));
+        }
+
+        if ($pendingWrite->pending && $pendingWrite->statementSent) {
+            $this->endTransaction($connection, $pendingWrite, true);
+        }
+
+        if ($event === $pendingWrite->lastEvent) {
             $this->forget($connection, $pendingWrite);
         }
+    }
+
+    private function paired(Connection $connection, Model $model, ModelEvent $event): null|PendingMirroredWrite
+    {
+        foreach (array_reverse($this->pendingWrites[(string) $connection->getName()] ?? []) as $pendingWrite) {
+            $completedBy = match ($pendingWrite->operation) {
+                Operation::Insert => ModelEvent::Created,
+                Operation::Update => ModelEvent::Updated,
+                Operation::Delete => ModelEvent::Deleted,
+            };
+
+            if ($pendingWrite->source === $model && ($event === $pendingWrite->lastEvent || $event === $completedBy)) {
+                return $pendingWrite;
+            }
+        }
+
+        return null;
     }
 
     private function finishFailed(Connection $connection): void
@@ -372,10 +442,22 @@ final class EventBridge
     {
         $name = (string) $connection->getName();
         $this->pendingWrites[$name] = array_values(array_filter($this->pendingWrites[$name] ?? [], fn (PendingMirroredWrite $open) => $open !== $pendingWrite));
+
+        if (($this->armed[$name] ?? null) === $pendingWrite) {
+            unset($this->armed[$name]);
+        }
     }
 
     private function close(Connection $connection, PendingMirroredWrite $pendingWrite, bool $commit): void
     {
+        $this->endTransaction($connection, $pendingWrite, $commit);
+        $this->forget($connection, $pendingWrite);
+    }
+
+    private function endTransaction(Connection $connection, PendingMirroredWrite $pendingWrite, bool $commit): void
+    {
+        $pendingWrite->pending = false;
+
         try {
             $this->internally(function () use ($connection, $pendingWrite, $commit): void {
                 if ($pendingWrite->savepoint !== null) {
@@ -405,35 +487,30 @@ final class EventBridge
 
             throw $e;
         }
-
-        $this->forget($connection, $pendingWrite);
     }
 
-    private function guard(ParsedWrite $parsedWrite): void
+    private function guard(Model $model): void
     {
-        $models = $this->mirrorIndex->modelsOf($parsedWrite->relation);
         $dispatcher = Model::getEventDispatcher();
+        $maps = $this->maps($model);
 
-        if ($models === [] || ! $dispatcher instanceof EventFake) {
+        if ($maps === [] || ! $dispatcher instanceof EventFake) {
             return;
         }
 
-        $count = 0;
-
-        foreach ($models as $model) {
-            foreach (ModelEvent::beginning() as $event) {
-                $count += $dispatcher->dispatched($event->for($model))->count();
+        foreach (ModelEvent::beginning() as $event) {
+            if ($dispatcher->dispatched($event->for($model::class), fn (string $fired, mixed $payload) => $payload === $model)->isNotEmpty()) {
+                throw CompatibilityEventMirrorBypassed::byFakedDispatcher(Str::afterLast($model->getTable(), '.'), $maps);
             }
         }
+    }
 
-        $counts = $this->faked[$dispatcher] ?? [];
-        $seen = $counts[$parsedWrite->relation] ?? 0;
-        $counts[$parsedWrite->relation] = $count;
-        $this->faked[$dispatcher] = $counts;
-
-        if ($count > $seen && $this->disabled === 0) {
-            throw CompatibilityEventMirrorBypassed::byFakedDispatcher($parsedWrite->relation, $this->mirrorIndex->mapsOf($parsedWrite->relation));
-        }
+    /**
+     * @return list<string>
+     */
+    private function maps(Model $model): array
+    {
+        return array_values(array_unique(array_map(fn (MapMember $member) => $member->map, $this->mirrorIndex->forModel($model::class))));
     }
 
     private function top(null|string $connection): null|PendingMirroredWrite

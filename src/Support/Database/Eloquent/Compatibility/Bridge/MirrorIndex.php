@@ -20,9 +20,6 @@ final class MirrorIndex
     /** @var array<string, list<MapMember>> */
     private array $tables = [];
 
-    /** @var array<string, list<class-string<Model>>> */
-    private array $relations = [];
-
     /**
      * @return list<class-string<Model>> the model classes this compatibility map adds
      */
@@ -33,20 +30,19 @@ final class MirrorIndex
         $added = [];
 
         $previous = $resolvedMap->previousModel;
-        $members = [(string) $previous->alias => [(string) $previous->model, $previous->view]];
+        $members = [(string) $previous->alias => (string) $previous->model];
 
         foreach ($resolvedMap->currentModels() as $model => $alias) {
-            $members[$alias] = [$model, $resolvedMap->table($alias)];
+            $members[$alias] = $model;
             $this->tables[$resolvedMap->table($alias)][] = new MapMember($name, $alias);
         }
 
-        foreach ($members as $alias => [$model, $relation]) {
+        foreach ($members as $alias => $model) {
             if (! array_key_exists($model, $this->models)) {
                 $added[] = $model;
             }
 
             $this->models[$model][] = new MapMember($name, $alias);
-            $this->relations[$relation][] = $model;
         }
 
         return $added;
@@ -78,25 +74,5 @@ final class MirrorIndex
     public function forRelation(string $relation): array
     {
         return $this->tables[$relation] ?? [];
-    }
-
-    /** @return list<class-string<Model>> */
-    public function modelsOf(string $relation): array
-    {
-        return array_values(array_unique($this->relations[$relation] ?? []));
-    }
-
-    /** @return list<string> */
-    public function mapsOf(string $relation): array
-    {
-        $maps = [];
-
-        foreach ($this->modelsOf($relation) as $model) {
-            foreach ($this->forModel($model) as $member) {
-                $maps[] = $member->map;
-            }
-        }
-
-        return array_values(array_unique($maps));
     }
 }

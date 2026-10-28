@@ -4,14 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
-enum Operation: string
+enum Operation
 {
-    case Insert = 'insert';
-    case Update = 'update';
-    case Delete = 'delete';
-
-    public function accepts(self $operation): bool
-    {
-        return $operation === $this || ($this === self::Delete && $operation === self::Update);
-    }
+    case Insert;
+    case Update;
+    case Delete;
 }

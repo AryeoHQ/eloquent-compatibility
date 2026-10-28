@@ -6,6 +6,8 @@ namespace Tests\Fixtures\Support\Workbench;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Provides\HasCompatibility;
 
 /**
  * @property int $id
@@ -14,8 +16,9 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  *
  * @method null|bool restore()
  */
-final class Widget extends Model
+final class Widget extends Model implements Compatible
 {
+    use HasCompatibility;
     use SoftDeletes;
 
     protected $table = 'widgets';
