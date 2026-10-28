@@ -5,7 +5,8 @@
     "license": "MIT",
     "autoload": {
         "psr-4": {
-            "Support\\": "src/Support/"
+            "Support\\": "src/Support/",
+            "Tooling\\": "src/Tooling/"
         },
         "exclude-from-classmap": [
             "src/**/*Test.php",
@@ -31,7 +32,9 @@
         "php": "^8.4",
         "ext-pdo": "*",
         "ext-pdo_pgsql": "*",
-        "laravel/framework": "12.x || ^13"
+        "laravel/framework": "12.x || ^13",
+        "nikic/php-parser": "^5.7",
+        "phpstan/phpstan": "^2.1"
     },
     "require-dev": {
         "aryeo/tooling-laravel": "0.0.41",
@@ -53,6 +56,7 @@
         },
         "tooling": {
             "phpstan": {
+                "rules": "tooling/phpstan/rules.neon",
                 "config": {
                     "paths": [
                         "src",

@@ -8,7 +8,7 @@ Every model a map names, the previous model and each current model, implements `
 
 Two kinds of model cannot carry the mark:
 
-- **A model that declares either method itself**, or extends a class that does. PHP prefers the class's method to the trait's, so the statement goes unmarked. `EventBridge::mirror()` refuses such a model with `InvalidCompatibilityMap`. A composite-key package that sets the save query's keys is one example.
+- **A model that declares either method itself**, or extends a class that does. PHP prefers the class's method to the trait's, so the statement goes unmarked. `EventBridge::mirror()` refuses such a model with `InvalidCompatibilityMap`. Before that, the `HasCompatibilityMustNotRedeclareWriteHooks` PHPStan rule reports a named class that declares either method. A composite-key package that sets the save query's keys is one example.
 - **A model whose own write method sends its statement through neither method**, such as an override of `performUpdate()` that builds its own query. The bridge cannot see that at registration. The write's created, updated or deleted event throws `CompatibilityEventMirrorBypassed`, which names the model and the event. Inside a transaction, the throw rolls the write back. Outside one, the write has already committed.
 
 [INV-50](invariants.md) records the rule.

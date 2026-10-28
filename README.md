@@ -84,6 +84,16 @@ final class Widget extends Model implements Compatible
 
 The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()` or `getAttributesForInsert()`.
 
+### PHPStan rules
+The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An application that runs `tooling:phpstan:analyze` loads them, so it finds a model that breaks the contract before `EventBridge::mirror()` refuses that model at boot:
+
+- `CompatibleMustUseHasCompatibility`: a model that implements `Compatible` uses `HasCompatibility`.
+- `HasCompatibilityMustImplementCompatible`: a model that uses `HasCompatibility` implements `Compatible`.
+- `HasCompatibilityMustOnlyBeOnModel`: only a `Model` subclass implements `Compatible` or uses `HasCompatibility`.
+- `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, declares neither `setKeysForSaveQuery()` nor `getAttributesForInsert()`.
+
+The rules skip anonymous classes. `EventBridge::mirror()` still checks those at boot.
+
 A migration installs the compatibility view and its triggers. A service provider registers an event mirror, a class that implements `Contracts\EventMirror` and names the map, so each side's model events fire for writes through the other:
 
 ```php
