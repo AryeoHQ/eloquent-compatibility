@@ -162,6 +162,20 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_compiles_a_recompile_before_the_initial_rename_without_taking_the_retained_table_for_the_view(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+
+        $output = $this->compile(['--for' => 'recompile', '--retained-table-is-currently' => 'widgets']);
+
+        DB::unprepared('ALTER TABLE widgets RENAME TO retained_widgets');
+        $executed = $this->executed(fn () => resolve(Installer::class)->recompile(new WidgetCompatibilityMap));
+
+        $this->assertNotContains('DROP VIEW widgets', $this->statements($output));
+        $this->assertSame($executed, $this->statements($output));
+    }
+
+    #[Test]
     public function it_keeps_a_header_value_with_a_line_break_on_its_own_comment_line(): void
     {
         $schema = "Tenant\r\nDROP TABLE gadgets";
@@ -397,6 +411,33 @@ final class CompileSqlTest extends TestCase
 
         $this->assertSame([[1, 2], [1, 2]], [$ids, DB::table('retained_widgets')->orderBy('id')->pluck('id')->all()]);
         $this->assertSame("nextval((pg_get_serial_sequence('public.retained_widgets'::text, 'id'::text))::regclass)", DB::scalar("select column_default from information_schema.columns where table_schema = current_schema() and table_name = 'widgets' and column_name = 'id'"));
+    }
+
+    #[Test]
+    #[TestWith(['widgets', 'retained_widgets', 'sku', 'sku'])]
+    #[TestWith(['gadgets', 'gadgets', 'name', 'title'])]
+    public function it_refuses_to_compile_before_the_rename_a_default_that_references_the_retained_table(string $current, string $table, string $column, string $attribute): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+        DB::unprepared("ALTER TABLE {$current} ALTER COLUMN {$column} SET DEFAULT 'widgets'::regclass::text");
+
+        $this->artisan('compatibility:sql', ['map' => 'widgets', '--retained-table-is-currently' => 'widgets'])
+            ->expectsOutputToContain("Compatibility map 'widgets' is declared wrongly: the default of {$table}.{$column} references the retained table by its name before the rename, widgets; compile the compatibility map after the rename")
+            ->assertFailed();
+
+        DB::unprepared('ALTER TABLE widgets RENAME TO retained_widgets');
+
+        $this->assertContains("ALTER VIEW \"widgets\" ALTER COLUMN \"{$attribute}\" SET DEFAULT ('retained_widgets'::regclass)::text", $this->statements($this->compile()));
+    }
+
+    #[Test]
+    public function it_compiles_a_serial_default_before_the_rename(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+
+        $printed = $this->statements($this->compile(['--retained-table-is-currently' => 'widgets']));
+
+        $this->assertContains("ALTER VIEW \"widgets\" ALTER COLUMN \"id\" SET DEFAULT nextval('retained_widgets_id_seq'::regclass)", $printed);
     }
 
     /**

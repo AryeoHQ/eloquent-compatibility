@@ -112,7 +112,7 @@ final class Compiler
             $default = $attribute->defaultsTo;
 
             if ($default === null && $attribute->storedAs !== null && $attribute->alias !== null && $resolvedMap->dependent($attribute->alias) === null) {
-                $default = $this->columnCatalog->of($resolvedMap->table($attribute->alias))[$attribute->storedAs]->default ?? null;
+                $default = $this->storedDefault($resolvedMap, $resolvedMap->table($attribute->alias), $attribute->storedAs);
             }
 
             $statements[] = 'ALTER VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view)
@@ -120,6 +120,17 @@ final class Compiler
         }
 
         return $statements;
+    }
+
+    private function storedDefault(ResolvedMap $resolvedMap, string $table, string $name): null|string
+    {
+        $column = $this->columnCatalog->of($table)[$name] ?? null;
+
+        if ($column?->defaultReferencesSource === true) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the default of {$table}.{$name} references the retained table by its name before the rename, {$this->columnCatalog->source((string) $resolvedMap->previousModel->table)}; compile the compatibility map after the rename");
+        }
+
+        return $column?->default;
     }
 
     private function insertFunction(ResolvedMap $resolvedMap): string
@@ -487,11 +498,13 @@ final class Compiler
         foreach ($assignments as $assignment) {
             if (! $mappedOnly || ! $assignment->attribute->retained) {
                 $value = $this->value($resolvedMap, $alias, $assignment->targetColumn);
-                $column = $this->columnCatalog->of($resolvedMap->table($alias))[$assignment->targetColumn->column];
+                $table = $resolvedMap->table($alias);
+                $column = $this->columnCatalog->of($table)[$assignment->targetColumn->column];
+                $default = $column->notNull ? $this->storedDefault($resolvedMap, $table, $assignment->targetColumn->column) : null;
                 $values[$assignment->targetColumn->column] = match (true) {
-                    ! $column->notNull || $column->default === null => $value,
-                    $column->baseType === null => 'COALESCE('.$value.', '.$column->default.')',
-                    default => 'CAST((COALESCE(CAST(('.$assignment->targetColumn->expression.') AS '.$column->baseType.'), '.$column->default.')) AS '.$column->type.')',
+                    $default === null => $value,
+                    $column->baseType === null => 'COALESCE('.$value.', '.$default.')',
+                    default => 'CAST((COALESCE(CAST(('.$assignment->targetColumn->expression.') AS '.$column->baseType.'), '.$default.')) AS '.$column->type.')',
                 };
             }
         }

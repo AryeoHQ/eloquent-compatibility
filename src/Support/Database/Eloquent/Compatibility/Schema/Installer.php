@@ -87,7 +87,7 @@ final readonly class Installer
      */
     private function recompileStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
-        $view = $this->relation($resolvedMap->previousModel->view);
+        $view = $resolvedMap->previousModel->view === $retainedTableIsCurrently ? null : $this->relation($resolvedMap->previousModel->view);
         $grants = $view === null ? [] : $this->viewGrants($resolvedMap, $view);
         $columns = array_map(fn (Attribute $attribute) => $attribute->column, $resolvedMap->attributes);
         $regrants = array_filter($grants, fn (object $grant) => $grant->column === null || in_array($grant->column, $columns, true));

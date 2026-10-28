@@ -6,7 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Console\OutputStyle;
-use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Connection;
 use Illuminate\Filesystem\Filesystem;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -23,8 +23,10 @@ final class CompileSql extends Command
 
     protected $description = 'Print the SQL statements the Installer runs for a compatibility map, running only catalog reads.';
 
-    public function handle(CompatibilityMaps $compatibilityMaps, Installer $installer, ConnectionInterface $connection, Filesystem $files): int
+    public function handle(CompatibilityMaps $compatibilityMaps, Installer $installer, Connection $connection, Filesystem $files): int
     {
+        $connection->useWriteConnectionWhenReading();
+
         $name = (string) $this->argument('map');
         $option = (string) $this->option('for');
         $for = InstallerAction::tryFrom($option);

@@ -43,6 +43,7 @@ final class ColumnCatalog
                 $row->generated === true,
                 $row->always_generated === true,
                 $row->base_type === null ? null : (string) $row->base_type,
+                $row->default_references_source === true,
             );
         }
 
@@ -61,7 +62,8 @@ final class ColumnCatalog
                     table_column.attnotnull or column_domain.inherited_not_null as not_null,
                     table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
                     table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated,
-                    column_domain.base_type
+                    column_domain.base_type,
+                    '.$this->referencesSource().' as default_references_source
              from pg_attribute table_column
              join pg_class table_relation on table_relation.oid = table_column.attrelid
              join pg_namespace table_schema on table_schema.oid = table_relation.relnamespace
@@ -81,8 +83,21 @@ final class ColumnCatalog
              ) column_domain
              where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [$table, SqlFragments::identifier($this->source($table))],
+            [$table, ...array_map(SqlFragments::identifier(...), array_values($this->sources)), SqlFragments::identifier($this->source($table))],
         );
+    }
+
+    private function referencesSource(): string
+    {
+        if ($this->sources === []) {
+            return 'false';
+        }
+
+        $sources = implode(', ', array_fill(0, count($this->sources), "to_regclass(quote_ident(current_schema()) || '.' || ?)"));
+
+        return "exists (select 1 from pg_depend default_dependency
+                 where default_dependency.classid = 'pg_attrdef'::regclass and default_dependency.objid = column_default.oid and default_dependency.deptype = 'n'
+                   and default_dependency.refclassid = 'pg_class'::regclass and default_dependency.refobjid in ({$sources}))";
     }
 
     /**
