@@ -20,6 +20,7 @@ use Tests\Fixtures\Support\Workbench\Journal;
 use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\SecondaryPerson;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
@@ -82,11 +83,21 @@ final class MirrorIndexTest extends TestCase
     {
         $this->addAll();
 
-        $this->assertSame([['accounts', 'person'], ['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('people')));
-        $this->assertSame([['widgets', 'gadget']], $this->members($this->mirrorIndex->forRelation('gadgets')));
-        $this->assertSame([['widgets', 'site']], $this->members($this->mirrorIndex->forRelation('gadget_sites')));
-        $this->assertSame([], $this->mirrorIndex->forRelation('widgets'));
-        $this->assertSame([], $this->mirrorIndex->forRelation('retained_widgets'));
+        $this->assertSame([['accounts', 'person'], ['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('pgsql', 'people')));
+        $this->assertSame([['widgets', 'gadget']], $this->members($this->mirrorIndex->forRelation('pgsql', 'gadgets')));
+        $this->assertSame([['widgets', 'site']], $this->members($this->mirrorIndex->forRelation('pgsql', 'gadget_sites')));
+        $this->assertSame([], $this->mirrorIndex->forRelation('pgsql', 'widgets'));
+        $this->assertSame([], $this->mirrorIndex->forRelation('pgsql', 'retained_widgets'));
+    }
+
+    #[Test]
+    public function it_lists_a_current_table_under_the_connection_of_its_model(): void
+    {
+        $this->add(new AccountCompatibilityMap);
+        $this->add(new ProfileCompatibilityMap(SecondaryPerson::class));
+
+        $this->assertSame([['accounts', 'person']], $this->members($this->mirrorIndex->forRelation('pgsql', 'people')));
+        $this->assertSame([['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('secondary', 'people')));
     }
 
     /**

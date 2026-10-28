@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Workbench;
 
+use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
@@ -11,6 +12,11 @@ use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 
 final class ProfileCompatibilityMap implements CompatibilityMap
 {
+    /**
+     * @param  class-string<Model>  $person
+     */
+    public function __construct(private readonly string $person = Person::class) {}
+
     public function name(): string
     {
         return 'profiles';
@@ -27,7 +33,7 @@ final class ProfileCompatibilityMap implements CompatibilityMap
 
     public function primaryCurrentModel(): PrimaryCurrentModel
     {
-        return PrimaryCurrentModel::for(Person::class)->aliasedAs('person');
+        return PrimaryCurrentModel::for($this->person)->aliasedAs('person');
     }
 
     public function dependentCurrentModels(): array

@@ -56,6 +56,7 @@ use Tests\Fixtures\Support\Workbench\LegacyItem;
 use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\SecondaryPerson;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -922,6 +923,28 @@ final class EventBridgeTest extends TestCase
 
         $this->assertWriteRefused(fn () => Person::query()->sole()->update(['email' => 'three@example.test']), "a 'updating' listener of Profile");
         $this->assertSame('two@example.test', DB::table('people')->value('email'));
+    }
+
+    #[Test]
+    public function it_raises_no_event_of_a_map_whose_current_table_of_the_same_name_is_on_another_connection(): void
+    {
+        config()->set('database.connections.secondary', config('database.connections.pgsql'));
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new AccountCompatibilityMap));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ProfileCompatibilityMap(SecondaryPerson::class)));
+        $account = Account::query()->create(['email' => 'one@example.test']);
+        DB::table('retained_profiles')->insert(['person_id' => Person::query()->sole()->getKey()]);
+        $connections = [];
+        Event::listen(QueryExecuted::class, function (QueryExecuted $query) use (&$connections): void {
+            $connections[] = $query->connectionName;
+        });
+        $this->recordMirroredEvents();
+
+        $account->update(['email' => 'two@example.test']);
+
+        $this->assertMirrored(Person::class, ModelEvent::Updated, fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(['pgsql'], array_values(array_unique($connections)));
     }
 
     #[Test]

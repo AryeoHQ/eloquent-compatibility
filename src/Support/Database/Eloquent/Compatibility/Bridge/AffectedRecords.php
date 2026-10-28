@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
@@ -17,7 +18,7 @@ final readonly class AffectedRecords
     /**
      * @return array<string, RecordSnapshot>
      */
-    public function before(ConnectionInterface $connection, Model $model, Operation $operation): array
+    public function before(Connection $connection, Model $model, Operation $operation): array
     {
         foreach ($operation === Operation::Insert ? $this->mirrorIndex->forModel($model::class) : [] as $member) {
             $this->mirrorIndex->keyTranslator($member->map)->clearCreatedPreviousKey($connection);
@@ -34,7 +35,7 @@ final readonly class AffectedRecords
     /**
      * @return array<string, AffectedRecord>
      */
-    public function of(ConnectionInterface $connection, Model $model, Operation $operation, bool $afterStatement): array
+    public function of(Connection $connection, Model $model, Operation $operation, bool $afterStatement): array
     {
         $records = [];
         $own = [];
@@ -216,14 +217,14 @@ final readonly class AffectedRecords
      * @param  list<AffectedRecord>  $own
      * @return array<string, AffectedRecord>
      */
-    private function acrossMaps(ConnectionInterface $connection, array $records, array $own): array
+    private function acrossMaps(Connection $connection, array $records, array $own): array
     {
         foreach ([...array_values($records), ...$own] as $record) {
             if ($record->role === RecordRole::Previous) {
                 continue;
             }
 
-            foreach ($this->mirrorIndex->forRelation($record->readFrom) as $member) {
+            foreach ($this->mirrorIndex->forRelation((string) $connection->getName(), $record->readFrom) as $member) {
                 if ($member->map === $record->map) {
                     continue;
                 }

@@ -242,6 +242,48 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(["create domain widget_phase as text default 'Draft'", 'widget_phase', 'Draft'])]
+    #[TestWith(["create domain widget_phase as text not null default 'Draft'", 'widget_phase', 'Draft'])]
+    #[TestWith(["create domain widget_phase as text default 'Draft'; create domain widget_stage as widget_phase", 'widget_stage', 'Draft'])]
+    #[TestWith(["create domain widget_phase as text default 'Draft'", "widget_phase default 'Active'", 'Active'])]
+    #[TestWith(["create domain widget_phase as text default 'Draft'; create domain widget_stage as widget_phase default 'Active'", 'widget_stage', 'Active'])]
+    public function it_writes_the_default_a_current_column_takes_from_its_domain_when_an_insert_through_the_view_omits_its_attribute(string $domains, string $column, string $stored): void
+    {
+        DB::statement('drop domain if exists widget_stage, widget_phase cascade');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop domain if exists widget_stage, widget_phase cascade');
+        });
+        DB::unprepared($domains);
+        DB::statement("alter table gadgets add column phase {$column}");
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('phase')->asType('text')->storedAs('gadget', 'phase'),
+        ]]));
+
+        DB::table('widgets')->insert(['title' => 'Defaulted']);
+
+        $this->assertSame([$stored], DB::table('gadgets')->pluck('phase')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_current_column_whose_domain_is_not_null_without_a_default_that_an_insert_leaves_empty(): void
+    {
+        DB::statement('drop domain if exists gadget_code cascade');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop domain if exists gadget_code cascade');
+        });
+        DB::statement('create domain gadget_code as text not null');
+        DB::statement('alter table gadgets add column code gadget_code');
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->install(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: gadgets.code is NOT NULL without a default, and an insert through widgets leaves it empty; map an attribute to it or fill it with fillWhenCreatedFromPrevious()",
+        );
+        $this->assertNull(DB::scalar("select to_regclass('widgets')"));
+    }
+
+    #[Test]
     public function it_compiles_without_running_any_statement(): void
     {
         $this->compiler()->compile(new WidgetCompatibilityMap);

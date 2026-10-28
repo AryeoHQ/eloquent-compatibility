@@ -108,7 +108,7 @@ The column list of `INSERT OR UPDATE OF` limits only the update, so the insert t
 
 ## Nullable columns keep no default on an insert
 
-An insert through the view writes every column an attribute stores. When the insert omits the attribute, a `NOT NULL` column with a default takes its default. A nullable column stores NULL instead, even when it has a default. That holds for a dependent's column and for a `writesTo()` target. A retained or primary column that an attribute stores through `Attribute::storedAs()` takes the column's default as its view default. [INV-46](invariants.md#inv-46-an-insert-through-the-view-keeps-a-not-null-columns-default) records the rule.
+An insert through the view writes every column an attribute stores. When the insert omits the attribute, a `NOT NULL` column with a default takes its default. A nullable column stores NULL instead, even when it has a default. That holds for a dependent's column and for a `writesTo()` target. A retained or primary column that an attribute stores through `Attribute::storedAs()` takes the column's default as its view default. A column without a default of its own takes its domain's default. [INV-46](invariants.md#inv-46-an-insert-through-the-view-keeps-a-not-null-columns-default) records the rule.
 
 ## An ignored insert raises on a conflict
 
