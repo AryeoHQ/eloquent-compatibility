@@ -602,6 +602,48 @@ final class HasCompatibilityTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['people'])]
+    #[TestWith(['widgets.people'])]
+    public function it_opens_an_armed_write_on_its_own_update_and_not_on_an_insert_into_another_table_an_earlier_callback_runs_first(string $table): void
+    {
+        if ($table === 'widgets.people') {
+            DB::statement('create schema widgets');
+            DB::statement('create table widgets.people (email text)');
+        }
+
+        $inserted = false;
+        DB::connection()->beforeExecuting(function (string $query) use ($table, &$inserted): void {
+            if (! $inserted && str_starts_with($query, 'update "widgets"')) {
+                $inserted = true;
+                DB::table($table)->insert(['email' => 'audit@example.test']);
+            }
+        });
+        $widget = $this->widget();
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget, RecordMirrored $event) => $event->rowBefore['name'] === 'Blue gadget' && $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(['audit@example.test'], DB::table($table)->pluck('email')->all());
+    }
+
+    #[Test]
+    public function it_opens_an_armed_write_on_its_own_statement_to_a_schema_qualified_table(): void
+    {
+        $widget = $this->widget()->setTable('public.widgets');
+        $created = new Widget(['title' => 'Created'])->setTable('public.widgets');
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+        $created->save();
+        $widget->delete();
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget, RecordMirrored $event) => $event->rowBefore['name'] === 'Blue gadget' && $gadget->getAttribute('name') === 'Renamed');
+        $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getAttribute('name') === 'Created');
+        $this->assertMirrored(Gadget::class, ModelEvent::Deleted, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
     #[TestWith(['creating', 'created'])]
     #[TestWith(['updating', 'updated'])]
     #[TestWith(['deleting', 'deleted'])]

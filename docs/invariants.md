@@ -247,25 +247,26 @@ A statement can also start while the write's own statement runs. A `beforeExecut
 
 ## INV-33: A pending mirrored write completes only on its own statement
 
-**Rule.** A pending mirrored write opens and completes only on the statement its model's own write method sends. The model marks that statement itself, through `HasCompatibility`, and the bridge reads no call stack. The armed write opens only on a statement whose first keyword is `INSERT`, `UPDATE` or `DELETE`. It completes only on that statement's `QueryExecuted`. [INV-50](#inv-50-every-mapped-model-marks-its-own-statement) requires the mark of every mapped model.
+**Rule.** A pending mirrored write opens and completes only on the statement its model's own write method sends. The model marks that statement itself, through `HasCompatibility`, and the bridge reads no call stack. The armed write opens only on an `INSERT`, `UPDATE` or `DELETE` on the model's own table, written as the model's query grammar writes that table. It completes only on that statement's `QueryExecuted`. [INV-50](#inv-50-every-mapped-model-marks-its-own-statement) requires the mark of every mapped model.
 
 **Why.** A listener of the beginning event can write the same table, or the same record, before the model's own statement. A match on each statement's SQL text cannot follow every form Eloquent sends. An increment's JSON-path or qualified extra and an `IS DISTINCT FROM` value each defeat it. A miss sends the model's own statement with no events mirrored, no lock and no record snapshot. Laravel 12 and 13 call `Model::setKeysForSaveQuery()` and `Model::getAttributesForInsert()` only inside the model's own write method, after its beginning event. No listener's query passes through them, so a mark there needs no guess. [Decision 0023](decisions/0023-a-mapped-model-marks-its-own-statement.md) records the designs it replaced.
 
-Two callbacks can still run a statement around the model's own. An earlier `beforeExecuting` callback can run a `SELECT` between the arm and the model's statement. Without the keyword test, that read would open the write, and complete it before the model's statement ran. A later `beforeExecuting` callback can run a statement after the write opens. Without the identity test on `QueryExecuted`, that statement would complete the write before the model's statement ran.
+Two callbacks can still run a statement around the model's own. An earlier `beforeExecuting` callback can run a `SELECT` between the arm and the model's statement, or an insert into another table, such as an audit row. Without the table test, that statement would open the write and complete it, and the model's own statement would then run unmirrored. The test compares the statement with the grammar's own output and parses nothing. So it matches a table prefix, a schema-qualified table and the `ctid` form of a limited update or delete. A later `beforeExecuting` callback can run a statement after the write opens. Without the identity test on `QueryExecuted`, that statement would complete the write before the model's statement ran.
 
 A reflection test fails when a Laravel version adds a public instance write method that no test covers.
 
 **Limits.**
 
-- A write statement that runs between the arm and the model's own statement opens the write. A later `beforeQuery` callback on the model's own query can run one, and so can a `beforeExecuting` callback registered before the bridge's.
-- A throw between the arm and the bridge's `beforeExecuting` callback leaves the write armed. The connection's next write statement then opens it, unless the next beginning event, `Looping` or termination drops it first.
+- A write to the model's own table that runs between the arm and the model's own statement opens the write. A later `beforeQuery` callback on the model's own query can run one, and so can a `beforeExecuting` callback registered before the bridge's. That write completes the mirror, and the model's own statement runs unmirrored. This is a limit of the package without its connection trait.
+- A throw between the arm and the bridge's `beforeExecuting` callback leaves the write armed. The connection's next write to the model's table then opens it, unless the next beginning event, `Looping` or termination drops it first.
 - An insert that Laravel skips, for a model with no attributes, arms a write that no statement follows. The model's saved event forgets it.
 
 **Code that must agree.**
 
 - `HasCompatibility::setKeysForSaveQuery()` hands the save query of an update, an increment, a decrement, a delete, a soft delete or a force delete to `EventBridge::markOwnStatement()`. `HasCompatibility::getAttributesForInsert()` marks an insert.
 - `EventBridge::markOwnStatement()` claims the topmost unclaimed write of the same instance begun under the current model dispatcher, and sets `PendingMirroredWrite::$claimed`. It claims nothing inside `EventBridge::withoutMirroring()`. A save query arms its write from a `beforeQuery` callback, when the query runs, and an insert arms its write at once.
-- The `beforeExecuting` callback in `EventBridge::watch()` asks the private `EventBridge::writes()` for the statement's first keyword. It opens the armed write on the connection's next `INSERT`, `UPDATE` or `DELETE`.
+- The private `EventBridge::arm()` records the table in `PendingMirroredWrite::$table`, through the builder's own grammar. A save query's table is `wrapTable()` of its `from`, and an insert's is `wrapTable()` of the model's table. Every update, delete and insert form of Laravel's PostgreSQL grammar writes the table through the same call.
+- The `beforeExecuting` callback in `EventBridge::watch()` asks the private `EventBridge::writesTo()` whether the statement starts with `update `, `insert into ` or `delete from `, then that table and a space. Any other statement leaves the write armed.
 - The private `EventBridge::open()` records that statement's SQL string and bindings in `PendingMirroredWrite::$statement` and `PendingMirroredWrite::$bindings`. `EventBridge::handleQuery()` completes the open write only on a `QueryExecuted` whose SQL and bindings are identical to them. It parses neither.
 
 ## INV-34: A pending mirrored write opens at its statement

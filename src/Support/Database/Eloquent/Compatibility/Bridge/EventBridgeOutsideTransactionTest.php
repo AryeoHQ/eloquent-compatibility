@@ -551,6 +551,26 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    public function it_mirrors_a_write_on_its_own_statement_when_an_earlier_before_executing_callback_inserts_into_another_table_first(): void
+    {
+        $inserted = false;
+        DB::connection()->beforeExecuting(function (string $query) use (&$inserted): void {
+            if (! $inserted && str_starts_with($query, 'update "widgets"')) {
+                $inserted = true;
+                DB::table('people')->insert(['email' => 'audit@example.test']);
+            }
+        });
+        $widget = $this->widget();
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget, RecordMirrored $event) => $event->rowBefore['name'] === 'Blue gadget' && $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['audit@example.test'], DB::table('people')->pluck('email')->all());
+    }
+
+    #[Test]
     public function it_mirrors_both_writes_when_an_earlier_query_executed_listener_makes_a_bridged_write_after_the_statement(): void
     {
         $widget = $this->widget();

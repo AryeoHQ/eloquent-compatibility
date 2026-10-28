@@ -15,6 +15,8 @@ final class PendingMirroredWrite
 
     public bool $statementSent = false;
 
+    public null|string $table = null;
+
     public null|string $statement = null;
 
     /** @var array<array-key, mixed> */

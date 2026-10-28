@@ -6,7 +6,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **alias**: the lowercase name a map gives the previous model and each current model, used in the compiled SQL and in attribute declarations.
 - **aliased table**: the table and key column an alias resolves to; an `AliasedTable`.
 - **applying flag**: the setting `Setting::Applying`, which each of the view's triggers holds at the map's name while it runs, and restores when it returns.
-- **armed write**: the claimed pending mirrored write that the connection's next `INSERT`, `UPDATE` or `DELETE` opens; one per connection, see `EventBridge::markOwnStatement()`.
+- **armed write**: the claimed pending mirrored write that the connection's next `INSERT`, `UPDATE` or `DELETE` on the model's own table opens; one per connection, see `EventBridge::markOwnStatement()`.
 - **assignment**: one attribute paired with one column it writes; an `Assignment`.
 - **beginning event**: a creating, updating or deleting model event. At its start the event bridge begins a pending mirrored write, and a dispatch that returns false forgets it; see `ModelEvent::beginning()`.
 - **claimed**: said of a pending mirrored write that its model's own write method has marked; see `PendingMirroredWrite::$claimed`.

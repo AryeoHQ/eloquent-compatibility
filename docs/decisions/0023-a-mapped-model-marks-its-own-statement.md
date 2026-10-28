@@ -8,7 +8,7 @@ A spike on 2026-10-27 tested a link that reads no SQL. Laravel 12 and 13 call `M
 
 ## Decision
 
-Every model of a mirrored map implements `Compatible` and uses `HasCompatibility`. The trait overrides the two protected methods, calls each parent first, and hands the model to `EventBridge::markOwnStatement()`. The bridge claims the model's pending mirrored write and arms it. The connection's next `INSERT`, `UPDATE` or `DELETE` opens the armed write.
+Every model of a mirrored map implements `Compatible` and uses `HasCompatibility`. The trait overrides the two protected methods, calls each parent first, and hands the model to `EventBridge::markOwnStatement()`. The bridge claims the model's pending mirrored write and arms it. The connection's next `INSERT`, `UPDATE` or `DELETE` on the model's own table opens the armed write.
 
 `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait. It also refuses a model whose two methods resolve to another declaration. A created, updated or deleted event for an unclaimed pending mirrored write throws `CompatibilityEventMirrorBypassed::byUnmarkedStatement()`.
 
@@ -41,7 +41,7 @@ Two other designs were declined too:
 - An application adds one interface and one `use` line to every mapped model. The package overrides three protected Laravel methods.
 - A model that declares any of the three methods itself, or takes one from another trait, cannot be mapped. A composite-key package that sets the save query's keys is one example.
 - A future Laravel write method that calls neither method never claims its write. A reflection test fails when Laravel adds a public write method that no test covers. At run time, the write's created, updated or deleted event refuses it, and inside a transaction the refusal rolls it back.
-- The bridge reads one thing from the SQL, the first keyword. So a `SELECT` that an earlier `beforeExecuting` callback runs cannot open the armed write.
+- The bridge reads only the start of the SQL: the write keyword and the model's table, as the model's query grammar writes it. So a `SELECT` or a write to another table that an earlier `beforeExecuting` callback runs cannot open the armed write. That callback's write to the model's own table still can.
 - The faked-dispatcher guard now throws before the statement, because the mark runs before it. A raw write runs no model method, so it never throws.
 - Registration still needs no database, as [decision 0011](0011-registration-needs-no-database.md) records. The new checks read the model classes through reflection.
 - [INV-33](../invariants.md) and [INV-50](../invariants.md) record the rules.

@@ -198,10 +198,10 @@ final class EventBridge
         $pendingWrite->claimed = true;
 
         if ($query === null) {
-            $this->arm($connection, $pendingWrite);
+            $this->arm($connection, $pendingWrite, $connection->getQueryGrammar()->wrapTable($model->getTable()));
         } else {
             // Armed when the query runs: SoftDeletes::runSoftDelete() sets attributes after setKeysForSaveQuery().
-            $query->beforeQuery(fn () => $this->arm($connection, $pendingWrite));
+            $query->beforeQuery(fn (Builder $query) => $this->arm($connection, $pendingWrite, $query->getGrammar()->wrapTable($query->from)));
         }
     }
 
@@ -266,11 +266,12 @@ final class EventBridge
         return null;
     }
 
-    private function arm(Connection $connection, PendingMirroredWrite $pendingWrite): void
+    private function arm(Connection $connection, PendingMirroredWrite $pendingWrite, string $table): void
     {
         $name = (string) $connection->getName();
 
         if ($pendingWrite->pending && ! $pendingWrite->statementSent && in_array($pendingWrite, $this->pendingWrites[$name] ?? [], true)) {
+            $pendingWrite->table = $table;
             $this->armed[$name] = $pendingWrite;
         }
     }
@@ -322,7 +323,8 @@ final class EventBridge
             }
 
             $name = (string) $connection->getName();
-            $armed = $this->writes($query) ? $this->armed[$name] ?? null : null;
+            $armed = $this->armed[$name] ?? null;
+            $armed = $armed !== null && $this->writesTo($query, $armed) ? $armed : null;
 
             if ($armed !== null) {
                 unset($this->armed[$name]);
@@ -352,9 +354,9 @@ final class EventBridge
         });
     }
 
-    private function writes(string $query): bool
+    private function writesTo(string $query, PendingMirroredWrite $armed): bool
     {
-        return preg_match('/^\s*(?:insert|update|delete)\b/i', $query) === 1;
+        return $armed->table !== null && array_any(['update ', 'insert into ', 'delete from '], fn (string $keyword) => str_starts_with($query, $keyword.$armed->table.' '));
     }
 
     private function complete(Connection $connection, PendingMirroredWrite $pendingWrite): void
