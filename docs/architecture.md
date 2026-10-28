@@ -59,7 +59,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 5. `AffectedRecords::before()` locks those records and the widget's retained row in the triggers' order. `AffectedRecords::snapshots()` then reads each one.
 6. The statement reaches the compatibility view. The view's update trigger checks every refusal, locks the gadget row, the retained row and the dependent rows, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
-8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which completes the open write. It reads no SQL.
+8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which completes the open write. It compares the event's SQL and bindings with the statement it opened on, and parses no SQL.
 9. `EventBridge::complete()` reads each record again, and `EventReplayer::replay()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
 10. The bridge commits or releases its savepoint and forgets the write. Eloquent then fires the widget's own `updated` and `saved`, and `EventBridge::finish()` finds no write of the widget left at their dispatch depth.
 

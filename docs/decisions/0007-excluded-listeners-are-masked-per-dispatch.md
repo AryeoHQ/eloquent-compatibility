@@ -6,10 +6,11 @@ Some listeners must not run for writes through the other side, such as a journal
 
 ## Decision
 
-`EventReplayer::mask()` swaps an event's listeners for wrappers for the length of one dispatch, then `EventReplayer::unmask()` restores them. A wrapper skips its listener only when the payload's subject is the instance under replay, recorded in an `Exclusion`.
+`EventReplayer::mask()` swaps an event's listeners for wrappers for the length of one dispatch, then `EventReplayer::unmask()` restores them. A wrapper skips its listener only when the payload's subject is the instance under replay, recorded in an `Exclusion`. The private `EventReplayer::maskWildcards()` and `EventReplayer::unmaskWildcards()` do the same for each wildcard registration that matches the event, such as `eloquent.updated: *`.
 
 ## Consequences
 
 - A native write inside a mirrored listener still runs the excluded listener.
 - The masking works through a decorating dispatcher, and acts on the real dispatcher behind an `EventFake`. The dispatch itself goes through the model's dispatcher, the fake included, so a faked event is recorded and runs no listener.
+- Laravel keeps wildcard listeners in a protected property that no method lists, so the wildcard masking reads and writes it through reflection. It needs an `Illuminate\Events\Dispatcher` for that, so a decorating dispatcher's wildcard listeners stay unmasked. The wrappers replace the listeners in place, and a wildcard listener still receives the event name and the payload.
 - Only a listener named by a class string, or by a class or object and a method, can be excluded. A closure cannot.

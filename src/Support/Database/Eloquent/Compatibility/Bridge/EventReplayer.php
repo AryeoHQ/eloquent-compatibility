@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Events\Dispatcher as EventDispatcher;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use ReflectionProperty;
@@ -25,8 +26,7 @@ final class EventReplayer
 
     private const array JSON_CASTS = ['array', 'json', 'json:unicode', 'object', 'collection'];
 
-    /** @var WeakMap<Model, true> */
-    private WeakMap $replaying;
+    private const array ENCRYPTED_CASTS = ['encrypted', 'encrypted:array', 'encrypted:collection', 'encrypted:json', 'encrypted:object'];
 
     /** @var list<ModelEvent> */
     private array $fired = [];
@@ -36,13 +36,7 @@ final class EventReplayer
 
     public function __construct(private readonly MirrorIndex $mirrorIndex)
     {
-        $this->replaying = new WeakMap;
         $this->excluded = new WeakMap;
-    }
-
-    public function isReplaying(Model $model): bool
-    {
-        return $this->replaying->offsetExists($model);
     }
 
     /**
@@ -65,7 +59,6 @@ final class EventReplayer
         $model->setConnection($connectionName);
         $outer = $this->fired;
         $this->fired = [];
-        $this->replaying[$model] = true;
 
         try {
             match (true) {
@@ -78,7 +71,6 @@ final class EventReplayer
 
             event(new RecordMirrored($record->map, $source, $model, $this->fired, $rowBefore, $rowAfter));
         } finally {
-            unset($this->replaying[$model]);
             $this->fired = $outer;
         }
     }
@@ -244,7 +236,9 @@ final class EventReplayer
 
         $real = $dispatcher instanceof EventFake ? $dispatcher->dispatcher : $dispatcher;
         $subject = is_object($event) ? $event : $model;
-        $masked = $this->mask($real, is_object($event) ? $event::class : $event, $excludedListeners, $modelEvent);
+        $name = is_object($event) ? $event::class : $event;
+        $masked = $this->mask($real, $name, $excludedListeners, $modelEvent);
+        $maskedWildcards = $this->maskWildcards($real, $name, $excludedListeners, $modelEvent);
         $this->excluded[$subject] = new Exclusion($modelEvent, $excludedListeners);
 
         try {
@@ -252,6 +246,7 @@ final class EventReplayer
         } finally {
             unset($this->excluded[$subject]);
             $this->unmask($real, $masked);
+            $this->unmaskWildcards($real, $maskedWildcards);
         }
     }
 
@@ -304,20 +299,81 @@ final class EventReplayer
         }
     }
 
-    private function guard(Dispatcher $events, string $key, mixed $listener): mixed
+    /**
+     * @param  list<ExcludedListener>  $excludedListeners
+     * @return array<string, list<mixed>>
+     */
+    private function maskWildcards(Dispatcher $events, string $name, array $excludedListeners, ModelEvent $modelEvent): array
+    {
+        if (! $events instanceof EventDispatcher) {
+            return [];
+        }
+
+        $wildcards = $this->wildcards($events);
+        $masked = [];
+
+        foreach ($wildcards as $pattern => $listeners) {
+            if (Str::is($pattern, $name) && array_any($listeners, fn (mixed $listener) => $this->excludes($excludedListeners, $modelEvent, $listener))) {
+                $masked[$pattern] = $listeners;
+                $wildcards[$pattern] = array_map(fn (mixed $listener) => $this->guard($events, $pattern, $listener, true), $listeners);
+            }
+        }
+
+        if ($masked !== []) {
+            $this->setWildcards($events, $wildcards);
+        }
+
+        return $masked;
+    }
+
+    /**
+     * @param  array<string, list<mixed>>  $masked
+     */
+    private function unmaskWildcards(Dispatcher $events, array $masked): void
+    {
+        if ($masked !== [] && $events instanceof EventDispatcher) {
+            $this->setWildcards($events, [...$this->wildcards($events), ...$masked]);
+        }
+    }
+
+    /**
+     * @return array<string, list<mixed>>
+     */
+    private function wildcards(EventDispatcher $events): array
+    {
+        /** @var array<string, list<mixed>> */
+        return new ReflectionProperty(EventDispatcher::class, 'wildcards')->getValue($events);
+    }
+
+    /**
+     * @param  array<string, list<mixed>>  $wildcards
+     */
+    private function setWildcards(EventDispatcher $events, array $wildcards): void
+    {
+        new ReflectionProperty(EventDispatcher::class, 'wildcards')->setValue($events, $wildcards);
+        new ReflectionProperty(EventDispatcher::class, 'wildcardsCache')->setValue($events, []);
+    }
+
+    private function guard(Dispatcher $events, string $key, mixed $listener, bool $wildcard = false): mixed
     {
         if ($this->identify($listener)[0] === null) {
             return $listener;
         }
 
-        $prepared = $events->makeListener($listener); // @phpstan-ignore staticMethod.dynamicCall
+        $prepared = $events->makeListener($listener, $wildcard); // @phpstan-ignore staticMethod.dynamicCall
 
-        return function (mixed ...$payload) use ($prepared, $key, $listener): mixed {
-            $subject = $payload[0] ?? null;
-            $exclusion = is_object($subject) ? $this->excluded[$subject] ?? null : null;
+        if ($wildcard) {
+            return fn (string $event, array $payload): mixed => $this->skips($payload[0] ?? null, $listener) ? null : $prepared($event, $payload);
+        }
 
-            return $exclusion !== null && $this->excludes($exclusion->listeners, $exclusion->event, $listener) ? null : $prepared($key, $payload);
-        };
+        return fn (mixed ...$payload): mixed => $this->skips($payload[0] ?? null, $listener) ? null : $prepared($key, $payload);
+    }
+
+    private function skips(mixed $subject, mixed $listener): bool
+    {
+        $exclusion = is_object($subject) ? $this->excluded[$subject] ?? null : null;
+
+        return $exclusion !== null && $this->excludes($exclusion->listeners, $exclusion->event, $listener);
     }
 
     /**
@@ -391,22 +447,64 @@ final class EventReplayer
         }
 
         if ($model->hasCast($column, self::JSON_CASTS) || in_array($type, ['json', 'jsonb'], true)) {
-            return is_string($before) && is_string($after) && json_validate($before) && json_validate($after) && $this->json(json_decode($before)) === $this->json(json_decode($after));
+            if (! is_string($before) || ! is_string($after)) {
+                return false;
+            }
+
+            $json = $this->json($before);
+
+            return $json !== null && $json === $this->json($after);
+        }
+
+        if ($model->hasCast($column, self::ENCRYPTED_CASTS) || class_exists(Str::before((string) ($model->getCasts()[$column] ?? ''), ':'))) {
+            $copy = $model->newInstance();
+            $copy->setRawAttributes([$column => $before], true);
+            $copy->setRawAttributes([$column => $after]);
+
+            return $copy->originalIsEquivalent($column);
         }
 
         return false;
     }
 
-    private function json(mixed $value): mixed
+    /**
+     * @return null|array{0: mixed}
+     */
+    private function json(string $json): null|array
+    {
+        if (! json_validate($json)) {
+            return null;
+        }
+
+        $exact = true;
+        $typed = preg_replace_callback(
+            '/"(?:[^"\\\\]++|\\\\.)*+"|-?\d++(?:\.\d++)?(?:[eE][+-]?\d++)?/',
+            function (array $token) use (&$exact): string {
+                if ($token[0][0] === '"') {
+                    return '"s'.substr($token[0], 1);
+                }
+
+                $number = $this->number($token[0]);
+                $exact = $exact && $number !== null;
+
+                return '"n'.$number.'"';
+            },
+            $json,
+        );
+
+        return $exact && is_string($typed) ? [$this->tree(json_decode($typed))] : null;
+    }
+
+    private function tree(mixed $value): mixed
     {
         if ($value instanceof stdClass) {
-            $members = array_map($this->json(...), get_object_vars($value));
+            $members = array_map($this->tree(...), get_object_vars($value));
             ksort($members, SORT_STRING);
 
             return ['object' => $members];
         }
 
-        return is_array($value) ? ['array' => array_map($this->json(...), $value)] : $value;
+        return is_array($value) ? ['array' => array_map($this->tree(...), $value)] : $value;
     }
 
     private function number(float|int|string $value): null|string

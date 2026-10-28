@@ -211,6 +211,37 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_writes_a_column_whose_type_and_default_come_from_a_later_schema_on_the_search_path(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('drop schema if exists shared_types cascade');
+        DB::statement('create schema shared_types');
+        DB::statement("create type shared_types.phase as enum ('draft', 'active', 'retired')");
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop schema if exists shared_types cascade');
+        });
+
+        try {
+            DB::statement("set search_path to {$searchPath}, shared_types");
+            DB::statement("alter table gadgets add column phase phase not null default 'draft'");
+            resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+                ...(new WidgetCompatibilityMap)->attributes(),
+                Attribute::mapped('phase')->asType('text')->storedAs('gadget', 'phase'),
+            ]]));
+
+            $this->assertSame("{$searchPath}, shared_types", DB::scalar('show search_path'));
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        $retired = DB::table('widgets')->insertGetId(['title' => 'Retired', 'phase' => 'active']);
+        DB::table('widgets')->insert(['title' => 'Defaulted', 'phase' => null]);
+        DB::table('widgets')->where('id', $retired)->update(['phase' => 'retired']);
+
+        $this->assertSame(['Defaulted' => 'draft', 'Retired' => 'retired'], DB::table('gadgets')->orderBy('name')->pluck('phase', 'name')->all());
+    }
+
+    #[Test]
     public function it_compiles_without_running_any_statement(): void
     {
         $this->compiler()->compile(new WidgetCompatibilityMap);
@@ -585,6 +616,34 @@ final class CompilerTest extends TestCase
         $this->assertWriteRefused(fn () => DB::table('intruders')->delete(), 'refused to run compatibility__widgets__primary_delete on public.intruders');
 
         $this->assertSame([1, 1], [DB::table('retained_widgets')->count(), DB::table('intruders')->count()]);
+    }
+
+    #[Test]
+    public function it_calls_no_function_of_the_installation_schema_that_takes_the_name_of_a_built_in_function(): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::statement('create table intruders (id uuid)');
+        DB::statement('create trigger intruder before insert on intruders for each row execute function compatibility__widgets__insert()');
+
+        foreach (['hashtextextended(text, integer) returns bigint', 'concat(text, uuid) returns text', 'pg_partition_root(oid) returns regclass'] as $overload) {
+            DB::unprepared("create function {$overload} language plpgsql as \$overload\$ begin raise exception 'The installation schema''s {$overload} ran'; end \$overload\$");
+        }
+
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop table if exists intruders');
+            DB::statement('drop function if exists hashtextextended(text, integer), concat(text, uuid), pg_partition_root(oid)');
+        });
+
+        $id = $this->widget();
+        DB::table('widgets')->where('id', $id)->update(['title' => 'Renamed', 'street' => '2 Main St']);
+        $gadget = DB::table('gadgets')->insertGetId(['name' => 'Directly']);
+        DB::table('gadget_places')->insert(['gadget_id' => $gadget, 'street' => '3 Direct St']);
+        DB::table('widgets')->where('id', $id)->delete();
+        DB::table('gadget_places')->where('gadget_id', $gadget)->delete();
+        DB::table('gadgets')->where('id', $gadget)->delete();
+
+        $this->assertWriteRefused(fn () => DB::table('intruders')->insert(['id' => $gadget]), 'refused to run compatibility__widgets__insert on public.intruders');
+        $this->assertSame([0, 0, 0], [DB::table('widgets')->count(), DB::table('retained_widgets')->count(), DB::table('gadgets')->count()]);
     }
 
     /**

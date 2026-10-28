@@ -194,6 +194,37 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['dependent_attribute', "attribute 'place_owner_id' stores place.gadget_id, the primary foreign key of dependent current model 'place'; the compatibility map maintains it"])]
+    #[TestWith(['read_only_dependent_attribute', "attribute 'place_owner_id' stores place.gadget_id, the primary foreign key of dependent current model 'place'; the compatibility map maintains it"])]
+    #[TestWith(['dependent_write', "attribute 'place_owner_id' stores place.gadget_id, the primary foreign key of dependent current model 'place'; the compatibility map maintains it"])]
+    #[TestWith(['dependent_fill', "dependent current model 'place' fills its primary foreign key gadget_id with fillWhenCreatedFromPrevious(); the compatibility map maintains it"])]
+    #[TestWith(['retained_fill', 'the previous model fills the primary foreign key gadget_id with fillWhenCreatedFromCurrent(); the compatibility map maintains it'])]
+    #[TestWith(['designation_fill', 'the previous model fills the designation column place_id with fillWhenCreatedFromCurrent(); the compatibility map maintains it'])]
+    public function it_refuses_at_registration_an_attribute_or_a_fill_that_sets_a_column_linking_the_record(string $case, string $message): void
+    {
+        $widgets = new WidgetCompatibilityMap;
+        [$place, $site] = $widgets->dependentCurrentModels();
+
+        $overrides = [
+            'dependent_attribute' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->storedAs('place', 'gadget_id')]],
+            'read_only_dependent_attribute' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->storedAs('place', 'gadget_id')->readOnlyBecause('A place keeps its gadget.')]],
+            'dependent_write' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->readAs('place', 'place.gadget_id')->writesTo('place', 'gadget_id', 'NEW.place_owner_id')]],
+            'dependent_fill' => ['dependentCurrentModels' => [$place->fillWhenCreatedFromPrevious(['gadget_id' => 'NEW.gadget_id']), $site]],
+            'retained_fill' => ['previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['gadget_id' => 'NULL'])],
+            'designation_fill' => [
+                'previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['place_id' => 'NULL']),
+                'dependentCurrentModels' => [$place->designatedBy('place_id'), $site],
+            ],
+        ][$case];
+
+        $this->assertThrows(
+            fn () => resolve(CompatibilityMaps::class)->register($this->compatibilityMap($overrides)),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$message}.",
+        );
+    }
+
+    #[Test]
     public function it_refuses_a_write_to_an_unknown_alias(): void
     {
         $this->expectInvalidMap("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', 'NEW.title')]]);

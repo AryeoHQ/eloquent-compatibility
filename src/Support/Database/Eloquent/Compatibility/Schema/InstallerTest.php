@@ -378,6 +378,31 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_one_retained_row_per_primary_row_when_a_trigger_inside_a_write_through_the_view_writes_through_another_compatibility_view(): void
+    {
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        DB::unprepared("create function insert_account() returns trigger language plpgsql as \$nested\$ begin insert into accounts (email) values (NEW.name || '@example.test'); return NEW; end \$nested\$");
+        DB::statement('create trigger a_insert_account after insert on gadgets for each row execute function insert_account()');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop function if exists insert_account() cascade');
+        });
+
+        DB::table('widgets')->insert(['title' => 'Through the view']);
+        DB::table('gadgets')->insert(['name' => 'Directly']);
+
+        $this->assertSame(
+            ['Directly' => 1, 'Through the view' => 1],
+            DB::table('gadgets')->leftJoin('retained_widgets', 'retained_widgets.gadget_id', '=', 'gadgets.id')->groupBy('gadgets.name')->orderBy('gadgets.name')
+                ->selectRaw('gadgets.name, count(retained_widgets.id) as retained')->pluck('retained', 'name')->all(),
+        );
+        $this->assertSame(
+            ['Directly@example.test' => 1, 'Through the view@example.test' => 1],
+            DB::table('people')->leftJoin('retained_accounts', 'retained_accounts.person_id', '=', 'people.id')->groupBy('people.email')->orderBy('people.email')
+                ->selectRaw('people.email, count(retained_accounts.id) as retained')->pluck('retained', 'email')->all(),
+        );
+    }
+
+    #[Test]
     public function it_locks_a_record_through_the_compatibility_view(): void
     {
         $id = $this->widget();

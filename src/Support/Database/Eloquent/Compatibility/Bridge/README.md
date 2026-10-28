@@ -8,7 +8,7 @@ Entry points:
 - `EventBridge::withoutMirroring()` switches the mirror off for one callback.
 - `EventBridge::fireModelEvent()` runs a mapped model's event dispatch, begins and pairs its pending mirrored writes, and forgets a vetoed one. `HasCompatibility` calls it.
 - `EventBridge::markOwnStatement()` claims and arms the pending mirrored write of a model's own statement. `HasCompatibility` calls it.
-- `EventBridge::handleQuery()` completes the open pending mirrored write on its `QueryExecuted`.
+- `EventBridge::handleQuery()` completes the open pending mirrored write on the `QueryExecuted` of its own statement.
 - `EventBridge::releaseFailed()` closes a write whose statement failed. `Provider` calls it.
 
 The other classes serve `EventBridge`. `AffectedRecords` and `KeyTranslator` find and lock the records, `EventReplayer` raises their events, and `MirrorIndex` indexes the mirrored maps.

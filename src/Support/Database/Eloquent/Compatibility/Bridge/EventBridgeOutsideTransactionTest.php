@@ -7,8 +7,10 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -182,6 +184,18 @@ final class EventBridgeOutsideTransactionTest extends TestCase
 
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Next write', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_releases_the_transaction_left_by_a_database_refusal_before_the_next_transaction_begins(): void
+    {
+        $this->refuseUuidChange($this->widget());
+
+        $count = DB::transaction(fn () => DB::table('gadgets')->count());
+
+        $this->assertSame(1, $count);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
     }
 
     #[Test]
@@ -498,6 +512,148 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         );
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Renamed by its created listener', DB::table('widgets')->value('title'));
+    }
+
+    #[Test]
+    public function it_commits_and_mirrors_a_write_whose_statement_an_earlier_query_executed_listener_follows_with_a_read(): void
+    {
+        $widget = $this->widget();
+        $this->listenBeforeTheBridge(function (QueryExecuted $query): void {
+            if (str_starts_with($query->sql, 'update "widgets"')) {
+                DB::select('select 1');
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_mirrors_a_write_whose_statement_a_later_before_executing_callback_precedes_with_a_read(): void
+    {
+        $widget = $this->widget();
+        DB::connection()->beforeExecuting(function (string $query): void {
+            if (str_starts_with($query, 'update "widgets"')) {
+                DB::select('select 1');
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_mirrors_both_writes_when_an_earlier_query_executed_listener_makes_a_bridged_write_after_the_statement(): void
+    {
+        $widget = $this->widget();
+        $other = Widget::query()->create(['title' => 'Other gadget']);
+        $this->listenBeforeTheBridge(function (QueryExecuted $query) use ($other): void {
+            if (str_starts_with($query->sql, 'update "widgets"') && $other->title === 'Other gadget') {
+                $other->update(['title' => 'Renamed by a listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed by a listener');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['Renamed', 'Renamed by a listener'], [$widget->refresh()->title, $other->refresh()->title]);
+    }
+
+    #[Test]
+    public function it_mirrors_a_mapped_write_that_an_after_commit_callback_of_a_mirrored_listener_makes(): void
+    {
+        $widget = Widget::query()->create(['title' => 'Blue gadget', 'latitude' => 47.5]);
+        $deferred = false;
+        Event::listen('eloquent.updated: '.Gadget::class, function (Gadget $gadget) use (&$deferred): void {
+            if (! $deferred) {
+                $deferred = true;
+                DB::afterCommit(fn () => GadgetSite::query()->where('gadget_id', $gadget->getKey())->firstOrFail()->update(['latitude' => 9.0]));
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => (float) $mirrored->getAttribute('latitude') === 9.0);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('9.000000000000', DB::table('gadget_sites')->value('latitude'));
+    }
+
+    #[Test]
+    #[TestWith([true])]
+    #[TestWith([false])]
+    public function it_mirrors_a_delete_made_again_after_its_touch_failed_before_its_statement(bool $retriedByTheTransaction): void
+    {
+        $this->widget();
+        GadgetPlace::resolveRelationUsing('gadget', fn (GadgetPlace $place) => $place->belongsTo(Gadget::class, 'gadget_id', 'id', 'gadget'));
+        $place = GadgetPlace::query()->sole()->setTouchedRelations(['gadget']);
+        DB::unprepared(<<<'SQL'
+            CREATE SEQUENCE touch_attempts;
+            CREATE FUNCTION fail_the_first_touch() RETURNS trigger LANGUAGE plpgsql AS $fail$
+            BEGIN
+              IF nextval('touch_attempts') = 1 THEN
+                RAISE EXCEPTION 'a concurrent update' USING ERRCODE = '40001';
+              END IF;
+              RETURN NEW;
+            END $fail$;
+            CREATE TRIGGER fail_the_first_touch BEFORE UPDATE ON gadgets FOR EACH ROW EXECUTE FUNCTION fail_the_first_touch();
+            SQL);
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::unprepared('DROP FUNCTION IF EXISTS fail_the_first_touch() CASCADE; DROP SEQUENCE IF EXISTS touch_attempts');
+        });
+        $this->recordMirroredEvents();
+
+        if ($retriedByTheTransaction) {
+            DB::transaction(fn () => $place->delete(), 2);
+        } else {
+            $this->assertThrows(fn () => $place->delete(), QueryException::class, 'a concurrent update');
+            $place->delete();
+        }
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $widget) => $widget->getAttribute('street') === null);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertNotNull(DB::table('gadget_places')->value('deleted_at'));
+    }
+
+    #[Test]
+    public function it_raises_a_unique_violation_for_an_insert_or_ignore_through_the_view_that_conflicts(): void
+    {
+        $taken = $this->widget()->refresh()->getAttribute('uuid');
+
+        $this->assertThrows(fn () => Widget::query()->insertOrIgnore(['title' => 'Duplicate', 'uuid' => $taken]), UniqueConstraintViolationException::class);
+
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+        $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_raises_a_unique_violation_for_a_save_or_ignore_through_the_view_that_conflicts(): void
+    {
+        $taken = $this->widget()->refresh()->getAttribute('uuid');
+
+        $this->assertThrows(fn () => (new Widget(['title' => 'Duplicate', 'uuid' => $taken]))->saveOrIgnore(), UniqueConstraintViolationException::class);
+
+        $this->assertSame(1, DB::table('retained_widgets')->count());
+        $this->assertSame(0, DB::transactionLevel());
+    }
+
+    private function listenBeforeTheBridge(Closure $listener): void
+    {
+        Event::forget(QueryExecuted::class);
+        DB::listen($listener);
+        Event::listen(QueryExecuted::class, resolve(EventBridge::class)->handleQuery(...));
     }
 
     private function concurrentConnection(): Connection

@@ -87,7 +87,7 @@ final class ColumnCatalogTest extends TestCase
         $this->assertEquals(
             [
                 'id' => new Column('integer', null, true, true, true),
-                'ticket' => new Column('integer', "nextval(pg_get_serial_sequence('public.numbered', 'ticket')::regclass)", true, true, false),
+                'ticket' => new Column('integer', "pg_catalog.nextval(pg_catalog.pg_get_serial_sequence('public.numbered', 'ticket')::regclass)", true, true, false),
                 'name' => new Column('text', null, true),
                 'shout' => new Column('text', null, false, true, true),
             ],
@@ -117,6 +117,25 @@ final class ColumnCatalogTest extends TestCase
         DB::statement('create domain widget_label as character varying(40)');
 
         $this->assertSame($equatable, (new ColumnCatalog(DB::connection()))->equatable($type));
+    }
+
+    #[Test]
+    public function it_names_a_type_and_a_default_as_its_search_path_finds_them_and_leaves_the_connections_own(): void
+    {
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('create schema shared_types');
+        DB::statement("create type shared_types.phase as enum ('draft', 'active')");
+        DB::statement("set local search_path to {$searchPath}, shared_types");
+        DB::statement("create table phased (phase phase not null default 'draft')");
+
+        $this->assertEquals(
+            [
+                ['phase' => new Column('shared_types.phase', "'draft'::shared_types.phase", true)],
+                ['phase' => new Column('phase', "'draft'::phase", true)],
+            ],
+            [(new ColumnCatalog(DB::connection(), '"public", pg_temp'))->of('phased'), (new ColumnCatalog(DB::connection()))->of('phased')],
+        );
+        $this->assertSame("{$searchPath}, shared_types", DB::scalar('show search_path'));
     }
 
     #[Test]

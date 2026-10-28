@@ -37,6 +37,7 @@ final readonly class AffectedRecords
     public function of(ConnectionInterface $connection, Model $model, Operation $operation, bool $afterStatement): array
     {
         $records = [];
+        $own = [];
 
         foreach ($this->mirrorIndex->forModel($model::class) as $member) {
             $resolvedMap = $this->mirrorIndex->resolvedMap($member->map);
@@ -55,8 +56,14 @@ final readonly class AffectedRecords
                 continue;
             }
 
+            $ownKey = $operation === Operation::Insert ? ($afterStatement ? $this->loaded($model, $column) : null) : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
+
+            if ($ownKey !== null) {
+                $own[] = $keyTranslator->currentRecord($alias, $ownKey);
+            }
+
             if ($alias === $resolvedMap->primaryCurrentModel->alias) {
-                $primaryKey = $operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
+                $primaryKey = $operation === Operation::Insert ? null : $ownKey;
                 $previousKeys = match (true) {
                     $primaryKey !== null => $keyTranslator->previousKeys($connection, $primaryKey),
                     $operation === Operation::Insert && $afterStatement => array_filter([$keyTranslator->createdPreviousKey($connection)], fn (null|string $key) => $key !== null),
@@ -82,7 +89,7 @@ final readonly class AffectedRecords
             }
         }
 
-        return $this->acrossMaps($connection, [...$records, ...$this->removed($connection, $model, $operation)]);
+        return $this->acrossMaps($connection, [...$records, ...$this->removed($connection, $model, $operation)], $own);
     }
 
     /**
@@ -206,11 +213,12 @@ final readonly class AffectedRecords
 
     /**
      * @param  array<string, AffectedRecord>  $records
+     * @param  list<AffectedRecord>  $own
      * @return array<string, AffectedRecord>
      */
-    private function acrossMaps(ConnectionInterface $connection, array $records): array
+    private function acrossMaps(ConnectionInterface $connection, array $records, array $own): array
     {
-        foreach ($records as $record) {
+        foreach ([...array_values($records), ...$own] as $record) {
             if ($record->role === RecordRole::Previous) {
                 continue;
             }

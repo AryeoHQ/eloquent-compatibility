@@ -23,8 +23,8 @@ final class Compiler
 
     public function __construct(ConnectionInterface $connection)
     {
-        $this->columnCatalog = new ColumnCatalog($connection);
         $this->schema = (string) $connection->scalar('select current_schema()');
+        $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath());
     }
 
     public function compile(CompatibilityMap|ResolvedMap $map): CompiledSql
@@ -142,7 +142,6 @@ final class Compiler
 
         $body = [
             ...$this->notNullChecks($resolvedMap, true),
-            $this->applying($resolvedMap),
             '  '.$this->insert($resolvedMap->table($primaryAlias), $this->insertValues($resolvedMap, $primaryAlias, $this->insertAssignmentsTo($resolvedMap, $primaryAlias), $primary->fillWhenCreatedFromPrevious), $resolvedMap->keyColumn($primaryAlias), $primaryKey),
             '  '.$this->insert((string) $previous->table, $previousColumns, '*', 'previous_row'),
         ];
@@ -167,11 +166,10 @@ final class Compiler
             .' JOIN '.SqlFragments::identifier($resolvedMap->table($primaryAlias)).' '.$primaryAlias
             .' ON '.$primaryAlias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primaryAlias)).' = '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
             .' WHERE '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).';';
-        $body[] = $this->applying($resolvedMap, false);
-        $body[] = '  PERFORM set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).'::text, true);';
+        $body[] = '  PERFORM pg_catalog.set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).'::text, true);';
         $body[] = '  RETURN NEW;';
 
-        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Insert), $previous->view, $this->variables($resolvedMap), $body);
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Insert), $previous->view, $this->variables($resolvedMap), $body, true);
     }
 
     private function updateFunction(ResolvedMap $resolvedMap): string
@@ -207,7 +205,6 @@ final class Compiler
         }
 
         $body[] = $this->conflict($resolvedMap);
-        $body[] = $this->applying($resolvedMap);
         $body[] = $this->updateTable($resolvedMap, (string) $resolvedMap->primaryCurrentModel->alias, $primaryKey, true);
         $body[] = $this->updateTable($resolvedMap, (string) $previous->alias, 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn), false);
 
@@ -215,10 +212,9 @@ final class Compiler
             $body[] = $this->updateDependent($resolvedMap, $dependent, $primaryKey);
         }
 
-        $body[] = $this->applying($resolvedMap, false);
         $body[] = '  RETURN NEW;';
 
-        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')));
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')), true);
     }
 
     private function deleteFunction(ResolvedMap $resolvedMap): string
@@ -229,7 +225,6 @@ final class Compiler
         $body = [
             $this->lockPrimary($resolvedMap),
             $this->loadPrevious($resolvedMap),
-            $this->applying($resolvedMap),
             '  DELETE FROM '.SqlFragments::identifier((string) $previous->table).' WHERE '.SqlFragments::identifier((string) $previous->keyColumn).' = OLD.'.SqlFragments::identifier((string) $previous->keyColumn).';',
         ];
 
@@ -240,10 +235,9 @@ final class Compiler
 
         $body[] = '  DELETE FROM '.SqlFragments::identifier($resolvedMap->table($primaryAlias))
             .' WHERE '.SqlFragments::identifier($resolvedMap->keyColumn($primaryAlias)).' = '.$primaryKey.';';
-        $body[] = $this->applying($resolvedMap, false);
         $body[] = '  RETURN OLD;';
 
-        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Delete), $previous->view, $this->variables($resolvedMap), $body);
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Delete), $previous->view, $this->variables($resolvedMap), $body, true);
     }
 
     private function primaryInsertFunction(ResolvedMap $resolvedMap): string
@@ -259,7 +253,7 @@ final class Compiler
         return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::PrimaryInsert), $resolvedMap->table((string) $resolvedMap->primaryCurrentModel->alias), '  created_key '.SqlFragments::identifier((string) $previous->table).'.'.SqlFragments::identifier((string) $previous->keyColumn)."%TYPE;\n", [
             $this->skipWhileApplying($resolvedMap, 'NEW'),
             '  '.$this->insert((string) $previous->table, $values, (string) $previous->keyColumn, 'created_key'),
-            '  PERFORM set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', created_key::text, true);',
+            '  PERFORM pg_catalog.set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', created_key::text, true);',
             '  RETURN NEW;',
         ]);
     }
@@ -304,7 +298,7 @@ final class Compiler
         $serialize = $primaryForeignKey === null ? [] : [
             '  PERFORM 1 FROM '.SqlFragments::identifier($resolvedMap->table($primary))
                 .' WHERE '.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = NEW.'.SqlFragments::identifier($primaryForeignKey).' FOR KEY SHARE;',
-            '  PERFORM pg_advisory_xact_lock(hashtextextended(concat('.SqlFragments::literal($resolvedMap->refuseFunctionName($state).':')
+            '  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(pg_catalog.concat('.SqlFragments::literal($resolvedMap->refuseFunctionName($state).':')
                 .', NEW.'.SqlFragments::identifier($primaryForeignKey).'), 0));',
         ];
 
@@ -652,14 +646,9 @@ final class Compiler
         );
     }
 
-    private function applying(ResolvedMap $resolvedMap, bool $on = true): string
-    {
-        return '  PERFORM set_config('.SqlFragments::literal(Setting::Applying->for($resolvedMap)).', '.SqlFragments::literal($on ? $resolvedMap->name : '').', true);';
-    }
-
     private function skipWhileApplying(ResolvedMap $resolvedMap, string $row): string
     {
-        return '  IF current_setting('.SqlFragments::literal(Setting::Applying->for($resolvedMap)).', true) = '.SqlFragments::literal($resolvedMap->name)." THEN\n    RETURN {$row};\n  END IF;";
+        return '  IF pg_catalog.current_setting('.SqlFragments::literal(Setting::Applying->for($resolvedMap)).', true) = '.SqlFragments::literal($resolvedMap->name)." THEN\n    RETURN {$row};\n  END IF;";
     }
 
     private function variables(ResolvedMap $resolvedMap): string
@@ -678,10 +667,10 @@ final class Compiler
     /**
      * @param  list<string>  $body
      */
-    private function function(ResolvedMap $resolvedMap, string $name, string $relation, string $variables, array $body): string
+    private function function(ResolvedMap $resolvedMap, string $name, string $relation, string $variables, array $body, bool $applying = false): string
     {
         $owner = SqlFragments::identifier($this->schema).'.'.SqlFragments::identifier($relation);
-        $guard = '  IF TG_RELID <> '.SqlFragments::literal($owner).'::regclass AND pg_partition_root(TG_RELID) IS DISTINCT FROM '.SqlFragments::literal($owner)."::regclass THEN\n    "
+        $guard = '  IF TG_RELID <> '.SqlFragments::literal($owner).'::regclass AND pg_catalog.pg_partition_root(TG_RELID) IS DISTINCT FROM '.SqlFragments::literal($owner)."::regclass THEN\n    "
             .SqlFragments::refuse(
                 SqlFragments::literal("Compatibility map '{$resolvedMap->name}' refused to run {$name} on ").' || TG_TABLE_SCHEMA || '.SqlFragments::literal('.').' || TG_TABLE_NAME',
                 "{$name} belongs to {$this->schema}.{$relation}, and only the compatibility map's own trigger on it may run it.",
@@ -693,8 +682,14 @@ final class Compiler
             throw InvalidCompatibilityMap::because($resolvedMap->name, "the SQL of trigger function {$name} contains \$compatibility\$, which would end its body early; remove it from the map's expressions");
         }
 
-        return 'CREATE OR REPLACE FUNCTION '.SqlFragments::identifier($name).'() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '.SqlFragments::identifier($this->schema)
-            .", pg_temp AS \$compatibility\$\n".$definition.'$compatibility$';
+        return 'CREATE OR REPLACE FUNCTION '.SqlFragments::identifier($name).'() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '.$this->searchPath()
+            .($applying ? ' SET '.Setting::Applying->for($resolvedMap).' = '.SqlFragments::literal($resolvedMap->name) : '')
+            ." AS \$compatibility\$\n".$definition.'$compatibility$';
+    }
+
+    private function searchPath(): string
+    {
+        return SqlFragments::identifier($this->schema).', pg_temp';
     }
 
     private function compared(ResolvedMap $resolvedMap, Attribute $attribute, string $expression): string

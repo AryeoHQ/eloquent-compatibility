@@ -7,9 +7,14 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Casts\AsEncryptedCollection;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\Concerns\AsPivot;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -66,10 +71,14 @@ final class EventBridgeTest extends TestCase
     /** @var list<array<string, mixed>> */
     private array $seen = [];
 
-    private bool $committed = false;
-
     /** @var list<string> */
     private array $recorded = [];
+
+    /** @var list<string> */
+    private array $committed = [];
+
+    /** @var list<string> */
+    private array $journaled = [];
 
     protected function setUp(): void
     {
@@ -342,7 +351,7 @@ final class EventBridgeTest extends TestCase
                 return $this->belongsTo(Gadget::class);
             }
         })::class;
-        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->withSite($site)));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->withDependent(DependentCurrentModel::for($site)->aliasedAs('site')->primaryForeignKey('gadget_id'))));
         $this->widget();
         $gadget = Gadget::query()->firstOrFail();
         $child = $site::query()->firstOrFail()->setRelation('gadget', $gadget)->setTouchedRelations(['gadget']);
@@ -360,6 +369,41 @@ final class EventBridgeTest extends TestCase
         $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget, RecordMirrored $event) => (float) $event->rowBefore['latitude'] === 47.5 && (float) $widget->getAttribute('latitude') === 2.0);
         $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget, RecordMirrored $event) => $event->rowBefore['title'] === 'Blue gadget' && $widget->title === 'Renamed');
         $this->assertCount(2, $this->mirroredEvents());
+    }
+
+    #[Test]
+    public function it_mirrors_a_delete_whose_touched_owner_in_no_map_saves_the_same_instance_from_its_saved_listener(): void
+    {
+        $owner = (new class extends Model
+        {
+            use HasUuids;
+
+            protected $table = 'gadgets';
+
+            protected $guarded = [];
+        })::class;
+        $place = (new class extends CompatibleModel
+        {
+            use HasUuids;
+            use SoftDeletes;
+
+            protected $table = 'gadget_places';
+
+            protected $guarded = [];
+        })::class;
+        $place::resolveRelationUsing('owner', fn (Model $model) => $model->belongsTo($owner, 'gadget_id', 'id', 'owner'));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->withDependent(
+            DependentCurrentModel::for($place)->aliasedAs('place')->primaryForeignKey('gadget_id')->readableWhen('place.parent_id IS NULL AND place.deleted_at IS NULL'),
+        )));
+        $this->widget();
+        $deleted = $place::query()->sole()->setRelation('owner', $owner::query()->sole())->setTouchedRelations(['owner']);
+        Event::listen("eloquent.saved: {$owner}", fn () => $deleted->save());
+        $this->recordMirroredEvents();
+
+        $deleted->delete();
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget) => $widget->getAttribute('street') === null);
+        $this->assertNotNull(DB::table('gadget_places')->value('deleted_at'));
     }
 
     #[Test]
@@ -462,30 +506,32 @@ final class EventBridgeTest extends TestCase
     {
         $this->mirror();
         $widget = $this->widget();
-        Event::listen('eloquent.saved: '.Gadget::class, function (): void {
-            DB::afterCommit(function (): void {
-                $this->committed = true;
-            });
-        });
         Event::listen('eloquent.saving: '.Gadget::class, function (Gadget $gadget): void {
-            if ($gadget->name === 'Invalid') {
+            $name = $gadget->name;
+            DB::afterCommit(function () use ($name): void {
+                $this->committed[] = $name;
+            });
+
+            if ($name === 'Invalid') {
                 throw ValidationException::withMessages(['name' => 'Invalid name.']);
             }
         });
 
-        try {
-            $widget->update(['title' => 'Invalid']);
-            $this->fail('Expected the mirrored rule to refuse the write.');
-        } catch (ValidationException) {
-        }
+        DB::transaction(function () use ($widget): void {
+            try {
+                $widget->update(['title' => 'Invalid']);
+                $this->fail('Expected the mirrored rule to refuse the write.');
+            } catch (ValidationException) {
+            }
+        });
 
         $this->assertSame('Blue gadget', DB::table('widgets')->value('title'));
         $this->assertSame(1, DB::transactionLevel());
-        $this->assertFalse($this->committed);
+        $this->assertSame([], $this->committed);
 
         $widget->refresh()->update(['title' => 'Valid']);
 
-        $this->assertTrue($this->committed);
+        $this->assertSame(['Valid'], $this->committed);
         $this->assertSame('Valid', DB::table('gadgets')->value('name'));
     }
 
@@ -530,6 +576,63 @@ final class EventBridgeTest extends TestCase
         $widget->update(['latitude' => 47.6]);
 
         $this->assertMirrored(GadgetSite::class, ModelEvent::Updated);
+    }
+
+    #[Test]
+    public function it_accepts_a_mirrored_listener_that_only_reads_an_encrypted_collection(): void
+    {
+        Schema::table('gadgets', fn (Blueprint $table) => $table->text('secrets')->nullable());
+        $gadget = (new class extends CompatibleModel
+        {
+            use HasUuids;
+            use SoftDeletes;
+
+            protected $guarded = [];
+
+            protected $casts = ['secrets' => AsEncryptedCollection::class];
+        })::class;
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->respelled(Widget::class, $gadget)));
+        $widget = $this->widget();
+        $gadget::query()->sole()->update(['secrets' => collect(['pin' => '1234'])]);
+        $read = [];
+        Event::listen("eloquent.updating: {$gadget}", function (Model $updating) use (&$read): void {
+            $read[] = $updating->getAttribute('secrets')->get('pin');
+        });
+        $this->recordMirroredEvents();
+
+        $widget->refresh()->update(['title' => 'Renamed']);
+
+        $this->assertSame(['1234'], $read);
+        $this->assertMirrored($gadget, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
+    #[TestWith(['{"n": 9223372036854775808}', '{"n": 9223372036854775809}'])]
+    #[TestWith(['{"n": 0.1}', '{"n": 0.10000000000000001}'])]
+    public function it_refuses_a_mirrored_listener_change_to_a_json_number_that_php_cannot_tell_apart(string $stored, string $changed): void
+    {
+        $this->mirrorWithSettings();
+        $this->widget();
+        DB::table('retained_widgets')->update(['settings' => $stored]);
+        Event::listen('eloquent.saving: '.Widget::class, fn (Widget $widget) => $widget->setAttribute('settings', $changed));
+
+        $this->assertWriteRefused(fn () => Gadget::query()->sole()->update(['name' => 'Renamed']), 'changed settings');
+
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_accepts_a_mirrored_listener_that_rewrites_json_as_the_same_numbers_with_its_keys_reordered(): void
+    {
+        $this->mirrorWithSettings();
+        $this->widget();
+        DB::table('retained_widgets')->update(['settings' => '{"n": 9223372036854775808, "m": 0.1}']);
+        Event::listen('eloquent.saving: '.Widget::class, fn (Widget $widget) => $widget->setAttribute('settings', '{"m":1e-1,"n":9223372036854775808.0}'));
+        $this->recordMirroredEvents();
+
+        Gadget::query()->sole()->update(['name' => 'Renamed']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget) => $widget->title === 'Renamed');
     }
 
     #[Test]
@@ -616,6 +719,24 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_skips_an_excluded_listener_registered_by_wildcard_for_mirrored_events_only(): void
+    {
+        $this->mirror([ExcludedListener::of(self::class.'@journal', 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);
+        $first = $this->widget();
+        $second = Widget::query()->create(['title' => 'Second gadget'])->refresh();
+        Event::listen('eloquent.updated: '.Gadget::class, function (Gadget $gadget) use ($second): void {
+            if ($gadget->getKey() !== $second->gadget_id) {
+                Gadget::query()->findOrFail($second->gadget_id)->update(['name' => 'Renamed natively']);
+            }
+        });
+        Event::listen('eloquent.updated: *', [$this, 'journal']);
+
+        $first->update(['title' => 'Through the previous model']);
+
+        $this->assertSame(['eloquent.updated: '.Gadget::class.' Renamed natively', 'eloquent.updated: '.Widget::class.' Through the previous model'], $this->journaled);
+    }
+
+    #[Test]
     public function it_mirrors_a_previous_model_whose_key_name_changes_at_runtime(): void
     {
         $this->mirror();
@@ -670,6 +791,21 @@ final class EventBridgeTest extends TestCase
         $widget->update(['title' => 'Partly faked']);
 
         $this->assertMirrored(Gadget::class, ModelEvent::Updated);
+    }
+
+    #[Test]
+    public function it_mirrors_a_write_once_the_fake_stops_faking_the_beginning_event_it_recorded_for_the_same_instance(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        $fake = Event::fake(['eloquent.updating: '.Widget::class]);
+        $this->assertThrows(fn () => $widget->update(['title' => 'Faked']), CompatibilityEventMirrorBypassed::class);
+        $fake->except(['eloquent.updating: '.Widget::class]);
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Dispatched']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Dispatched');
     }
 
     #[Test]
@@ -759,6 +895,36 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    public function it_raises_the_events_of_every_previous_model_over_a_current_table_that_another_model_class_maps(): void
+    {
+        $person = (new class extends CompatibleModel
+        {
+            use HasUuids;
+
+            protected $table = 'people';
+
+            protected $guarded = [];
+        })::class;
+        $profiles = $this->profilesOver($person);
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        resolve(Installer::class)->install($profiles);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new AccountCompatibilityMap));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($profiles));
+        Account::query()->create(['email' => 'one@example.test']);
+        $this->recordMirroredEvents();
+
+        Person::query()->sole()->update(['email' => 'two@example.test']);
+
+        $this->assertMirrored(Account::class, ModelEvent::Updated, fn (Model $account) => $account->getAttribute('email') === 'two@example.test');
+        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile) => $profile->getAttribute('email') === 'two@example.test');
+
+        Event::listen('eloquent.updating: '.Profile::class, fn () => false);
+
+        $this->assertWriteRefused(fn () => Person::query()->sole()->update(['email' => 'three@example.test']), "a 'updating' listener of Profile");
+        $this->assertSame('two@example.test', DB::table('people')->value('email'));
+    }
+
+    #[Test]
     public function it_raises_the_previous_model_events_of_a_write_to_a_current_table_whose_quoted_name_keeps_its_case_and_a_hyphen(): void
     {
         Tables::createItems();
@@ -788,6 +954,24 @@ final class EventBridgeTest extends TestCase
         $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('street') === 'Added by a listener');
         $this->assertSame('Added by a listener', DB::table('widgets')->value('street'));
         $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_mirrors_a_write_a_mirrored_listener_makes_on_the_instance_it_was_given(): void
+    {
+        $this->mirror();
+        $widget = $this->widget();
+        Event::listen('eloquent.updated: '.Gadget::class, function (Gadget $gadget): void {
+            if ($gadget->name === 'First') {
+                $gadget->update(['name' => 'Second']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'First']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('title') === 'Second');
+        $this->assertSame('Second', DB::table('widgets')->value('title'));
     }
 
     private function mirrorWithSettings(): void
@@ -1381,6 +1565,74 @@ final class EventBridgeTest extends TestCase
         $this->assertSame('After the refusal', DB::table('gadgets')->value('name'));
     }
 
+    #[Test]
+    public function it_mirrors_a_write_whose_statement_an_earlier_query_executed_listener_follows_with_a_read_inside_a_callers_transaction(): void
+    {
+        DB::listen(function (QueryExecuted $query): void {
+            if (str_starts_with($query->sql, 'update "widgets"')) {
+                DB::select('select 1');
+            }
+        });
+        $this->mirror();
+        $widget = $this->widget();
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    #[TestWith([true])]
+    #[TestWith([false])]
+    public function it_refuses_to_mirror_a_map_whose_current_model_another_mirrored_map_names_in_the_other_current_role(bool $widgetsFirst): void
+    {
+        $holders = $this->holdersOfGadgets();
+        $mirrors = [new CompatibilityMapEventMirror(new WidgetCompatibilityMap), new CompatibilityMapEventMirror($holders)];
+        [$first, $second] = $widgetsFirst ? $mirrors : array_reverse($mirrors);
+        resolve(EventBridge::class)->mirror($first);
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror($second),
+            InvalidCompatibilityMap::class,
+            "Compatibility map '".($widgetsFirst ? 'holders' : 'widgets')."' is declared wrongly: ".Gadget::class." is the primary current model of compatibility map 'widgets' and a dependent current model of compatibility map 'holders', so the event bridge cannot lock its row in the order the triggers of both maps lock it, and a write through either view can deadlock a bridged write; map ".Gadget::class.' in one of those roles only.',
+        );
+
+        $this->assertSame([$widgetsFirst ? 'widgets' : 'holders'], array_map(fn (ResolvedMap $resolvedMap) => $resolvedMap->name, resolve(CompatibilityMaps::class)->all()));
+    }
+
+    #[Test]
+    #[TestWith(['previous'])]
+    #[TestWith(['primary'])]
+    #[TestWith(['dependent'])]
+    public function it_refuses_to_mirror_a_map_that_names_a_pivot_model(string $role): void
+    {
+        $pivot = (new class extends Pivot implements Compatible
+        {
+            use HasCompatibility;
+
+            protected $table = 'gadgets';
+        })::class;
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming($role, $pivot))),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$pivot} uses ".AsPivot::class.', as every Pivot does, so its delete without its key loaded sends a statement HasCompatibility never marks, and the event bridge would refuse that delete only after it reached the database; map a plain Model over the pivot table instead.',
+        );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $payload
+     */
+    public function journal(string $event, array $payload): void // @phpstan-ignore phpunit.testMethodMustHaveTestAttribute
+    {
+        $this->assertInstanceOf(Model::class, $payload[0]);
+        $this->journaled[] = $event.' '.($payload[0]->getAttribute('name') ?? $payload[0]->getAttribute('title'));
+    }
+
     /**
      * @param  list<ExcludedListener>  $excludedListeners
      */
@@ -1466,17 +1718,11 @@ final class EventBridgeTest extends TestCase
         };
     }
 
-    /**
-     * @param  class-string<Model>  $site
-     */
-    private function withSite(string $site): CompatibilityMap
+    private function withDependent(DependentCurrentModel $replacement): CompatibilityMap
     {
-        return new readonly class(new WidgetCompatibilityMap, $site) implements CompatibilityMap
+        return new readonly class(new WidgetCompatibilityMap, $replacement) implements CompatibilityMap
         {
-            /**
-             * @param  class-string<Model>  $site
-             */
-            public function __construct(private WidgetCompatibilityMap $base, private string $site) {}
+            public function __construct(private WidgetCompatibilityMap $base, private DependentCurrentModel $replacement) {}
 
             public function name(): string
             {
@@ -1496,7 +1742,7 @@ final class EventBridgeTest extends TestCase
             public function dependentCurrentModels(): array
             {
                 return array_map(
-                    fn (DependentCurrentModel $dependent) => (string) $dependent->alias === 'site' ? DependentCurrentModel::for($this->site)->aliasedAs('site')->primaryForeignKey('gadget_id') : $dependent,
+                    fn (DependentCurrentModel $dependent) => (string) $dependent->alias === (string) $this->replacement->alias ? $this->replacement : $dependent,
                     $this->base->dependentCurrentModels(),
                 );
             }
@@ -1509,6 +1755,105 @@ final class EventBridgeTest extends TestCase
             public function unrepresentableStates(): array
             {
                 return $this->base->unrepresentableStates();
+            }
+        };
+    }
+
+    /**
+     * @param  class-string<Model>  $person
+     */
+    private function profilesOver(string $person): CompatibilityMap
+    {
+        return new readonly class(new ProfileCompatibilityMap, $person) implements CompatibilityMap
+        {
+            /**
+             * @param  class-string<Model>  $person
+             */
+            public function __construct(private ProfileCompatibilityMap $base, private string $person) {}
+
+            public function name(): string
+            {
+                return $this->base->name();
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return $this->base->previousModel();
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return PrimaryCurrentModel::for($this->person)->aliasedAs('person');
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return $this->base->dependentCurrentModels();
+            }
+
+            public function attributes(): array
+            {
+                return $this->base->attributes();
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return $this->base->unrepresentableStates();
+            }
+        };
+    }
+
+    private function holdersOfGadgets(): CompatibilityMap
+    {
+        $holder = (new class extends CompatibleModel
+        {
+            protected $table = 'holders';
+        })::class;
+
+        return new readonly class($holder) implements CompatibilityMap
+        {
+            /**
+             * @param  class-string<Model>  $holder
+             */
+            public function __construct(private string $holder) {}
+
+            public function name(): string
+            {
+                return 'holders';
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return PreviousModel::servedAsView('holders')
+                    ->retainedInTable('retained_holders')
+                    ->forModel($this->holder)
+                    ->aliasedAs('holder')
+                    ->primaryForeignKey('person_id');
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return PrimaryCurrentModel::for(Person::class)->aliasedAs('person');
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return [DependentCurrentModel::for(Gadget::class)->aliasedAs('gadget')->primaryForeignKey('person_id')];
+            }
+
+            public function attributes(): array
+            {
+                return [
+                    Attribute::retained('id')->readOnlyBecause('A holder keeps its id.'),
+                    Attribute::retained('person_id')->readOnlyBecause('A holder stays tied to its person.'),
+                    Attribute::mapped('email')->asType('character varying(255)')->storedAs('person', 'email'),
+                    Attribute::mapped('gadget_name')->asType('character varying(255)')->storedAs('gadget', 'name'),
+                ];
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return [];
             }
         };
     }

@@ -14,7 +14,7 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
-    public function __construct(private readonly ConnectionInterface $connection) {}
+    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null) {}
 
     /**
      * @return array<string, Column>
@@ -25,21 +25,7 @@ final class ColumnCatalog
             return $this->tables[$table];
         }
 
-        $rows = $this->connection->select(
-            'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
-                    case when table_column.attidentity = \'d\' then format(\'nextval(pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, table_relation.relname), table_column.attname)
-                         when table_column.attgenerated = \'\' then pg_get_expr(column_default.adbin, column_default.adrelid) end as "default", table_column.attnotnull as not_null,
-                    table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
-                    table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated
-             from pg_attribute table_column
-             join pg_class table_relation on table_relation.oid = table_column.attrelid
-             join pg_namespace table_schema on table_schema.oid = table_relation.relnamespace
-             left join pg_attrdef column_default on column_default.adrelid = table_column.attrelid and column_default.adnum = table_column.attnum
-             where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
-             order by table_column.attnum',
-            [SqlFragments::identifier($table)],
-        );
-
+        $rows = $this->searchPath === null ? $this->columns($table) : $this->underSearchPath($this->searchPath, fn () => $this->columns($table));
         $columns = [];
 
         foreach ($rows as $row) {
@@ -53,6 +39,44 @@ final class ColumnCatalog
         }
 
         return $this->tables[$table] = $columns;
+    }
+
+    /**
+     * @return array<int, object>
+     */
+    private function columns(string $table): array
+    {
+        return $this->connection->select(
+            'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
+                    case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, table_relation.relname), table_column.attname)
+                         when table_column.attgenerated = \'\' then pg_get_expr(column_default.adbin, column_default.adrelid) end as "default", table_column.attnotnull as not_null,
+                    table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
+                    table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated
+             from pg_attribute table_column
+             join pg_class table_relation on table_relation.oid = table_column.attrelid
+             join pg_namespace table_schema on table_schema.oid = table_relation.relnamespace
+             left join pg_attrdef column_default on column_default.adrelid = table_column.attrelid and column_default.adnum = table_column.attnum
+             where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
+             order by table_column.attnum',
+            [SqlFragments::identifier($table)],
+        );
+    }
+
+    /**
+     * @param  callable(): array<int, object>  $read
+     * @return array<int, object>
+     */
+    private function underSearchPath(string $searchPath, callable $read): array
+    {
+        $this->connection->beginTransaction();
+
+        try {
+            $this->connection->statement("select pg_catalog.set_config('search_path', ?, true)", [$searchPath]);
+
+            return $read();
+        } finally {
+            $this->connection->rollBack();
+        }
     }
 
     public function type(string $table, string $column): null|string

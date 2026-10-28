@@ -8,6 +8,8 @@ composer require aryeo/eloquent-compatibility
 
 The package supports PostgreSQL 14, 16 and 18, on Laravel 12 and 13.
 
+Install each map in a schema where only trusted roles can create objects. The compiled trigger functions run with their owner's rights, and they look names up in that schema. A function or an operator another role creates there can replace a built-in one inside them. PostgreSQL 14 lets every role create objects in `public` by default, and `REVOKE CREATE ON SCHEMA public FROM PUBLIC` withdraws that. [Adopting a map](docs/adopting-a-map.md#before-the-install-who-can-create-objects-in-the-installation-schema) describes the requirement.
+
 ## Usage
 A compatibility map declares how the previous model's attributes map onto its current models. One record of the previous model becomes a primary current model and any number of dependent current models.
 

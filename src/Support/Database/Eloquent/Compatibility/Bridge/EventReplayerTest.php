@@ -393,39 +393,6 @@ final class EventReplayerTest extends TestCase
     }
 
     #[Test]
-    public function it_reports_only_the_instance_it_replays_as_replaying_and_only_while_it_replays(): void
-    {
-        [$id, $before, $after] = $this->renamed();
-        $this->watch(Gadget::class, 'updating', fn (Gadget $gadget) => [
-            'model' => $gadget,
-            'replaying' => $this->eventReplayer->isReplaying($gadget),
-            'other' => $this->eventReplayer->isReplaying(new Gadget),
-            'source' => $this->eventReplayer->isReplaying($this->source),
-        ]);
-
-        $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql');
-
-        $replayed = $this->sole()->destination;
-        $this->assertSame([['event' => 'updating', 'model' => $replayed, 'replaying' => true, 'other' => false, 'source' => false]], $this->seen);
-        $this->assertFalse($this->eventReplayer->isReplaying($replayed));
-    }
-
-    #[Test]
-    public function it_stops_reporting_an_instance_as_replaying_once_a_listener_refuses_it(): void
-    {
-        [$id, $before, $after] = $this->renamed();
-        $this->watch(Gadget::class, 'updating', fn (Gadget $gadget) => ['model' => $gadget, 'replaying' => $this->eventReplayer->isReplaying($gadget)]);
-        Event::listen('eloquent.updating: '.Gadget::class, fn () => false);
-
-        $this->refusal(fn () => $this->eventReplayer->replay($this->gadgetRecord($id), $before, $after, $this->source, 'pgsql'));
-
-        $this->assertCount(1, $this->seen);
-        $this->assertTrue($this->seen[0]['replaying']);
-        $this->assertInstanceOf(Gadget::class, $this->seen[0]['model']);
-        $this->assertFalse($this->eventReplayer->isReplaying($this->seen[0]['model']));
-    }
-
-    #[Test]
     public function it_skips_an_excluded_listener_for_its_replayed_event_only(): void
     {
         $this->mirror([ExcludedListener::of(Journal::class, 'The journal records only writes through the current model.')->forEvent(ModelEvent::Updated)]);

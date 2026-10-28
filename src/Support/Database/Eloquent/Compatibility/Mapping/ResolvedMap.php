@@ -89,6 +89,7 @@ final readonly class ResolvedMap
         $attributes = array_map(fn (Attribute $attribute) => $attribute->resolve((string) $previous->alias), $map->attributes());
         $resolvedMap = new self($name, $previous, $primary, $dependents, $attributes, $map->unrepresentableStates(), $tables);
         $resolvedMap->validateAttributes();
+        $resolvedMap->validateLinks();
         $resolvedMap->validateUnrepresentableStates();
 
         return $resolvedMap;
@@ -291,6 +292,37 @@ final readonly class ResolvedMap
 
         if (! array_key_exists((string) $this->previousModel->primaryForeignKey, $columns)) {
             throw InvalidCompatibilityMap::because($this->name, "the primary foreign key '{$this->previousModel->primaryForeignKey}' is not an attribute");
+        }
+    }
+
+    private function validateLinks(): void
+    {
+        foreach ($this->dependentCurrentModels as $dependent) {
+            $link = $dependent->alias.'.'.$dependent->primaryForeignKey;
+
+            foreach ($this->attributes as $attribute) {
+                $stored = array_map(fn (TargetColumn $targetColumn) => $targetColumn->alias.'.'.$targetColumn->column, $attribute->writesTo);
+
+                if (in_array($link, [...$stored, $attribute->alias.'.'.$attribute->storedAs], true)) {
+                    throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' stores {$link}, the primary foreign key of dependent current model '{$dependent->alias}'; the compatibility map maintains it");
+                }
+            }
+
+            if (array_key_exists((string) $dependent->primaryForeignKey, $dependent->fillWhenCreatedFromPrevious)) {
+                throw InvalidCompatibilityMap::because($this->name, "dependent current model '{$dependent->alias}' fills its primary foreign key {$dependent->primaryForeignKey} with fillWhenCreatedFromPrevious(); the compatibility map maintains it");
+            }
+        }
+
+        $maintained = [(string) $this->previousModel->primaryForeignKey => 'the primary foreign key'];
+
+        foreach ($this->designated() as $dependent) {
+            $maintained[(string) $dependent->designationColumn] = 'the designation column';
+        }
+
+        foreach ($maintained as $column => $role) {
+            if (array_key_exists($column, $this->previousModel->fillWhenCreatedFromCurrent)) {
+                throw InvalidCompatibilityMap::because($this->name, "the previous model fills {$role} {$column} with fillWhenCreatedFromCurrent(); the compatibility map maintains it");
+            }
         }
     }
 
