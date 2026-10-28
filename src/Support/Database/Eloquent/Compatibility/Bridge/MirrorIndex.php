@@ -17,7 +17,7 @@ final class MirrorIndex
     /** @var array<class-string<Model>, list<MapMember>> */
     private array $models = [];
 
-    /** @var array<string, array<string, list<MapMember>>> */
+    /** @var array<string, list<array{null|string, MapMember}>> */
     private array $tables = [];
 
     /**
@@ -34,8 +34,7 @@ final class MirrorIndex
 
         foreach ($resolvedMap->currentModels() as $model => $alias) {
             $members[$alias] = $model;
-            $connection = (new $model)->getConnectionName() ?? (string) Model::getConnectionResolver()?->getDefaultConnection();
-            $this->tables[$connection][$resolvedMap->table($alias)][] = new MapMember($name, $alias);
+            $this->tables[$resolvedMap->table($alias)][] = [(new $model)->getConnectionName(), new MapMember($name, $alias)];
         }
 
         foreach ($members as $alias => $model) {
@@ -74,6 +73,11 @@ final class MirrorIndex
     /** @return list<MapMember> */
     public function forRelation(string $connection, string $relation): array
     {
-        return $this->tables[$connection][$relation] ?? [];
+        $default = Model::getConnectionResolver()?->getDefaultConnection();
+
+        return array_values(array_map(
+            fn (array $member) => $member[1],
+            array_filter($this->tables[$relation] ?? [], fn (array $member) => ($member[0] ?? $default) === $connection),
+        ));
     }
 }

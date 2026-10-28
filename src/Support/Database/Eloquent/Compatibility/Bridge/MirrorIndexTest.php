@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
@@ -35,6 +36,12 @@ final class MirrorIndexTest extends TestCase
         parent::setUp();
 
         $this->mirrorIndex = new MirrorIndex;
+    }
+
+    /** @return list<string> */
+    protected function connectionsToTransact(): array
+    {
+        return ['pgsql'];
     }
 
     #[Test]
@@ -97,6 +104,19 @@ final class MirrorIndexTest extends TestCase
         $this->add(new ProfileCompatibilityMap(SecondaryPerson::class));
 
         $this->assertSame([['accounts', 'person']], $this->members($this->mirrorIndex->forRelation('pgsql', 'people')));
+        $this->assertSame([['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('secondary', 'people')));
+    }
+
+    #[Test]
+    public function it_lists_a_current_table_of_a_model_without_a_connection_name_under_the_default_connection_of_the_lookup(): void
+    {
+        $this->add(new AccountCompatibilityMap);
+        $this->add(new ProfileCompatibilityMap(SecondaryPerson::class));
+
+        DB::setDefaultConnection('tenant');
+
+        $this->assertSame([['accounts', 'person']], $this->members($this->mirrorIndex->forRelation('tenant', 'people')));
+        $this->assertSame([], $this->members($this->mirrorIndex->forRelation('pgsql', 'people')));
         $this->assertSame([['profiles', 'person']], $this->members($this->mirrorIndex->forRelation('secondary', 'people')));
     }
 

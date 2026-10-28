@@ -33,7 +33,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
 - **mapped attribute**: a previous model's attribute stored in a current model's table; see `Attribute::mapped()`.
-- **mirror index**: the event bridge's index of mirrored maps by model class, and by connection and current table; `MirrorIndex`.
+- **mirror index**: the event bridge's index of mirrored maps by model class, and by connection and current table, where a model without a connection name follows the current default connection; `MirrorIndex`.
 - **mirrored event**: a model event the event replayer raises for a record that a write through the other side changed.
 - **mirrored listener**: a listener while it runs for a mirrored event.
 - **mirrored map**: a resolved map with its event mirror and key translator; a `MirroredMap`.

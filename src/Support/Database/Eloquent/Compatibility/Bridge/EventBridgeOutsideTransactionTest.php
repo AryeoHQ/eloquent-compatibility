@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Closure;
 use Illuminate\Database\Connection;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -29,10 +30,16 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
+use Tests\Fixtures\Support\Workbench\Account;
+use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
+use Tests\Fixtures\Support\Workbench\CompatibleModel;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
+use Tests\Fixtures\Support\Workbench\Person;
+use Tests\Fixtures\Support\Workbench\Profile;
+use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -647,6 +654,56 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    public function it_raises_the_events_of_every_previous_model_over_a_current_table_on_a_default_connection_set_after_registration(): void
+    {
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        resolve(Installer::class)->install(new ProfileCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new AccountCompatibilityMap));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ProfileCompatibilityMap));
+        $this->switchTheDefaultConnection();
+        $account = Account::query()->create(['email' => 'one@example.test']);
+        $this->recordMirroredEvents();
+
+        $account->update(['email' => 'two@example.test']);
+
+        $this->assertMirrored(Person::class, ModelEvent::Updated, fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
+        $this->assertMirrored(Profile::class, ModelEvent::Updated, fn (Model $profile) => $profile->getAttribute('email') === 'two@example.test');
+        $this->assertSame('tenant', $account->getConnectionName());
+    }
+
+    #[Test]
+    public function it_raises_no_event_of_a_map_whose_current_model_names_a_connection_other_than_the_default_set_after_registration(): void
+    {
+        $person = (new class extends CompatibleModel
+        {
+            use HasUuids;
+
+            protected $connection = 'pgsql';
+
+            protected $table = 'people';
+
+            protected $guarded = [];
+        })::class;
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        resolve(Installer::class)->install(new ProfileCompatibilityMap($person));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new AccountCompatibilityMap));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ProfileCompatibilityMap($person)));
+        $this->switchTheDefaultConnection();
+        $account = Account::query()->create(['email' => 'one@example.test']);
+        $connections = [];
+        Event::listen(QueryExecuted::class, function (QueryExecuted $query) use (&$connections): void {
+            $connections[] = $query->connectionName;
+        });
+        $this->recordMirroredEvents();
+
+        $account->update(['email' => 'two@example.test']);
+
+        $this->assertMirrored(Person::class, ModelEvent::Updated, fn (Model $person) => $person->getAttribute('email') === 'two@example.test');
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(['tenant'], array_values(array_unique($connections)));
+    }
+
+    #[Test]
     public function it_raises_a_unique_violation_for_an_insert_or_ignore_through_the_view_that_conflicts(): void
     {
         $taken = $this->widget()->refresh()->getAttribute('uuid');
@@ -667,6 +724,12 @@ final class EventBridgeOutsideTransactionTest extends TestCase
 
         $this->assertSame(1, DB::table('retained_widgets')->count());
         $this->assertSame(0, DB::transactionLevel());
+    }
+
+    private function switchTheDefaultConnection(): void
+    {
+        config()->set('database.connections.tenant', config('database.connections.pgsql'));
+        DB::setDefaultConnection('tenant');
     }
 
     private function listenBeforeTheBridge(Closure $listener): void

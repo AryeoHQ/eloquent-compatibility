@@ -71,7 +71,7 @@ An application trigger can write through a second compatibility view inside the 
 
 **Rule.** When a current record changes, every map with a previous model over that record's table on the same connection raises its previous model's events. That holds when another map names a different model class over the same table. A map whose current model of that table name uses another connection raises nothing, and the bridge sends it no query.
 
-**Why.** Two previous models can read one current row, so a write through either side must reach the listeners of both. The bridge finds a model's own maps by its exact class. It finds the other maps over the record's table by the write's connection and the table, whatever class they name. Two connections can each hold a table of one name, and those tables share no row. A model without a connection name counts under the default connection's name, so registration still needs no database.
+**Why.** Two previous models can read one current row, so a write through either side must reach the listeners of both. The bridge finds a model's own maps by its exact class. It finds the other maps over the record's table by the write's connection and the table, whatever class they name. Two connections can each hold a table of one name, and those tables share no row. A model without a connection name counts under the default connection at the write, not at registration, so registration still needs no database.
 
 **Code that must agree.** `AffectedRecords::acrossMaps()`, `MirrorIndex::forRelation()`, `MirrorIndex::add()` and `KeyTranslator::previousKeys()`. `AffectedRecords::of()` also hands `AffectedRecords::acrossMaps()` the current model's own record in each of its maps, and leaves that record out of the result.
 
