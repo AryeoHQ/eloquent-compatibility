@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
@@ -281,6 +282,38 @@ final class CompilerTest extends TestCase
             "Compatibility map 'widgets' is declared wrongly: gadgets.code is NOT NULL without a default, and an insert through widgets leaves it empty; map an attribute to it or fill it with fillWhenCreatedFromPrevious()",
         );
         $this->assertNull(DB::scalar("select to_regclass('widgets')"));
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    #[Test]
+    #[TestWith(["create domain widget_label as text not null default 'Unlabelled'", 'dependent', 'gadget_sites', ['title' => 'Defaulted', 'latitude' => 1.5]])]
+    #[TestWith(["create domain widget_label as text not null default 'Unlabelled'", 'primary', 'gadgets', ['title' => 'Defaulted', 'label' => null]])]
+    #[TestWith(["create domain widget_label as text not null default 'Unlabelled'", 'writesTo', 'gadgets', ['title' => 'Defaulted']])]
+    #[TestWith(["create domain widget_label_base as text not null default 'Unlabelled'; create domain widget_label as widget_label_base", 'dependent', 'gadget_sites', ['title' => 'Defaulted', 'latitude' => 1.5]])]
+    public function it_writes_the_default_of_a_not_null_domain_to_a_current_column_that_an_insert_through_the_view_leaves_null(string $domains, string $target, string $table, array $values): void
+    {
+        $this->installWithLabel($domains, $target, $table);
+
+        DB::table('widgets')->insert($values);
+
+        $this->assertSame(['Unlabelled'], DB::table($table)->pluck('label')->all());
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    #[Test]
+    #[TestWith(['dependent', 'gadget_sites', ['title' => 'Refused', 'latitude' => 1.5]])]
+    #[TestWith(['primary', 'gadgets', ['title' => 'Refused', 'label' => null]])]
+    public function it_refuses_a_null_to_a_current_column_whose_domain_is_not_null_without_a_default(string $target, string $table, array $values): void
+    {
+        $this->installWithLabel('create domain widget_label as text not null', $target, $table);
+
+        $this->assertThrows(fn () => DB::table('widgets')->insert($values), QueryException::class, 'domain widget_label does not allow null values');
+
+        $this->assertSame([0, 0], [DB::table('gadgets')->count(), DB::table('retained_widgets')->count()]);
     }
 
     #[Test]
@@ -894,6 +927,24 @@ final class CompilerTest extends TestCase
                 })::class)->aliasedAs('another_place_with_a_long_name')->primaryForeignKey('gadget_id')->designatedBy('place_id'),
             ]],
         ][$case]);
+    }
+
+    private function installWithLabel(string $domains, string $target, string $table): void
+    {
+        DB::statement('drop domain if exists widget_label, widget_label_base cascade');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop domain if exists widget_label, widget_label_base cascade');
+        });
+        DB::unprepared($domains);
+        DB::statement("alter table {$table} add column label widget_label");
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            match ($target) {
+                'dependent' => Attribute::mapped('label')->asType('text')->storedAs('site', 'label'),
+                'primary' => Attribute::mapped('label')->asType('text')->storedAs('gadget', 'label'),
+                default => Attribute::mapped('label')->asType('text')->readAs('gadget', 'gadget.label')->writesTo('gadget', 'label', 'upper(NEW.label)'),
+            },
+        ]]));
     }
 
     /**

@@ -35,6 +35,7 @@ final class ColumnCatalog
                 $row->not_null === true,
                 $row->generated === true,
                 $row->always_generated === true,
+                $row->base_type === null ? null : (string) $row->base_type,
             );
         }
 
@@ -52,7 +53,8 @@ final class ColumnCatalog
                          when table_column.attgenerated = \'\' then coalesce(pg_get_expr(column_default.adbin, column_default.adrelid), column_domain.inherited_default) end as "default",
                     table_column.attnotnull or column_domain.inherited_not_null as not_null,
                     table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
-                    table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated
+                    table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated,
+                    column_domain.base_type
              from pg_attribute table_column
              join pg_class table_relation on table_relation.oid = table_column.attrelid
              join pg_namespace table_schema on table_schema.oid = table_relation.relnamespace
@@ -66,7 +68,8 @@ final class ColumnCatalog
                      where declared.typtype = \'d\'
                  )
                  select (array_agg(pg_get_expr(declared.typdefaultbin, 0) order by domain_chain.depth) filter (where declared.typdefaultbin is not null))[1] as inherited_default,
-                        coalesce(bool_or(declared.typnotnull), false) as inherited_not_null
+                        coalesce(bool_or(declared.typnotnull), false) as inherited_not_null,
+                        (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = \'d\'
              ) column_domain
              where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped

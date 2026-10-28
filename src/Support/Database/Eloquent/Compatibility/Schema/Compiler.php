@@ -485,7 +485,11 @@ final class Compiler
             if (! $mappedOnly || ! $assignment->attribute->retained) {
                 $value = $this->value($resolvedMap, $alias, $assignment->targetColumn);
                 $column = $this->columnCatalog->of($resolvedMap->table($alias))[$assignment->targetColumn->column];
-                $values[$assignment->targetColumn->column] = $column->notNull && $column->default !== null ? 'COALESCE('.$value.', '.$column->default.')' : $value;
+                $values[$assignment->targetColumn->column] = match (true) {
+                    ! $column->notNull || $column->default === null => $value,
+                    $column->baseType === null => 'COALESCE('.$value.', '.$column->default.')',
+                    default => 'CAST((COALESCE(CAST(('.$assignment->targetColumn->expression.') AS '.$column->baseType.'), '.$column->default.')) AS '.$column->type.')',
+                };
             }
         }
 
