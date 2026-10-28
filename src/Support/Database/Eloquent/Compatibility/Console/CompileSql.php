@@ -59,7 +59,8 @@ final class CompileSql extends Command
             $header[] = "-- The grants are derived from the grants on {$table} and the map's attribute columns, because the view {$resolvedMap->previousModel->view} does not exist yet, and they omit the grants to {$server->role}, the role this command ran as, as install() omits the role it runs as";
         }
 
-        $sql = implode("\n", $header)."\n\n".implode("\n\n", array_map(fn (string $statement) => $statement.';', $statements))."\n";
+        $header = array_map(fn (string $line) => str_replace(["\r", "\n"], ['\\r', '\\n'], $line), $header);
+        $sql = implode("\n", $header)."\n\n".implode("\n\n", array_map(fn (string $statement) => $statement."\n;", $statements))."\n";
 
         if (! is_string($file) || $file === '') {
             $this->output->write($sql, false, OutputStyle::OUTPUT_RAW);

@@ -132,7 +132,7 @@ final readonly class Installer
             }
         }
 
-        return [...$this->dropStatements($resolvedMap), ...($view === null ? [] : ['DROP VIEW '.$view]), ...$compiledSql->statements(), ...$this->revokeStatements($resolvedMap)];
+        return [...$this->dropStatements($resolvedMap, $sources), ...($view === null ? [] : ['DROP VIEW '.$view]), ...$compiledSql->statements(), $this->revokeStatement($resolvedMap)];
     }
 
     /**
@@ -142,24 +142,33 @@ final readonly class Installer
     {
         $view = $this->relation($resolvedMap->previousModel->view);
 
-        return $view === null ? $this->dropStatements($resolvedMap) : [...$this->dropStatements($resolvedMap), 'DROP VIEW '.$view];
+        return $view === null ? $this->dropStatements($resolvedMap, []) : [...$this->dropStatements($resolvedMap, []), 'DROP VIEW '.$view];
     }
 
     /**
+     * @param  array<string, string>  $sources
      * @return list<string>
      */
-    private function dropStatements(ResolvedMap $resolvedMap): array
+    private function dropStatements(ResolvedMap $resolvedMap, array $sources): array
     {
         $prefix = SqlFragments::like($resolvedMap->objectPrefix());
         $statements = [];
+        $relation = 'table_trigger.tgrelid::regclass::text';
+        $bindings = [];
+
+        foreach ($sources as $table => $source) {
+            $relation = "case when trigger_relation.relname = ? then quote_ident(?) else {$relation} end";
+            $bindings = [$source, $table, ...$bindings];
+        }
 
         $triggers = $this->connection->select(
-            "select table_trigger.tgname as name, table_trigger.tgrelid::regclass::text as relation
+            "select table_trigger.tgname as name, {$relation} as relation
              from pg_trigger table_trigger join pg_proc trigger_function on trigger_function.oid = table_trigger.tgfoid
              join pg_class trigger_relation on trigger_relation.oid = table_trigger.tgrelid
              where not table_trigger.tgisinternal and table_trigger.tgname like {$prefix}
                and trigger_function.pronamespace = to_regnamespace(quote_ident(current_schema()))
                and trigger_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))",
+            $bindings,
         );
 
         foreach ($triggers as $trigger) {
@@ -177,22 +186,15 @@ final readonly class Installer
         return $statements;
     }
 
-    /**
-     * @return list<string>
-     */
-    private function revokeStatements(ResolvedMap $resolvedMap): array
+    private function revokeStatement(ResolvedMap $resolvedMap): string
     {
-        $view = SqlFragments::identifier($resolvedMap->previousModel->view);
+        $view = SqlFragments::literal(SqlFragments::identifier($resolvedMap->previousModel->view)).'::regclass';
 
-        $grantees = $this->connection->select(
-            "select distinct CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END as grantee
-             from pg_default_acl default_privilege, aclexplode(default_privilege.defaclacl) privilege
-             where default_privilege.defaclrole = (select oid from pg_roles where rolname = current_user) and default_privilege.defaclobjtype = 'r'
-               and default_privilege.defaclnamespace in (0::oid, to_regnamespace(quote_ident(current_schema()))::oid) and privilege.grantee <> default_privilege.defaclrole
-             order by 1",
-        );
-
-        return array_map(fn (object $grantee) => 'REVOKE ALL ON '.$view.' FROM '.$grantee->grantee, array_values($grantees));
+        return "DO \$compatibility\$\nDECLARE\n  revoked text;\nBEGIN\n"
+            ."  FOR revoked IN SELECT DISTINCT CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(privilege.grantee)) END\n"
+            ."    FROM pg_catalog.pg_class relation, pg_catalog.aclexplode(relation.relacl) privilege\n"
+            ."    WHERE relation.oid = {$view} AND privilege.grantee <> relation.relowner\n"
+            ."  LOOP\n    EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s', {$view}, revoked);\n  END LOOP;\nEND;\n\$compatibility\$";
     }
 
     /**

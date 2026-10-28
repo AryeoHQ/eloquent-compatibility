@@ -17,7 +17,11 @@ use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
+use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\ItemCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
@@ -141,6 +145,63 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_compiles_a_recompile_before_the_rename_with_the_name_the_retained_table_takes_after_it(): void
+    {
+        $map = $this->widgetsRefusedOnTheRetainedTable();
+        resolve(CompatibilityMaps::class)->register($map);
+        resolve(Installer::class)->install($map);
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO legacy_widgets');
+
+        $output = $this->compile(['--for' => 'recompile', '--retained-table-is-currently' => 'legacy_widgets']);
+
+        DB::unprepared('ALTER TABLE legacy_widgets RENAME TO retained_widgets');
+        $executed = $this->executed(fn () => resolve(Installer::class)->recompile($map));
+
+        $this->assertContains('DROP TRIGGER IF EXISTS "compatibility__widgets__refuse_blocked_sku" ON retained_widgets', $executed);
+        $this->assertSame($executed, $this->statements($output));
+    }
+
+    #[Test]
+    public function it_keeps_a_header_value_with_a_line_break_on_its_own_comment_line(): void
+    {
+        $schema = "Tenant\r\nDROP TABLE gadgets";
+        $searchPath = (string) DB::scalar('show search_path');
+        DB::statement('create schema '.SqlFragments::identifier($schema));
+
+        try {
+            DB::statement('set search_path to '.SqlFragments::identifier($schema).', '.$searchPath);
+            Tables::create();
+            DB::unprepared('ALTER TABLE retained_widgets RENAME TO '.SqlFragments::identifier("legacy\nwidgets"));
+
+            $output = $this->compile(['--retained-table-is-currently' => "legacy\nwidgets"]);
+        } finally {
+            DB::statement('set search_path to '.$searchPath);
+        }
+
+        $this->assertNotEmpty($this->statements($output));
+        $this->assertStringContainsString('-- Read from database '.DB::connection()->getDatabaseName().', schema Tenant\r\nDROP TABLE gadgets (search path', $output);
+        $this->assertStringContainsString('-- The retained table retained_widgets was read from legacy\nwidgets, its name before the rename', $output);
+    }
+
+    #[Test]
+    public function it_terminates_a_statement_that_ends_in_a_line_comment(): void
+    {
+        resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap(['sku' => Attribute::retained('sku')->defaultsTo("'SKU-0' -- explanation")]));
+        $file = (string) tempnam(sys_get_temp_dir(), 'compatibility');
+
+        try {
+            $this->artisan('compatibility:sql', ['map' => 'widgets', '--output' => $file])->assertSuccessful();
+            DB::unprepared((string) file_get_contents($file));
+        } finally {
+            File::delete($file);
+        }
+
+        $id = DB::table('widgets')->insertGetId(['title' => 'First']);
+
+        $this->assertSame('SKU-0', DB::table('widgets')->where('id', $id)->value('sku'));
+    }
+
+    #[Test]
     public function it_writes_the_statements_to_the_output_file(): void
     {
         $file = (string) tempnam(sys_get_temp_dir(), 'compatibility');
@@ -258,7 +319,7 @@ final class CompileSqlTest extends TestCase
     #[TestWith(['install', ''])]
     #[TestWith(['recompile', 'in schema public'])]
     #[TestWith(['recompile', ''])]
-    public function it_prints_the_revokes_of_the_grants_the_default_privileges_give_the_view(string $for, string $scope): void
+    public function it_prints_the_revoke_of_the_grants_the_default_privileges_give_the_view(string $for, string $scope): void
     {
         if ($for === 'recompile') {
             resolve(Installer::class)->install(new WidgetCompatibilityMap);
@@ -275,16 +336,47 @@ final class CompileSqlTest extends TestCase
             DB::statement("alter default privileges {$scope} revoke delete on tables from pg_monitor");
         }
 
-        $revokes = array_keys(array_filter($printed, fn (string $statement) => str_starts_with($statement, 'REVOKE ALL ON "widgets" ')));
+        $revokes = array_keys(array_filter($printed, fn (string $statement) => str_starts_with($statement, 'DO ')));
         $grants = array_keys(array_filter($printed, fn (string $statement) => str_starts_with($statement, 'GRANT ')));
         $created = array_search('CREATE OR REPLACE VIEW', array_map(fn (string $statement) => substr($statement, 0, 22), $printed), true);
 
         $this->assertSame($executed, $printed);
-        $this->assertSame(['REVOKE ALL ON "widgets" FROM PUBLIC', 'REVOKE ALL ON "widgets" FROM pg_monitor'], $this->sorted(array_map(fn (int $index) => $printed[$index], $revokes)));
+        $this->assertCount(1, $revokes);
         $this->assertIsInt($created);
-        $this->assertGreaterThan($created, min($revokes));
-        $this->assertGreaterThan(max($revokes), min($grants));
+        $this->assertGreaterThan($created, $revokes[0]);
+        $this->assertGreaterThan($revokes[0], min($grants));
         $this->assertFalse(DB::scalar("select has_table_privilege('pg_monitor', 'widgets', 'DELETE')"));
+    }
+
+    #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    public function it_revokes_a_default_privilege_granted_after_the_statements_were_printed(string $for): void
+    {
+        if ($for === 'recompile') {
+            resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        }
+
+        $printed = $this->statements($this->compile(['--for' => $for]));
+        DB::statement('alter default privileges grant delete on tables to pg_monitor');
+        DB::statement('alter default privileges in schema public grant truncate on tables to public');
+
+        try {
+            foreach ($printed as $statement) {
+                DB::unprepared($statement);
+            }
+        } finally {
+            DB::statement('alter default privileges revoke delete on tables from pg_monitor');
+            DB::statement('alter default privileges in schema public revoke truncate on tables from public');
+        }
+
+        $grants = DB::select(
+            "select case when privilege.grantee = 0 then 'PUBLIC' else pg_get_userbyid(privilege.grantee)::text end || ' ' || privilege.privilege_type || case when privilege.is_grantable then ' WITH GRANT OPTION' else '' end as grant
+             from pg_class relation, aclexplode(relation.relacl) privilege
+             where relation.oid = 'widgets'::regclass and privilege.grantee <> relation.relowner",
+        );
+
+        $this->assertSame(['PUBLIC SELECT', 'pg_monitor INSERT WITH GRANT OPTION'], $this->sorted(array_map(fn (object $grant) => (string) $grant->grant, $grants)));
     }
 
     #[Test]
@@ -346,6 +438,53 @@ final class CompileSqlTest extends TestCase
         }
     }
 
+    private function widgetsRefusedOnTheRetainedTable(): CompatibilityMap
+    {
+        return new class implements CompatibilityMap
+        {
+            private WidgetCompatibilityMap $base;
+
+            public function __construct()
+            {
+                $this->base = new WidgetCompatibilityMap;
+            }
+
+            public function name(): string
+            {
+                return $this->base->name();
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return $this->base->previousModel();
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return $this->base->primaryCurrentModel();
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return $this->base->dependentCurrentModels();
+            }
+
+            public function attributes(): array
+            {
+                return $this->base->attributes();
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return [
+                    ...$this->base->unrepresentableStates(),
+                    UnrepresentableState::refuse('blocked_sku', 'a blocked sku', 'A blocked sku has no widget.', 'Choose another sku.')
+                        ->checkedOn('widget', "widget.sku = 'BLOCKED'"),
+                ];
+            }
+        };
+    }
+
     /**
      * @param  array<string, string>  $options
      */
@@ -367,9 +506,9 @@ final class CompileSqlTest extends TestCase
             $this->assertStringStartsWith('-- ', $line);
         }
 
-        $this->assertStringEndsWith(";\n", $body);
+        $this->assertStringEndsWith("\n;\n", $body);
 
-        return explode(";\n\n", substr($body, 0, -2));
+        return explode("\n;\n\n", substr($body, 0, -3));
     }
 
     /**
