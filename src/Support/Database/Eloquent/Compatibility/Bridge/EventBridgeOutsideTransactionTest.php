@@ -393,13 +393,13 @@ final class EventBridgeOutsideTransactionTest extends TestCase
 
         $this->assertThrows(
             function () use ($widget, $beginning, $finishing): void {
-                Event::until("eloquent.{$beginning}: ".Widget::class, $widget);
+                $this->fire($widget, $beginning);
                 match ($beginning) {
                     'creating' => Widget::query()->insert(['title' => 'Unmarked']),
                     'updating' => Widget::query()->whereKey($widget->getKey())->update(['title' => 'Unmarked']),
                     default => Widget::query()->whereKey($widget->getKey())->forceDelete(),
                 };
-                Event::dispatch("eloquent.{$finishing}: ".Widget::class, $widget);
+                $this->fire($widget, $finishing);
             },
             CompatibilityEventMirrorBypassed::class,
             'The '.Widget::class." write that fired '{$finishing}' reached the database on a statement HasCompatibility never marked, so the event bridge mirrored none of it.",
@@ -551,6 +551,11 @@ final class EventBridgeOutsideTransactionTest extends TestCase
                 $this->concurrentOutcome = (string) $e->getCode();
             }
         });
+    }
+
+    private function fire(Model $model, string $event): void
+    {
+        (fn () => $this->fireModelEvent($event, in_array($event, ['creating', 'updating', 'deleting'], true)))->call($model);
     }
 
     private function widget(): Widget

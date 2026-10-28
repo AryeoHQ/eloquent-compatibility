@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
@@ -43,6 +44,7 @@ use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetItem;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
+use Tests\Fixtures\Support\Workbench\GadgetUpdating;
 use Tests\Fixtures\Support\Workbench\ItemCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Journal;
 use Tests\Fixtures\Support\Workbench\LegacyItem;
@@ -291,6 +293,73 @@ final class EventBridgeTest extends TestCase
             ['Renamed by the listener', [ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved]],
         ], array_map(fn (RecordMirrored $event) => [$event->destination->getAttribute('title'), $event->events], $this->mirroredEvents()));
         $this->assertSame($first->getKey(), $this->mirroredEvents()[2]->destination->getAttribute('gadget_id'));
+    }
+
+    #[Test]
+    public function it_mirrors_an_update_whose_custom_updating_event_listener_returns_a_value(): void
+    {
+        $gadget = (new class extends CompatibleModel
+        {
+            use SoftDeletes;
+
+            public $incrementing = false;
+
+            protected $keyType = 'string';
+
+            protected $guarded = [];
+
+            protected $dispatchesEvents = ['updating' => GadgetUpdating::class];
+        })::class;
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->respelled(Widget::class, $gadget)));
+        $this->widget();
+        Event::listen(GadgetUpdating::class, fn (GadgetUpdating $updating) => $updating->gadget->getKey());
+        $this->recordMirroredEvents();
+
+        $gadget::query()->firstOrFail()->update(['name' => 'Renamed']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget) => $widget->title === 'Renamed');
+        $this->assertCount(1, $this->mirroredEvents());
+    }
+
+    #[Test]
+    public function it_mirrors_both_writes_when_an_updating_listener_saves_a_child_that_touches_the_same_instance(): void
+    {
+        $site = (new class extends CompatibleModel
+        {
+            public $incrementing = false;
+
+            protected $table = 'gadget_sites';
+
+            protected $keyType = 'string';
+
+            protected $guarded = [];
+
+            /**
+             * @return BelongsTo<Gadget, $this>
+             */
+            public function gadget(): BelongsTo
+            {
+                return $this->belongsTo(Gadget::class);
+            }
+        })::class;
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->withSite($site)));
+        $this->widget();
+        $gadget = Gadget::query()->firstOrFail();
+        $child = $site::query()->firstOrFail()->setRelation('gadget', $gadget)->setTouchedRelations(['gadget']);
+        $saved = false;
+        Event::listen('eloquent.updating: '.Gadget::class.'*', function (string $name, array $payload) use ($gadget, $child, &$saved): void {
+            if (! $saved && $payload[0] === $gadget) {
+                $saved = true;
+                $child->setAttribute('latitude', 2.0)->save();
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $gadget->update(['name' => 'Renamed']);
+
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget, RecordMirrored $event) => (float) $event->rowBefore['latitude'] === 47.5 && (float) $widget->getAttribute('latitude') === 2.0);
+        $this->assertMirrored(Widget::class, ModelEvent::Updated, fn (Widget $widget, RecordMirrored $event) => $event->rowBefore['title'] === 'Blue gadget' && $widget->title === 'Renamed');
+        $this->assertCount(2, $this->mirroredEvents());
     }
 
     #[Test]
@@ -1227,6 +1296,50 @@ final class EventBridgeTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['primary', 'class'])]
+    #[TestWith(['dependent', 'subclass'])]
+    public function it_refuses_to_mirror_a_map_whose_model_redeclares_the_method_the_trait_sees_its_model_events_through(string $role, string $declaredIn): void
+    {
+        $model = $declaredIn === 'class'
+            ? (new class extends Model implements Compatible
+            {
+                use HasCompatibility;
+
+                protected $table = 'gadgets';
+
+                /**
+                 * @param  string  $event
+                 * @param  bool  $halt
+                 * @return mixed
+                 */
+                protected function fireModelEvent($event, $halt = true)
+                {
+                    return parent::fireModelEvent($event, $halt);
+                }
+            })::class
+            : (new class extends CompatibleModel
+            {
+                /**
+                 * @param  string  $event
+                 * @param  bool  $halt
+                 * @return mixed
+                 */
+                protected function fireModelEvent($event, $halt = true)
+                {
+                    return parent::fireModelEvent($event, $halt);
+                }
+            })::class;
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming($role, $model))),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: {$model} resolves fireModelEvent() to {$model}::fireModelEvent(), not to the method of ".HasCompatibility::class.', so the event bridge never sees its model events and would mirror none of its writes; remove that declaration.',
+        );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+    }
+
+    #[Test]
     public function it_mirrors_a_map_whose_model_inherits_the_trait_from_the_class_it_extends(): void
     {
         $model = (new class extends CompatibleModel {})::class;
@@ -1339,6 +1452,53 @@ final class EventBridgeTest extends TestCase
             public function dependentCurrentModels(): array
             {
                 return [...$this->base->dependentCurrentModels(), ...$this->dependents];
+            }
+
+            public function attributes(): array
+            {
+                return $this->base->attributes();
+            }
+
+            public function unrepresentableStates(): array
+            {
+                return $this->base->unrepresentableStates();
+            }
+        };
+    }
+
+    /**
+     * @param  class-string<Model>  $site
+     */
+    private function withSite(string $site): CompatibilityMap
+    {
+        return new readonly class(new WidgetCompatibilityMap, $site) implements CompatibilityMap
+        {
+            /**
+             * @param  class-string<Model>  $site
+             */
+            public function __construct(private WidgetCompatibilityMap $base, private string $site) {}
+
+            public function name(): string
+            {
+                return $this->base->name();
+            }
+
+            public function previousModel(): PreviousModel
+            {
+                return $this->base->previousModel();
+            }
+
+            public function primaryCurrentModel(): PrimaryCurrentModel
+            {
+                return $this->base->primaryCurrentModel();
+            }
+
+            public function dependentCurrentModels(): array
+            {
+                return array_map(
+                    fn (DependentCurrentModel $dependent) => (string) $dependent->alias === 'site' ? DependentCurrentModel::for($this->site)->aliasedAs('site')->primaryForeignKey('gadget_id') : $dependent,
+                    $this->base->dependentCurrentModels(),
+                );
             }
 
             public function attributes(): array

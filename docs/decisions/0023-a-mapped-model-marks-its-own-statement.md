@@ -14,13 +14,21 @@ Every model of a mirrored map implements `Compatible` and uses `HasCompatibility
 
 The user chose this design on 2026-10-27, over a design on the connection alone.
 
+The trait also overrides `Model::fireModelEvent()`, and hands every model event to `EventBridge::fireModelEvent()`. The bridge so sees each dispatch start and end, whatever its listeners return. It begins a write at the start of the beginning event, and forgets it only when the dispatch returns false or throws. A finishing event pairs with the instance's write at the same dispatch depth. `EventBridge::mirror()` refuses a model whose `fireModelEvent()` resolves to another declaration, like the other two.
+
+The user chose this third hook on 2026-10-28, over listeners on the dispatcher. Two critics found that the listeners missed writes and left state behind:
+
+- A direct listener that returns a value stops the dispatch before a later listener runs. So does a `$dispatchesEvents` listener, after which Eloquent dispatches no string event. The bridge's own listener then never began the write, and the write mirrored nothing.
+- The listeners could not see a save end without its saved event, as a veto or an ignored `saveOrIgnore()` does. A per-instance count of saving events stood in for that, and a clean or vetoed save left it wrong. The next increment's write then stayed on the stack until termination.
+- A saved event with no write of its own, from a save with nothing to change or from `touchOwners()`, paired with an outer save's write and forgot it.
+
 ## Declined: a link from the connection alone
 
 A design on the connection alone would change no model. It cannot tell the two statements apart, for four reasons:
 
 1. Laravel hands the connection neither the model nor the Eloquent builder. `Model::newBaseQueryBuilder()` calls `Connection::query()` with no argument, and the Eloquent builder passes the base query only the table name.
 2. A listener's write through the same instance's `Model::newQuery()` comes down the same chain. It has the same connection and the same table, and it can bind the same key. Any test on the connection therefore guesses at the statement's shape, as the matcher did.
-3. Timing does not separate the two either. `Model::save()` builds its query before the saving event, so the model's own builder exists before the bridge begins. `Model::delete()` touches the model's owners between its deleting event and its own statement, at the same dispatch depth as that statement.
+3. Timing does not separate the two either. `Model::save()` builds its query before the saving event, so the model's own builder exists before the bridge begins. `Model::delete()` touches the model's owners between its deleting event and its own statement, outside any listener, as that statement is.
 4. The only code that runs in the model's own write method, after its beginning event and on no listener's query, is on the model.
 
 Two other designs were declined too:
@@ -30,8 +38,8 @@ Two other designs were declined too:
 
 ## Consequences
 
-- An application adds one interface and one `use` line to every mapped model. The package overrides two protected Laravel methods.
-- A model that declares either method itself cannot be mapped. A composite-key package that sets the save query's keys is one example.
+- An application adds one interface and one `use` line to every mapped model. The package overrides three protected Laravel methods.
+- A model that declares any of the three methods itself, or takes one from another trait, cannot be mapped. A composite-key package that sets the save query's keys is one example.
 - A future Laravel write method that calls neither method never claims its write. `HasCompatibilityTest::it_covers_each_public_instance_write_method_of_eloquent_with_a_test_of_its_own()` fails when Laravel adds a public write method that no test covers. At run time, the write's created, updated or deleted event refuses it, and inside a transaction the refusal rolls it back.
 - The bridge reads one thing from the SQL, the first keyword. So a `SELECT` that an earlier `beforeExecuting` callback runs cannot open the armed write.
 - The faked-dispatcher guard now throws before the statement, because the mark runs before it. A raw write runs no model method, so it never throws.

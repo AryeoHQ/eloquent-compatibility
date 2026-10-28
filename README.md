@@ -82,7 +82,7 @@ final class Widget extends Model implements Compatible
 }
 ```
 
-The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()` or `getAttributesForInsert()`.
+The trait marks each statement the model's own write methods send, so the event bridge mirrors that statement and no listener's. It also hands the bridge every model event through `fireModelEvent()`. `EventBridge::mirror()` refuses a map whose model lacks the interface or the trait, or declares its own `setKeysForSaveQuery()`, `getAttributesForInsert()` or `fireModelEvent()`.
 
 ### PHPStan rules
 The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An application that runs `tooling:phpstan:analyze` loads them, so it finds a model that breaks the contract before `EventBridge::mirror()` refuses that model at boot:
@@ -90,7 +90,7 @@ The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An app
 - `CompatibleMustUseHasCompatibility`: a model that implements `Compatible` uses `HasCompatibility`.
 - `HasCompatibilityMustImplementCompatible`: a model that uses `HasCompatibility` implements `Compatible`.
 - `HasCompatibilityMustOnlyBeOnModel`: only a `Model` subclass implements `Compatible` or uses `HasCompatibility`.
-- `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, resolves `setKeysForSaveQuery()` and `getAttributesForInsert()` to the trait's own methods. A declaration in the class or a parent fails, and so does a method another trait brings in.
+- `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, resolves `setKeysForSaveQuery()`, `getAttributesForInsert()` and `fireModelEvent()` to the trait's own methods. A declaration in the class or a parent fails, and so does a method another trait brings in.
 
 The rules skip anonymous classes. `EventBridge::mirror()` still checks those at boot.
 

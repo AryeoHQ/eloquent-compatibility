@@ -9,6 +9,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Events\NullDispatcher;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use ReflectionMethod;
@@ -42,9 +43,6 @@ final class EventBridge
     /** @var array<string, true> */
     private array $mirrored = [];
 
-    /** @var WeakMap<Model, int> */
-    private WeakMap $saving;
-
     /** @var WeakMap<Connection, true> */
     private WeakMap $watched;
 
@@ -54,6 +52,8 @@ final class EventBridge
 
     private int $savepoints = 0;
 
+    private int $depth = 0;
+
     public function __construct(
         private readonly Dispatcher $events,
         private readonly CompatibilityMaps $compatibilityMaps,
@@ -61,7 +61,6 @@ final class EventBridge
         $this->mirrorIndex = new MirrorIndex;
         $this->affectedRecords = new AffectedRecords($this->mirrorIndex);
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
-        $this->saving = new WeakMap;
         $this->watched = new WeakMap;
     }
 
@@ -83,12 +82,13 @@ final class EventBridge
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} does not implement ".Compatible::class.' and use '.HasCompatibility::class.", so the event bridge cannot tell the model's own statement from a listener's and would mirror none of its writes; implement the interface and use the trait in the model");
             }
 
-            foreach (['setKeysForSaveQuery', 'getAttributesForInsert'] as $method) {
+            foreach (['setKeysForSaveQuery', 'getAttributesForInsert', 'fireModelEvent'] as $method) {
                 $resolved = new ReflectionMethod($model, $method);
                 $marking = new ReflectionMethod(HasCompatibility::class, $method);
+                $consequence = $method === 'fireModelEvent' ? 'the event bridge never sees its model events and' : 'its own statement carries no mark and the event bridge';
 
                 if ($resolved->getFileName() !== $marking->getFileName() || $resolved->getStartLine() !== $marking->getStartLine()) {
-                    throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} resolves {$method}() to {$resolved->getDeclaringClass()->getName()}::{$method}(), not to the method of ".HasCompatibility::class.', so its own statement carries no mark and the event bridge would mirror none of its writes; remove that declaration');
+                    throw InvalidCompatibilityMap::because($resolvedMap->name, "{$model} resolves {$method}() to {$resolved->getDeclaringClass()->getName()}::{$method}(), not to the method of ".HasCompatibility::class.", so {$consequence} would mirror none of its writes; remove that declaration");
                 }
             }
         }
@@ -100,10 +100,7 @@ final class EventBridge
         }
 
         $this->mirrored[$resolvedMap->name] = true;
-
-        foreach ($this->mirrorIndex->add($resolvedMap, $mirror) as $model) {
-            $this->listen($model);
-        }
+        $this->mirrorIndex->add($resolvedMap, $mirror);
     }
 
     /**
@@ -121,6 +118,46 @@ final class EventBridge
         } finally {
             $this->disabled--;
         }
+    }
+
+    /**
+     * @param  callable(): mixed  $fire
+     */
+    public function fireModelEvent(Model&Compatible $model, string $event, callable $fire): mixed
+    {
+        $modelEvent = ModelEvent::tryFrom($event);
+
+        if ($modelEvent === null || ! $this->sees($model)) {
+            return $fire();
+        }
+
+        $connection = $model->getConnection();
+        $operation = $modelEvent->operation();
+        $pendingWrite = $operation === null ? null : $this->begin($connection, $model, $operation);
+
+        if ($operation === null) {
+            $this->finish($connection, $model, $modelEvent);
+        }
+
+        $this->depth++;
+
+        try {
+            $result = $fire();
+        } catch (Throwable $e) {
+            if ($pendingWrite !== null) {
+                $this->forget($connection, $pendingWrite);
+            }
+
+            throw $e;
+        } finally {
+            $this->depth--;
+        }
+
+        if ($pendingWrite !== null && ($result === false || $this->faked($model, $modelEvent))) {
+            $this->forget($connection, $pendingWrite);
+        }
+
+        return $result;
     }
 
     public function markOwnStatement(Model&Compatible $model, null|Builder $query = null): void
@@ -164,7 +201,6 @@ final class EventBridge
     public function releaseFailed(): void
     {
         $this->armed = [];
-        $this->saving = new WeakMap;
 
         foreach ($this->pendingWrites as $name => $pendingWrites) {
             $pendingWrite = $pendingWrites[0] ?? null;
@@ -176,70 +212,26 @@ final class EventBridge
         }
     }
 
-    /**
-     * @param  class-string<Model>  $model
-     */
-    private function listen(string $model): void
+    private function sees(Model $model): bool
     {
-        $saving = ModelEvent::Saving->for($model);
+        $dispatcher = Model::getEventDispatcher();
 
-        $this->events->listen($saving.'*', function (string $fired, array $payload) use ($saving): void {
-            $target = $payload[0] ?? null;
-
-            if ($fired === $saving && $target instanceof Model && $this->disabled === 0 && ! $this->eventReplayer->isReplaying($target)) {
-                $this->saving[$target] = ($this->saving[$target] ?? 0) + 1;
-            }
-        });
-
-        foreach (ModelEvent::beginning() as $event) {
-            $name = $event->for($model);
-            $operation = $event->operation();
-
-            $this->events->listen($name.'*', function (string $fired, array $payload) use ($name, $operation): void {
-                $target = $payload[0] ?? null;
-
-                if ($fired === $name && $target instanceof Model && $operation !== null) {
-                    $this->begin($target, $operation);
-                }
-            });
-        }
-
-        foreach ([ModelEvent::Created, ...ModelEvent::finishing()] as $event) {
-            $this->events->listen($event->for($model), fn (Model $target) => $this->finish($target, $event));
-        }
+        return $this->disabled === 0
+            && $dispatcher !== null
+            && ! $dispatcher instanceof NullDispatcher
+            && ! $this->eventReplayer->isReplaying($model)
+            && $this->mirrorIndex->forModel($model::class) !== [];
     }
 
-    private function begin(Model $model, Operation $operation): void
+    private function begin(Connection $connection, Model $model, Operation $operation): PendingMirroredWrite
     {
-        if ($this->disabled > 0 || $this->eventReplayer->isReplaying($model)) {
-            return;
-        }
-
-        $connection = $model->getConnection();
         $this->watch($connection);
         $this->finishFailed($connection);
         unset($this->armed[(string) $connection->getName()]);
-        // Only a save fires saving first; an increment fires no saved, so its write must leave at updated.
-        $saves = $operation !== Operation::Delete && $this->takeSaving($model);
-        $lastEvent = match (true) {
-            $operation === Operation::Delete => ModelEvent::Deleted,
-            $operation === Operation::Insert || $saves => ModelEvent::Saved,
-            default => ModelEvent::Updated,
-        };
-        $this->pendingWrites[$connection->getName()][] = new PendingMirroredWrite($model, $operation, Model::getEventDispatcher(), $lastEvent);
-    }
+        $pendingWrite = new PendingMirroredWrite($model, $operation, Model::getEventDispatcher(), $this->depth);
+        $this->pendingWrites[$connection->getName()][] = $pendingWrite;
 
-    private function takeSaving(Model $model): bool
-    {
-        $saving = $this->saving[$model] ?? 0;
-
-        if ($saving === 0) {
-            return false;
-        }
-
-        $this->saving[$model] = $saving - 1;
-
-        return true;
+        return $pendingWrite;
     }
 
     private function unclaimed(Connection $connection, Model $model): null|PendingMirroredWrite
@@ -365,52 +357,39 @@ final class EventBridge
             throw $e;
         }
 
-        $this->endTransaction($connection, $pendingWrite, true);
+        $this->close($connection, $pendingWrite, true);
     }
 
-    private function finish(Model $model, ModelEvent $event): void
+    private function finish(Connection $connection, Model $model, ModelEvent $event): void
     {
-        if ($this->disabled > 0) {
+        if (! in_array($event, [ModelEvent::Created, ...ModelEvent::finishing()], true)) {
             return;
         }
 
-        $connection = $model->getConnection();
-        $pendingWrite = $this->paired($connection, $model, $event);
+        $operation = match ($event) {
+            ModelEvent::Created => Operation::Insert,
+            ModelEvent::Updated => Operation::Update,
+            ModelEvent::Deleted => Operation::Delete,
+            default => null,
+        };
 
-        if ($pendingWrite === null) {
-            return;
-        }
-
-        if (! $pendingWrite->claimed && $event !== ModelEvent::Saved) {
-            $this->forget($connection, $pendingWrite);
-
-            throw CompatibilityEventMirrorBypassed::byUnmarkedStatement($model::class, $event, $this->maps($model));
-        }
-
-        if ($pendingWrite->pending && $pendingWrite->statementSent) {
-            $this->endTransaction($connection, $pendingWrite, true);
-        }
-
-        if ($event === $pendingWrite->lastEvent) {
-            $this->forget($connection, $pendingWrite);
-        }
-    }
-
-    private function paired(Connection $connection, Model $model, ModelEvent $event): null|PendingMirroredWrite
-    {
-        foreach (array_reverse($this->pendingWrites[(string) $connection->getName()] ?? []) as $pendingWrite) {
-            $completedBy = match ($pendingWrite->operation) {
-                Operation::Insert => ModelEvent::Created,
-                Operation::Update => ModelEvent::Updated,
-                Operation::Delete => ModelEvent::Deleted,
-            };
-
-            if ($pendingWrite->source === $model && ($event === $pendingWrite->lastEvent || $event === $completedBy)) {
-                return $pendingWrite;
+        foreach ($this->pendingWrites[(string) $connection->getName()] ?? [] as $pendingWrite) {
+            if ($pendingWrite->source !== $model || $pendingWrite->depth !== $this->depth || ($operation !== null && $pendingWrite->operation !== $operation)) {
+                continue;
             }
-        }
 
-        return null;
+            if ($operation !== null && ! $pendingWrite->claimed) {
+                $this->forget($connection, $pendingWrite);
+
+                throw CompatibilityEventMirrorBypassed::byUnmarkedStatement($model::class, $event, $this->maps($model));
+            }
+
+            if ($pendingWrite->pending && $pendingWrite->statementSent) {
+                $this->endTransaction($connection, $pendingWrite, true);
+            }
+
+            $this->forget($connection, $pendingWrite);
+        }
     }
 
     private function finishFailed(Connection $connection): void
@@ -493,18 +472,20 @@ final class EventBridge
 
     private function guard(Model $model): void
     {
-        $dispatcher = Model::getEventDispatcher();
         $maps = $this->maps($model);
 
-        if ($maps === [] || ! $dispatcher instanceof EventFake) {
-            return;
-        }
-
-        foreach (ModelEvent::beginning() as $event) {
-            if ($dispatcher->dispatched($event->for($model::class), fn (string $fired, mixed $payload) => $payload === $model)->isNotEmpty()) {
+        foreach ($maps === [] ? [] : ModelEvent::beginning() as $event) {
+            if ($this->faked($model, $event)) {
                 throw CompatibilityEventMirrorBypassed::byFakedDispatcher(Str::afterLast($model->getTable(), '.'), $maps);
             }
         }
+    }
+
+    private function faked(Model $model, ModelEvent $event): bool
+    {
+        $dispatcher = Model::getEventDispatcher();
+
+        return $dispatcher instanceof EventFake && $dispatcher->dispatched($event->for($model::class), fn (string $fired, mixed $payload) => $payload === $model)->isNotEmpty();
     }
 
     /**

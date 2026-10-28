@@ -25,7 +25,7 @@ A write that skips model events, such as a query builder update, still reaches t
 | resolved map | Mapping | `ResolvedMap::of()` | validates a map and answers every question about it |
 | registry | root | `CompatibilityMaps::register()`, `CompatibilityMaps::get()` | holds the application's maps by name |
 | schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()` | reads the catalog, compiles SQL and installs it in one transaction |
-| model contract | Contracts, Provides | `Compatible`, `HasCompatibility` | marks each mapped model's own statement for the event bridge |
+| model contract | Contracts, Provides | `Compatible`, `HasCompatibility` | marks each mapped model's own statement, and shows its model events to the event bridge |
 | PHPStan rules | Tooling\Database\Eloquent\Compatibility\PhpStan | `CompatibleMustUseHasCompatibility`, `HasCompatibilityMustImplementCompatible`, `HasCompatibilityMustOnlyBeOnModel`, `HasCompatibilityMustNotRedeclareWriteHooks` | report a model that breaks the model contract at analysis time |
 | event bridge | Bridge | `EventBridge::mirror()`, `EventBridge::withoutMirroring()` | mirrors model events across the two sides |
 | drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree |
@@ -52,7 +52,7 @@ flowchart LR
 
 Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php). `Widget` is the previous model and `Gadget` its primary current model.
 
-1. Eloquent fires `updating` on the widget, and `EventBridge::begin()` records a `PendingMirroredWrite`. It opens nothing yet.
+1. Eloquent fires `updating` on the widget through `HasCompatibility::fireModelEvent()`. Before any listener runs, `EventBridge::begin()` records a `PendingMirroredWrite`. It opens nothing yet.
 2. `Widget` uses `HasCompatibility`, so `HasCompatibility::setKeysForSaveQuery()` hands the widget's save query to `EventBridge::markOwnStatement()`. The bridge claims the pending write, and arms it when the query runs. Eloquent then sends `update "widgets" set ... where "id" = ?`, and the bridge's `beforeExecuting` callback opens the armed write on it.
 3. The bridge opens a transaction, or a savepoint when the caller already holds one.
 4. `AffectedRecords::before()` asks `AffectedRecords::of()` for every record the write can change: the gadget, its place and its site.
@@ -61,7 +61,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
 8. `QueryExecuted` reaches `EventBridge::handleQuery()`, which completes the open write. It reads no SQL.
 9. `EventBridge::complete()` reads each record again, and `EventReplayer::replay()` raises the gadget's `saving`, `updating`, `updated` and `saved` events.
-10. The bridge commits or releases its savepoint, and Eloquent fires the widget's own `updated` and `saved`. `EventBridge::finish()` pairs each with the pending write, and forgets the write at `saved`.
+10. The bridge commits or releases its savepoint and forgets the write. Eloquent then fires the widget's own `updated` and `saved`, and `EventBridge::finish()` finds no write of the widget left at their dispatch depth.
 
 The flows below take each step in depth:
 
@@ -83,7 +83,7 @@ Read the code in this order. Each step answers one question.
 5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first.
 6. `Installer` and `SqlFragments`: in what order does the SQL run, and how is a refusal raised?
 7. `CompatibilityWriteRefused`: how does a refusal become a PHP exception?
-8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement, and when does a pending write begin, complete, finish and fail?
+8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events, and when does a pending write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order are they locked?
 10. `EventReplayer`: how are native model events reproduced, and how are listeners excluded?
 11. `DriftQueries`: which five kinds of drift does the check find?

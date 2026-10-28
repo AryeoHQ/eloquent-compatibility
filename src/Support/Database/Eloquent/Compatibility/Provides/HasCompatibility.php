@@ -40,6 +40,22 @@ trait HasCompatibility
         return $attributes;
     }
 
+    /**
+     * @param  string  $event
+     * @param  bool  $halt
+     * @return mixed
+     */
+    protected function fireModelEvent($event, $halt = true)
+    {
+        $bridge = $this->compatibilityEventBridge();
+
+        if ($bridge === null) {
+            return parent::fireModelEvent($event, $halt);
+        }
+
+        return $bridge->fireModelEvent($this, $event, fn () => parent::fireModelEvent($event, $halt));
+    }
+
     private function compatibilityEventBridge(): null|EventBridge
     {
         $container = Container::getInstance();

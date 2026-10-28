@@ -4,11 +4,11 @@ This page is for the pull request that adds a compatibility map to an applicatio
 
 ## Mark each mapped model
 
-Every model a map names, the previous model and each current model, implements `Compatible` and uses `HasCompatibility`. The trait overrides `Model::setKeysForSaveQuery()` and `Model::getAttributesForInsert()`, and each override calls its parent first. Laravel calls them only inside the model's own write method, so the event bridge can tell the model's own statement from a listener's. [Decision 0023](decisions/0023-a-mapped-model-marks-its-own-statement.md) records why the mark lives on the model.
+Every model a map names, the previous model and each current model, implements `Compatible` and uses `HasCompatibility`. The trait overrides `Model::setKeysForSaveQuery()` and `Model::getAttributesForInsert()`, and each override calls its parent first. Laravel calls them only inside the model's own write method, so the event bridge can tell the model's own statement from a listener's. The trait also overrides `Model::fireModelEvent()`, so the bridge sees every model event of the model, whatever its listeners return. [Decision 0023](decisions/0023-a-mapped-model-marks-its-own-statement.md) records why the mark lives on the model.
 
 Two kinds of model cannot carry the mark:
 
-- **A model that declares either method itself**, takes it from another trait, or extends a class that does. PHP prefers the class's method to the trait's, so the statement goes unmarked. `EventBridge::mirror()` refuses such a model with `InvalidCompatibilityMap`. Before that, the `HasCompatibilityMustNotRedeclareWriteHooks` PHPStan rule reports a named class whose method resolves anywhere but `HasCompatibility`. A composite-key package that sets the save query's keys is one example.
+- **A model that declares any of the three methods itself**, takes one from another trait, or extends a class that does. PHP prefers the class's method to the trait's, so the statement goes unmarked, or the bridge never sees the model's events. `EventBridge::mirror()` refuses such a model with `InvalidCompatibilityMap`. Before that, the `HasCompatibilityMustNotRedeclareWriteHooks` PHPStan rule reports a named class whose method resolves anywhere but `HasCompatibility`. A composite-key package that sets the save query's keys is one example.
 - **A model whose own write method sends its statement through neither method**, such as an override of `performUpdate()` that builds its own query. The bridge cannot see that at registration. The write's created, updated or deleted event throws `CompatibilityEventMirrorBypassed`, which names the model and the event. Inside a transaction, the throw rolls the write back. Outside one, the write has already committed.
 
 [INV-50](invariants.md) records the rule.
@@ -89,7 +89,7 @@ An insert through the view writes every column an attribute stores. When the ins
 
 ## Tests that fake every event
 
-Once a model is mapped, a test that writes it under `Event::fake()` or `Event::fakeExcept()` throws `CompatibilityEventMirrorBypassed`. The throw comes before the statement, so the write never reaches the database. The fake swallows the beginning event the bridge listens for, so the other side's events never run and the test proves nothing about them. The guard stays on by default, because it is what stops silently lost mirrored events. [INV-21](invariants.md) records it.
+Once a model is mapped, a test that writes it under `Event::fake()` or `Event::fakeExcept()` throws `CompatibilityEventMirrorBypassed`. The throw comes before the statement, so the write never reaches the database. The fake swallows the beginning event, so no listener runs, the bridge forgets the write it began, and the test proves nothing about the other side. The guard stays on by default, because it is what stops silently lost mirrored events. [INV-21](invariants.md) records it.
 
 The pull request that adds each map moves every test it touches to one of two forms:
 

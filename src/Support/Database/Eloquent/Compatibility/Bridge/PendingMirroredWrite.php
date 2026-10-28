@@ -6,7 +6,6 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
-use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 
 final class PendingMirroredWrite
 {
@@ -27,6 +26,6 @@ final class PendingMirroredWrite
         public readonly Model $source,
         public readonly Operation $operation,
         public readonly null|Dispatcher $dispatcher,
-        public readonly ModelEvent $lastEvent,
+        public readonly int $depth,
     ) {}
 }

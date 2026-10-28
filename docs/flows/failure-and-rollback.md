@@ -52,7 +52,7 @@ A failed statement fires no `QueryExecuted`, so `EventBridge::complete()` never 
 3. **A queue worker's next loop.** `Provider::boot()` calls `EventBridge::releaseFailed()` on each `Looping` event.
 4. **Application termination.** `Provider::boot()` calls `EventBridge::releaseFailed()` from the terminating callbacks too.
 
-`EventBridge::releaseFailed()` forgets every write that holds no transaction: one whose statement never started, and one that completed. It then runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
+`EventBridge::releaseFailed()` forgets every write that holds no transaction, such as one whose statement never started. A completed write has already left the stack. It then runs `EventBridge::finishFailed()` for each connection with a pending write. `Provider::boot()` skips it when the application never resolved the bridge.
 
 Until one of the four happens, `Connection::transactionLevel()` still reports 1. `EventBridgeOutsideTransactionTest` names this a declared limit. `EventBridge::finishFailed()` leaves the write alone when the connection's level no longer sits one above it.
 

@@ -21,6 +21,7 @@ final class HasCompatibilityMustNotRedeclareWriteHooks extends Rule
     private const array METHODS = [
         'setKeysForSaveQuery',
         'getAttributesForInsert',
+        'fireModelEvent',
     ];
 
     /**

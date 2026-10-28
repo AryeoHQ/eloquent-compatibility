@@ -16,6 +16,7 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use ReflectionClass;
 use ReflectionMethod;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -33,6 +34,7 @@ use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
+use WeakReference;
 
 #[CoversClass(EventBridge::class)]
 #[CoversTrait(HasCompatibility::class)]
@@ -451,6 +453,138 @@ final class HasCompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_mirrors_both_updates_when_an_updating_listener_saves_the_same_instance_twice_and_then_changes_another_attribute(): void
+    {
+        $widget = $this->widget();
+        $this->writeThroughTheSameInstance('updating', Widget::class, function (Model $widget): void {
+            $widget->save();
+            $widget->save();
+            $widget->setAttribute('latitude', 2.0);
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertMirrored(GadgetSite::class, ModelEvent::Updated, fn (Model $site, RecordMirrored $event) => (float) ($event->rowBefore['latitude'] ?? null) === 47.5 && (float) $site->getAttribute('latitude') === 2.0);
+        $this->assertCount(2, $this->mirroredEvents());
+        $this->assertSame(['Renamed', 2.0], [DB::table('gadgets')->value('name'), (float) DB::table('gadget_sites')->value('latitude')]);
+    }
+
+    #[Test]
+    public function it_mirrors_an_update_whose_updating_listener_returns_a_value(): void
+    {
+        $widget = $this->widget();
+        Event::listen('eloquent.updating: '.Widget::class, fn (Widget $updating) => $updating->title !== 'Forbidden');
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertCount(1, $this->mirroredEvents());
+    }
+
+    #[Test]
+    public function it_holds_no_model_after_a_save_with_nothing_to_change_and_an_increment(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Unchanged', 'price_cents' => 100]);
+
+        $gadget->save();
+        $gadget->increment('price_cents');
+        $reference = WeakReference::create($gadget);
+        unset($gadget);
+
+        $this->assertReleased($reference);
+    }
+
+    #[Test]
+    public function it_holds_no_model_after_many_saves_with_nothing_to_change_and_their_increments(): void
+    {
+        $references = [];
+
+        foreach (range(1, 300) as $number) {
+            $gadget = Gadget::query()->create(['name' => "Gadget {$number}", 'price_cents' => 100]);
+            $gadget->save();
+            $gadget->increment('price_cents');
+            $references[] = WeakReference::create($gadget);
+        }
+
+        unset($gadget);
+
+        foreach ($references as $reference) {
+            $this->assertReleased($reference);
+        }
+    }
+
+    #[Test]
+    public function it_holds_no_model_after_a_save_an_updating_listener_vetoes_and_an_increment(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Original', 'price_cents' => 100]);
+        Event::listen('eloquent.updating: '.Gadget::class, fn (Gadget $updating) => $updating->name === 'Vetoed' ? false : null);
+
+        $gadget->name = 'Vetoed';
+        $this->assertFalse($gadget->save());
+        $gadget->name = 'Original';
+        $gadget->increment('price_cents');
+        $reference = WeakReference::create($gadget);
+        unset($gadget);
+
+        $this->assertSame([101, 'Original'], [DB::table('gadgets')->value('price_cents'), DB::table('gadgets')->value('name')]);
+        $this->assertReleased($reference);
+    }
+
+    #[Test]
+    public function it_holds_no_model_after_an_updating_listener_throws_and_an_increment(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Original', 'price_cents' => 100]);
+        Event::listen('eloquent.updating: '.Gadget::class, fn (Gadget $updating) => $updating->name === 'Thrown' ? throw new RuntimeException('Refused by a listener') : null);
+
+        $this->assertThrows(fn () => $gadget->update(['name' => 'Thrown']), RuntimeException::class, 'Refused by a listener');
+        $gadget->name = 'Original';
+        $gadget->increment('price_cents');
+        $reference = WeakReference::create($gadget);
+        unset($gadget);
+
+        $this->assertSame([101, 'Original'], [DB::table('gadgets')->value('price_cents'), DB::table('gadgets')->value('name')]);
+        $this->assertReleased($reference);
+    }
+
+    #[Test]
+    public function it_holds_no_model_after_a_save_vetoed_inside_the_same_instances_save_that_then_sends_no_statement(): void
+    {
+        $widget = $this->widget();
+        Event::listen('eloquent.updating: '.Widget::class, fn (Widget $updating) => $updating->title === 'Vetoed' ? false : null);
+        $this->writeThroughTheSameInstance('updating', Widget::class, function (Model $widget): void {
+            $widget->setAttribute('title', 'Vetoed')->save();
+            $widget->syncOriginal();
+        });
+
+        $widget->update(['title' => 'Renamed']);
+        $widget->setAttribute('title', 'Blue gadget')->syncOriginal();
+        $widget->increment('latitude');
+        $reference = WeakReference::create($widget);
+        unset($widget);
+
+        $this->assertSame(['Blue gadget', 48.5], [DB::table('gadgets')->value('name'), (float) DB::table('gadget_sites')->value('latitude')]);
+        $this->assertReleased($reference);
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_holds_no_model_after_an_ignored_save_or_ignore(): void
+    {
+        DB::statement('create unique index gadgets_name_unique on gadgets (name)');
+        Gadget::query()->create(['name' => 'Taken']);
+        $gadget = new Gadget(['name' => 'Taken']);
+
+        $this->assertFalse($gadget->saveOrIgnore());
+        $reference = WeakReference::create($gadget);
+        unset($gadget);
+
+        $this->assertReleased($reference);
+    }
+
+    #[Test]
     public function it_opens_an_armed_write_on_its_own_update_and_not_on_a_select_an_earlier_callback_runs_first(): void
     {
         DB::connection()->beforeExecuting(function (string $query): void {
@@ -478,13 +612,13 @@ final class HasCompatibilityTest extends TestCase
 
         $this->assertThrows(
             fn () => DB::transaction(function () use ($widget, $beginning, $finishing): void {
-                Event::until("eloquent.{$beginning}: ".Widget::class, $widget);
+                $this->fire($widget, $beginning);
                 match ($beginning) {
                     'creating' => Widget::query()->insert(['title' => 'Unmarked']),
                     'updating' => Widget::query()->whereKey($widget->getKey())->update(['title' => 'Unmarked']),
                     default => Widget::query()->whereKey($widget->getKey())->delete(),
                 };
-                Event::dispatch("eloquent.{$finishing}: ".Widget::class, $widget);
+                $this->fire($widget, $finishing);
             }),
             CompatibilityEventMirrorBypassed::class,
             'The '.Widget::class." write that fired '{$finishing}' reached the database on a statement HasCompatibility never marked, so the event bridge mirrored none of it.",
@@ -541,6 +675,11 @@ final class HasCompatibilityTest extends TestCase
         return $names[1];
     }
 
+    private function fire(Model $model, string $event): void
+    {
+        (fn () => $this->fireModelEvent($event, in_array($event, ['creating', 'updating', 'deleting'], true)))->call($model);
+    }
+
     private function widget(): Widget
     {
         return Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St', 'latitude' => 47.5])->refresh();
@@ -576,6 +715,16 @@ final class HasCompatibilityTest extends TestCase
     private function updateLatitudeThroughTheSameInstance(string $event, string $model): void
     {
         $this->writeThroughTheSameInstance($event, $model, fn (Model $record) => $record->newQuery()->whereKey($record->getKey())->update(['latitude' => 1.0]));
+    }
+
+    /**
+     * @param  WeakReference<Model>  $reference
+     */
+    private function assertReleased(WeakReference $reference): void
+    {
+        gc_collect_cycles();
+
+        $this->assertNull($reference->get(), 'The event bridge still holds the model after its writes returned.');
     }
 
     private function assertRenamedAndNotRelocated(): void
