@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
@@ -24,6 +25,7 @@ use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMa
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Tables;
+use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
@@ -358,6 +360,90 @@ final class InstallerTest extends TestCase
         $id = $this->widget();
 
         $this->assertSame($id, DB::table('widgets')->where('id', $id)->lockForUpdate()->sole()->id);
+    }
+
+    #[Test]
+    public function it_locks_the_retained_and_primary_rows_and_no_dependent_row_through_the_compatibility_view(): void
+    {
+        $id = $this->widget();
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+        $concurrent = DB::connection('concurrent');
+        $tables = ['retained_widgets', 'gadgets', 'gadget_places', 'gadget_sites'];
+
+        $locked = DB::transaction(function () use ($id, $concurrent, $tables): array {
+            Widget::query()->whereKey($id)->lockForUpdate()->firstOrFail();
+
+            return array_combine($tables, array_map(fn (string $table) => $this->lockOutcome($concurrent, $table), $tables));
+        });
+
+        $this->assertSame(
+            ['retained_widgets' => '55P03', 'gadgets' => '55P03', 'gadget_places' => 'free', 'gadget_sites' => 'free'],
+            $locked,
+            'Declared limit: the view reads each dependent through a scalar subquery, so FOR UPDATE locks only the rows of its FROM list.',
+        );
+    }
+
+    #[Test]
+    public function it_writes_the_current_tables_through_a_simple_view_over_the_compatibility_view(): void
+    {
+        $id = $this->widget();
+        DB::statement("create view widget_listings as select id, title, street, latitude, sku from widgets where status = 'Draft'");
+
+        $this->assertSame(
+            ['is_updatable' => 'NO', 'is_insertable_into' => 'NO'],
+            (array) DB::selectOne("select is_updatable, is_insertable_into from information_schema.views where table_name = 'widget_listings'"),
+            'Declared limit: the catalog reports no view over a view with INSTEAD OF triggers as updatable, though PostgreSQL rewrites its writes onto that view.',
+        );
+
+        $this->assertSame(1, DB::update("update widget_listings set title = 'Outer title', street = '2 Outer St', latitude = 12.5, sku = 'Outer sku' where id = ?", [$id]));
+
+        $this->assertSame(
+            ['Outer title', '2 Outer St', '12.500000000000', 'Outer sku'],
+            [DB::table('gadgets')->value('name'), DB::table('gadget_places')->value('street'), DB::table('gadget_sites')->value('latitude'), DB::table('retained_widgets')->value('sku')],
+        );
+        $this->assertWriteRefused(
+            fn () => DB::update('update widget_listings set id = 99 where id = ?', [$id]),
+            'refused a change to widgets.id',
+        );
+    }
+
+    #[Test]
+    public function it_writes_each_joined_row_with_its_own_values_through_an_update_from_values(): void
+    {
+        [$first, $second, $third] = [$this->widget(), $this->widget(), $this->widget()];
+
+        $updated = DB::update(
+            'update widgets set title = ordering.title, latitude = ordering.latitude, sku = ordering.sku
+             from (values (?::integer, ?, ?::double precision, ?), (?::integer, ?, ?::double precision, ?)) as ordering(id, title, latitude, sku)
+             where widgets.id = ordering.id',
+            [$first, 'First', 10.5, 'First sku', $second, 'Second', 20.5, 'Second sku'],
+        );
+
+        $this->assertSame(2, $updated);
+        $this->assertSame(
+            [[$first, 'First', 10.5, 'First sku'], [$second, 'Second', 20.5, 'Second sku'], [$third, 'Blue gadget', 47.5, null]],
+            DB::table('widgets')->orderBy('id')->get()->map(fn (object $widget) => [$widget->id, $widget->title, $widget->latitude, $widget->sku])->all(),
+        );
+        $this->assertSame(['Blue gadget', 'First', 'Second'], DB::table('gadgets')->orderBy('name')->pluck('name')->all());
+    }
+
+    #[Test]
+    public function it_raises_a_serialization_failure_when_an_update_from_values_joins_one_record_twice(): void
+    {
+        $id = $this->widget();
+
+        try {
+            DB::update(
+                'update widgets set title = ordering.title from (values (?::integer, ?), (?::integer, ?)) as ordering(id, title) where widgets.id = ordering.id',
+                [$id, 'First', $id, 'Second'],
+            );
+            $this->fail('Expected the second firing of the update trigger on one record to fail.');
+        } catch (QueryException $e) {
+            $this->assertSame('40001', $e->getCode(), 'Declared limit: the trigger fires once per joined row, and the second firing finds the record changed since its OLD row.');
+        }
+
+        $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $id)->value('title'));
     }
 
     #[Test]
@@ -981,6 +1067,17 @@ final class InstallerTest extends TestCase
     private function objects(string $catalog, string $column): int
     {
         return (int) DB::scalar("select count(*) from {$catalog} where {$column} like 'compatibility\\_\\_widgets\\_\\_%'");
+    }
+
+    private function lockOutcome(Connection $concurrent, string $table): string
+    {
+        try {
+            $concurrent->transaction(fn () => $concurrent->select('select 1 from '.SqlFragments::identifier($table).' for update nowait'));
+
+            return 'free';
+        } catch (QueryException $e) {
+            return (string) $e->getCode();
+        }
     }
 
     private function writeConcurrently(string $statement): InvokedProcess

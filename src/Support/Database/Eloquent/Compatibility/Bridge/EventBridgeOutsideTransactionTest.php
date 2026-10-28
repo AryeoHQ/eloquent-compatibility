@@ -9,8 +9,10 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PDOException;
@@ -37,6 +39,17 @@ use Tests\TestCase;
 final class EventBridgeOutsideTransactionTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
+
+    private const string CONCURRENT_STATEMENT = <<<'PHP'
+        $config = json_decode((string) getenv('CONCURRENT_CONNECTION'), true);
+        $connection = new PDO("pgsql:host={$config['host']};port={$config['port']};dbname={$config['database']}", $config['username'], $config['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $connection->exec("set application_name = 'compatibility_concurrent_reader'");
+        $connection->exec("set lock_timeout = '10s'");
+        $connection->exec("set deadlock_timeout = '100ms'");
+        $connection->beginTransaction();
+        $connection->exec((string) getenv('CONCURRENT_STATEMENT'));
+        $connection->commit();
+        PHP;
 
     private null|string $concurrentOutcome = null;
 
@@ -366,6 +379,106 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $widget->refresh()->update(['title' => 'After a failed commit']);
         $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'After a failed commit');
         $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_makes_a_bridged_update_wait_on_the_primary_row_a_lock_through_the_view_holds(): void
+    {
+        $widget = $this->widget();
+        $concurrent = $this->concurrentConnection();
+        $concurrent->beginTransaction();
+        Widget::on('concurrent')->whereKey($widget->getKey())->lockForUpdate()->firstOrFail();
+        DB::statement("set lock_timeout = '200ms'");
+
+        try {
+            $widget->update(['title' => 'Renamed']);
+            $this->fail('Expected the bridged update to wait on the locked record.');
+        } catch (QueryException $e) {
+            $this->assertSame(['55P03', 'select 1 from "gadgets" where "id" = ? for update'], [$e->getCode(), $e->getSql()]);
+        } finally {
+            DB::statement('reset lock_timeout');
+            $concurrent->rollBack();
+        }
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->recordMirroredEvents();
+        $widget->update(['title' => 'Renamed']);
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
+    public function it_does_not_deadlock_a_lock_through_the_view_against_a_bridged_update_of_the_same_record(): void
+    {
+        if (getenv('COMPATIBILITY_KNOWN_DEFECTS') !== '1') {
+            $this->markTestSkipped('Known defect: a lock through the view locks the retained row before the primary row, against the order of INV-1, so it deadlocks a bridged update of the same record with 40P01. Set COMPATIBILITY_KNOWN_DEFECTS=1 to run it.');
+        }
+
+        $widget = $this->widget();
+        $lock = Widget::query()->whereKey($widget->getKey())->lockForUpdate()->toRawSql();
+        $reader = null;
+        $this->concurrentConnection();
+        DB::connection()->beforeExecuting(function (string $query) use ($lock, &$reader): void {
+            if ($reader === null && str_starts_with($query, 'select 1 from "retained_widgets"')) {
+                $reader = $this->lockConcurrently($lock);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertInstanceOf(InvokedProcess::class, $reader);
+        $result = $reader->wait();
+        $this->assertTrue($result->successful(), $result->output().$result->errorOutput());
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_mirrors_a_create_and_the_update_its_created_listener_makes_to_the_same_instance(bool $inTransaction): void
+    {
+        if (getenv('COMPATIBILITY_KNOWN_DEFECTS') !== '1') {
+            $this->markTestSkipped("Known defect: Eloquent syncs a model's original only after its created event, so AffectedRecords::originalKey() finds no key for an update inside it, and the bridge mirrors that update to no record. Set COMPATIBILITY_KNOWN_DEFECTS=1 to run it.");
+        }
+
+        Event::listen('eloquent.created: '.Widget::class, fn (Widget $widget) => $widget->update(['title' => 'Slug of '.$widget->getKey()]));
+        $this->recordMirroredEvents();
+        $create = fn () => Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St']);
+
+        $widget = $inTransaction ? DB::transaction($create) : $create();
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getAttribute('name') === 'Blue gadget');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Slug of '.$widget->getKey());
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Slug of '.$widget->getKey(), DB::table('gadgets')->value('name'));
+    }
+
+    private function concurrentConnection(): Connection
+    {
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+
+        return DB::connection('concurrent');
+    }
+
+    private function lockConcurrently(string $statement): InvokedProcess
+    {
+        $reader = Process::env([
+            'CONCURRENT_CONNECTION' => (string) json_encode(config('database.connections.concurrent')),
+            'CONCURRENT_STATEMENT' => $statement,
+        ])->start([PHP_BINARY, '-r', self::CONCURRENT_STATEMENT]);
+
+        for ($attempt = 0; $attempt < 250 && $reader->running(); $attempt++) {
+            if (DB::connection('concurrent')->scalar("select exists (select 1 from pg_stat_activity where datname = current_database() and application_name = 'compatibility_concurrent_reader' and wait_event_type = 'Lock')") === true) {
+                return $reader;
+            }
+
+            usleep(20_000);
+        }
+
+        $result = $reader->wait();
+
+        $this->fail('The concurrent reader never waited on a lock. '.$result->output().$result->errorOutput());
     }
 
     /**
