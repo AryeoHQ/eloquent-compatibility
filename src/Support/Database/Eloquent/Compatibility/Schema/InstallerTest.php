@@ -251,6 +251,29 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_does_not_deadlock_a_lock_through_the_view_against_an_update_through_the_view_that_holds_the_primary_row(): void
+    {
+        $id = $this->widget();
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        $this->beforeApplicationDestroyed(fn () => DB::purge('concurrent'));
+
+        DB::beginTransaction();
+        DB::table('gadgets')->lockForUpdate()->sole();
+        $reader = $this->writeConcurrently(Widget::query()->whereKey($id)->lockForUpdate()->toRawSql());
+
+        try {
+            DB::table('widgets')->where('id', $id)->update(['title' => 'Renamed']);
+            DB::commit();
+        } finally {
+            DB::rollBack(0);
+            $result = $reader->wait();
+        }
+
+        $this->assertTrue($result->successful(), $result->output().$result->errorOutput());
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
     public function it_refuses_a_previous_model_update_that_reaches_a_declared_state(): void
     {
         $id = $this->widget();

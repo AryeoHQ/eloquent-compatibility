@@ -257,7 +257,9 @@ final readonly class AffectedRecords
 
     private function persisted(ConnectionInterface $connection, Model $model, string $relation, string $column): null|int|string
     {
-        $self = $model->getOriginal($model->getKeyName());
+        $self = $model->wasRecentlyCreated && ! array_key_exists($model->getKeyName(), $model->getRawOriginal())
+            ? $model->getKey()
+            : $model->getOriginal($model->getKeyName());
         $key = $self === null ? null : $connection->scalar(
             'select '.SqlFragments::identifier($column).' from '.SqlFragments::identifier($relation).' where '.SqlFragments::identifier($model->getKeyName()).' = ?',
             [$self],

@@ -409,10 +409,6 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     #[Test]
     public function it_does_not_deadlock_a_lock_through_the_view_against_a_bridged_update_of_the_same_record(): void
     {
-        if (getenv('COMPATIBILITY_KNOWN_DEFECTS') !== '1') {
-            $this->markTestSkipped('Known defect: a lock through the view locks the retained row before the primary row, against the order of INV-1, so it deadlocks a bridged update of the same record with 40P01. Set COMPATIBILITY_KNOWN_DEFECTS=1 to run it.');
-        }
-
         $widget = $this->widget();
         $lock = Widget::query()->whereKey($widget->getKey())->lockForUpdate()->toRawSql();
         $reader = null;
@@ -437,10 +433,6 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     #[TestWith([true])]
     public function it_mirrors_a_create_and_the_update_its_created_listener_makes_to_the_same_instance(bool $inTransaction): void
     {
-        if (getenv('COMPATIBILITY_KNOWN_DEFECTS') !== '1') {
-            $this->markTestSkipped("Known defect: Eloquent syncs a model's original only after its created event, so AffectedRecords::originalKey() finds no key for an update inside it, and the bridge mirrors that update to no record. Set COMPATIBILITY_KNOWN_DEFECTS=1 to run it.");
-        }
-
         Event::listen('eloquent.created: '.Widget::class, fn (Widget $widget) => $widget->update(['title' => 'Slug of '.$widget->getKey()]));
         $this->recordMirroredEvents();
         $create = fn () => Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St']);
@@ -451,6 +443,32 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Slug of '.$widget->getKey());
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Slug of '.$widget->getKey(), DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_mirrors_a_current_model_create_and_the_update_its_created_listener_makes_to_the_same_instance(bool $inTransaction): void
+    {
+        Event::listen('eloquent.created: '.Gadget::class, fn (Gadget $gadget) => $gadget->update(['name' => 'Renamed by its created listener']));
+        $this->recordMirroredEvents();
+        $create = fn () => Gadget::query()->create(['name' => 'Blue gadget']);
+
+        $inTransaction ? DB::transaction($create) : $create();
+
+        $this->assertSame(
+            [
+                [Widget::class, 'Blue gadget', ['saving', 'creating', 'created', 'saved']],
+                [Widget::class, 'Renamed by its created listener', ['saving', 'updating', 'updated', 'saved']],
+            ],
+            array_map(fn (RecordMirrored $recordMirrored) => [
+                $recordMirrored->destination::class,
+                $recordMirrored->destination->getAttribute('title'),
+                array_map(fn (ModelEvent $event) => $event->value, $recordMirrored->events),
+            ], $this->mirroredEvents()),
+        );
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Renamed by its created listener', DB::table('widgets')->value('title'));
     }
 
     private function concurrentConnection(): Connection

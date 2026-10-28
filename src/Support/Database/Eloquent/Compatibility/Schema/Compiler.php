@@ -79,9 +79,9 @@ final class Compiler
         );
 
         return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($previous->view)." AS SELECT\n  ".implode(",\n  ", $columns)
-            ."\nFROM ".SqlFragments::identifier((string) $previous->table).' '.$previous->alias
-            ."\nJOIN ".SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
-            .' ON '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)).' = '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
+            ."\nFROM ".SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
+            ."\nJOIN ".SqlFragments::identifier((string) $previous->table).' '.$previous->alias
+            .' ON '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey).' = '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary))
             .($hidden === [] ? '' : "\nWHERE ".implode("\n  AND ", $hidden));
     }
 
