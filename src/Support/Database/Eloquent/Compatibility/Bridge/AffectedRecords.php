@@ -19,6 +19,10 @@ final readonly class AffectedRecords
      */
     public function before(ConnectionInterface $connection, Model $model, Operation $operation): array
     {
+        foreach ($operation === Operation::Insert ? $this->mirrorIndex->forModel($model::class) : [] as $member) {
+            $this->mirrorIndex->keyTranslator($member->map)->clearCreatedPreviousKey($connection);
+        }
+
         $records = $this->of($connection, $model, $operation, false);
         $this->lock($connection, [...array_values($records), ...$this->lockedOnly($connection, $model, $operation)]);
         $newcomers = array_diff_key($this->of($connection, $model, $operation, false), $records);
@@ -52,11 +56,11 @@ final readonly class AffectedRecords
             }
 
             if ($alias === $resolvedMap->primaryCurrentModel->alias) {
-                $primaryKey = $operation === Operation::Insert ? $this->loaded($model, $column) : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
+                $primaryKey = $operation === Operation::Insert ? null : $this->originalKey($connection, $model, $resolvedMap->table($alias), $column);
                 $previousKeys = match (true) {
-                    $operation === Operation::Insert && ! $afterStatement => [],
                     $primaryKey !== null => $keyTranslator->previousKeys($connection, $primaryKey),
-                    default => array_filter([$keyTranslator->createdPreviousKey($connection)], fn (null|string $key) => $key !== null),
+                    $operation === Operation::Insert && $afterStatement => array_filter([$keyTranslator->createdPreviousKey($connection)], fn (null|string $key) => $key !== null),
+                    default => [],
                 };
             } else {
                 $dependent = $resolvedMap->dependent($alias);

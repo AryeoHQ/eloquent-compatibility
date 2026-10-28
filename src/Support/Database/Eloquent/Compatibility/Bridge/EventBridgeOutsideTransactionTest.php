@@ -22,6 +22,7 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
@@ -379,6 +380,34 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $widget->refresh()->update(['title' => 'After a failed commit']);
         $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'After a failed commit');
         $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[Test]
+    #[TestWith(['creating', 'created'])]
+    #[TestWith(['updating', 'updated'])]
+    #[TestWith(['deleting', 'deleted'])]
+    public function it_refuses_a_write_whose_statement_ran_without_its_mark_and_leaves_the_statement_committed_outside_a_transaction(string $beginning, string $finishing): void
+    {
+        $widget = $beginning === 'creating' ? new Widget(['title' => 'Unmarked']) : $this->widget();
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(
+            function () use ($widget, $beginning, $finishing): void {
+                Event::until("eloquent.{$beginning}: ".Widget::class, $widget);
+                match ($beginning) {
+                    'creating' => Widget::query()->insert(['title' => 'Unmarked']),
+                    'updating' => Widget::query()->whereKey($widget->getKey())->update(['title' => 'Unmarked']),
+                    default => Widget::query()->whereKey($widget->getKey())->forceDelete(),
+                };
+                Event::dispatch("eloquent.{$finishing}: ".Widget::class, $widget);
+            },
+            CompatibilityEventMirrorBypassed::class,
+            'The '.Widget::class." write that fired '{$finishing}' reached the database on a statement HasCompatibility never marked, so the event bridge mirrored none of it.",
+        );
+
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame($beginning === 'deleting' ? [] : ['Unmarked'], DB::table('gadgets')->pluck('name')->all());
     }
 
     #[Test]

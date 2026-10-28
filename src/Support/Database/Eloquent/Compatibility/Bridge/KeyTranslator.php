@@ -110,4 +110,9 @@ final readonly class KeyTranslator
 
         return is_string($key) && $key !== '' ? $key : null;
     }
+
+    public function clearCreatedPreviousKey(ConnectionInterface $connection): void
+    {
+        $connection->select('select set_config('.SqlFragments::literal(Setting::Created->for($this->resolvedMap)).", '', true)");
+    }
 }

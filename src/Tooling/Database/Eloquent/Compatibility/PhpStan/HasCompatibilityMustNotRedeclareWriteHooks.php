@@ -6,8 +6,8 @@ namespace Tooling\Database\Eloquent\Compatibility\PhpStan;
 
 use PhpParser\Node;
 use PhpParser\Node\Stmt\Class_;
-use PhpParser\Node\Stmt\ClassMethod;
 use PHPStan\Analyser\Scope;
+use PHPStan\Type\ObjectType;
 use Support\Database\Eloquent\Compatibility\Provides\HasCompatibility;
 use Tooling\PhpStan\Rules\Rule;
 use Tooling\Rules\Attributes\NodeType;
@@ -52,11 +52,22 @@ final class HasCompatibilityMustNotRedeclareWriteHooks extends Rule
      */
     private function redeclaredWriteHooks(Class_ $node): array
     {
+        $className = $node->namespacedName?->toString();
+        $class = $className === null ? null : (new ObjectType($className))->getClassReflection();
+        $trait = (new ObjectType(HasCompatibility::class))->getClassReflection();
+
+        if ($class === null || $trait === null) {
+            return [];
+        }
+
         $found = [];
 
-        foreach ($node->stmts as $stmt) {
-            if ($stmt instanceof ClassMethod && in_array($stmt->name->toString(), self::METHODS, true)) {
-                $found[] = $stmt->name->toString();
+        foreach (self::METHODS as $method) {
+            $resolved = $class->getNativeReflection()->getMethod($method);
+            $marking = $trait->getNativeReflection()->getMethod($method);
+
+            if ($resolved->getFileName() !== $marking->getFileName() || $resolved->getStartLine() !== $marking->getStartLine()) {
+                $found[] = $method;
             }
         }
 

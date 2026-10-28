@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -232,6 +233,64 @@ final class EventBridgeTest extends TestCase
             ['event' => 'created', 'id' => true, 'title' => 'New from the current model'],
         ], $this->seen);
         $this->assertSame('New from the current model', Widget::query()->sole()->title);
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_raises_no_created_events_for_an_ignored_insert_of_a_primary_current_model_whose_key_the_database_assigns(): void
+    {
+        $gadget = $this->gadgetKeyedByTheDatabase();
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->respelled(Widget::class, $gadget)));
+        DB::statement('create unique index gadgets_name_unique on gadgets (name)');
+        $this->recordMirroredEvents();
+
+        $gadget::query()->create(['name' => 'First']);
+        $ignored = (new $gadget(['name' => 'First']))->saveOrIgnore();
+
+        $this->assertFalse($ignored);
+        $this->assertMirrored(Widget::class, ModelEvent::Created);
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_raises_no_created_events_for_an_ignored_insert_of_a_primary_current_model_whose_key_already_exists(): void
+    {
+        $this->mirror();
+        $existing = Gadget::query()->create(['name' => 'First']);
+        $this->recordMirroredEvents();
+
+        $ignored = (new Gadget(['id' => $existing->getKey(), 'name' => 'Second']))->saveOrIgnore();
+
+        $this->assertFalse($ignored);
+        $this->assertNothingMirrored();
+        $this->assertSame(['First'], DB::table('widgets')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_mirrors_a_created_listeners_update_to_its_own_record_after_the_listener_creates_another_record_of_the_same_model(): void
+    {
+        $gadget = $this->gadgetKeyedByTheDatabase();
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->respelled(Widget::class, $gadget)));
+        $listened = false;
+        Event::listen("eloquent.created: {$gadget}", function (Model $created) use ($gadget, &$listened): void {
+            if (! $listened) {
+                $listened = true;
+                $gadget::query()->create(['name' => 'Created by the listener']);
+                $created->update(['name' => 'Renamed by the listener']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $first = $gadget::query()->create(['name' => 'First']);
+
+        $this->assertSame([
+            ['First', [ModelEvent::Saving, ModelEvent::Creating, ModelEvent::Created, ModelEvent::Saved]],
+            ['Created by the listener', [ModelEvent::Saving, ModelEvent::Creating, ModelEvent::Created, ModelEvent::Saved]],
+            ['Renamed by the listener', [ModelEvent::Saving, ModelEvent::Updating, ModelEvent::Updated, ModelEvent::Saved]],
+        ], array_map(fn (RecordMirrored $event) => [$event->destination->getAttribute('title'), $event->events], $this->mirroredEvents()));
+        $this->assertSame($first->getKey(), $this->mirroredEvents()[2]->destination->getAttribute('gadget_id'));
     }
 
     #[Test]
@@ -1215,6 +1274,21 @@ final class EventBridgeTest extends TestCase
     private function mirror(array $excludedListeners = []): void
     {
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new WidgetCompatibilityMap, $excludedListeners));
+    }
+
+    /**
+     * @return class-string<CompatibleModel>
+     */
+    private function gadgetKeyedByTheDatabase(): string
+    {
+        return (new class extends CompatibleModel
+        {
+            use SoftDeletes;
+
+            protected $keyType = 'string';
+
+            protected $guarded = [];
+        })::class;
     }
 
     /**

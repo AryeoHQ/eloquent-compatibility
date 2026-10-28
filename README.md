@@ -90,7 +90,7 @@ The package registers four PHPStan rules in `tooling/phpstan/rules.neon`. An app
 - `CompatibleMustUseHasCompatibility`: a model that implements `Compatible` uses `HasCompatibility`.
 - `HasCompatibilityMustImplementCompatible`: a model that uses `HasCompatibility` implements `Compatible`.
 - `HasCompatibilityMustOnlyBeOnModel`: only a `Model` subclass implements `Compatible` or uses `HasCompatibility`.
-- `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, declares neither `setKeysForSaveQuery()` nor `getAttributesForInsert()`.
+- `HasCompatibilityMustNotRedeclareWriteHooks`: a class that uses `HasCompatibility`, or extends one that does, resolves `setKeysForSaveQuery()` and `getAttributesForInsert()` to the trait's own methods. A declaration in the class or a parent fails, and so does a method another trait brings in.
 
 The rules skip anonymous classes. `EventBridge::mirror()` still checks those at boot.
 

@@ -131,6 +131,20 @@ final class KeyTranslatorTest extends TestCase
         $this->assertSame((string) $account->getKey(), $accounts->createdPreviousKey(DB::connection()));
     }
 
+    #[Test]
+    public function it_clears_the_previous_key_its_own_map_created_and_leaves_another_maps_alone(): void
+    {
+        resolve(Installer::class)->install(new AccountCompatibilityMap);
+        $accounts = $this->keyTranslator(new AccountCompatibilityMap);
+        $this->widget();
+        $account = Account::query()->create(['email' => 'one@example.test']);
+
+        $this->keyTranslator->clearCreatedPreviousKey(DB::connection());
+
+        $this->assertNull($this->keyTranslator->createdPreviousKey(DB::connection()));
+        $this->assertSame((string) $account->getKey(), $accounts->createdPreviousKey(DB::connection()));
+    }
+
     private function keyTranslator(CompatibilityMap $map): KeyTranslator
     {
         return new KeyTranslator(resolve(CompatibilityMaps::class)->register($map));

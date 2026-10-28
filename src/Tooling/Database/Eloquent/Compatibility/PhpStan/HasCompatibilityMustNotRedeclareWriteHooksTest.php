@@ -34,6 +34,12 @@ class HasCompatibilityMustNotRedeclareWriteHooksTest extends RuleTestCase
     }
 
     #[Test]
+    public function it_passes_when_a_class_takes_has_compatibility_through_another_trait(): void
+    {
+        $this->analyse([$this->getFixturePath('Compatibility/ComposedModel.php')], []);
+    }
+
+    #[Test]
     public function it_passes_when_class_does_not_use_has_compatibility(): void
     {
         $this->analyse([$this->getFixturePath('Compatibility/PlainModel.php')], []);
@@ -64,6 +70,17 @@ class HasCompatibilityMustNotRedeclareWriteHooksTest extends RuleTestCase
     public function it_fails_when_a_subclass_of_has_compatibility_redeclares_a_write_hook(): void
     {
         $this->analyse([$this->getFixturePath('Compatibility/SubclassRedeclaresWriteHook.php')], [
+            [
+                'HasCompatibility must not redeclare getAttributesForInsert().',
+                7,
+            ],
+        ]);
+    }
+
+    #[Test]
+    public function it_fails_when_a_subclass_of_has_compatibility_imports_a_write_hook_through_another_trait(): void
+    {
+        $this->analyse([$this->getFixturePath('Compatibility/SubclassImportsWriteHook.php')], [
             [
                 'HasCompatibility must not redeclare getAttributesForInsert().',
                 7,

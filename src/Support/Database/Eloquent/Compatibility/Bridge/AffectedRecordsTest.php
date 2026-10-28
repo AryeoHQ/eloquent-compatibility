@@ -169,6 +169,29 @@ final class AffectedRecordsTest extends TestCase
     }
 
     #[Test]
+    public function it_finds_no_created_record_after_an_insert_that_inserted_no_row(): void
+    {
+        Gadget::query()->create(['name' => 'Created earlier']);
+        $gadget = new Gadget(['name' => 'Never inserted']);
+
+        $this->affectedRecords->before(DB::connection(), $gadget, Operation::Insert);
+
+        $this->assertSame([], $this->affectedRecords->of(DB::connection(), $gadget, Operation::Insert, true));
+    }
+
+    #[Test]
+    #[TestWith([Operation::Update])]
+    #[TestWith([Operation::Delete])]
+    public function it_finds_no_record_of_a_primary_current_model_write_whose_key_resolves_to_no_row_after_a_create_in_the_transaction(Operation $operation): void
+    {
+        Gadget::query()->create(['name' => 'Created earlier']);
+        $gadget = (new Gadget)->newFromBuilder(['name' => 'Loaded without its key']);
+
+        $this->assertSame([], $this->affectedRecords->of(DB::connection(), $gadget, $operation, false));
+        $this->assertSame([], $this->affectedRecords->of(DB::connection(), $gadget, $operation, true));
+    }
+
+    #[Test]
     public function it_finds_the_previous_record_of_a_dependent_current_model_before_its_insert(): void
     {
         $widget = $this->widget();
