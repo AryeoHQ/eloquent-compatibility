@@ -144,6 +144,7 @@ final class EventBridge
      */
     public function fireModelEvent(Model&Compatible $model, string $event, callable $fire): mixed
     {
+        $this->eventReplayer->trackSave($model, $event);
         $modelEvent = ModelEvent::tryFrom($event);
 
         if ($modelEvent === null || ! $this->sees($model)) {

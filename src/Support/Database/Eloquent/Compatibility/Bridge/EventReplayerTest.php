@@ -21,6 +21,7 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
@@ -31,7 +32,10 @@ use Support\Database\Eloquent\StateMachines\Triggers\Exceptions\Duplicate;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Article;
 use Tests\Fixtures\Support\Workbench\ArticleCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Bulletin;
+use Tests\Fixtures\Support\Workbench\BulletinCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CastGadget;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -495,19 +499,19 @@ final class EventReplayerTest extends TestCase
     public function it_runs_the_trigger_of_a_stored_state_on_the_stored_row_with_the_source_state_and_lets_it_save_only_what_handle_changed(): void
     {
         $journal = $this->journal();
-        [$record, $before] = $this->publication();
-        $after = $this->stored($record, ['state' => 'published', 'title' => 'Renamed']);
+        $this->bridge(new ArticleCompatibilityMap);
+        $article = Article::query()->create(['title' => 'Draft publication'])->refresh();
         $statements = [];
         Event::listen(Transitioning::class, fn (Transitioning $event) => $this->seen[] = ['event' => 'before', 'state' => $event->publication->getAttributes()['state'] ?? null, 'original' => $event->publication->getRawOriginal('state'), 'title' => $event->publication->getAttribute('title'), 'connection' => $event->publication->getConnectionName()]);
         DB::listen(function (QueryExecuted $query) use (&$statements): void {
             $statements[] = $query->sql;
         });
 
-        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']);
+        $article->update(['status' => 'published', 'title' => 'Renamed']);
 
-        $this->assertSame(['Publication '.json_encode($record->keyValue)], $journal->entries);
+        $this->assertSame(['Publication '.json_encode($article->publication_id)], $journal->entries);
         $this->assertSame([['event' => 'before', 'state' => 'draft', 'original' => 'draft', 'title' => 'Renamed', 'connection' => 'pgsql']], $this->seen);
-        $this->assertSame(['update "publications" set "published_at" = ?, "updated_at" = ? where "id" = ?'], array_values(array_filter($statements, fn (string $sql) => str_starts_with($sql, 'update'))));
+        $this->assertSame(['update "publications" set "published_at" = ?, "updated_at" = ? where "id" = ?'], array_values(array_filter($statements, fn (string $sql) => str_starts_with($sql, 'update "publications"'))));
         $this->assertSame(['published', 'Renamed', true], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at') !== null]);
     }
 
@@ -516,13 +520,12 @@ final class EventReplayerTest extends TestCase
     public function it_runs_the_trigger_of_each_moved_state_column_in_turn_through_its_own_column(): void
     {
         $journal = $this->journal();
-        [$record, $before] = $this->publication();
-        DB::table('placements')->insert(['id' => (string) Str::uuid(), 'publication_id' => $record->keyValue, 'slot' => 'side']);
-        $after = $this->stored($record, ['state' => 'published', 'review' => 'approved']);
+        $this->bridge(new BulletinCompatibilityMap);
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
 
-        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state', 'review']);
+        $bulletin->update(['status' => 'published', 'review_status' => 'approved']);
 
-        $this->assertSame(['Publication '.json_encode($record->keyValue)], $journal->entries);
+        $this->assertSame(['Publication '.json_encode($bulletin->publication_id)], $journal->entries);
         $this->assertSame(['published', 'approved', true, 'front'], [DB::table('publications')->value('state'), DB::table('publications')->value('review'), DB::table('publications')->value('published_at') !== null, DB::table('placements')->value('slot')]);
     }
 
@@ -530,10 +533,11 @@ final class EventReplayerTest extends TestCase
     #[Test]
     public function it_calls_a_trigger_whose_class_name_has_several_words_by_the_method_name_its_proxy_accepts(): void
     {
-        [$record, $before] = $this->publication(['state' => 'featured', 'featured_at' => '2020-01-01 00:00:00']);
-        $after = $this->stored($record, ['state' => 'published']);
+        $this->bridge(new ArticleCompatibilityMap);
+        $article = Article::query()->create(['title' => 'Draft publication'])->refresh();
+        DB::table('publications')->update(['state' => 'featured', 'featured_at' => '2020-01-01 00:00:00']);
 
-        $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']);
+        $article->refresh()->update(['status' => 'published']);
 
         $this->assertSame(['published', null], [DB::table('publications')->value('state'), DB::table('publications')->value('featured_at')]);
     }
@@ -600,6 +604,12 @@ final class EventReplayerTest extends TestCase
         $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap), new CompatibilityMapEventMirror(new WidgetCompatibilityMap, $excludedListeners));
         $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new AccountCompatibilityMap), new CompatibilityMapEventMirror(new AccountCompatibilityMap));
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
+    }
+
+    private function bridge(CompatibilityMap $map): void
+    {
+        resolve(Installer::class)->install($map);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($map));
     }
 
     private function journal(): Journal

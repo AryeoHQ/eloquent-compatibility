@@ -598,6 +598,40 @@ final class EventBridgeTransitionTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_a_listener_vetoes_the_triggers_last_save_after_handle_saved_the_instance(): void
+    {
+        $article = $this->article();
+        DB::table('publications')->update(['state' => 'published']);
+        $article->refresh();
+        $this->recordMirroredEvents();
+        Event::listen('eloquent.saving: '.Publication::class, fn (Publication $publication) => $publication->isDirty() ? null : false);
+
+        $refusal = $this->assertWriteRefused(fn () => $article->update(['status' => 'featured']), "state of Publication #{$article->publication_id}");
+
+        $this->assertStringEndsWith("the replay failed: The trigger's save of Publication was vetoed, as a saving or updating listener that returns false does.", $refusal->because);
+        $this->assertSame(['published', null], [DB::table('publications')->value('state'), DB::table('publications')->value('featured_at')]);
+        $this->assertSame(['published', null], [DB::table('articles')->value('status'), DB::table('articles')->value('featured_at')]);
+        $this->assertSame(['before published'], $this->seen);
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_keeps_a_write_whose_saved_listeners_return_false_as_a_native_trigger_does(): void
+    {
+        $native = $this->article();
+        $article = $this->article();
+        Event::listen(['eloquent.saved: '.Publication::class, PublicationSaved::class], fn () => false);
+
+        Publication::query()->findOrFail($native->publication_id)->state->publish()->now();
+        $this->seen = [];
+        DB::transaction(fn () => $article->update(['status' => 'published']));
+
+        $this->assertSame(['before draft', 'after published'], $this->seen);
+        $stored = DB::table('publications')->where('id', $article->publication_id);
+        $this->assertSame(['published', true], [$stored->value('state'), $stored->value('published_at') !== null]);
+    }
+
+    #[Test]
     public function it_counts_a_save_whose_custom_saved_event_listener_returns_a_value_as_a_save(): void
     {
         $article = $this->article();

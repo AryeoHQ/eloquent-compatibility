@@ -130,7 +130,6 @@ final class EventReplayer
         $class = $record->model;
         $template = (new $class)->setConnection($connectionName);
         $excludedListeners = $this->mirrorIndex->excludedListeners($record->map);
-        $unlisten = $this->listenForSaves($template);
         $unmask = $this->maskModelEvents($template, $excludedListeners);
 
         try {
@@ -139,7 +138,6 @@ final class EventReplayer
                 $model->setRawAttributes([...($this->read($record, $template) ?? $rowAfter), $state => $rowBefore[$state] ?? null], true);
                 $trigger = $this->trigger($record, $model, $state, $rowBefore[$state] ?? null, $rowAfter[$state] ?? null);
                 $this->transitioning[$model] = $excludedListeners;
-                $this->saves[$model] = false;
 
                 try {
                     $pendingTrigger = $model->getAttribute($state)->{$trigger}();
@@ -149,7 +147,7 @@ final class EventReplayer
                     }
 
                     $pendingTrigger->withoutTransition()->now();
-                    $saved = $this->saved($model);
+                    $saved = $this->saves[$model] ?? false;
                 } catch (Invalid|BindingResolutionException $e) {
                     throw $this->refusal($record, $model, $state, $e);
                 } finally {
@@ -162,7 +160,13 @@ final class EventReplayer
             }
         } finally {
             $unmask();
-            $unlisten();
+        }
+    }
+
+    public function trackSave(Model $model, string $event): void
+    {
+        if ($this->transitioning->offsetExists($model) && in_array($event, [ModelEvent::Saving->value, ModelEvent::Saved->value], true)) {
+            $this->saves[$model] = $event === ModelEvent::Saved->value;
         }
     }
 
@@ -347,55 +351,6 @@ final class EventReplayer
         );
 
         return $row === null ? null : (array) $row;
-    }
-
-    /**
-     * @return Closure(): void
-     */
-    private function listenForSaves(Model $model): Closure
-    {
-        $dispatcher = $model::getEventDispatcher();
-
-        if ($dispatcher === null) {
-            return static function (): void {};
-        }
-
-        $real = $dispatcher instanceof EventFake ? $dispatcher->dispatcher : $dispatcher;
-        $custom = $model->dispatchesEvents()[ModelEvent::Saved->value] ?? null;
-        $names = [ModelEvent::Saved->for($model::class), ...(is_string($custom) && class_exists($custom) ? [$custom] : [])];
-        $listener = function (object $subject): void {
-            $saved = $subject instanceof Model ? $subject : array_find((array) $subject, fn (mixed $value) => $value instanceof Model && $this->saves->offsetExists($value));
-
-            if ($saved instanceof Model && $this->saves->offsetExists($saved)) {
-                $this->saves[$saved] = true;
-            }
-        };
-
-        foreach ($names as $name) {
-            $real->listen($name, $listener);
-        }
-
-        return function () use ($real, $names, $listener): void {
-            $raw = $real->getRawListeners(); // @phpstan-ignore staticMethod.dynamicCall
-
-            foreach ($names as $name) {
-                $real->forget($name);
-
-                foreach ($raw[$name] ?? [] as $other) {
-                    if ($other !== $listener) {
-                        $real->listen($name, $other);
-                    }
-                }
-            }
-        };
-    }
-
-    private function saved(Model $model): bool
-    {
-        $dispatcher = $model::getEventDispatcher();
-
-        return ($this->saves[$model] ?? false)
-            || ($dispatcher instanceof EventFake && $dispatcher->dispatched(ModelEvent::Saved->for($model::class), fn (string $fired, mixed $payload) => $payload === $model)->isNotEmpty());
     }
 
     private function fakes(BusDispatcher $bus, object $trigger): bool
