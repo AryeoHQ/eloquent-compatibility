@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Connections;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
+use Support\Database\Eloquent\Compatibility\Bridge\PendingMirroredWrite;
 use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
 use Throwable;
 use WeakReference;
@@ -21,8 +22,11 @@ trait DispatchesQueryFailed
     /** @var null|WeakReference<QueryException> */
     private null|WeakReference $compatibilityDispatchedQueryFailure = null;
 
-    /** @var null|array{Closure(string, array<array-key, mixed>, Connection): void, Closure(string, array<array-key, mixed>, Connection): void, Closure(string, array<array-key, mixed>, Connection): void} */
-    private null|array $compatibilityEventBridge = null;
+    /** @var null|Closure(string, array<array-key, mixed>, Connection): void */
+    private null|Closure $compatibilityEventBridgeRelease = null;
+
+    /** @var list<Closure> */
+    private array $compatibilityBeforeExecutingCallbacks = [];
 
     /**
      * @param  Closure(QueryFailed): mixed  $callback
@@ -33,14 +37,28 @@ trait DispatchesQueryFailed
     }
 
     /**
-     * @param  Closure(string, array<array-key, mixed>, Connection): void  $start
-     * @param  Closure(string, array<array-key, mixed>, Connection): void  $open
+     * @param  Closure(string, array<array-key, mixed>, Connection): (null|PendingMirroredWrite)  $start
+     * @param  Closure(null|PendingMirroredWrite, string, array<array-key, mixed>, Connection): void  $open
      * @param  Closure(string, array<array-key, mixed>, Connection): void  $release
      */
     public function registerEventBridge(Closure $start, Closure $open, Closure $release): void
     {
-        $this->compatibilityEventBridge = [$start, $open, $release];
-        $this->orderEventBridgeCallbacks();
+        if ($this->compatibilityEventBridgeRelease === null) {
+            $this->compatibilityBeforeExecutingCallbacks = array_values($this->beforeExecutingCallbacks);
+        }
+
+        $this->compatibilityEventBridgeRelease = $release;
+        $this->beforeExecutingCallbacks = [
+            function (string &$query, array &$bindings, Connection $connection) use ($start, $open): void { // @phpstan-ignore ergebnis.noParameterPassedByReference, ergebnis.noParameterPassedByReference
+                $taken = $start($query, $bindings, $connection);
+
+                foreach ($this->compatibilityBeforeExecutingCallbacks as $callback) {
+                    $callback($query, $bindings, $connection);
+                }
+
+                $open($taken, $query, $bindings, $connection);
+            },
+        ];
     }
 
     /**
@@ -48,8 +66,11 @@ trait DispatchesQueryFailed
      */
     public function beforeExecuting(Closure $callback)
     {
-        parent::beforeExecuting($callback);
-        $this->orderEventBridgeCallbacks();
+        if ($this->compatibilityEventBridgeRelease === null) {
+            return parent::beforeExecuting($callback);
+        }
+
+        $this->compatibilityBeforeExecutingCallbacks[] = $callback;
 
         return $this;
     }
@@ -69,8 +90,8 @@ trait DispatchesQueryFailed
                 throw $failure;
             }
 
-            if ($this->compatibilityEventBridge !== null) {
-                $this->compatibilityEventBridge[2]($query, $bindings, $this);
+            if ($this->compatibilityEventBridgeRelease !== null) {
+                ($this->compatibilityEventBridgeRelease)($query, $bindings, $this);
             }
 
             if (! $this->compatibilityDispatchingQueryFailed && $failure !== $this->compatibilityDispatchedQueryFailure?->get()) {
@@ -80,7 +101,10 @@ trait DispatchesQueryFailed
                 try {
                     $this->event(new QueryFailed($query, $bindings, null, $this, $failure, $this->latestReadWriteTypeUsed()));
                 } catch (Throwable $listenerFailure) {
-                    report($listenerFailure);
+                    try {
+                        report($listenerFailure);
+                    } catch (Throwable) {
+                    }
                 } finally {
                     $this->compatibilityDispatchingQueryFailed = false;
                 }
@@ -97,22 +121,11 @@ trait DispatchesQueryFailed
                 return false;
             }
 
-            if (in_array(DispatchesQueryFailed::class, class_uses($class), true)) {
+            if (in_array(DispatchesQueryFailed::class, trait_uses_recursive($class), true)) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    private function orderEventBridgeCallbacks(): void
-    {
-        if ($this->compatibilityEventBridge === null) {
-            return;
-        }
-
-        [$start, $open] = $this->compatibilityEventBridge;
-        $others = array_filter($this->beforeExecutingCallbacks, fn (Closure $callback) => $callback !== $start && $callback !== $open);
-        $this->beforeExecutingCallbacks = [$start, ...$others, $open];
     }
 }

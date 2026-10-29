@@ -45,6 +45,7 @@ use Tests\Fixtures\Support\Connections\OverridesBeforeExecutingConnection;
 use Tests\Fixtures\Support\Connections\OverridesHandleQueryExceptionConnection;
 use Tests\Fixtures\Support\Connections\OverridesRegisterEventBridgeConnection;
 use Tests\Fixtures\Support\Connections\QueryFailedConnection;
+use Tests\Fixtures\Support\Connections\WrappedChildConnection;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Article;
@@ -622,6 +623,102 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_mirrors_a_write_whose_before_executing_callback_rewrites_its_sql_or_bindings_by_reference_outside_a_transaction(bool $rewritesBindings): void
+    {
+        $widget = $this->widget();
+        DB::connection()->beforeExecuting(function (string &$query, array &$bindings) use ($rewritesBindings): void { // @phpstan-ignore ergebnis.noParameterPassedByReference, ergebnis.noParameterPassedByReference
+            if (! str_starts_with($query, 'update "widgets"')) {
+                return;
+            }
+
+            if ($rewritesBindings) {
+                $bindings = array_map(fn (mixed $binding) => $binding === 'Renamed' ? 'Rewritten' : $binding, $bindings);
+            } else {
+                $query .= ' /* rewritten */';
+            }
+        });
+        $executed = [];
+        DB::listen(function (QueryExecuted $query) use (&$executed): void {
+            if (str_starts_with($query->sql, 'update "widgets"')) {
+                $executed[] = $query->sql;
+            }
+        });
+        $name = $rewritesBindings ? 'Rewritten' : 'Renamed';
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertCount(1, $executed);
+        $this->assertSame(! $rewritesBindings, str_ends_with($executed[0], ' /* rewritten */'));
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === $name);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame($name, DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_mirrors_a_write_whose_before_executing_callback_catches_a_failed_statement_with_the_same_sql_and_bindings(bool $inTransaction): void
+    {
+        $widget = $this->widget();
+        $updates = 0;
+        $caught = null;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings, Connection $connection) use (&$updates, &$caught): void {
+            if (! str_starts_with($query, 'update "widgets"')) {
+                return;
+            }
+
+            if (++$updates === 2) {
+                throw new RuntimeException('Stopped the repeated statement.');
+            }
+
+            try {
+                $connection->update($query, $bindings);
+            } catch (RuntimeException $e) {
+                $caught = $e;
+            }
+        });
+        $this->recordMirroredEvents();
+        $update = fn () => $widget->update(['title' => 'Renamed']);
+
+        $inTransaction ? DB::transaction($update) : $update();
+
+        $this->assertSame(2, $updates);
+        $this->assertSame('Stopped the repeated statement.', $caught?->getMessage());
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_runs_the_before_executing_callbacks_of_the_application_in_the_order_they_registered_around_a_mirrored_write(): void
+    {
+        $order = [];
+        $register = function (string $callback) use (&$order): void {
+            DB::connection()->beforeExecuting(function (string $query) use ($callback, &$order): void {
+                if (str_starts_with($query, 'update "widgets"')) {
+                    $order[] = $callback;
+                }
+            });
+        };
+        $register('before the event bridge');
+        $widget = $this->widget();
+        $register('after the event bridge');
+        $register('last');
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertSame(['before the event bridge', 'after the event bridge', 'last'], $order);
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+    }
+
+    #[Test]
     public function it_mirrors_a_mapped_create_a_before_executing_callback_makes_on_an_update_and_the_update_itself_outside_a_transaction(): void
     {
         $widget = $this->widget();
@@ -696,6 +793,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     #[Test]
     #[TestWith([QueryFailedConnection::class])]
     #[TestWith([ChildConnection::class])]
+    #[TestWith([WrappedChildConnection::class])]
     public function it_rolls_back_its_transaction_before_query_failed_reaches_a_listener(string $class): void
     {
         $default = (string) config('database.default');

@@ -9,14 +9,17 @@ use Illuminate\Database\Events\ConnectionEstablished;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
 use Tests\Fixtures\Support\Connections\ChildConnection;
 use Tests\Fixtures\Support\Connections\QueryFailedConnection;
 use Tests\Fixtures\Support\Connections\ResilientConnection;
+use Tests\Fixtures\Support\Connections\WrappedChildConnection;
 use Tests\TestCase;
 use WeakReference;
 
@@ -37,6 +40,7 @@ final class DispatchesQueryFailedTest extends TestCase
             'database.connections.query-failed' => [...(array) config("database.connections.{$default}"), 'connection_class' => QueryFailedConnection::class],
             'database.connections.resilient' => [...(array) config("database.connections.{$default}"), 'connection_class' => ResilientConnection::class],
             'database.connections.child' => [...(array) config("database.connections.{$default}"), 'connection_class' => ChildConnection::class],
+            'database.connections.wrapped-child' => [...(array) config("database.connections.{$default}"), 'connection_class' => WrappedChildConnection::class],
         ]);
     }
 
@@ -46,6 +50,7 @@ final class DispatchesQueryFailedTest extends TestCase
         yield 'a connection that uses the trait' => ['query-failed'];
         yield 'a connection that overrides run() and the lost-connection retry' => ['resilient'];
         yield 'a connection whose parent class uses the trait too' => ['child'];
+        yield 'a connection that uses the trait through another trait, over a parent class that uses it' => ['wrapped-child'];
     }
 
     #[DataProvider('connections')]
@@ -75,6 +80,38 @@ final class DispatchesQueryFailedTest extends TestCase
         gc_collect_cycles();
 
         $this->assertNull($failure->get());
+    }
+
+    #[DataProvider('connections')]
+    #[Test]
+    public function it_runs_the_callbacks_of_the_event_bridge_it_registered_last_around_every_other_before_executing_callback(string $name): void
+    {
+        $connection = $this->connection($name);
+        $calls = [];
+
+        foreach (['first', 'second'] as $bridge) {
+            $connection->registerEventBridge(
+                function () use ($bridge, &$calls): null {
+                    $calls[] = "{$bridge} start";
+
+                    return null;
+                },
+                function () use ($bridge, &$calls): void {
+                    $calls[] = "{$bridge} open";
+                },
+                function () use ($bridge, &$calls): void {
+                    $calls[] = "{$bridge} release";
+                },
+            );
+        }
+
+        $connection->beforeExecuting(function () use (&$calls): void {
+            $calls[] = 'application';
+        });
+
+        $this->failing($connection, 'select * from missing_relation');
+
+        $this->assertSame(['second start', 'application', 'second open', 'second release'], $calls);
     }
 
     #[DataProvider('connections')]
@@ -159,6 +196,22 @@ final class DispatchesQueryFailedTest extends TestCase
 
     #[DataProvider('connections')]
     #[Test]
+    public function it_throws_the_query_exception_when_a_query_failed_listener_throws_and_reporting_it_throws_too(string $name): void
+    {
+        Exceptions::fake()->throwOnReport();
+        $connection = $this->connection($name);
+        $connection->listenForFailures(fn () => throw new RuntimeException('A failure listener failed.'));
+
+        $thrown = $this->failing($connection, 'select * from missing_relation');
+
+        $this->assertSame('42P01', $thrown->getCode());
+        $this->assertCount(1, $this->failures);
+        $this->assertSame($thrown, $this->failures[0]->exception);
+        Exceptions::assertReported(fn (RuntimeException $e) => $e->getMessage() === 'A failure listener failed.');
+    }
+
+    #[DataProvider('connections')]
+    #[Test]
     public function it_dispatches_query_failed_once_for_a_statement_that_fails_during_a_lost_connection_retry_and_escapes_it(string $name): void
     {
         $connection = $this->connection($name);
@@ -178,10 +231,10 @@ final class DispatchesQueryFailedTest extends TestCase
         $this->assertRetried($connection);
     }
 
-    private function connection(string $name): ChildConnection|QueryFailedConnection|ResilientConnection
+    private function connection(string $name): ChildConnection|QueryFailedConnection|ResilientConnection|WrappedChildConnection
     {
         $connection = DB::connection($name);
-        $this->assertTrue($connection instanceof ChildConnection || $connection instanceof QueryFailedConnection || $connection instanceof ResilientConnection);
+        $this->assertTrue($connection instanceof ChildConnection || $connection instanceof QueryFailedConnection || $connection instanceof ResilientConnection || $connection instanceof WrappedChildConnection);
         $connection->listenForFailures(function (QueryFailed $failure): void {
             $this->failures[] = $failure;
         });

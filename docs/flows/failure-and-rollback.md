@@ -65,12 +65,12 @@ The trait raises the event from `DispatchesQueryFailed::handleQueryException()`,
 
 - A statement that a lost-connection retry recovers throws nothing, so it raises no event.
 - A statement that fails inside a `QueryFailed` listener, on the same connection, raises no second event. The bridge's release still runs for it.
-- A listener that throws does not replace the statement's `QueryException`. The trait reports the listener's throwable and throws the `QueryException`.
-- When a parent class and its subclass both use the trait, only the copy in the subclass calls the bridge and raises the event.
+- A listener that throws does not replace the statement's `QueryException`. The trait reports the listener's throwable and throws the `QueryException`. A report that throws does not replace it either, because the trait drops that throwable too.
+- When a parent class and its subclass both use the trait, only the copy in the subclass calls the bridge and raises the event. The subclass can use the trait through another trait.
 - The trait keeps no reference to a failure once the caller lets it go.
 - The event carries the SQL, the bindings, the connection and its name, the exception and the read/write type. Its `QueryFailed::$time` is null, because no statement completed.
 
-`EventBridge::watch()` hands the trait its callbacks through `DispatchesQueryFailed::registerEventBridge()`. `DispatchesQueryFailed::beforeExecuting()` keeps the bridge's first `beforeExecuting` callback before every other one, and its last after every other one. [Mirroring a write](mirroring-a-write.md#opening-at-the-statement) describes the two callbacks.
+`EventBridge::watch()` hands the trait its callbacks through `DispatchesQueryFailed::registerEventBridge()`. The trait then holds the application's `beforeExecuting` callbacks in its own list, and gives Laravel one callback. That callback runs the bridge's first callback, then the application's in registration order, then the bridge's last. [Mirroring a write](mirroring-a-write.md#opening-at-the-statement) describes the two callbacks.
 
 A connection class that overrides `Connection::run()` or the lost-connection retry, such as Aryeo's ResilientPostgresConnection, still calls `DispatchesQueryFailed::handleQueryException()`. So the trait composes with it, and the event fires after that class's own retry.
 

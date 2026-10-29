@@ -43,9 +43,6 @@ final class EventBridge
     /** @var array<string, PendingMirroredWrite> */
     private array $armed = [];
 
-    /** @var array<string, list<array{null|PendingMirroredWrite, string, array<array-key, mixed>}>> */
-    private array $starting = [];
-
     /** @var array<string, true> */
     private array $mirrored = [];
 
@@ -227,7 +224,6 @@ final class EventBridge
     public function releaseFailed(): void
     {
         $this->armed = [];
-        $this->starting = [];
 
         foreach ($this->pendingWrites as $name => $pendingWrites) {
             $pendingWrite = $pendingWrites[0] ?? null;
@@ -343,10 +339,10 @@ final class EventBridge
     /**
      * @param  array<array-key, mixed>  $bindings
      */
-    private function startStatement(string $query, array $bindings, Connection $connection): void
+    private function startStatement(string $query, array $bindings, Connection $connection): null|PendingMirroredWrite
     {
         if ($this->internal > 0) {
-            return;
+            return null;
         }
 
         $name = (string) $connection->getName();
@@ -357,49 +353,32 @@ final class EventBridge
             unset($this->armed[$name]);
         }
 
-        $this->starting[$name][] = [$armed, $query, $bindings];
         $this->closeFailedAbove($connection, $armed);
+
+        return $armed;
     }
 
     /**
      * @param  array<array-key, mixed>  $bindings
      */
-    private function openStatement(string $query, array $bindings, Connection $connection): void
+    private function openStatement(null|PendingMirroredWrite $taken, string $query, array $bindings, Connection $connection): void
     {
-        if ($this->internal > 0) {
-            return;
-        }
-
         $name = (string) $connection->getName();
-        $starting = $this->starting[$name] ?? [];
-        $armed = null;
 
-        while ($starting !== []) {
-            [$write, $statement, $statementBindings] = array_pop($starting);
-
-            if ($statement === $query && $statementBindings === $bindings) {
-                $armed = $write;
-
-                break;
-            }
-        }
-
-        $this->starting[$name] = $starting;
-
-        if ($armed === null || ! in_array($armed, $this->pendingWrites[$name] ?? [], true)) {
+        if ($taken === null || ! in_array($taken, $this->pendingWrites[$name] ?? [], true)) {
             return;
         }
 
-        $this->closeFailedAbove($connection, $armed);
+        $this->closeFailedAbove($connection, $taken);
 
-        if ($this->top($name) === $armed) {
+        if ($this->top($name) === $taken) {
             foreach ($this->pendingWrites[$name] ?? [] as $stale) {
-                if ($stale !== $armed && $stale->source === $armed->source && $stale->operation === $armed->operation && $stale->depth === $armed->depth && ! $stale->claimed && ! $stale->statementSent) {
+                if ($stale !== $taken && $stale->source === $taken->source && $stale->operation === $taken->operation && $stale->depth === $taken->depth && ! $stale->claimed && ! $stale->statementSent) {
                     $this->forget($connection, $stale);
                 }
             }
 
-            $this->open($connection, $armed, $query, $bindings);
+            $this->open($connection, $taken, $query, $bindings);
         }
     }
 
@@ -667,10 +646,6 @@ final class EventBridge
 
         if (($this->armed[$name] ?? null) === $pendingWrite) {
             unset($this->armed[$name]);
-        }
-
-        if ($this->pendingWrites[$name] === []) {
-            unset($this->starting[$name]);
         }
     }
 
