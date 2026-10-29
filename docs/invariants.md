@@ -296,6 +296,8 @@ The list has this order. An install lists the drops of the map's prefixed trigge
 - `CompatibilityWriteRefused::byTransition()` names the previous model's attribute and the current model's column.
 - The trigger's lifecycle transaction is a savepoint inside the write's transaction, and `EventBridge::complete()` rolls the write back on any throw.
 
+**Limit.** When a save inside `handle()` or a listener throws and the surrounding code catches the exception, the tracking cannot detect whether that save completed or failed. The frame stays on the stack. A later successful save, or the enclosing save, cannot empty the stack, and the bridge refuses a write that commits natively. This is a limit of the interim guard. [eloquent-state-machines#60](https://github.com/AryeoHQ/eloquent-state-machines/pull/60) makes `Trigger::after()` throw on a vetoed save. Once that ships, the bridge catches that exception, and this tracking is deleted.
+
 ## INV-30: A replay reports each change once on each side
 
 **Rule.** The trigger saves what `handle()` changed, and the bridge mirrors that save as a native write. The bridge's own events, on the current model and on the previous model's instance, leave those changes out. They report the new state and the write's other changes.
