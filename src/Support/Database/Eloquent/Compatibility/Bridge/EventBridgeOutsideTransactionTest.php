@@ -46,6 +46,7 @@ use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Publication;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
+use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -150,6 +151,37 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertCount(2, $this->mirroredEvents());
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame(['featured', true], [DB::table('publications')->value('state'), DB::table('publications')->value('featured_at') !== null]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_rolls_back_a_state_change_made_outside_a_transaction_and_fires_no_after_event_when_its_trigger_throws_or_refuses(bool $refuses): void
+    {
+        resolve(Installer::class)->install(new ArticleCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $article = Article::query()->create(['title' => 'Draft article']);
+        DB::connection()->setTransactionManager(new DatabaseTransactionsManager);
+        $after = [];
+        Event::listen(Transitioned::class, function () use (&$after): void {
+            $after[] = DB::transactionLevel();
+        });
+
+        if ($refuses) {
+            DB::table('publications')->update(['locked' => true]);
+        } else {
+            Event::listen(Transitioning::class, fn () => throw new RuntimeException('The before event failed.'));
+        }
+
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => $article->update(['title' => 'Rolled back', 'status' => 'published']), $refuses ? CompatibilityWriteRefused::class : RuntimeException::class);
+
+        $this->assertSame([], $after);
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['draft', 'Draft article', null], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at')]);
     }
 
     #[Test]

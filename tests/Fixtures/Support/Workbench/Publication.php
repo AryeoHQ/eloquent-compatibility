@@ -28,6 +28,8 @@ final class Publication extends Model implements Compatible
 
     protected $guarded = [];
 
+    protected $dispatchesEvents = ['saved' => PublicationSaved::class];
+
     protected function casts(): array
     {
         return [

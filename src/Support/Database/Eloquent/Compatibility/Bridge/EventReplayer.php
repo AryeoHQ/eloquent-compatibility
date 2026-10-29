@@ -5,25 +5,35 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use BackedEnum;
+use Closure;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Bus\Dispatcher as BusDispatcher;
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher as EventDispatcher;
 use Illuminate\Support\Str;
+use Illuminate\Support\Testing\Fakes\BusFake;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use InvalidArgumentException;
 use ReflectionProperty;
+use RuntimeException;
 use stdClass;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Mapping\Assignment;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid;
 use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Transition;
 use Support\Database\Eloquent\StateMachines\Contracts\StateMachineable;
 use Support\Database\Eloquent\StateMachines\Triggers\Exceptions\Duplicate;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
+use Throwable;
+use TypeError;
 use WeakMap;
 
 final class EventReplayer
@@ -42,9 +52,17 @@ final class EventReplayer
     /** @var WeakMap<object, Exclusion> */
     private WeakMap $excluded;
 
+    /** @var WeakMap<Model, list<ExcludedListener>> */
+    private WeakMap $transitioning;
+
+    /** @var WeakMap<Model, bool> */
+    private WeakMap $saves;
+
     public function __construct(private readonly MirrorIndex $mirrorIndex)
     {
         $this->excluded = new WeakMap;
+        $this->transitioning = new WeakMap;
+        $this->saves = new WeakMap;
     }
 
     /**
@@ -110,18 +128,41 @@ final class EventReplayer
     public function transition(AffectedRecord $record, array $rowBefore, array $rowAfter, string $connectionName, array $states): void
     {
         $class = $record->model;
-        $model = (new $class)->newInstance([], true);
-        $model->setConnection($connectionName);
-        $model->setRawAttributes([...$rowAfter, ...array_intersect_key($rowBefore, array_flip($states))], true);
+        $template = (new $class)->setConnection($connectionName);
+        $excludedListeners = $this->mirrorIndex->excludedListeners($record->map);
+        $unlisten = $this->listenForSaves($template);
+        $unmask = $this->maskModelEvents($template, $excludedListeners);
 
-        foreach ($states as $state) {
-            $trigger = $this->trigger($record, $model, $state, $rowBefore[$state] ?? null, $rowAfter[$state] ?? null);
+        try {
+            foreach ($states as $state) {
+                $model = $template->newInstance([], true);
+                $model->setRawAttributes([...($this->read($record, $template) ?? $rowAfter), $state => $rowBefore[$state] ?? null], true);
+                $trigger = $this->trigger($record, $model, $state, $rowBefore[$state] ?? null, $rowAfter[$state] ?? null);
+                $this->transitioning[$model] = $excludedListeners;
+                $this->saves[$model] = false;
 
-            try {
-                $model->getAttribute($state)->{$trigger}()->withoutTransition()->now();
-            } catch (Invalid|BindingResolutionException $e) {
-                throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, $e);
+                try {
+                    $pendingTrigger = $model->getAttribute($state)->{$trigger}();
+
+                    if ($this->fakes(Container::getInstance()->make(BusDispatcher::class), $pendingTrigger)) {
+                        throw CompatibilityEventMirrorBypassed::byFakedBus($pendingTrigger::class, [$record->map]);
+                    }
+
+                    $pendingTrigger->withoutTransition()->now();
+                    $saved = $this->saved($model);
+                } catch (Invalid|BindingResolutionException $e) {
+                    throw $this->refusal($record, $model, $state, $e);
+                } finally {
+                    unset($this->transitioning[$model], $this->saves[$model]);
+                }
+
+                if (! $saved) {
+                    throw $this->refusal($record, $model, $state, new RuntimeException("The trigger's save of ".class_basename($model).' was vetoed, as a saving or updating listener that returns false does.'));
+                }
             }
+        } finally {
+            $unmask();
+            $unlisten();
         }
     }
 
@@ -257,7 +298,7 @@ final class EventReplayer
         if (! $from instanceof StateMachineable || ! $to instanceof StateMachineable) {
             $cast = (string) ($model->getCasts()[$state] ?? '');
 
-            throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, new InvalidArgumentException(
+            throw $this->refusal($record, $model, $state, new InvalidArgumentException(
                 '['.var_export($to instanceof StateMachineable ? $before : $after, true).'] is not a case of ['.class_basename($cast).'].',
             ));
         }
@@ -265,7 +306,7 @@ final class EventReplayer
         $transitions = $from->transitions()->filter(fn (Transition $transition) => $transition->to === $to);
 
         if ($transitions->count() !== 1) {
-            throw CompatibilityWriteRefused::byTransition($record->map, $model, $state, $transitions->isEmpty() ? new Invalid($model, $to, $state) : new Duplicate($to->name, $from));
+            throw $this->refusal($record, $model, $state, $transitions->isEmpty() ? new Invalid($model, $to, $state) : new Duplicate($to->name, $from));
         }
 
         return Str::camel(class_basename($transitions->sole()->using));
@@ -275,7 +316,123 @@ final class EventReplayer
     {
         $cast = $model->getCasts()[$state] ?? null;
 
-        return is_string($cast) && is_a($cast, BackedEnum::class, true) && (is_int($value) || is_string($value)) ? $cast::tryFrom($value) : null;
+        if (! is_string($cast) || ! is_a($cast, BackedEnum::class, true) || (! is_int($value) && ! is_string($value))) {
+            return null;
+        }
+
+        try {
+            return $cast::tryFrom($value);
+        } catch (TypeError) {
+            return null;
+        }
+    }
+
+    private function refusal(AffectedRecord $record, Model $model, string $state, Throwable $previous): CompatibilityWriteRefused
+    {
+        $resolvedMap = $this->mirrorIndex->resolvedMap($record->map);
+        $alias = $resolvedMap->currentModels()[$record->model] ?? null;
+        $assignment = $alias === null ? null : array_find($resolvedMap->assignmentsTo($alias), fn (Assignment $assignment) => $assignment->targetColumn->column === $state);
+
+        return CompatibilityWriteRefused::byTransition($record->map, $model, $state, (string) $resolvedMap->previousModel->model, $assignment->attribute->column ?? $state, $previous);
+    }
+
+    /**
+     * @return null|array<string, mixed>
+     */
+    private function read(AffectedRecord $record, Model $model): null|array
+    {
+        $row = $model->getConnection()->selectOne(
+            'select * from '.SqlFragments::identifier($record->readFrom).' where '.SqlFragments::identifier($record->keyColumn).' = ? limit 1',
+            [$record->keyValue],
+        );
+
+        return $row === null ? null : (array) $row;
+    }
+
+    /**
+     * @return Closure(): void
+     */
+    private function listenForSaves(Model $model): Closure
+    {
+        $dispatcher = $model::getEventDispatcher();
+
+        if ($dispatcher === null) {
+            return static function (): void {};
+        }
+
+        $real = $dispatcher instanceof EventFake ? $dispatcher->dispatcher : $dispatcher;
+        $custom = $model->dispatchesEvents()[ModelEvent::Saved->value] ?? null;
+        $names = [ModelEvent::Saved->for($model::class), ...(is_string($custom) && class_exists($custom) ? [$custom] : [])];
+        $listener = function (object $subject): void {
+            $saved = $subject instanceof Model ? $subject : array_find((array) $subject, fn (mixed $value) => $value instanceof Model && $this->saves->offsetExists($value));
+
+            if ($saved instanceof Model && $this->saves->offsetExists($saved)) {
+                $this->saves[$saved] = true;
+            }
+        };
+
+        foreach ($names as $name) {
+            $real->listen($name, $listener);
+        }
+
+        return function () use ($real, $names, $listener): void {
+            $raw = $real->getRawListeners(); // @phpstan-ignore staticMethod.dynamicCall
+
+            foreach ($names as $name) {
+                $real->forget($name);
+
+                foreach ($raw[$name] ?? [] as $other) {
+                    if ($other !== $listener) {
+                        $real->listen($name, $other);
+                    }
+                }
+            }
+        };
+    }
+
+    private function saved(Model $model): bool
+    {
+        $dispatcher = $model::getEventDispatcher();
+
+        return ($this->saves[$model] ?? false)
+            || ($dispatcher instanceof EventFake && $dispatcher->dispatched(ModelEvent::Saved->for($model::class), fn (string $fired, mixed $payload) => $payload === $model)->isNotEmpty());
+    }
+
+    private function fakes(BusDispatcher $bus, object $trigger): bool
+    {
+        return $bus instanceof BusFake && (fn (object $command): bool => $this->shouldFakeJob($command))->call($bus, $trigger);
+    }
+
+    /**
+     * @param  list<ExcludedListener>  $excludedListeners
+     * @return Closure(): void
+     */
+    private function maskModelEvents(Model $model, array $excludedListeners): Closure
+    {
+        $dispatcher = $model::getEventDispatcher();
+
+        if ($dispatcher === null || $excludedListeners === []) {
+            return static function (): void {};
+        }
+
+        $real = $dispatcher instanceof EventFake ? $dispatcher->dispatcher : $dispatcher;
+        $masked = [];
+        $maskedWildcards = [];
+
+        foreach (ModelEvent::cases() as $event) {
+            $applying = array_values(array_filter($excludedListeners, fn (ExcludedListener $excludedListener) => $excludedListener->appliesTo($event)));
+            $custom = $model->dispatchesEvents()[$event->value] ?? null;
+
+            foreach ($applying === [] ? [] : [$event->for($model::class), ...(is_string($custom) && class_exists($custom) ? [$custom] : [])] as $name) {
+                $masked += $this->mask($real, $name, $applying, $event);
+                $maskedWildcards += $this->maskWildcards($real, $name, $applying, $event);
+            }
+        }
+
+        return function () use ($real, $masked, $maskedWildcards): void {
+            $this->unmask($real, $masked);
+            $this->unmaskWildcards($real, $maskedWildcards);
+        };
     }
 
     private function ing(AffectedRecord $record, Model $model, ModelEvent $event): void
@@ -469,17 +626,34 @@ final class EventReplayer
         $prepared = $events->makeListener($listener, $wildcard); // @phpstan-ignore staticMethod.dynamicCall
 
         if ($wildcard) {
-            return fn (string $event, array $payload): mixed => $this->skips($payload[0] ?? null, $listener) ? null : $prepared($event, $payload);
+            return fn (string $event, array $payload): mixed => $this->skips($payload[0] ?? null, $listener, $event) ? null : $prepared($event, $payload);
         }
 
-        return fn (mixed ...$payload): mixed => $this->skips($payload[0] ?? null, $listener) ? null : $prepared($key, $payload);
+        return fn (mixed ...$payload): mixed => $this->skips($payload[0] ?? null, $listener, $key) ? null : $prepared($key, $payload);
     }
 
-    private function skips(mixed $subject, mixed $listener): bool
+    private function skips(mixed $subject, mixed $listener, string $name): bool
     {
-        $exclusion = is_object($subject) ? $this->excluded[$subject] ?? null : null;
+        $exclusion = is_object($subject) ? $this->excluded[$subject] ?? $this->transitioning($subject, $name) : null;
 
         return $exclusion !== null && $this->excludes($exclusion->listeners, $exclusion->event, $listener);
+    }
+
+    private function transitioning(object $subject, string $name): null|Exclusion
+    {
+        if (count($this->transitioning) === 0) {
+            return null;
+        }
+
+        $model = $subject instanceof Model ? $subject : array_find((array) $subject, fn (mixed $value) => $value instanceof Model && $this->transitioning->offsetExists($value));
+
+        if (! $model instanceof Model || ! $this->transitioning->offsetExists($model)) {
+            return null;
+        }
+
+        $event = ModelEvent::tryFrom($subject instanceof Model ? Str::between($name, 'eloquent.', ': ') : (string) array_search($subject::class, $model->dispatchesEvents(), true));
+
+        return $event === null ? null : new Exclusion($event, $this->transitioning[$model]);
     }
 
     /**

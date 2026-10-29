@@ -568,12 +568,27 @@ final class EventReplayerTest extends TestCase
 
         $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']));
 
-        $this->assertStringContainsString("refused this write, because it changes state of Publication #{$record->keyValue}", $refusal->refused);
+        $this->assertStringContainsString("refused this write, because it changes status of Article, stored as state of Publication #{$record->keyValue}, in a way", $refusal->refused);
         $this->assertStringContainsString($because, $refusal->because);
         $this->assertInstanceOf($previous, $refusal->getPrevious());
         $this->assertSame([], $journal->entries);
         $this->assertSame([], $this->seen);
         $this->assertSame([$written, null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_a_state_value_of_a_type_the_enum_cannot_take(): void
+    {
+        $journal = $this->journal();
+        [$record, $before] = $this->publication();
+
+        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, [...$before, 'state' => 1], 'pgsql', ['state']));
+
+        $this->assertStringContainsString('[1] is not a case of [PublicationState].', $refusal->because);
+        $this->assertInstanceOf(InvalidArgumentException::class, $refusal->getPrevious());
+        $this->assertSame([], $journal->entries);
+        $this->assertSame(['draft', null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
     }
 
     /**

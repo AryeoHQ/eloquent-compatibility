@@ -25,6 +25,20 @@ final class CompatibilityEventMirrorBypassed extends CompatibilityException
     /**
      * @param  list<string>  $maps
      */
+    public static function byFakedBus(string $trigger, array $maps): self
+    {
+        $names = implode("', '", $maps);
+
+        return new self(
+            'A write that runs the '.class_basename($trigger).' trigger was rolled back, because Bus::fake() fakes that trigger and the event bridge could not run it. '
+            ."Why: compatibility map '{$names}' runs a state machine's trigger for a state change through the other side, so a faked bus would store the new state without the trigger and the test would prove nothing about compatibility. "
+            .'Instead: fake only the jobs the test asserts, such as Bus::fake([ShipOrder::class]), or wrap the write in EventBridge::withoutMirroring() to switch the mirror off on purpose.',
+        );
+    }
+
+    /**
+     * @param  list<string>  $maps
+     */
     public static function byUnmarkedStatement(string $model, ModelEvent $event, array $maps): self
     {
         $names = implode("', '", $maps);

@@ -27,7 +27,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **event mirror**: the class that names a map and the listeners to exclude; it implements `EventMirror`.
 - **event replayer**: the part of the event bridge that raises one record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the event bridge skips for mirrored events; `ExcludedListener`.
-- **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
+- **exclusion**: the excluded listeners in force for one mirrored dispatch, or for one model event of the instance a trigger runs on; an `Exclusion`.
 - **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **installer action**: install, recompile or uninstall, the three Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.

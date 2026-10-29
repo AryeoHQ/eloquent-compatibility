@@ -435,7 +435,15 @@ final class EventBridge
             $this->copy($native, $pendingWrite->source, $caller[$native->id()]->row, $replayed[$native->id()]->row);
         }
 
-        return [$entries, array_diff_key($replayed, $natives)];
+        $replayed = array_diff_key($replayed, $natives);
+
+        foreach ($replayed as $id => $snapshot) {
+            if ($snapshot->row === null) {
+                $replayed[$id] = $after[$id] ?? $snapshot;
+            }
+        }
+
+        return [$entries, $replayed];
     }
 
     /**
@@ -472,9 +480,12 @@ final class EventBridge
             return;
         }
 
-        $attributes = [...$model->getAttributes(), ...$changes];
-        $model->setRawAttributes([...$model->getRawOriginal(), ...array_diff_key($changes, $model->getDirty())], true);
-        $model->setRawAttributes($attributes);
+        (function () use ($changes): void {
+            $this->attributes = [...$this->attributes, ...$changes];
+            $this->original = [...$this->original, ...$changes];
+            $this->classCastCache = array_diff_key($this->classCastCache, $changes);
+            $this->attributeCastCache = array_diff_key($this->attributeCastCache, $changes);
+        })->call($model);
     }
 
     private function finish(Connection $connection, Model $model, ModelEvent $event): void

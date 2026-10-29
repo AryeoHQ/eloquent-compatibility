@@ -155,15 +155,18 @@ A current model may cast a column to a state machine enum from `aryeo/eloquent-s
 - After the statement stores the new state, and before the current model's events, the event bridge runs the trigger of the one `#[Transition]` that leads from the stored state to the new one. It calls the trigger through the column's proxy with `Trigger::withoutTransition()`, so the trigger does not write the state column again.
 - The trigger's checks, `allowed()`, the before event and `handle()` each run once, inside the write's transaction. The after event fires once, after the outermost commit.
 - The trigger saves what `handle()` changed. The bridge mirrors that save as a native write, and its own events report the new state and the write's other changes. Each change is therefore reported once on each side.
-- The previous model's instance holds what the trigger saved before its own `updated` and `saved` events, and those events report only the write's own changes.
+- A listener that the map's event mirror excludes is skipped for every model event of the trigger's own instance while the trigger runs. It still runs for any other model that `handle()` saves.
+- The previous model's instance holds what the trigger saved before its own `updated` and `saved` events. Those events report the write's own changes, except a column that `handle()` changed too.
+- A column that both the write and `handle()` change is reported once on each side, from the value the write stored. The previous model's own `getChanges()` does not list that column.
 - A previous model may cast its mapped column to the same state machine.
-- The bridge refuses the whole write with `CompatibilityWriteRefused` and rolls it back in five cases: the stored or the new state is not a case of the enum, no `#[Transition]` leads from the stored state to the new one, more than one does, the trigger refuses the transition, or the container cannot build the trigger. An `Invalid` or a `BindingResolutionException` thrown inside `handle()` also refuses the write, with the original exception as `previous`. Any other exception from the trigger rolls the write back and reaches the caller unchanged.
+- The bridge refuses the whole write with `CompatibilityWriteRefused` and rolls it back in six cases: the stored or the new state is not a case of the enum, no `#[Transition]` leads from the stored state to the new one, more than one does, the trigger refuses the transition, the container cannot build the trigger, or a `saving` or `updating` listener vetoes the trigger's save. The bridge tells a veto by the missing `saved` event, so a `saved` listener that changes the instance without saving it keeps the write, as it does natively. An `Invalid` or a `BindingResolutionException` thrown inside `handle()` also refuses the write, with the original exception as `previous`. Any other exception from the trigger rolls the write back and reaches the caller unchanged.
+- Under `Illuminate\Support\Facades\Bus::fake()`, a bus fake that would record the trigger instead of running it makes the write throw `CompatibilityEventMirrorBypassed`, and the bridge rolls the write back. A bus fake that fakes only other jobs runs the trigger.
 
 A write through the previous model differs from a native transition in these ways:
 
-- **The database holds the new state while the trigger runs.** The model holds the previous state in its attribute until the trigger's phase, as on a native run. A read of the database inside `handle()` sees the new state, and so does `failed()` after a rollback.
+- **The database holds the new state while the trigger runs.** The model holds the previous state in its attribute until the trigger's phase, as on a native run. A read of the database inside `allowed()` or `handle()` sees the new state, and so does `failed()` after a rollback. An `allowed()` that compares such a read with the model's state therefore refuses every write through the previous model.
 - **The trigger takes no arguments.** The proxy builds it with `make()`, so an optional constructor argument takes its default. A required argument that the container cannot resolve refuses the write.
-- **Each side raises two sets of events.** The trigger's save reports `handle()`'s changes, and the bridge's events then report the new state. A native transition reports both in one set. A trigger whose `handle()` changes nothing saves nothing.
+- **Each side raises two sets of events.** The trigger's save reports `handle()`'s changes, and the bridge's events then report the new state. A native transition reports both in one set. The trigger always saves, so its `saving` and `saved` events fire even when `handle()` changes nothing. That save then writes nothing, and fires no `updating` or `updated` event.
 - **`updated_at` moves only with a write.** The bridge writes nothing itself. When the previous model does not write `updated_at` and `handle()` changes nothing, the current model's `updated_at` stays as it was.
 - **`failed()` cannot keep its writes.** A throw from the trigger rolls back the whole write, and the writes of `failed()` with it.
 
@@ -172,7 +175,7 @@ A repair can set a state that no `#[Transition]` reaches. Two routes skip the tr
 - Write the current model directly. The bridge mirrors that native write to the previous model and runs no trigger.
 - Write the previous model inside `resolve(EventBridge::class)->withoutMirroring(fn () => $article->update([...]))`. The bridge runs no trigger and raises no events on the current model.
 
-A map whose current models cast no column to a state machine behaves as it does without the package. So does every map with a release of eloquent-state-machines that has no `Trigger::withoutTransition()`.
+A map whose current models cast no column to a state machine behaves as it does without the package. So does every map with a release of eloquent-state-machines that has no `Trigger::withoutTransition()`. The trigger runs from the first installed release that has `Trigger::withoutTransition()`, so the upgrade to that release changes what a write through the previous model does.
 
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
