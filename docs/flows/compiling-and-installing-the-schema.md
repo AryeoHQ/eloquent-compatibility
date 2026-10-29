@@ -66,7 +66,7 @@ A migration renames the previous model's table before it installs, and `--retain
 
 A recompile before the first rename finds the retained table under the view's name. It treats that table as no installed view, as the recompile after the rename finds none. So it lists no drop of the view and restores no grants.
 
-A column default that references the retained table, such as `'widgets'::regclass`, refuses before the rename. PostgreSQL prints that reference under the table's current name, so after the rename the printed default would reference another relation, often the view. The message names the column and says to compile after the rename. A serial column's default references its sequence, so it compiles. [INV-51](../invariants.md#inv-51-a-compile-before-the-rename-refuses-a-default-that-references-the-retained-table) records the rule.
+A column default that references the retained table, such as `'widgets'::regclass` or `'widgets'::regtype`, refuses before the rename. PostgreSQL prints that reference under the table's current name, so after the rename the printed default would reference another relation, often the view. The check reads the default the column takes: its own default, or else the default of its domain chain. The message names the column and says to compile after the rename. A serial column's default references its sequence, so it compiles. A generated column's expression is not copied, so it compiles too. [INV-51](../invariants.md#inv-51-a-compile-before-the-rename-refuses-a-default-that-references-the-retained-table) records the rule.
 
 ## Compiling
 

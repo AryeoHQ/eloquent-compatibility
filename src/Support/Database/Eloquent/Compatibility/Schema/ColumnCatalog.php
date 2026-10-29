@@ -77,6 +77,7 @@ final class ColumnCatalog
                      where declared.typtype = \'d\'
                  )
                  select (array_agg(pg_get_expr(declared.typdefaultbin, 0) order by domain_chain.depth) filter (where declared.typdefaultbin is not null))[1] as inherited_default,
+                        (array_agg(declared.oid order by domain_chain.depth) filter (where declared.typdefaultbin is not null))[1] as default_domain,
                         coalesce(bool_or(declared.typnotnull), false) as inherited_not_null,
                         (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = \'d\'
@@ -95,9 +96,16 @@ final class ColumnCatalog
 
         $sources = implode(', ', array_fill(0, count($this->sources), "to_regclass(quote_ident(current_schema()) || '.' || ?)"));
 
-        return "exists (select 1 from pg_depend default_dependency
-                 where default_dependency.classid = 'pg_attrdef'::regclass and default_dependency.objid = column_default.oid and default_dependency.deptype = 'n'
-                   and default_dependency.refclassid = 'pg_class'::regclass and default_dependency.refobjid in ({$sources}))";
+        return "table_column.attidentity <> 'd' and table_column.attgenerated = '' and exists (
+                 select 1
+                 from pg_depend default_dependency
+                 join pg_class source_relation on source_relation.oid in ({$sources})
+                 left join pg_type source_type on source_type.oid = source_relation.reltype
+                 where default_dependency.deptype = 'n'
+                   and case when column_default.oid is null then default_dependency.classid = 'pg_type'::regclass and default_dependency.objid = column_domain.default_domain
+                            else default_dependency.classid = 'pg_attrdef'::regclass and default_dependency.objid = column_default.oid end
+                   and ((default_dependency.refclassid = 'pg_class'::regclass and default_dependency.refobjid = source_relation.oid)
+                        or (default_dependency.refclassid = 'pg_type'::regclass and default_dependency.refobjid in (source_relation.reltype, source_type.typarray))))";
     }
 
     /**

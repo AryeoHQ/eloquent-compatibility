@@ -414,12 +414,14 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['widgets', 'retained_widgets', 'sku', 'sku'])]
-    #[TestWith(['gadgets', 'gadgets', 'name', 'title'])]
-    public function it_refuses_to_compile_before_the_rename_a_default_that_references_the_retained_table(string $current, string $table, string $column, string $attribute): void
+    #[TestWith(['widgets', 'retained_widgets', 'sku', 'sku', "'widgets'::regclass", "'retained_widgets'::regclass"])]
+    #[TestWith(['gadgets', 'gadgets', 'name', 'title', "'widgets'::regclass", "'retained_widgets'::regclass"])]
+    #[TestWith(['gadgets', 'gadgets', 'name', 'title', "'widgets'::regtype", "'retained_widgets'::regtype"])]
+    #[TestWith(['gadgets', 'gadgets', 'name', 'title', "'widgets[]'::regtype", "'retained_widgets[]'::regtype"])]
+    public function it_refuses_to_compile_before_the_rename_a_default_that_references_the_retained_table(string $current, string $table, string $column, string $attribute, string $reference, string $printed): void
     {
         DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
-        DB::unprepared("ALTER TABLE {$current} ALTER COLUMN {$column} SET DEFAULT 'widgets'::regclass::text");
+        DB::unprepared("ALTER TABLE {$current} ALTER COLUMN {$column} SET DEFAULT {$reference}::text");
 
         $this->artisan('compatibility:sql', ['map' => 'widgets', '--retained-table-is-currently' => 'widgets'])
             ->expectsOutputToContain("Compatibility map 'widgets' is declared wrongly: the default of {$table}.{$column} references the retained table by its name before the rename, widgets; compile the compatibility map after the rename")
@@ -427,7 +429,41 @@ final class CompileSqlTest extends TestCase
 
         DB::unprepared('ALTER TABLE widgets RENAME TO retained_widgets');
 
-        $this->assertContains("ALTER VIEW \"widgets\" ALTER COLUMN \"{$attribute}\" SET DEFAULT ('retained_widgets'::regclass)::text", $this->statements($this->compile()));
+        $this->assertContains("ALTER VIEW \"widgets\" ALTER COLUMN \"{$attribute}\" SET DEFAULT ({$printed})::text", $this->statements($this->compile()));
+    }
+
+    #[Test]
+    public function it_refuses_to_compile_before_the_rename_a_domain_default_that_references_the_retained_table(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+        DB::unprepared("CREATE DOMAIN widget_label AS text DEFAULT 'widgets'::regclass::text; CREATE DOMAIN gadget_label AS widget_label; ALTER TABLE gadgets ALTER COLUMN name TYPE gadget_label");
+
+        $this->artisan('compatibility:sql', ['map' => 'widgets', '--retained-table-is-currently' => 'widgets'])
+            ->expectsOutputToContain("Compatibility map 'widgets' is declared wrongly: the default of gadgets.name references the retained table by its name before the rename, widgets; compile the compatibility map after the rename")
+            ->assertFailed();
+    }
+
+    #[Test]
+    public function it_compiles_before_the_rename_a_column_default_that_overrides_a_domain_default_that_references_the_retained_table(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+        DB::unprepared("CREATE DOMAIN gadget_label AS text DEFAULT 'widgets'::regclass::text; ALTER TABLE gadgets ALTER COLUMN name TYPE gadget_label, ALTER COLUMN name SET DEFAULT 'Unnamed'");
+
+        $printed = $this->statements($this->compile(['--retained-table-is-currently' => 'widgets']));
+
+        $this->assertContains("ALTER VIEW \"widgets\" ALTER COLUMN \"title\" SET DEFAULT 'Unnamed'::text", $printed);
+    }
+
+    #[Test]
+    public function it_compiles_before_the_rename_a_generated_column_that_references_the_retained_table(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+        DB::unprepared("ALTER TABLE gadgets ADD COLUMN origin oid GENERATED ALWAYS AS ('widgets'::regclass::oid) STORED");
+        resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap(['delivered_at' => Attribute::mapped('origin')->asType('oid')->storedAs('gadget', 'origin')->readOnlyBecause('The database derives it.')]));
+
+        $printed = $this->statements($this->compile(['--retained-table-is-currently' => 'widgets']));
+
+        $this->assertContains('ALTER VIEW "widgets" ALTER COLUMN "origin" DROP DEFAULT', $printed);
     }
 
     #[Test]
