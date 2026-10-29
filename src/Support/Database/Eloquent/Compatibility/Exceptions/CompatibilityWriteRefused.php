@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
-use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use PDOException;
-use Support\Database\Eloquent\Compatibility\Connections\DispatchesQueryFailed;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\SqlState;
 use Throwable;
@@ -84,21 +82,6 @@ final class CompatibilityWriteRefused extends CompatibilityException
             'A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: '.rtrim($previous->getMessage(), '.').'.',
             "Change {$written} to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on ".class_basename($destination).' itself.',
             $previous,
-        );
-    }
-
-    /**
-     * @param  list<string>  $maps
-     */
-    public static function byConnection(array $maps, Connection $connection): self
-    {
-        $names = implode("', '", $maps);
-        $name = (string) $connection->getName();
-
-        return new self(
-            "Compatibility map '{$names}' refused this write, because connection '{$name}' is an instance of ".$connection::class.', which does not use the trait '.DispatchesQueryFailed::class,
-            "Outside a transaction the event bridge runs a mirrored write in a transaction of its own, and only the trait's QueryFailed event lets the bridge roll that transaction back the moment the write's statement fails. Without it, the next DB::transaction() or createOrFirst() on the connection fails with 25P02, and a DB::afterCommit() callback registered before the next statement is lost.",
-            "Use the trait in the class of connection '{$name}', or register a connection class that uses it with Connection::resolverFor('{$connection->getDriverName()}', …), as docs/adopting-a-map.md shows.",
         );
     }
 

@@ -30,10 +30,10 @@ A write that skips model events, such as a query builder update, still reaches t
 | event bridge | Bridge | `EventBridge::mirror()`, `EventBridge::withoutMirroring()` | mirrors model events across the two sides |
 | drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree |
 | SQL printer | Console | `compatibility:sql`, run by `CompileSql` | prints the statements an Installer method runs, and runs only catalog reads |
-| exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap`, `CompatibilityEventMirrorBypassed` | every error the package raises |
+| exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap`, `CompatibilityEventMirrorBypassed`, `CompatibilityConnectionUnsupported` | every error the package raises |
 | testing trait | Testing | `InteractsWithCompatibilityMaps` | records mirrored events for application tests |
 | provider | root | `Provider` | binds the singletons and releases failed writes |
-| failure event | Connections | `DispatchesQueryFailed`, `QueryFailed` | a trait the application's connection class must use, which raises an event for each failed statement |
+| failure event | Connections | `DispatchesQueryFailed`, `QueryFailed` | a trait the application's connection class must use, which runs the event bridge's callbacks around every statement and raises an event for each failed statement |
 
 ```mermaid
 flowchart LR
@@ -48,12 +48,12 @@ flowchart LR
   Print --> Installer
   Bridge --> Database
   Check --> Database
-  Connection["DispatchesQueryFailed"] -->|QueryFailed| Bridge
+  Connection["DispatchesQueryFailed"] -->|statements and failures| Bridge
 ```
 
 `Installer` resolves each map itself and never reads the registry. `CompileSql` takes a map from the registry and asks `Installer::statements()` for the statements it prints. `EventBridge::mirror()` registers the map it mirrors, so `CheckDrift` sees every mirrored map. Three namespaces carry a README of their own: [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Bridge](../src/Support/Database/Eloquent/Compatibility/Bridge/README.md).
 
-The Connections namespace holds a trait the application adds to its own connection class, `DispatchesQueryFailed`. `EventBridge::mirror()` listens for the trait's `QueryFailed`, so a failed write outside a transaction rolls back at once. The bridge refuses every mirrored write on a connection whose class does not use the trait, as [failure and rollback](flows/failure-and-rollback.md) describes.
+The Connections namespace holds a trait the application adds to its own connection class, `DispatchesQueryFailed`. The bridge hands the trait its `beforeExecuting` callbacks and its release, and the trait calls the release before it raises `QueryFailed`. So a failed write outside a transaction rolls back at once. The bridge refuses every mirrored write on a connection whose class does not use the trait, as [failure and rollback](flows/failure-and-rollback.md) describes.
 
 ## The life of a write
 

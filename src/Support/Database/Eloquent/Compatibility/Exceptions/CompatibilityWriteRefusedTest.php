@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
 use Closure;
-use Illuminate\Database\PostgresConnection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -131,21 +130,6 @@ final class CompatibilityWriteRefusedTest extends TestCase
 
         $this->assertStringContainsString('because it changes review_status of Article, stored as review of Gadget (new), in a way', $unsaved->refused);
         $this->assertStringEndsWith('the replay failed: Unresolvable dependency.', $unsaved->because);
-    }
-
-    #[Test]
-    public function it_names_the_connection_its_class_and_the_trait_the_class_lacks(): void
-    {
-        $default = (string) config('database.default');
-        config(['database.connections.reporting' => [...(array) config("database.connections.{$default}"), 'connection_class' => PostgresConnection::class]]);
-        $this->beforeApplicationDestroyed(fn () => DB::purge('reporting'));
-
-        $refusal = CompatibilityWriteRefused::byConnection(['widgets', 'accounts'], DB::connection('reporting'));
-
-        $this->assertSame("Compatibility map 'widgets', 'accounts' refused this write, because connection 'reporting' is an instance of Illuminate\\Database\\PostgresConnection, which does not use the trait Support\\Database\\Eloquent\\Compatibility\\Connections\\DispatchesQueryFailed", $refusal->refused);
-        $this->assertSame("Outside a transaction the event bridge runs a mirrored write in a transaction of its own, and only the trait's QueryFailed event lets the bridge roll that transaction back the moment the write's statement fails. Without it, the next DB::transaction() or createOrFirst() on the connection fails with 25P02, and a DB::afterCommit() callback registered before the next statement is lost.", $refusal->because);
-        $this->assertSame("Use the trait in the class of connection 'reporting', or register a connection class that uses it with Connection::resolverFor('pgsql', …), as docs/adopting-a-map.md shows.", $refusal->instead);
-        $this->assertTrue(CompatibilityWriteRefused::isRefusal($refusal));
     }
 
     private function secondRootPlace(): QueryException

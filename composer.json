@@ -37,7 +37,7 @@
         "php": "^8.4",
         "ext-pdo": "*",
         "ext-pdo_pgsql": "*",
-        "laravel/framework": "12.x || ^13",
+        "laravel/framework": "^12.45 || ^13",
         "nikic/php-parser": "^5.7",
         "phpstan/phpstan": "^2.1"
     },

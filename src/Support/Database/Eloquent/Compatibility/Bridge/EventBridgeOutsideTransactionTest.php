@@ -10,6 +10,7 @@ use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\PostgresConnection;
 use Illuminate\Database\QueryException;
@@ -18,6 +19,7 @@ use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -29,12 +31,20 @@ use PHPUnit\Framework\Attributes\TestWith;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Connections\DispatchesQueryFailed;
+use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityConnectionUnsupported;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
+use Tests\Fixtures\Support\Connections\ChildConnection;
+use Tests\Fixtures\Support\Connections\FailingRollBackConnection;
+use Tests\Fixtures\Support\Connections\OverridesBeforeExecutingConnection;
+use Tests\Fixtures\Support\Connections\OverridesHandleQueryExceptionConnection;
+use Tests\Fixtures\Support\Connections\OverridesRegisterEventBridgeConnection;
+use Tests\Fixtures\Support\Connections\QueryFailedConnection;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Article;
@@ -217,8 +227,32 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertArrayNotHasKey($default, DB::getConnections());
         $this->recordMirroredEvents();
         $refusal = "connection '{$default}' is an instance of ".PostgresConnection::class.', which does not use the trait '.DispatchesQueryFailed::class;
-        $this->assertThrows(fn () => $widget->update(['title' => 'Refused']), CompatibilityWriteRefused::class, $refusal);
-        $this->assertThrows(fn () => Widget::query()->create(['title' => 'Refused too']), CompatibilityWriteRefused::class, $refusal);
+        $this->assertThrows(fn () => $widget->update(['title' => 'Refused']), CompatibilityConnectionUnsupported::class, $refusal);
+        $this->assertThrows(fn () => Widget::query()->create(['title' => 'Refused too']), CompatibilityConnectionUnsupported::class, $refusal);
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['Blue gadget'], DB::table('gadgets')->pluck('name')->all());
+    }
+
+    /**
+     * @param  class-string<Connection>  $class
+     */
+    #[Test]
+    #[TestWith([OverridesHandleQueryExceptionConnection::class, 'handleQueryException'])]
+    #[TestWith([OverridesBeforeExecutingConnection::class, 'beforeExecuting'])]
+    #[TestWith([OverridesRegisterEventBridgeConnection::class, 'registerEventBridge'])]
+    public function it_refuses_every_mirrored_write_on_a_connection_whose_class_replaces_a_method_of_the_trait_and_names_that_class(string $class, string $method): void
+    {
+        $default = (string) config('database.default');
+        $widget = $this->widget();
+        config(["database.connections.{$default}.connection_class" => $class]);
+        DB::purge($default);
+        $this->recordMirroredEvents();
+        $refusal = "connection '{$default}' is an instance of {$class}, which resolves {$method}() to {$class}::{$method}(), not to the method of ".DispatchesQueryFailed::class;
+
+        $this->assertThrows(fn () => $widget->update(['title' => 'Refused']), CompatibilityConnectionUnsupported::class, $refusal);
+        $this->assertThrows(fn () => Widget::query()->create(['title' => 'Refused too']), CompatibilityConnectionUnsupported::class, $refusal);
+
         $this->assertNothingMirrored();
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame(['Blue gadget'], DB::table('gadgets')->pluck('name')->all());
@@ -291,6 +325,155 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    public function it_rolls_back_at_once_a_write_whose_own_statement_fails_before_it_reaches_the_database_outside_a_transaction(): void
+    {
+        $widget = $this->widget()->refresh();
+        $concurrent = $this->concurrentConnection();
+        $concurrent->statement("set lock_timeout = '200ms'");
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => $widget->update(['title' => DB::raw("coalesce(:x, 'Renamed')")]), QueryException::class, 'HY093');
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Blue gadget', $concurrent->transaction(fn () => $concurrent->table('gadgets')->where('id', $widget->gadget_id)->lockForUpdate()->value('name')));
+        DB::table('people')->insert(['email' => 'later@example.test']);
+        $this->assertSame(['later@example.test'], $concurrent->table('people')->pluck('email')->all());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertNothingMirrored();
+    }
+
+    #[Test]
+    public function it_rolls_back_to_its_savepoint_and_releases_it_when_its_own_statement_fails_before_it_reaches_the_database_inside_a_caller_transaction(): void
+    {
+        $widget = $this->widget()->refresh();
+        $concurrent = $this->concurrentConnection();
+        $concurrent->statement("set lock_timeout = '200ms'");
+        $this->recordMirroredEvents();
+        DB::beginTransaction();
+
+        try {
+            $this->assertThrows(fn () => $widget->update(['title' => DB::raw("coalesce(:x, 'Renamed')")]), QueryException::class, 'HY093');
+
+            $this->assertSame(1, DB::transactionLevel());
+            $this->assertSame('Blue gadget', $concurrent->transaction(fn () => $concurrent->table('gadgets')->where('id', $widget->gadget_id)->lockForUpdate()->value('name')));
+            $widget->refresh()->update(['title' => 'Renamed']);
+        } finally {
+            DB::commit();
+        }
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_fails_and_rolls_back_a_write_whose_query_executed_listener_catches_a_failed_mapped_create_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        $nested = null;
+        $this->listenBeforeTheBridge(function (QueryExecuted $query) use (&$nested): void {
+            if ($nested === null && str_starts_with($query->sql, 'update "widgets"')) {
+                try {
+                    Widget::query()->create(['title' => null, 'street' => '2 Nested St']);
+                } catch (QueryException $e) {
+                    $nested = $e;
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => $widget->update(['title' => 'Never mirrored']), QueryException::class, 'current transaction is aborted');
+
+        $this->assertSame('23502', $nested?->getCode());
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame(['Blue gadget'], DB::table('gadgets')->pluck('name')->all());
+    }
+
+    #[Test]
+    public function it_completes_a_write_whose_statement_fails_on_another_connection_of_the_same_name_outside_a_transaction(): void
+    {
+        $default = (string) config('database.default');
+        $read = DB::connection("{$default}::read");
+        $this->assertSame($default, $read->getName());
+        $this->assertTrue((new Widget(['title' => 'Written through the read connection']))->setConnection("{$default}::read")->save());
+        $widget = $this->widget();
+        $read->beginTransaction();
+        $read->statement("set local lock_timeout = '100ms'");
+        $failures = [];
+        $this->listenBeforeTheBridge(function (QueryExecuted $query) use ($read, &$failures): void {
+            if ($failures === [] && $query->connection === DB::connection() && str_starts_with($query->sql, 'update "widgets"')) {
+                try {
+                    $read->update($query->sql, $query->bindings);
+                } catch (QueryException $e) {
+                    $failures[] = $e;
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        try {
+            $widget->update(['title' => 'Renamed']);
+        } finally {
+            $read->rollBack();
+        }
+
+        $this->assertSame('55P03', ($failures[0] ?? null)?->getCode());
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame([0, 0], [DB::transactionLevel(), $read->transactionLevel()]);
+    }
+
+    #[Test]
+    public function it_keeps_a_write_whose_rollback_fails_and_retries_the_rollback_once_on_each_later_statement_outside_a_transaction(): void
+    {
+        $default = (string) config('database.default');
+        $widget = $this->widget();
+        config(["database.connections.{$default}.connection_class" => FailingRollBackConnection::class]);
+        DB::purge($default);
+        $connection = DB::connection();
+        $this->assertInstanceOf(FailingRollBackConnection::class, $connection);
+        $connection->rollBackFailures = 2;
+
+        $this->refuseUuidChange($widget);
+
+        $this->assertSame([1, 1], [$connection->rollBackAttempts, DB::transactionLevel()]);
+        $this->assertThrows(fn () => DB::table('gadgets')->count(), PDOException::class, 'The server failed the rollback.');
+        $this->assertSame([2, 1], [$connection->rollBackAttempts, DB::transactionLevel()]);
+        $this->assertSame(1, DB::table('gadgets')->count());
+        $this->assertSame([3, 0], [$connection->rollBackAttempts, DB::transactionLevel()]);
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_rolls_back_and_never_commits_a_write_whose_rollback_failed_when_a_later_save_of_its_model_sends_no_statement(): void
+    {
+        $default = (string) config('database.default');
+        $widget = $this->widget();
+        config(["database.connections.{$default}.connection_class" => FailingRollBackConnection::class]);
+        DB::purge($default);
+        $connection = DB::connection();
+        $this->assertInstanceOf(FailingRollBackConnection::class, $connection);
+        $connection->rollBackFailures = 1;
+        $this->refuseUuidChange($widget);
+        $ended = [];
+        Event::listen(TransactionCommitted::class, function () use (&$ended): void {
+            $ended[] = 'committed';
+        });
+        Event::listen(TransactionRolledBack::class, function () use (&$ended): void {
+            $ended[] = 'rolled back';
+        });
+
+        $widget->syncOriginalAttribute('uuid');
+        $this->assertTrue($widget->save());
+
+        $this->assertSame(['rolled back'], $ended);
+        $this->assertSame([2, 0], [$connection->rollBackAttempts, DB::transactionLevel()]);
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
     public function it_leaves_a_caller_transaction_aborted_after_a_database_refusal_inside_it_as_a_native_write_would(): void
     {
         $widget = $this->widget();
@@ -312,15 +495,19 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     public function it_throws_the_original_query_exception_when_the_connection_is_lost_during_a_bridged_write_outside_a_transaction(): void
     {
         $default = (string) config('database.default');
-        config(['database.connections.terminator' => config("database.connections.{$default}")]);
         $widget = $this->widget();
-        $pid = (int) DB::connection()->scalar('select pg_backend_pid()');
-        $armed = true;
-        DB::connection()->beforeExecuting(function (string $query) use (&$armed, $pid): void {
-            if ($armed && str_starts_with($query, 'update "widgets"')) {
-                $armed = false;
-                DB::connection('terminator')->scalar('select pg_terminate_backend(?, 5000)', [$pid]);
-            }
+        DB::unprepared(<<<'SQL'
+            CREATE FUNCTION lose_the_connection() RETURNS trigger LANGUAGE plpgsql AS $lose$
+            BEGIN
+              IF NEW.name = 'Lost' THEN
+                PERFORM pg_terminate_backend(pg_backend_pid());
+              END IF;
+              RETURN NEW;
+            END $lose$;
+            CREATE TRIGGER lose_the_connection BEFORE UPDATE ON gadgets FOR EACH ROW EXECUTE FUNCTION lose_the_connection();
+            SQL);
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::unprepared('DROP FUNCTION IF EXISTS lose_the_connection() CASCADE');
         });
 
         try {
@@ -347,32 +534,207 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
-    public function it_fails_a_write_whose_transaction_a_failed_statement_in_its_window_aborted_instead_of_running_it_unmirrored_outside_a_transaction(): void
+    #[TestWith([false, false])]
+    #[TestWith([false, true])]
+    #[TestWith([true, false])]
+    #[TestWith([true, true])]
+    public function it_mirrors_a_write_whose_before_executing_callback_catches_a_failed_statement_outside_a_transaction(bool $registeredFirst, bool $readsAgain): void
     {
-        $widget = $this->widget();
         $caught = null;
-        DB::connection()->beforeExecuting(function (string $query) use (&$caught): void {
+        $callback = function (string $query) use ($readsAgain, &$caught): void {
             if ($caught === null && str_starts_with($query, 'update "widgets"')) {
                 try {
                     DB::select('select * from missing_relation');
                 } catch (QueryException $e) {
                     $caught = $e;
                 }
+
+                if ($readsAgain) {
+                    DB::select('select 1');
+                }
             }
-        });
+        };
+
+        if ($registeredFirst) {
+            DB::connection()->beforeExecuting($callback);
+        }
+
+        $widget = $this->widget();
+
+        if (! $registeredFirst) {
+            DB::connection()->beforeExecuting($callback);
+        }
+
         $this->recordMirroredEvents();
 
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertInstanceOf(QueryException::class, $caught);
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame('Renamed', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_fails_a_write_with_25p02_when_its_before_executing_callback_catches_a_failed_statement_and_reads_again_inside_a_caller_transaction(bool $registeredFirst): void
+    {
+        $caught = null;
+        $callback = function (string $query) use (&$caught): void {
+            if ($caught === null && str_starts_with($query, 'update "widgets"')) {
+                try {
+                    DB::select('select * from missing_relation');
+                } catch (QueryException $e) {
+                    $caught = $e;
+                }
+
+                DB::select('select 1');
+            }
+        };
+
+        if ($registeredFirst) {
+            DB::connection()->beforeExecuting($callback);
+        }
+
+        $widget = $this->widget();
+
+        if (! $registeredFirst) {
+            DB::connection()->beforeExecuting($callback);
+        }
+
+        $this->recordMirroredEvents();
+        DB::beginTransaction();
+
         try {
-            $widget->update(['title' => 'Never mirrored']);
-            $this->fail('Expected the aborted transaction to fail the write.');
+            $widget->update(['title' => 'Never written']);
+            $this->fail('Expected the aborted caller transaction to fail the write.');
         } catch (QueryException $e) {
             $this->assertSame('25P02', $e->getCode());
+        } finally {
+            DB::rollBack();
         }
 
         $this->assertInstanceOf(QueryException::class, $caught);
         $this->assertNothingMirrored();
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    #[Test]
+    public function it_mirrors_a_mapped_create_a_before_executing_callback_makes_on_an_update_and_the_update_itself_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        $created = false;
+        DB::connection()->beforeExecuting(function (string $query) use (&$created): void {
+            if (! $created && str_starts_with($query, 'update "widgets"')) {
+                $created = true;
+                Widget::query()->create(['title' => 'Created on the update', 'street' => '2 Window St']);
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Created, fn (Model $gadget) => $gadget->getAttribute('name') === 'Created on the update');
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['Created on the update', 'Renamed'], DB::table('gadgets')->orderBy('name')->pluck('name')->all());
+    }
+
+    #[Test]
+    public function it_mirrors_an_update_whose_before_executing_callback_catches_a_failed_mapped_create_outside_a_transaction(): void
+    {
+        $widget = $this->widget();
+        $nested = null;
+        DB::connection()->beforeExecuting(function (string $query) use (&$nested): void {
+            if ($nested === null && str_starts_with($query, 'update "widgets"')) {
+                try {
+                    Widget::query()->create(['title' => null, 'street' => '2 Nested St']);
+                } catch (QueryException $e) {
+                    $nested = $e;
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertSame('23502', $nested?->getCode());
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertCount(1, $this->mirroredEvents());
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame(['Renamed'], DB::table('gadgets')->pluck('name')->all());
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_rolls_back_its_transaction_at_once_when_an_earlier_query_failed_listener_returns_false_or_throws(bool $throws): void
+    {
+        Exceptions::fake();
+        $widget = $this->widget();
+        $this->listenForFailuresBeforeTheBridge(fn () => $throws ? throw new RuntimeException('A failure listener failed.') : false);
+
+        $this->refuseUuidChange($widget);
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+
+        if ($throws) {
+            Exceptions::assertReported(fn (RuntimeException $e) => $e->getMessage() === 'A failure listener failed.');
+        } else {
+            Exceptions::assertNothingReported();
+        }
+    }
+
+    /**
+     * @param  class-string<Connection>  $class
+     */
+    #[Test]
+    #[TestWith([QueryFailedConnection::class])]
+    #[TestWith([ChildConnection::class])]
+    public function it_rolls_back_its_transaction_before_query_failed_reaches_a_listener(string $class): void
+    {
+        $default = (string) config('database.default');
+        $widget = $this->widget();
+        config(["database.connections.{$default}.connection_class" => $class]);
+        DB::purge($default);
+        $levels = [];
+        Event::listen(QueryFailed::class, function () use (&$levels): void {
+            $levels[] = DB::transactionLevel();
+        });
+
+        $this->refuseUuidChange($widget);
+
+        $this->assertInstanceOf($class, DB::connection());
+        $this->assertSame([0], $levels);
+        $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_rolls_back_at_once_the_transaction_of_a_mirrored_write_refused_inside_a_query_failed_listener(): void
+    {
+        $widget = $this->widget();
+        $refusals = [];
+        Event::listen(QueryFailed::class, function () use ($widget, &$refusals): void {
+            if ($refusals === []) {
+                try {
+                    $widget->update(['uuid' => '00000000-0000-0000-0000-000000000000']);
+                } catch (QueryException $e) {
+                    $refusals[] = $e;
+                }
+            }
+        });
+
+        $this->assertThrows(fn () => DB::select('select * from missing_relation'), QueryException::class, 'missing_relation');
+
+        $this->assertCount(1, $refusals);
+        $this->assertTrue(CompatibilityWriteRefused::isRefusal($refusals[0]));
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
     }
 
     #[Test]
@@ -396,17 +758,21 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
-    public function it_releases_the_transaction_left_by_a_stopped_statement_when_the_application_terminates(): void
+    public function it_opens_no_transaction_and_takes_no_lock_for_a_write_whose_statement_another_before_executing_callback_stops(): void
     {
-        $this->stopBeforeTheStatement($this->widget());
-
-        $this->assertSame(1, DB::table('gadgets')->count());
-        $this->assertSame(1, DB::transactionLevel(), 'Declared limit: no event reports a statement that never ran, and its transaction stays healthy, so only a queue loop or termination releases it.');
-
-        $this->app->terminate();
+        $widget = $this->widget()->refresh();
+        $this->stopBeforeTheStatement($widget);
 
         $this->assertSame(0, DB::transactionLevel());
-        $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+        $concurrent = $this->concurrentConnection();
+        $concurrent->statement("set lock_timeout = '200ms'");
+        $this->assertSame('Blue gadget', $concurrent->transaction(fn () => $concurrent->table('gadgets')->where('id', $widget->gadget_id)->lockForUpdate()->value('name')));
+        $this->recordMirroredEvents();
+
+        $widget->update(['title' => 'Renamed']);
+
+        $this->assertMirrored(Gadget::class, ModelEvent::Updated, fn (Model $gadget) => $gadget->getAttribute('name') === 'Renamed');
+        $this->assertSame(0, DB::transactionLevel());
     }
 
     #[Test]
@@ -477,7 +843,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $widget = Widget::query()->select(['uuid', 'title'])->firstOrFail();
         $widget->setKeyName('uuid')->setKeyType('string')->setIncrementing(false);
         $this->concurrently(
-            fn (string $query) => str_starts_with($query, 'update "widgets"'),
+            $this->lockedFor(fn (string $query) => str_starts_with($query, 'update "widgets"')),
             fn (Connection $concurrent) => $concurrent->table('retained_widgets')->where('id', $id)->update(['sku' => 'Concurrent']),
         );
 
@@ -966,6 +1332,48 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         Event::listen(QueryExecuted::class, resolve(EventBridge::class)->handleQuery(...));
     }
 
+    private function listenForFailuresBeforeTheBridge(Closure $listener): void
+    {
+        /** @var list<Closure> $listeners */
+        $listeners = Event::getRawListeners()[QueryFailed::class] ?? [];
+        Event::forget(QueryFailed::class);
+        Event::listen(QueryFailed::class, $listener);
+
+        foreach ($listeners as $registered) {
+            Event::listen(QueryFailed::class, $registered);
+        }
+    }
+
+    /**
+     * @param  Closure(string): bool  $statement
+     * @return Closure(string): bool
+     */
+    private function lockedFor(Closure $statement): Closure
+    {
+        $started = false;
+
+        return function (string $query) use ($statement, &$started): bool {
+            if (! $started) {
+                $started = $statement($query);
+
+                return false;
+            }
+
+            return str_starts_with($query, 'select * from ');
+        };
+    }
+
+    private function assertAfterCommitRunsAtOnce(): void
+    {
+        $levels = [];
+
+        DB::afterCommit(function () use (&$levels): void {
+            $levels[] = DB::transactionLevel();
+        });
+
+        $this->assertSame([0], $levels);
+    }
+
     private function concurrentConnection(): Connection
     {
         config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
@@ -1036,9 +1444,9 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->recordMirroredEvents();
         $updates = 0;
         $this->concurrently(
-            function (string $query) use ($update, &$updates): bool {
+            $this->lockedFor(function (string $query) use ($update, &$updates): bool {
                 return str_starts_with($query, 'update "widgets"') && ++$updates === $update;
-            },
+            }),
             fn (Connection $concurrent) => $concurrent->table('retained_widgets')->where('id', $widget->getKey())->update(['sku' => 'Concurrent']),
         );
 

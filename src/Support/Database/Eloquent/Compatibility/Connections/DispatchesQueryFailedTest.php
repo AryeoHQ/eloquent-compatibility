@@ -14,9 +14,11 @@ use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
+use Tests\Fixtures\Support\Connections\ChildConnection;
 use Tests\Fixtures\Support\Connections\QueryFailedConnection;
 use Tests\Fixtures\Support\Connections\ResilientConnection;
 use Tests\TestCase;
+use WeakReference;
 
 #[CoversClass(QueryFailed::class)]
 #[CoversTrait(DispatchesQueryFailed::class)]
@@ -34,6 +36,7 @@ final class DispatchesQueryFailedTest extends TestCase
         config([
             'database.connections.query-failed' => [...(array) config("database.connections.{$default}"), 'connection_class' => QueryFailedConnection::class],
             'database.connections.resilient' => [...(array) config("database.connections.{$default}"), 'connection_class' => ResilientConnection::class],
+            'database.connections.child' => [...(array) config("database.connections.{$default}"), 'connection_class' => ChildConnection::class],
         ]);
     }
 
@@ -42,6 +45,7 @@ final class DispatchesQueryFailedTest extends TestCase
     {
         yield 'a connection that uses the trait' => ['query-failed'];
         yield 'a connection that overrides run() and the lost-connection retry' => ['resilient'];
+        yield 'a connection whose parent class uses the trait too' => ['child'];
     }
 
     #[DataProvider('connections')]
@@ -60,6 +64,17 @@ final class DispatchesQueryFailedTest extends TestCase
         $this->assertSame($thrown, $this->failures[0]->exception);
         $this->assertSame('42P01', $thrown->getCode());
         $this->assertSame('select * from missing_relation where id = 7', $this->failures[0]->toRawSql());
+    }
+
+    #[DataProvider('connections')]
+    #[Test]
+    public function it_holds_no_reference_to_a_failure_its_caller_let_go(string $name): void
+    {
+        $failure = WeakReference::create($this->failing(DB::connection($name), 'select * from missing_relation'));
+
+        gc_collect_cycles();
+
+        $this->assertNull($failure->get());
     }
 
     #[DataProvider('connections')]
@@ -163,10 +178,10 @@ final class DispatchesQueryFailedTest extends TestCase
         $this->assertRetried($connection);
     }
 
-    private function connection(string $name): QueryFailedConnection|ResilientConnection
+    private function connection(string $name): ChildConnection|QueryFailedConnection|ResilientConnection
     {
         $connection = DB::connection($name);
-        $this->assertTrue($connection instanceof QueryFailedConnection || $connection instanceof ResilientConnection);
+        $this->assertTrue($connection instanceof ChildConnection || $connection instanceof QueryFailedConnection || $connection instanceof ResilientConnection);
         $connection->listenForFailures(function (QueryFailed $failure): void {
             $this->failures[] = $failure;
         });

@@ -552,6 +552,29 @@ final class HasCompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_holds_no_model_after_a_before_executing_callback_stops_its_statement_and_an_increment(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Original', 'price_cents' => 100]);
+        $stopped = false;
+        DB::connection()->beforeExecuting(function (string $query) use (&$stopped): void {
+            if (! $stopped && str_starts_with($query, 'update "gadgets"')) {
+                $stopped = true;
+
+                throw new RuntimeException('Stopped before the statement.');
+            }
+        });
+
+        $this->assertThrows(fn () => $gadget->update(['name' => 'Stopped']), RuntimeException::class, 'Stopped before the statement.');
+        $gadget->name = 'Original';
+        $gadget->increment('price_cents');
+        $reference = WeakReference::create($gadget);
+        unset($gadget);
+
+        $this->assertSame([101, 'Original'], [DB::table('gadgets')->value('price_cents'), DB::table('gadgets')->value('name')]);
+        $this->assertReleased($reference);
+    }
+
+    #[Test]
     public function it_holds_no_model_after_a_save_vetoed_inside_the_same_instances_save_that_then_sends_no_statement(): void
     {
         $widget = $this->widget();
