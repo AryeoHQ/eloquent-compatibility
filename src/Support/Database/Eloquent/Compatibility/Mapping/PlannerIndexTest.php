@@ -14,7 +14,7 @@ final class PlannerIndexTest extends TestCase
     #[Test]
     public function it_names_the_index_with_no_column_and_no_filter(): void
     {
-        $this->assertSame(['name' => 'archived_newest', 'columns' => [], 'whereNull' => null, 'whereNotNull' => null], get_object_vars(PlannerIndex::named('archived_newest')));
+        $this->assertSame(['name' => 'archived_newest', 'columns' => [], 'filters' => []], get_object_vars(PlannerIndex::named('archived_newest')));
     }
 
     #[Test]
@@ -24,20 +24,27 @@ final class PlannerIndexTest extends TestCase
 
         $indexed = $original->on('created_at', descending: true)->on('title');
 
-        $this->assertSame(['name' => 'archived_newest', 'columns' => ['is_archived' => false, 'created_at' => true, 'title' => false], 'whereNull' => 'deleted_at', 'whereNotNull' => null], get_object_vars($indexed));
-        $this->assertSame(['is_archived' => false], $original->columns);
+        $this->assertSame([
+            'name' => 'archived_newest',
+            'columns' => [['attribute' => 'is_archived', 'descending' => false], ['attribute' => 'created_at', 'descending' => true], ['attribute' => 'title', 'descending' => false]],
+            'filters' => [['filter' => PlannerIndexFilter::WhereNull, 'attribute' => 'deleted_at']],
+        ], get_object_vars($indexed));
+        $this->assertSame([['attribute' => 'is_archived', 'descending' => false]], $original->columns);
     }
 
     #[Test]
-    public function it_keeps_one_column_per_attribute_at_its_first_place_with_the_direction_said_last(): void
+    public function it_records_a_repeated_column_as_a_second_call(): void
     {
         $indexed = PlannerIndex::named('archived_newest')->on('created_at')->on('is_archived')->on('created_at', descending: true);
 
-        $this->assertSame(['created_at' => true, 'is_archived' => false], $indexed->columns);
+        $this->assertSame(
+            [['attribute' => 'created_at', 'descending' => false], ['attribute' => 'is_archived', 'descending' => false], ['attribute' => 'created_at', 'descending' => true]],
+            $indexed->columns,
+        );
     }
 
     #[Test]
-    public function it_filters_on_a_copy_on_one_attribute_and_replaces_an_earlier_filter(): void
+    public function it_records_each_filter_on_a_copy_in_order_and_keeps_the_earlier_ones(): void
     {
         $original = PlannerIndex::named('archived_newest')->on('created_at');
 
@@ -46,9 +53,14 @@ final class PlannerIndexTest extends TestCase
         $nullAgain = $notNull->whereNull('updated_at');
 
         $this->assertSame(
-            [[null, null], ['deleted_at', null], [null, 'delivered_at'], ['updated_at', null]],
-            array_map(fn (PlannerIndex $index) => [$index->whereNull, $index->whereNotNull], [$original, $null, $notNull, $nullAgain]),
+            [
+                [],
+                [['filter' => PlannerIndexFilter::WhereNull, 'attribute' => 'deleted_at']],
+                [['filter' => PlannerIndexFilter::WhereNull, 'attribute' => 'deleted_at'], ['filter' => PlannerIndexFilter::WhereNotNull, 'attribute' => 'delivered_at']],
+                [['filter' => PlannerIndexFilter::WhereNull, 'attribute' => 'deleted_at'], ['filter' => PlannerIndexFilter::WhereNotNull, 'attribute' => 'delivered_at'], ['filter' => PlannerIndexFilter::WhereNull, 'attribute' => 'updated_at']],
+            ],
+            array_map(fn (PlannerIndex $index) => $index->filters, [$original, $null, $notNull, $nullAgain]),
         );
-        $this->assertSame([['created_at' => false], ['created_at' => false]], [$null->columns, $nullAgain->columns]);
+        $this->assertSame([[['attribute' => 'created_at', 'descending' => false]], [['attribute' => 'created_at', 'descending' => false]]], [$null->columns, $nullAgain->columns]);
     }
 }

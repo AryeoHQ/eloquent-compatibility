@@ -78,9 +78,8 @@ final class Compiler
     public function prepare(CompatibilityMap|ResolvedMap $map): array
     {
         $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
-        $statements = $this->planner($resolvedMap, true);
 
-        if ($statements === []) {
+        if ($resolvedMap->statisticsExpressions() === [] && $resolvedMap->primaryCurrentModel->indexes === []) {
             return [];
         }
 
@@ -93,7 +92,7 @@ final class Compiler
         $planned = [];
 
         foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
-            $planned = [...$planned, ...array_keys($index->columns), $index->whereNull, $index->whereNotNull];
+            $planned = [...$planned, ...array_column($index->columns, 'attribute'), ...array_column($index->filters, 'attribute')];
         }
 
         foreach ($resolvedMap->attributes as $attribute) {
@@ -108,26 +107,76 @@ final class Compiler
             }
         }
 
-        return $statements;
+        return $this->planner($resolvedMap, true);
     }
 
     /** @return list<string> */
     private function planner(ResolvedMap $resolvedMap, bool $concurrently): array
     {
         $table = SqlFragments::identifier($resolvedMap->primaryTable());
-        $expressions = $resolvedMap->statisticsExpressions();
-        $statements = $expressions === [] ? [] : [
-            'CREATE STATISTICS IF NOT EXISTS '.SqlFragments::identifier($resolvedMap->statisticsName())
-                .' ON '.implode(', ', array_map(fn (string $expression) => '('.$expression.')', $expressions)).' FROM '.$table,
-        ];
+        $statements = $this->statistics($resolvedMap, $table);
+        $indexes = $resolvedMap->primaryCurrentModel->indexes === [] ? [] : $this->plannerIndexes($resolvedMap);
 
         foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
-            $filter = $resolvedMap->indexFilter($index);
-            $statements[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($resolvedMap->indexName($index))
-                .' ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
+            $name = $resolvedMap->indexName($index);
+            $existing = $indexes[$name] ?? null;
+
+            if ($existing === null) {
+                $filter = $resolvedMap->indexFilter($index);
+                $statements[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($name)
+                    .' ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
+            } elseif (! $existing->valid) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, "index {$existing->relation} exists but is invalid, as a failed or unfinished CREATE INDEX CONCURRENTLY leaves it, so the planner cannot use it; DROP INDEX CONCURRENTLY {$existing->relation}, then prepare again");
+            }
         }
 
         return $statements === [] ? [] : [...$statements, 'ANALYZE '.$table];
+    }
+
+    /** @return list<string> */
+    private function statistics(ResolvedMap $resolvedMap, string $table): array
+    {
+        $expressions = $resolvedMap->statisticsExpressions();
+
+        if ($expressions === []) {
+            return [];
+        }
+
+        $name = $resolvedMap->statisticsName();
+        $declared = implode(', ', array_map(fn (string $expression) => '('.$expression.')', $expressions));
+        $existing = $this->connection->selectOne(
+            "select quote_ident(statistics_namespace.nspname) || '.' || quote_ident(statistics.stxname) as name, obj_description(statistics.oid, 'pg_statistic_ext') as expressions
+             from pg_statistic_ext statistics join pg_namespace statistics_namespace on statistics_namespace.oid = statistics.stxnamespace
+             where statistics.stxname = ? and statistics.stxnamespace = to_regnamespace(quote_ident(current_schema()))",
+            [$name],
+        );
+
+        if ($existing !== null && $existing->expressions === $declared) {
+            return [];
+        }
+
+        return [
+            ...($existing === null ? [] : ['DROP STATISTICS IF EXISTS '.$existing->name]),
+            'CREATE STATISTICS IF NOT EXISTS '.SqlFragments::identifier($name).' ON '.$declared.' FROM '.$table,
+            'COMMENT ON STATISTICS '.SqlFragments::identifier($name).' IS '.SqlFragments::literal($declared),
+        ];
+    }
+
+    /** @return array<string, object{relation: string, valid: bool}> */
+    private function plannerIndexes(ResolvedMap $resolvedMap): array
+    {
+        $indexes = [];
+        $rows = $this->connection->select(
+            'select index_relation.relname as name, index_relation.oid::regclass::text as relation, planner_index.indisvalid as valid
+             from pg_index planner_index join pg_class index_relation on index_relation.oid = planner_index.indexrelid
+             where index_relation.relname like '.SqlFragments::like($resolvedMap->objectPrefix()).' and index_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))',
+        );
+
+        foreach ($rows as $row) {
+            $indexes[(string) $row->name] = (object) ['relation' => (string) $row->relation, 'valid' => $row->valid === true];
+        }
+
+        return $indexes;
     }
 
     private function view(ResolvedMap $resolvedMap): string
@@ -175,7 +224,7 @@ final class Compiler
 
             if ($default === null && $attribute->storedAs !== null && $attribute->alias !== null && $resolvedMap->dependent($attribute->alias) === null) {
                 $default = $this->storedDefault($resolvedMap, $resolvedMap->table($attribute->alias), $attribute->storedAs);
-                $default = $default === null || $attribute->timeZone === null ? $default : $this->inTimeZone($attribute, '('.$default.')');
+                $default = $default === null || $attribute->timeZone === null ? $default : SqlFragments::atTimeZone('('.$default.')', $attribute->timeZone);
             }
 
             $statements[] = 'ALTER VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view)
@@ -542,7 +591,7 @@ final class Compiler
             if (! $attribute->retained && $attribute->alias === $alias && $attribute->storedAs !== null && $attribute->writesTo === []
                 && ! $resolvedMap->writes($alias, $attribute->storedAs)
                 && ! ($this->columnCatalog->of($resolvedMap->table($alias))[$attribute->storedAs]->alwaysGenerated ?? false)) {
-                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, $this->inTimeZone($attribute, 'NEW.'.SqlFragments::identifier($attribute->column))));
+                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, SqlFragments::atTimeZone('NEW.'.SqlFragments::identifier($attribute->column), $attribute->timeZone)));
             }
         }
 
@@ -777,11 +826,6 @@ final class Compiler
     private function searchPath(): string
     {
         return SqlFragments::identifier($this->schema).', pg_temp';
-    }
-
-    private function inTimeZone(Attribute $attribute, string $expression): string
-    {
-        return $attribute->timeZone === null ? $expression : $expression.' AT TIME ZONE '.SqlFragments::literal($attribute->timeZone);
     }
 
     private function compared(ResolvedMap $resolvedMap, Attribute $attribute, string $expression): string

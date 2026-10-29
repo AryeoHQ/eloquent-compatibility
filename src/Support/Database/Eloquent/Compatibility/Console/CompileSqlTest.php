@@ -85,6 +85,21 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_exactly_the_planner_statements_a_recompile_runs_when_it_rebuilds_the_statistics_and_creates_a_missing_index(): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::statement('comment on statistics compatibility__widgets__statistics is null');
+        DB::statement('drop index compatibility__widgets__index_archived_newest');
+
+        $printed = $this->statements($this->compile(['--for' => 'recompile']));
+        $executed = $this->executed(fn () => resolve(Installer::class)->recompile(new WidgetCompatibilityMap));
+
+        $this->assertContains('DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics', $printed);
+        $this->assertContains('ANALYZE "gadgets"', $printed);
+        $this->assertSame($executed, $printed);
+    }
+
+    #[Test]
     #[TestWith(['install'])]
     #[TestWith(['recompile'])]
     #[TestWith(['uninstall'])]

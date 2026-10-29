@@ -4,12 +4,12 @@ This namespace is the database half of the package. `Compiler` turns a resolved 
 
 Entry points:
 
-- `Installer::install()`, `Installer::recompile()` and `Installer::uninstall()` change the database, each in one transaction. Install and recompile emit a map's planner statistics and indexes with the rest, and an uninstall drops them.
-- `Installer::prepare()` builds only the planner statistics and indexes, with `CREATE INDEX CONCURRENTLY`. It runs outside a transaction, one statement at a time, ahead of the install migration or of a recompile that adds or renames an index, so the install or recompile finds each object and creates nothing.
+- `Installer::install()`, `Installer::recompile()` and `Installer::uninstall()` change the database, each in one transaction. Install and recompile plan a map's planner statistics and indexes from the catalog: they create what is missing, rebuild a statistics object whose expressions changed, refuse an invalid index, and analyze only after they create something. An uninstall drops them.
+- `Installer::prepare()` plans only the planner statistics and indexes, the same way, and builds with `CREATE INDEX CONCURRENTLY`. It runs outside a transaction, one statement at a time, ahead of the install migration or of a recompile that adds or renames an index or changes a zoned attribute, so the install or recompile lists no planner statement and no `ANALYZE`.
 - `Installer::statements()` returns the statements one of those methods runs, named by an `InstallerAction`, without running them. The `compatibility:sql` command prints them, with `--for=prepare` among its actions.
-- `Compiler::compile()` returns the `CompiledSql` without running it. Its `CompiledSql::$planner` holds the planner list, after the triggers. `Compiler::prepare()` returns that list for a prepare.
+- `Compiler::compile()` returns the `CompiledSql` without running it. Its `CompiledSql::$planner` holds the planner list, after the triggers. `Compiler::prepare()` returns that list for a prepare. Both read the catalog to plan it and run nothing.
 
-`ColumnCatalog` reads the catalog, and `SqlFragments` quotes names and raises refusals. `SqlState`, `Setting` and `TriggerFunction` name the codes, settings and function suffixes the SQL uses.
+`ColumnCatalog` reads the catalog, and `SqlFragments` quotes names, converts `AT TIME ZONE` and raises refusals. `SqlState`, `Setting` and `TriggerFunction` name the codes, settings and function suffixes the SQL uses.
 
 Flows: [compiling and installing the schema](../../../../../../docs/flows/compiling-and-installing-the-schema.md), [writing through the view](../../../../../../docs/flows/writing-through-the-view.md) and the refusals in [failure and rollback](../../../../../../docs/flows/failure-and-rollback.md).
 

@@ -61,6 +61,29 @@ final class SqlFragmentsTest extends TestCase
         $this->assertSame($matches, DB::scalar('select ? like '.SqlFragments::like($prefix), [$value]));
     }
 
+    #[Test]
+    #[TestWith(['UTC', 'gadget."delivered_at" AT TIME ZONE \'UTC\''])]
+    #[TestWith(["Mars/O'Neill", 'gadget."delivered_at" AT TIME ZONE \'Mars/O\'\'Neill\''])]
+    #[TestWith([null, 'gadget."delivered_at"'])]
+    public function it_converts_an_expression_at_a_quoted_time_zone_and_leaves_it_unchanged_without_one(null|string $zone, string $converted): void
+    {
+        $this->assertSame($converted, SqlFragments::atTimeZone('gadget."delivered_at"', $zone));
+    }
+
+    #[Test]
+    public function it_converts_between_an_instant_and_the_time_in_the_zone_whatever_the_session_time_zone(): void
+    {
+        DB::statement("set local time zone 'Asia/Tokyo'");
+
+        $this->assertSame(
+            ['2026-10-28 07:00:00', '2026-10-28 17:00:00'],
+            [
+                DB::scalar('select to_char('.SqlFragments::atTimeZone("timestamptz '2026-10-28 12:00:00+00'", 'America/Chicago').", 'YYYY-MM-DD HH24:MI:SS')"),
+                DB::scalar('select to_char(('.SqlFragments::atTimeZone("timestamp '2026-10-28 12:00:00'", 'America/Chicago').") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"),
+            ],
+        );
+    }
+
     /**
      * @param  array{null|string, null|string}  $old
      * @param  array{null|string, null|string}  $new

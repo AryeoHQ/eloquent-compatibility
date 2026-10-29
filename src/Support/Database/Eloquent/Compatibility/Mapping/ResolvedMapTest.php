@@ -462,18 +462,6 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
-    public function it_converts_an_attribute_stored_in_the_retained_table_and_leaves_it_out_of_the_statistics(): void
-    {
-        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
-            ...(new WidgetCompatibilityMap)->attributes(),
-            Attribute::mapped('retired_at')->asType('timestamp(0) without time zone')->storedAs('widget', 'retired_at')->inTimeZone('UTC'),
-        ]]));
-
-        $this->assertSame(ResolvedMap::of(new WidgetCompatibilityMap)->statisticsExpressions(), $resolvedMap->statisticsExpressions());
-        $this->assertSame('widget."retired_at" AT TIME ZONE \'UTC\'', array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->column === 'retired_at'))[0]->readAs);
-    }
-
-    #[Test]
     public function it_exposes_each_statistics_expression_once_in_the_order_first_seen_when_two_zoned_attributes_read_one_column(): void
     {
         $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
@@ -550,11 +538,13 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_time_zone_on_an_attribute_stored_on_a_dependent_current_model(): void
+    #[TestWith(['place', 'created_at', "attribute 'placed_at' says inTimeZone() but is stored on dependent current model 'place'; only a column of primary current model 'gadget' converts its time zone, because the statistics object covers that table alone"])]
+    #[TestWith(['widget', 'retired_at', "attribute 'placed_at' says inTimeZone() but is stored on the retained table retained_widgets; only a column of primary current model 'gadget' converts its time zone, because the statistics object covers that table alone"])]
+    public function it_refuses_a_time_zone_on_an_attribute_stored_outside_the_primary_current_model(string $alias, string $column, string $message): void
     {
-        $this->expectInvalidMap("attribute 'placed_at' says inTimeZone() but is stored on dependent current model 'place'; only a column of the primary current model or the retained table converts its time zone", ['attributes' => [
+        $this->expectInvalidMap($message, ['attributes' => [
             ...(new WidgetCompatibilityMap)->attributes(),
-            Attribute::mapped('placed_at')->asType('timestamp(0) without time zone')->storedAs('place', 'created_at')->inTimeZone('UTC'),
+            Attribute::mapped('placed_at')->asType('timestamp(0) without time zone')->storedAs($alias, $column)->inTimeZone('UTC'),
         ]]);
     }
 
@@ -591,6 +581,27 @@ final class ResolvedMapTest extends TestCase
     public function it_refuses_an_index_that_says_no_column(): void
     {
         $this->expectInvalidMap("index 'archived_newest' says no on()", ['primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named('archived_newest')->whereNull('deleted_at'))]);
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_refuses_an_index_that_says_one_column_twice(bool $descending): void
+    {
+        $this->expectInvalidMap("index 'archived_newest' says on('created_at') twice; an index lists each column once, with one direction", [
+            'primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named('archived_newest')->on('created_at')->on('is_archived')->on('created_at', $descending)),
+        ]);
+    }
+
+    #[Test]
+    #[TestWith(['whereNotNull', "index 'archived_newest' says whereNull('deleted_at') and whereNotNull('delivered_at'); an index takes one filter at most, so declare one whereNull() or whereNotNull()"])]
+    #[TestWith(['whereNull', "index 'archived_newest' says whereNull('deleted_at') and whereNull('delivered_at'); an index takes one filter at most, so declare one whereNull() or whereNotNull()"])]
+    public function it_refuses_an_index_that_says_more_than_one_filter(string $second, string $message): void
+    {
+        $index = PlannerIndex::named('archived_newest')->on('created_at')->whereNull('deleted_at');
+        $index = $second === 'whereNull' ? $index->whereNull('delivered_at') : $index->whereNotNull('delivered_at');
+
+        $this->expectInvalidMap($message, ['primaryCurrentModel' => $this->unindexedGadget()->indexedBy($index)]);
     }
 
     #[Test]

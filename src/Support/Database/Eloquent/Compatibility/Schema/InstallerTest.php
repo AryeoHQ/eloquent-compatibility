@@ -36,7 +36,9 @@ final class InstallerTest extends TestCase
 {
     use InteractsWithCompatibilityMaps;
 
-    private const array KEYWORDS = ['as', 'create', 'for', 'join', 'left', 'limit', 'on', 'order', 'returning', 'set', 'where'];
+    private const array KEYWORDS = ['as', 'comment', 'create', 'for', 'join', 'left', 'limit', 'on', 'order', 'returning', 'set', 'where'];
+
+    private const string PLANNER_STATEMENT = '/^(?:CREATE (?:STATISTICS|INDEX)|COMMENT ON STATISTICS|DROP (?:STATISTICS|INDEX)|ANALYZE) /';
 
     private const string CONCURRENT_WRITER = <<<'PHP'
         $config = json_decode((string) getenv('CONCURRENT_CONNECTION'), true);
@@ -892,12 +894,16 @@ final class InstallerTest extends TestCase
 
     #[Test]
     #[TestWith(['install', 'ANALYZE "gadgets"'])]
-    #[TestWith(['recompile', 'ANALYZE "gadgets"'])]
+    #[TestWith(['recompile', 'DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics'])]
     #[TestWith(['uninstall', 'DROP INDEX IF EXISTS compatibility__widgets__index_archived_newest'])]
     public function it_runs_the_statements_it_lists_for_each_action_inside_one_transaction(string $for, string $planner): void
     {
         if ($for === 'install') {
             resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        }
+
+        if ($for === 'recompile') {
+            DB::statement('comment on statistics compatibility__widgets__statistics is null');
         }
 
         $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::from($for));
@@ -947,16 +953,76 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_creates_nothing_new_when_it_installs_after_a_prepare(): void
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    public function it_lists_no_planner_statement_and_no_analyze_and_creates_nothing_new_when_each_planner_object_is_present_and_current(string $for): void
     {
-        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        if ($for === 'install') {
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+            resolve(Installer::class)->prepare(new WidgetCompatibilityMap);
+        }
+
+        $present = $this->plannerObjects();
+        $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::from($for));
+
+        resolve(Installer::class)->{$for}(new WidgetCompatibilityMap);
+
+        $this->assertSame([], $this->plannerStatements($listed));
+        $this->assertSame(['indexes' => 1, 'statistics' => 1], array_map(count(...), $present));
+        $this->assertSame($present, $this->plannerObjects());
+    }
+
+    #[Test]
+    public function it_rebuilds_the_statistics_and_analyzes_the_new_expression_when_a_recompile_adds_a_zoned_attribute(): void
+    {
+        DB::statement('alter table gadgets add column packed_at timestamp(0) with time zone');
+        DB::table('gadgets')->insert([['name' => 'Packed', 'packed_at' => '2026-10-28 12:00:00+00'], ['name' => 'Waiting', 'packed_at' => null]]);
+        $installed = $this->plannerObjects();
+        $map = $this->withAttributes([...(new WidgetCompatibilityMap)->attributes(), Attribute::mapped('packed_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'packed_at')->inTimeZone('UTC')]);
+
+        $planner = $this->plannerStatements(resolve(Installer::class)->statements($map, InstallerAction::Recompile));
+        resolve(Installer::class)->recompile($map);
+
+        $this->assertSame(['expression' => "((packed_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone", 'analyzed' => true], (array) DB::selectOne(
+            "select expr as expression, null_frac is not null as analyzed from pg_stats_ext_exprs
+             where statistics_schemaname = current_schema() and statistics_name = 'compatibility__widgets__statistics' and tablename = 'gadgets' and expr like '%packed_at%'",
+        ));
+        $this->assertSame(5, (int) DB::scalar("select count(*) from pg_stats_ext_exprs where statistics_schemaname = current_schema() and statistics_name = 'compatibility__widgets__statistics'"));
+        $this->assertCount(4, $planner);
+        $this->assertSame(['DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics', 'ANALYZE "gadgets"'], [$planner[0], $planner[3]]);
+        $this->assertStringEndsWith(', (CAST(("packed_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)) FROM "gadgets"', $planner[1]);
+        $this->assertStringStartsWith('COMMENT ON STATISTICS "compatibility__widgets__statistics" IS ', $planner[2]);
+        $this->assertSame($installed['indexes'], $this->plannerObjects()['indexes']);
+    }
+
+    #[Test]
+    #[TestWith(['prepare'])]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    public function it_refuses_an_invalid_index_of_the_map_before_it_runs_anything_and_prepares_again_once_it_is_dropped(string $for): void
+    {
+        if ($for === 'recompile') {
+            DB::statement('drop index compatibility__widgets__index_archived_newest');
+        } else {
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        }
+
+        DB::table('gadgets')->insert([['name' => 'First'], ['name' => 'Second']]);
+        $this->assertThrows(fn () => DB::statement('create unique index concurrently compatibility__widgets__index_archived_newest on gadgets (archived)'), QueryException::class, 'could not create unique index');
+        $executed = $this->executedWithLevel();
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->{$for}(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: index compatibility__widgets__index_archived_newest exists but is invalid, as a failed or unfinished CREATE INDEX CONCURRENTLY leaves it, so the planner cannot use it; DROP INDEX CONCURRENTLY compatibility__widgets__index_archived_newest, then prepare again.",
+        );
+
+        $this->assertSame([], $executed());
+
+        DB::statement('drop index concurrently compatibility__widgets__index_archived_newest');
         resolve(Installer::class)->prepare(new WidgetCompatibilityMap);
-        $prepared = $this->plannerObjects();
 
-        resolve(Installer::class)->install(new WidgetCompatibilityMap);
-
-        $this->assertSame(['indexes' => 1, 'statistics' => 1], array_map(count(...), $prepared));
-        $this->assertSame($prepared, $this->plannerObjects());
+        $this->assertTrue(DB::scalar("select indisvalid from pg_index where indexrelid = 'compatibility__widgets__index_archived_newest'::regclass"));
     }
 
     #[Test]
@@ -1130,6 +1196,8 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_compiles_only_full_word_aliases_variables_and_object_names(): void
     {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+
         foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
             $resolvedMap = ResolvedMap::of($map);
             $sql = implode("\n", [...(new Compiler(DB::connection()))->compile($map)->statements(), ...(new Compiler(DB::connection()))->prepare($map)]);
@@ -1312,6 +1380,15 @@ final class InstallerTest extends TestCase
     private function objects(string $catalog, string $column): int
     {
         return (int) DB::scalar("select count(*) from {$catalog} where {$column} like 'compatibility\\_\\_widgets\\_\\_%'");
+    }
+
+    /**
+     * @param  list<string>  $statements
+     * @return list<string>
+     */
+    private function plannerStatements(array $statements): array
+    {
+        return array_values(array_filter($statements, fn (string $statement) => preg_match(self::PLANNER_STATEMENT, $statement) === 1));
     }
 
     /**

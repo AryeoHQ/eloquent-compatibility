@@ -116,7 +116,7 @@ final readonly class Attribute
             return null;
         }
 
-        return 'CAST(('.$this->inZone(SqlFragments::identifier($this->storedAs), $this->timeZone).') AS '.$this->type.')';
+        return 'CAST(('.SqlFragments::atTimeZone(SqlFragments::identifier($this->storedAs), $this->timeZone).') AS '.$this->type.')';
     }
 
     public function resolve(string $previousAlias): self
@@ -141,16 +141,11 @@ final readonly class Attribute
 
     private function storedRead(string $alias, string $column, null|string $zone): string
     {
-        return $this->inZone($alias.'.'.SqlFragments::identifier($column), $zone);
+        return SqlFragments::atTimeZone($alias.'.'.SqlFragments::identifier($column), $zone);
     }
 
     private function storedWrite(string $alias, string $column, null|string $zone): TargetColumn
     {
-        return new TargetColumn($alias, $column, $this->inZone('NEW.'.SqlFragments::identifier($this->column), $zone));
-    }
-
-    private function inZone(string $expression, null|string $zone): string
-    {
-        return $zone === null ? $expression : $expression.' AT TIME ZONE '.SqlFragments::literal($zone);
+        return new TargetColumn($alias, $column, SqlFragments::atTimeZone('NEW.'.SqlFragments::identifier($this->column), $zone));
     }
 }

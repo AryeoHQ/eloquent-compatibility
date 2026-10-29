@@ -21,6 +21,11 @@ final class SqlFragments
         return self::literal(addcslashes($prefix, '\\_%').'%');
     }
 
+    public static function atTimeZone(string $expression, null|string $zone): string
+    {
+        return $zone === null ? $expression : $expression.' AT TIME ZONE '.self::literal($zone);
+    }
+
     /**
      * @param  list<string>  $columns
      * @param  list<string>  $comparedAsText

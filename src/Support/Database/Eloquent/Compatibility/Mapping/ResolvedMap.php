@@ -276,8 +276,8 @@ final readonly class ResolvedMap
     {
         $columns = [];
 
-        foreach ($index->columns as $attribute => $descending) {
-            $columns[] = $this->plannerExpression((string) $attribute).($descending ? ' DESC' : '');
+        foreach ($index->columns as $column) {
+            $columns[] = $this->plannerExpression($column['attribute']).($column['descending'] ? ' DESC' : '');
         }
 
         return $columns;
@@ -285,11 +285,9 @@ final readonly class ResolvedMap
 
     public function indexFilter(PlannerIndex $index): null|string
     {
-        return match (true) {
-            $index->whereNull !== null => $this->plannerExpression($index->whereNull).' IS NULL',
-            $index->whereNotNull !== null => $this->plannerExpression($index->whereNotNull).' IS NOT NULL',
-            default => null,
-        };
+        $filter = $index->filters[0] ?? null;
+
+        return $filter === null ? null : $this->plannerExpression($filter['attribute']).' '.$filter['filter']->predicate();
     }
 
     public function objectPrefix(): string
@@ -456,8 +454,10 @@ final readonly class ResolvedMap
                 throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone(), which needs asType() of a timestamp without time zone, not '{$attribute->type}'");
             }
 
-            if ($this->dependent((string) $attribute->alias) !== null) {
-                throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone() but is stored on dependent current model '{$attribute->alias}'; only a column of the primary current model or the retained table converts its time zone");
+            if ($attribute->alias !== $this->primaryCurrentModel->alias) {
+                $owner = $this->dependent((string) $attribute->alias) === null ? "the retained table {$this->previousModel->table}" : "dependent current model '{$attribute->alias}'";
+
+                throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone() but is stored on {$owner}; only a column of primary current model '{$this->primaryCurrentModel->alias}' converts its time zone, because the statistics object covers that table alone");
             }
         }
 
@@ -487,14 +487,25 @@ final readonly class ResolvedMap
                 throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says no on()");
             }
 
-            foreach (array_keys($index->columns) as $attribute) {
-                $this->validateIndexed($index, 'is on', (string) $attribute);
+            $columns = [];
+
+            foreach ($index->columns as $column) {
+                if (array_key_exists($column['attribute'], $columns)) {
+                    throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says on('{$column['attribute']}') twice; an index lists each column once, with one direction");
+                }
+
+                $columns[$column['attribute']] = true;
+                $this->validateIndexed($index, 'is on', $column['attribute']);
             }
 
-            $filter = $index->whereNull ?? $index->whereNotNull;
+            if (count($index->filters) > 1) {
+                $filters = array_map(fn (array $filter) => "{$filter['filter']->value}('{$filter['attribute']}')", $index->filters);
 
-            if ($filter !== null) {
-                $this->validateIndexed($index, 'filters on', $filter);
+                throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says ".implode(' and ', $filters).'; an index takes one filter at most, so declare one whereNull() or whereNotNull()');
+            }
+
+            foreach ($index->filters as $filter) {
+                $this->validateIndexed($index, 'filters on', $filter['attribute']);
             }
 
             $this->indexName($index);

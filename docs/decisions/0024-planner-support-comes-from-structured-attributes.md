@@ -29,11 +29,26 @@ The map declares the structure, and the package generates every planner expressi
 
 ## Consequences
 
-- `IF NOT EXISTS` matches by name alone. A changed definition under the same name is never rebuilt, and an object removed from the map stays until an uninstall. To change one, rename it.
-- A failed `CREATE INDEX CONCURRENTLY` leaves an invalid index, which a later prepare or install skips. The adopter drops it and prepares again.
+- `IF NOT EXISTS` matches by name alone. A changed definition under the same name is never rebuilt, and an object removed from the map stays until an uninstall. To change one, rename it. [The planned list](#superseded-in-part-the-planned-list) superseded this for the statistics object, which is now rebuilt when its expressions change. An index still keeps its definition.
+- A failed `CREATE INDEX CONCURRENTLY` leaves an invalid index, which a later prepare or install skips. The adopter drops it and prepares again. [The planned list](#superseded-in-part-the-planned-list) superseded this: the invalid index now refuses.
 - `Installer::prepare()` cannot serve a partitioned primary current model's table, because PostgreSQL refuses `CREATE INDEX CONCURRENTLY` there. Install can.
 - Install's planner statements hold their locks longer. A recompile and an uninstall hold an `ACCESS EXCLUSIVE` lock on the primary current model's table from their `DROP TRIGGER`, so a recompile that builds an index, and its `ANALYZE`, block reads too. [Adopting a map](../adopting-a-map.md#before-the-install-prebuild-the-planner-objects) says to prebuild, before the install and before a recompile that adds or renames an index.
 - An index on an attribute that reads a `timestamp with time zone` column as a `timestamp without time zone` needs `Attribute::inTimeZone()`. Without it, install fails with PostgreSQL's 42P17. An attribute of its column's own type needs no zone.
 - `Compiler` checks each zone against `pg_timezone_names` and `pg_timezone_abbrevs` while it lists the statements. An unknown zone would install over an empty table and then fail every write.
 - Statistics cover the zoned attributes alone, which are the expressions the spike measured. The package offers no opt-out.
 - A map's index and statistics names join its other objects under the prefix, so [INV-9](../invariants.md) covers their discovery. [INV-52](../invariants.md#inv-52-every-planner-expression-comes-from-the-structured-parts-of-the-view-column) records the rule on expressions.
+
+## Superseded in part: the planned list
+
+Review found three costs of name-only `IF NOT EXISTS`. A recompile that added a zoned attribute kept the old statistics object, so the new expression planned from the default selectivity. A failed concurrent build left an invalid index that every later run skipped. And an install after a prepare still took a `SHARE` lock on the primary current model's table for each `CREATE INDEX`, and ran `ANALYZE`, inside the swap transaction.
+
+The compiler now plans the planner list from the catalog while it lists the statements, before anything runs, for install, recompile and prepare alike:
+
+- It emits a `CREATE` only for an object the catalog lacks, and the `ANALYZE` only after a `CREATE`. So an install after a prepare lists no planner statement.
+- It writes the statistics object's expression list into a `COMMENT ON STATISTICS`, and drops and creates the object again when the declared list differs from the comment, or the comment is missing. `DROP STATISTICS` and `CREATE STATISTICS` take only a `SHARE UPDATE EXCLUSIVE` lock on the table. The comment is compared, not `pg_get_statisticsobjdef_expressions()`, because PostgreSQL deparses an expression in its own form, and normalising both sides would copy its deparser.
+- It refuses an index whose `pg_index.indisvalid` is false, with the hint `DROP INDEX CONCURRENTLY <name>, then prepare again`.
+- Each `CREATE` keeps `IF NOT EXISTS`, as a guard against a concurrent session.
+
+Declined: a statistics name derived from a hash of its expressions, which a recompile would drop and replace by name. The hash's digits would break the full-word rule of [0010](0010-compiled-identifiers-are-full-words.md). A changed index definition under the same name is still never rebuilt, and the adopter still renames it.
+
+Review also found that a zoned attribute stored on the retained table converted its zone but got no statistics, because the statistics object covers the primary current model's table alone. `ResolvedMap::of()` now refuses `Attribute::inTimeZone()` on an attribute stored anywhere but the primary current model, as it already did on a dependent. Hide predicates still get no planner support.

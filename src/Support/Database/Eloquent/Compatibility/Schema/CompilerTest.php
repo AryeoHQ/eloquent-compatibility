@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Process\InvokedProcess;
@@ -108,15 +109,16 @@ final class CompilerTest extends TestCase
     #[Test]
     public function it_compiles_the_statistics_the_indexes_and_an_analyze_of_the_primary_table_and_builds_the_indexes_concurrently_for_prepare(): void
     {
-        $statistics = 'CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON '
-            .'(CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), '
-            .'(CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)) FROM "gadgets"';
+        $expressions = '(CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), '
+            .'(CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone))';
+        $statistics = 'CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON '.$expressions.' FROM "gadgets"';
+        $comment = 'COMMENT ON STATISTICS "compatibility__widgets__statistics" IS \''.str_replace("'", "''", $expressions).'\'';
         $index = 'IF NOT EXISTS "compatibility__widgets__index_archived_newest" ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC) '
             .'WHERE CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) IS NULL';
 
         $this->assertSame([
-            [$statistics, 'CREATE INDEX '.$index, 'ANALYZE "gadgets"'],
-            [$statistics, 'CREATE INDEX CONCURRENTLY '.$index, 'ANALYZE "gadgets"'],
+            [$statistics, $comment, 'CREATE INDEX '.$index, 'ANALYZE "gadgets"'],
+            [$statistics, $comment, 'CREATE INDEX CONCURRENTLY '.$index, 'ANALYZE "gadgets"'],
         ], [$this->compiler()->compile(new WidgetCompatibilityMap)->planner, $this->compiler()->prepare(new WidgetCompatibilityMap)]);
     }
 
@@ -125,12 +127,13 @@ final class CompilerTest extends TestCase
     {
         $map = $this->compatibilityMap(['primaryCurrentModel' => PrimaryCurrentModel::for(Person::class)->aliasedAs('person')->indexedBy(PlannerIndex::named('with_email')->on('email')->whereNotNull('email'))], new AccountCompatibilityMap);
 
+        $planner = $this->compiler()->compile($map)->planner;
         resolve(Installer::class)->install($map);
 
         $this->assertSame([
             'CREATE INDEX IF NOT EXISTS "compatibility__accounts__index_with_email" ON "people" (CAST(("email") AS character varying(255))) WHERE CAST(("email") AS character varying(255)) IS NOT NULL',
             'ANALYZE "people"',
-        ], $this->compiler()->compile($map)->planner);
+        ], $planner);
         $this->assertSame([1, 0], [$this->objects('pg_indexes', 'indexname', 'compatibility__accounts__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__accounts__')]);
     }
 
@@ -501,11 +504,26 @@ final class CompilerTest extends TestCase
     #[Test]
     public function it_compiles_without_running_any_statement(): void
     {
-        $this->compiler()->compile(new WidgetCompatibilityMap);
+        $compiler = $this->compiler();
+        $queries = [];
+        DB::listen(function (QueryExecuted $query) use (&$queries): void {
+            $queries[] = $query->sql;
+        });
 
+        $compiler->compile(new WidgetCompatibilityMap);
+        $compiler->prepare(new WidgetCompatibilityMap);
+
+        $this->assertNotEmpty($queries);
+        $this->assertSame([], array_values(array_filter($queries, fn (string $sql) => preg_match('/^(?:select|with recursive) /', $sql) !== 1)));
         $this->assertSame(
-            [false, 0, 0],
-            [DB::scalar("select to_regclass('widgets') is not null"), $this->objects('pg_proc', 'proname', 'compatibility__widgets__'), $this->objects('pg_trigger', 'tgname', 'compatibility__widgets__')],
+            [false, 0, 0, 0, 0],
+            [
+                DB::scalar("select to_regclass('widgets') is not null"),
+                $this->objects('pg_proc', 'proname', 'compatibility__widgets__'),
+                $this->objects('pg_trigger', 'tgname', 'compatibility__widgets__'),
+                $this->objects('pg_indexes', 'indexname', 'compatibility__widgets__'),
+                $this->objects('pg_statistic_ext', 'stxname', 'compatibility__widgets__'),
+            ],
         );
     }
 
