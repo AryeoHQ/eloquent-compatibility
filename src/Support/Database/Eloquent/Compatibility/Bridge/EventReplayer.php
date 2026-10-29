@@ -70,6 +70,9 @@ final class EventReplayer
     /** @var WeakMap<Model, list<ExcludedListener>> */
     private WeakMap $transitioning;
 
+    /** @var WeakMap<Model, list<ModelEvent>> */
+    private WeakMap $dispatching;
+
     /** @var WeakMap<Model, list<string>> */
     private WeakMap $openSaves;
 
@@ -80,6 +83,7 @@ final class EventReplayer
     {
         $this->excluded = new WeakMap;
         $this->transitioning = new WeakMap;
+        $this->dispatching = new WeakMap;
         $this->openSaves = new WeakMap;
         $this->saves = new WeakMap;
     }
@@ -167,10 +171,10 @@ final class EventReplayer
 
                     $pendingTrigger->withoutTransition()->now();
                     $saved = $this->saves[$model] ?? false;
-                } catch (Invalid|BindingResolutionException|Interrupted|Prevented $e) {
+                } catch (Invalid|BindingResolutionException|Interrupted|Prevented|Duplicate $e) {
                     throw $this->refusal($record, $model, $state, $e);
                 } finally {
-                    unset($this->transitioning[$model], $this->openSaves[$model], $this->saves[$model]);
+                    unset($this->transitioning[$model], $this->dispatching[$model], $this->openSaves[$model], $this->saves[$model]);
                 }
 
                 if (! $saved) {
@@ -187,6 +191,28 @@ final class EventReplayer
         $type = $parameter->getType();
 
         return ! $parameter->isDefaultValueAvailable() && $type instanceof ReflectionNamedType && is_subclass_of($type->getName(), Model::class);
+    }
+
+    /**
+     * @param  callable(): mixed  $fire
+     */
+    public function dispatching(Model $model, string $event, callable $fire): mixed
+    {
+        $modelEvent = ModelEvent::tryFrom($event);
+
+        if ($modelEvent === null || ! $this->transitioning->offsetExists($model)) {
+            return $fire();
+        }
+
+        $this->dispatching[$model] = [...$this->dispatching[$model] ?? [], $modelEvent];
+
+        try {
+            return $fire();
+        } finally {
+            $events = $this->dispatching[$model] ?? [];
+            array_pop($events);
+            $this->dispatching[$model] = $events;
+        }
     }
 
     public function trackSave(Model $model, string $event): void
@@ -705,7 +731,14 @@ final class EventReplayer
             return null;
         }
 
-        $event = ModelEvent::tryFrom($subject instanceof Model ? Str::between($name, 'eloquent.', ': ') : (string) array_search($subject::class, $model->dispatchesEvents(), true));
+        $events = $this->dispatching[$model] ?? [];
+        $top = array_key_last($events);
+
+        $event = match (true) {
+            $subject instanceof Model => ModelEvent::tryFrom(Str::between($name, 'eloquent.', ': ')),
+            $top !== null && ($model->dispatchesEvents()[$events[$top]->value] ?? null) === $subject::class => $events[$top],
+            default => null,
+        };
 
         return $event === null ? null : new Exclusion($event, $this->transitioning[$model]);
     }

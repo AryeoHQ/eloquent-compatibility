@@ -15,11 +15,13 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Release;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reopen;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal;
 
 /**
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish publish()
@@ -32,6 +34,8 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin pin(null|\Tests\Fixtures\Support\Workbench\Placement $placement)
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo embargo()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve reserve()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Release release()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal\Release release()
  */
 enum PublicationState: string implements StateMachineable
 {
@@ -60,6 +64,8 @@ enum PublicationState: string implements StateMachineable
     case Archived = 'archived';
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]
+    #[Transition(to: self::Published, using: Release::class)]
+    #[Transition(to: self::Archived, using: Withdrawal\Release::class)]
     case Scheduled = 'scheduled';
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]

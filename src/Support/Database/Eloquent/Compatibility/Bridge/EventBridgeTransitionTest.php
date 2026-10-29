@@ -39,8 +39,10 @@ use Tests\Fixtures\Support\Workbench\CastBulletin;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\Journal;
+use Tests\Fixtures\Support\Workbench\NotifyingPublication;
 use Tests\Fixtures\Support\Workbench\Placement;
 use Tests\Fixtures\Support\Workbench\Publication;
+use Tests\Fixtures\Support\Workbench\PublicationChanged;
 use Tests\Fixtures\Support\Workbench\PublicationSaved;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
@@ -150,6 +152,7 @@ final class EventBridgeTransitionTest extends TestCase
         return [
             'no matching transition' => ['published', false, 'draft', 'Invalid transition from [Published] to [Draft] on [Publication].', Invalid::class],
             'two matching transitions' => ['archived', false, 'draft', 'Multiple [Draft] triggers defined on [Archived]', Duplicate::class],
+            'two transitions whose triggers share a class basename' => ['scheduled', false, 'published', 'Multiple [release] triggers defined on [Scheduled]', Duplicate::class],
             'a blocked transition' => ['draft', true, 'published', 'Invalid transition from [Draft] to [Published] on [Publication].', Invalid::class],
             'a trigger the container cannot build' => ['draft', false, 'archived', 'Unresolvable dependency resolving', BindingResolutionException::class],
             'a trigger that takes a model argument without a default' => ['draft', false, 'scheduled', '[Schedule] takes the model argument [$placement] without a default, and the container builds it as an empty [Placement].', InvalidArgumentException::class],
@@ -489,6 +492,26 @@ final class EventBridgeTransitionTest extends TestCase
         $this->assertSame(['before draft', 'after published'], $this->seen);
         $this->assertSame(['published', true], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at') !== null]);
         $this->assertSame($listeners, $this->savedListeners());
+    }
+
+    /**
+     * @param  list<string>  $expected
+     */
+    #[Test]
+    #[TestWith(['saved', ['PublicationChanged', 'updated published_at', 'saved published_at', 'PublicationChanged', 'updated state', 'saved state']])]
+    #[TestWith(['updated', ['updated published_at', 'PublicationChanged', 'saved published_at', 'updated state', 'PublicationChanged', 'saved state']])]
+    public function it_skips_a_listener_the_map_excludes_for_one_event_only_for_that_event_of_the_triggers_save_when_the_model_maps_both_to_one_class(string $excluded, array $expected): void
+    {
+        $this->mirrorBulletins(publication: NotifyingPublication::class, excludedListeners: [ExcludedListener::of(self::class.'@audit', 'The audit records only writes through the current model.')->forEvent(ModelEvent::from($excluded))]);
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+        Event::listen(PublicationChanged::class, [$this, 'audit']);
+        Event::listen('eloquent.updated: '.NotifyingPublication::class, fn (NotifyingPublication $publication) => $this->audited[] = 'updated '.$this->changed($publication, ['state', 'published_at']));
+        Event::listen('eloquent.saved: '.NotifyingPublication::class, fn (NotifyingPublication $publication) => $this->audited[] = 'saved '.$this->changed($publication, ['state', 'published_at']));
+
+        $bulletin->update(['status' => 'published']);
+
+        $this->assertSame($expected, $this->audited);
+        $this->assertSame(['published', true], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at') !== null]);
     }
 
     #[Test]
@@ -876,7 +899,7 @@ final class EventBridgeTransitionTest extends TestCase
         $wildcard = is_string($arguments[0] ?? null);
         $subject = $wildcard ? (is_array($arguments[1] ?? null) ? $arguments[1][0] ?? null : null) : $arguments[0] ?? null;
 
-        if ($subject instanceof Publication || $subject instanceof PublicationSaved) {
+        if ($subject instanceof Publication || $subject instanceof PublicationSaved || $subject instanceof PublicationChanged) {
             $this->audited[] = ($wildcard ? 'wildcard ' : '').class_basename($subject);
         }
     }
@@ -899,11 +922,12 @@ final class EventBridgeTransitionTest extends TestCase
     /**
      * @param  class-string<Model>  $bulletin
      * @param  list<ExcludedListener>  $excludedListeners
+     * @param  class-string<Publication>  $publication
      */
-    private function mirrorBulletins(string $bulletin = Bulletin::class, array $excludedListeners = []): void
+    private function mirrorBulletins(string $bulletin = Bulletin::class, array $excludedListeners = [], string $publication = Publication::class): void
     {
-        resolve(Installer::class)->install(new BulletinCompatibilityMap($bulletin));
-        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new BulletinCompatibilityMap($bulletin), $excludedListeners));
+        resolve(Installer::class)->install(new BulletinCompatibilityMap($bulletin, $publication));
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new BulletinCompatibilityMap($bulletin, $publication), $excludedListeners));
     }
 
     private function publishedFrom(Model $model): string

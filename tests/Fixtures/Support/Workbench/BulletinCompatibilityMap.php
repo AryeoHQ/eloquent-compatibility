@@ -15,8 +15,9 @@ final readonly class BulletinCompatibilityMap implements CompatibilityMap
 {
     /**
      * @param  class-string<Model>  $bulletin
+     * @param  class-string<Publication>  $publication
      */
-    public function __construct(private string $bulletin = Bulletin::class) {}
+    public function __construct(private string $bulletin = Bulletin::class, private string $publication = Publication::class) {}
 
     public function name(): string
     {
@@ -34,7 +35,7 @@ final readonly class BulletinCompatibilityMap implements CompatibilityMap
 
     public function primaryCurrentModel(): PrimaryCurrentModel
     {
-        return PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication');
+        return PrimaryCurrentModel::for($this->publication)->aliasedAs('publication');
     }
 
     public function dependentCurrentModels(): array

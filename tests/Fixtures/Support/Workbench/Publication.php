@@ -19,7 +19,7 @@ use Tests\Fixtures\Support\Workbench\ReviewState\ReviewState;
  * @phpstan-property \Support\Database\Eloquent\StateMachines\StateMachine<\Tests\Fixtures\Support\Workbench\PublicationState\PublicationState> $state
  * @phpstan-property \Support\Database\Eloquent\StateMachines\StateMachine<\Tests\Fixtures\Support\Workbench\ReviewState\ReviewState> $review
  */
-final class Publication extends Model implements Compatible
+class Publication extends Model implements Compatible
 {
     use HasCompatibility;
     use HasUuids;

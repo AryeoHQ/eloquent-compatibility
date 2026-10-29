@@ -148,7 +148,7 @@ final class EventBridge
         $modelEvent = ModelEvent::tryFrom($event);
 
         if ($modelEvent === null || ! $this->sees($model)) {
-            return $this->eventReplayer->trackSaveResult($model, $event, $fire());
+            return $this->eventReplayer->trackSaveResult($model, $event, $this->eventReplayer->dispatching($model, $event, $fire));
         }
 
         $connection = $model->getConnection();
@@ -163,7 +163,7 @@ final class EventBridge
         $this->depth++;
 
         try {
-            $result = $fire();
+            $result = $this->eventReplayer->dispatching($model, $event, $fire);
         } catch (Throwable $e) {
             if ($pendingWrite !== null) {
                 $this->forget($connection, $pendingWrite);
