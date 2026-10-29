@@ -90,6 +90,8 @@ trait DispatchesQueryFailed
                 throw $failure;
             }
 
+            $readWriteType = $this->latestReadWriteTypeUsed();
+
             if ($this->compatibilityEventBridgeRelease !== null) {
                 ($this->compatibilityEventBridgeRelease)($query, $bindings, $this);
             }
@@ -99,7 +101,7 @@ trait DispatchesQueryFailed
                 $this->compatibilityDispatchedQueryFailure = WeakReference::create($failure);
 
                 try {
-                    $this->event(new QueryFailed($query, $bindings, null, $this, $failure, $this->latestReadWriteTypeUsed()));
+                    $this->event(new QueryFailed($query, $bindings, null, $this, $failure, $readWriteType));
                 } catch (Throwable $listenerFailure) {
                     try {
                         report($listenerFailure);

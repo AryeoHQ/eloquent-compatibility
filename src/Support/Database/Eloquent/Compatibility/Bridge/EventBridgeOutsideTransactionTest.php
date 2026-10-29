@@ -394,6 +394,59 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    public function it_fails_and_rolls_back_a_write_whose_query_executed_listener_catches_the_failure_of_its_identical_statement_outside_a_transaction(): void
+    {
+        $nested = null;
+        $this->listenBeforeTheBridge(function (QueryExecuted $query) use (&$nested): void {
+            if ($nested === null && str_starts_with($query->sql, 'insert into "widgets"')) {
+                try {
+                    DB::insert($query->sql, $query->bindings);
+                } catch (QueryException $e) {
+                    $nested = $e;
+                }
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => Widget::query()->create(['id' => 900, 'title' => 'Kept', 'street' => '1 Main St']), QueryException::class, 'current transaction is aborted');
+
+        $this->assertSame('23505', $nested?->getCode());
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame(0, DB::table('widgets')->count());
+        $this->assertSame([], DB::table('gadgets')->pluck('name')->all());
+    }
+
+    #[Test]
+    public function it_dispatches_query_failed_as_a_write_when_a_rolled_back_listener_reads_on_a_read_write_connection_outside_a_transaction(): void
+    {
+        $default = (string) config('database.default');
+        $host = config("database.connections.{$default}.host");
+        config(["database.connections.{$default}.read" => ['host' => [$host]], "database.connections.{$default}.write" => ['host' => [$host]]]);
+        DB::purge($default);
+        $widget = $this->widget();
+        $reads = 0;
+        Event::listen(TransactionRolledBack::class, function () use (&$reads): void {
+            DB::select('select 1');
+            $reads++;
+        });
+        $failures = [];
+        DB::connection()->listenForFailures(function (QueryFailed $failure) use (&$failures): void {
+            $failures[] = $failure;
+        });
+
+        $this->assertThrows(fn () => $widget->update(['title' => null]), QueryException::class);
+
+        $this->assertNotNull(DB::connection()->getRawReadPdo());
+        $this->assertSame(1, $reads);
+        $this->assertCount(1, $failures);
+        $this->assertStringStartsWith('update "widgets"', $failures[0]->sql);
+        $this->assertSame('write', $failures[0]->readWriteType);
+        $this->assertSame(0, DB::transactionLevel());
+    }
+
+    #[Test]
     public function it_completes_a_write_whose_statement_fails_on_another_connection_of_the_same_name_outside_a_transaction(): void
     {
         $default = (string) config('database.default');

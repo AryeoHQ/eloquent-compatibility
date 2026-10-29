@@ -49,6 +49,9 @@ final class EventBridge
     /** @var WeakMap<Connection, true> */
     private WeakMap $watched;
 
+    /** @var WeakMap<Connection, null|PendingMirroredWrite> */
+    private WeakMap $started;
+
     private int $internal = 0;
 
     private int $disabled = 0;
@@ -65,6 +68,7 @@ final class EventBridge
         $this->affectedRecords = new AffectedRecords($this->mirrorIndex);
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
         $this->watched = new WeakMap;
+        $this->started = new WeakMap;
     }
 
     public function mirror(EventMirror $mirror): void
@@ -345,6 +349,7 @@ final class EventBridge
             return null;
         }
 
+        $this->started[$connection] = null;
         $name = (string) $connection->getName();
         $armed = $this->armed[$name] ?? null;
         $armed = $armed !== null && $this->writesTo($query, $armed) ? $armed : null;
@@ -379,6 +384,7 @@ final class EventBridge
             }
 
             $this->open($connection, $taken, $query, $bindings);
+            $this->started[$connection] = $taken;
         }
     }
 
@@ -393,7 +399,7 @@ final class EventBridge
 
         $pendingWrite = $this->top($connection->getName());
 
-        if ($pendingWrite === null || ! $pendingWrite->pending || ! $pendingWrite->statementSent || $pendingWrite->failed || $pendingWrite->statement !== $query || $pendingWrite->bindings !== $bindings || $pendingWrite->source->getConnection() !== $connection) {
+        if ($pendingWrite === null || ! $pendingWrite->pending || ! $pendingWrite->statementSent || $pendingWrite->failed || $pendingWrite->statement !== $query || $pendingWrite->bindings !== $bindings || $pendingWrite->source->getConnection() !== $connection || ($this->started[$connection] ?? null) !== $pendingWrite) {
             return;
         }
 
