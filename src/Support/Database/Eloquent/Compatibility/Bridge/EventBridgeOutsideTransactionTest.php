@@ -37,6 +37,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityConnectionUn
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
@@ -52,6 +53,8 @@ use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Article;
 use Tests\Fixtures\Support\Workbench\ArticleCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Bulletin;
+use Tests\Fixtures\Support\Workbench\BulletinCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\CompatibleModel;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -63,6 +66,7 @@ use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Publication;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -199,6 +203,31 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertNothingMirrored();
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame(['draft', 'Draft article', null], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_retries_a_state_change_whose_trigger_argument_closure_meets_a_serialization_failure_inside_a_transaction_that_retries(): void
+    {
+        $calls = 0;
+        $map = new BulletinCompatibilityMap(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Archive::class, [
+            'reason' => function () use (&$calls): string {
+                if (++$calls === 1) {
+                    throw new QueryException('pgsql', 'select * from "bulletins"', [], new PDOException('could not serialize access due to concurrent update', 40001));
+                }
+
+                return 'retired';
+            },
+        ]));
+        resolve(Installer::class)->install($map);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($map));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        DB::transaction(fn () => $bulletin->update(['status' => 'archived']), 2);
+
+        $this->assertSame(2, $calls);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['archived', 'Draft bulletin (retired)'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
     }
 
     #[Test]

@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
 use Support\Database\Eloquent\Compatibility\Bridge\KeyTranslator;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
@@ -21,6 +22,9 @@ use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
+use Tests\Fixtures\Support\Workbench\Placement;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdraw;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -188,6 +192,65 @@ final class DependentCurrentModelTest extends TestCase
             InvalidCompatibilityMap::class,
             'attribute place_id writes the designation column place_id; the compatibility map maintains it',
         );
+    }
+
+    #[Test]
+    public function it_declares_the_model_with_no_trigger_arguments_and_adds_the_arguments_of_a_trigger_on_a_copy_that_keeps_the_rest(): void
+    {
+        $reason = fn (): string => 'retired';
+        $original = DependentCurrentModel::for(Placement::class)->aliasedAs('placement')->primaryForeignKey('publication_id')->readableWhen('placement.slot IS NOT NULL')
+            ->fillWhenCreatedFromPrevious(['slot' => "'main'"])->createdWhen('NEW.slot IS NOT NULL')->designatedBy('placement_id');
+
+        $declared = $original->triggerArguments(Archive::class, ['reason' => $reason]);
+
+        $this->assertSame([], DependentCurrentModel::for(Placement::class)->triggerArguments);
+        $this->assertSame([
+            'model' => Placement::class,
+            'alias' => 'placement',
+            'primaryForeignKey' => 'publication_id',
+            'readableWhen' => 'placement.slot IS NOT NULL',
+            'fillWhenCreatedFromPrevious' => ['slot' => "'main'"],
+            'createdWhen' => 'NEW.slot IS NOT NULL',
+            'designationColumn' => 'placement_id',
+            'triggerArguments' => [Archive::class => ['reason' => $reason]],
+        ], get_object_vars($declared));
+        $this->assertSame([], $original->triggerArguments);
+    }
+
+    #[Test]
+    public function it_replaces_the_arguments_of_a_trigger_declared_again_and_keeps_those_of_other_triggers(): void
+    {
+        $first = fn (): string => 'retired';
+        $withdrawn = fn (): string => 'withdrawn';
+        $second = fn (): string => 'superseded';
+        $original = DependentCurrentModel::for(Placement::class)->triggerArguments(Archive::class, ['reason' => $first])->triggerArguments(Withdraw::class, ['reason' => $withdrawn]);
+
+        $replaced = $original->triggerArguments(Archive::class, ['REASON' => $second]);
+
+        $this->assertSame([Archive::class => ['REASON' => $second], Withdraw::class => ['reason' => $withdrawn]], $replaced->triggerArguments);
+        $this->assertSame([Archive::class => ['reason' => $first], Withdraw::class => ['reason' => $withdrawn]], $original->triggerArguments);
+    }
+
+    /**
+     * @param  string|array<string, string>  $value
+     */
+    #[Test]
+    #[TestWith(['alias', 'aliasedAs', 'placement'])]
+    #[TestWith(['primaryForeignKey', 'primaryForeignKey', 'publication_id'])]
+    #[TestWith(['readableWhen', 'readableWhen', 'placement.slot IS NOT NULL'])]
+    #[TestWith(['fillWhenCreatedFromPrevious', 'fillWhenCreatedFromPrevious', ['slot' => "'main'"]])]
+    #[TestWith(['createdWhen', 'createdWhen', 'NEW.slot IS NOT NULL'])]
+    #[TestWith(['designationColumn', 'designatedBy', 'placement_id'])]
+    public function it_keeps_the_trigger_arguments_when_another_builder_sets_its_property_on_a_copy(string $property, string $method, string|array $value): void
+    {
+        $reason = fn (): string => 'retired';
+        $original = DependentCurrentModel::for(Placement::class)->triggerArguments(Archive::class, ['reason' => $reason]);
+
+        $changed = $original->{$method}($value);
+
+        $this->assertSame([Archive::class => ['reason' => $reason]], $changed->triggerArguments);
+        $this->assertSame($value, $changed->{$property});
+        $this->assertNotSame($value, $original->{$property});
     }
 
     /**

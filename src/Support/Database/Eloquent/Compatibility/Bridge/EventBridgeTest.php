@@ -43,6 +43,7 @@ use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\BulletinCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\CompatibleModel;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -56,6 +57,8 @@ use Tests\Fixtures\Support\Workbench\LegacyItem;
 use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Publication;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
 use Tests\Fixtures\Support\Workbench\SecondaryPerson;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
@@ -1554,6 +1557,23 @@ final class EventBridgeTest extends TestCase
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->naming('dependent', $model)));
 
         $this->assertSame(['widgets'], array_map(fn (ResolvedMap $resolvedMap) => $resolvedMap->name, resolve(CompatibilityMaps::class)->all()));
+    }
+
+    #[Test]
+    public function it_registers_nothing_for_a_map_refused_for_its_trigger_arguments(): void
+    {
+        $map = new BulletinCompatibilityMap(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Archive::class, ['until' => fn (): string => 'later']));
+
+        $this->assertThrows(
+            fn () => resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($map)),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'bulletins' is declared wrongly: ",
+        );
+
+        $this->assertSame([], resolve(CompatibilityMaps::class)->all());
+        $this->artisan('compatibility:check')
+            ->expectsOutputToContain('No compatibility map is registered, so nothing was checked.')
+            ->assertFailed();
     }
 
     #[Test]

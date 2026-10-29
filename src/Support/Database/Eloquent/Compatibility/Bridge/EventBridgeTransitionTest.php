@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Closure;
 use Illuminate\Bus\UniqueLock;
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Database\Eloquent\Model;
@@ -26,6 +27,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorB
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid;
@@ -47,8 +49,12 @@ use Tests\Fixtures\Support\Workbench\PublicationSaved;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\PublicationState\PublicationState;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdraw;
 use Tests\Fixtures\Support\Workbench\ReviewState\Events\Reviewed;
 use Tests\Fixtures\Support\Workbench\StatefulBulletin;
 use Tests\Fixtures\Support\Workbench\Tables;
@@ -56,6 +62,7 @@ use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 use Throwable;
+use TypeError;
 
 #[CoversClass(EventBridge::class)]
 #[CoversClass(EventReplayer::class)]
@@ -216,6 +223,141 @@ final class EventBridgeTransitionTest extends TestCase
         $this->assertSame([], $this->journal->entries);
         $this->assertNothingMirrored();
         $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_runs_the_trigger_with_the_arguments_the_map_builds_from_the_current_and_the_previous_model(): void
+    {
+        $received = [];
+        $this->mirrorBulletins(publication: $this->archivedWith(['reason' => function (Publication $publication, Bulletin $bulletin) use (&$received): string {
+            $received = [$publication, $bulletin, $publication->getAttributes()['state'] ?? null, $publication->getAttribute('title')];
+
+            return "retired from {$bulletin->getAttribute('slot')}";
+        }]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['title' => 'Retired bulletin', 'status' => 'archived']);
+
+        $this->assertSame(['archived', 'Retired bulletin (retired from side)'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertInstanceOf(Publication::class, $received[0]);
+        $this->assertSame($bulletin->publication_id, $received[0]->getKey());
+        $this->assertSame([$bulletin, 'draft', 'Retired bulletin'], array_slice($received, 1));
+        $this->assertSame(['before draft', 'after archived'], $this->seen);
+    }
+
+    #[Test]
+    public function it_registers_and_runs_a_trigger_whose_other_parameter_the_container_resolves_through_a_contextual_attribute(): void
+    {
+        config(['bulletins.desk' => 'the news desk']);
+        $this->mirrorBulletins(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Withdraw::class, ['reason' => fn (): string => 'withdrawn']));
+        $bulletin = Bulletin::query()->create(['title' => 'Published bulletin', 'slot' => 'side'])->refresh();
+        DB::table('publications')->update(['state' => 'published']);
+        $bulletin->refresh();
+
+        $bulletin->update(['status' => 'archived']);
+
+        $this->assertSame(['archived', 'Published bulletin (withdrawn by the news desk)'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+    }
+
+    #[Test]
+    public function it_runs_a_trigger_the_map_declares_no_arguments_for_without_arguments(): void
+    {
+        $calls = 0;
+        $this->mirrorBulletins(publication: $this->archivedWith(['reason' => function () use (&$calls): string {
+            $calls++;
+
+            return 'unused';
+        }]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['status' => 'published']);
+
+        $this->assertSame(0, $calls);
+        $this->assertSame(['before draft', 'after published'], $this->seen);
+        $this->assertSame(['Publication '.json_encode($bulletin->publication_id)], $this->journal->entries);
+        $this->assertSame(['published', 'Draft bulletin'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+    }
+
+    #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_a_declared_argument_throws(): void
+    {
+        $this->mirrorBulletins(publication: $this->archivedWith(['reason' => fn (): string => throw new RuntimeException('No reason.')]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+        $this->recordMirroredEvents();
+
+        $refusal = $this->assertWriteRefused(fn () => $bulletin->update(['title' => 'Refused', 'status' => 'archived']), "Compatibility map 'bulletins' refused this write, because its triggerArguments() closure for argument 'reason' of ".Archive::class." threw for Publication #{$bulletin->publication_id}");
+
+        $this->assertInstanceOf(RuntimeException::class, $refusal->getPrevious());
+        $this->assertStringContainsString('No reason', $refusal->because);
+        $this->assertStringContainsString("Fix the closure for 'reason' in the map's triggerArguments() for ".Archive::class, $refusal->instead);
+        $this->assertSame(['draft', 'Draft bulletin'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertSame([], $this->seen);
+        $this->assertNothingMirrored();
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_a_declared_argument_returns_a_value_the_trigger_cannot_take(): void
+    {
+        $this->mirrorBulletins(publication: $this->archivedWith(['reason' => fn () => null]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+        $this->recordMirroredEvents();
+
+        $refusal = $this->assertWriteRefused(fn () => $bulletin->update(['title' => 'Refused', 'status' => 'archived']), "refused this write, because it changes status of Bulletin, stored as state of Publication #{$bulletin->publication_id}, in a way");
+
+        $this->assertInstanceOf(TypeError::class, $refusal->getPrevious());
+        $this->assertStringContainsString('($reason) must be of type string, null given', $refusal->because);
+        $this->assertSame(['draft', 'Draft bulletin'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertSame([], $this->seen);
+        $this->assertNothingMirrored();
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_rolls_back_the_whole_write_and_passes_a_type_error_from_the_running_trigger_to_the_caller_unchanged(): void
+    {
+        $this->mirrorBulletins(publication: $this->archivedWith(['reason' => fn (): string => 'retired']));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+        $this->recordMirroredEvents();
+        Event::listen(Transitioning::class, fn () => throw new TypeError('The before event failed.'));
+
+        $this->assertThrows(fn () => DB::transaction(fn () => $bulletin->update(['title' => 'Thrown', 'status' => 'archived'])), TypeError::class, 'The before event failed.');
+
+        $this->assertSame(['draft', 'Draft bulletin'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertNothingMirrored();
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    #[TestWith(['placement'])]
+    #[TestWith(['PLACEMENT'])]
+    public function it_runs_a_trigger_whose_model_argument_without_a_default_the_map_declares(string $argument): void
+    {
+        $this->mirrorBulletins(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Schedule::class, [
+            $argument => fn (Publication $publication): Placement => Placement::query()->where('publication_id', $publication->getKey())->sole(),
+        ]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['status' => 'scheduled']);
+
+        $this->assertSame(['scheduled', 'Draft bulletin (side)'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertSame(['before draft', 'after scheduled'], $this->seen);
+        $this->assertSame(['Publication '.json_encode($bulletin->publication_id)], $this->journal->entries);
+    }
+
+    #[Test]
+    public function it_refuses_a_trigger_whose_model_argument_without_a_default_the_map_declares_only_for_another_trigger(): void
+    {
+        $this->mirrorBulletins(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Pin::class, [
+            'placement' => fn (Publication $publication): Placement => Placement::query()->where('publication_id', $publication->getKey())->sole(),
+        ]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $refusal = $this->assertWriteRefused(fn () => $bulletin->update(['status' => 'scheduled']), "stored as state of Publication #{$bulletin->publication_id}");
+
+        $this->assertStringContainsString('[Schedule] takes the model argument [$placement] without a default', $refusal->because);
+        $this->assertSame([], $this->journal->entries);
+        $this->assertSame('draft', DB::table('publications')->value('state'));
     }
 
     #[Test]
@@ -922,9 +1064,9 @@ final class EventBridgeTransitionTest extends TestCase
     /**
      * @param  class-string<Model>  $bulletin
      * @param  list<ExcludedListener>  $excludedListeners
-     * @param  class-string<Publication>  $publication
+     * @param  class-string<Publication>|PrimaryCurrentModel  $publication
      */
-    private function mirrorBulletins(string $bulletin = Bulletin::class, array $excludedListeners = [], string $publication = Publication::class): void
+    private function mirrorBulletins(string $bulletin = Bulletin::class, array $excludedListeners = [], string|PrimaryCurrentModel $publication = Publication::class): void
     {
         resolve(Installer::class)->install(new BulletinCompatibilityMap($bulletin, $publication));
         resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new BulletinCompatibilityMap($bulletin, $publication), $excludedListeners));
@@ -933,6 +1075,14 @@ final class EventBridgeTransitionTest extends TestCase
     private function publishedFrom(Model $model): string
     {
         return $model->wasChanged('published_at') ? ' from '.substr((string) $model->getRawOriginal('published_at'), 0, 10) : '';
+    }
+
+    /**
+     * @param  array<string, Closure>  $arguments
+     */
+    private function archivedWith(array $arguments): PrimaryCurrentModel
+    {
+        return PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Archive::class, $arguments);
     }
 
     /**

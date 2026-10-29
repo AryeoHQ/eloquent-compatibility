@@ -137,6 +137,8 @@ The pull request that adds each map moves every test it touches to one of two fo
 
 A write through the previous model that moves a current model's state column runs that state machine's trigger, as the [README](../README.md) describes. The bridge does that only when the installed `aryeo/eloquent-state-machines` has `Trigger::withoutTransition()`. So the upgrade to the first such release changes what those writes do, and the pull request that makes it reviews them as a behaviour change.
 
+A map that declares `triggerArguments()` needs that release before it adopts. Without `Trigger::withoutTransition()`, `ResolvedMap::of()` throws `InvalidCompatibilityMap` for the map. Every caller of `ResolvedMap::of()` then fails, the install migration included. Check the installed release first, and check every installed package that pins eloquent-state-machines to an exact version, because that pin decides the release.
+
 A test that writes such a state under a bus fake that fakes the trigger throws `CompatibilityEventMirrorBypassed`, and the bridge rolls the write back. `Illuminate\Support\Facades\Bus::fake()` with no list fakes every trigger. Give it a list of only the jobs the test asserts, or wrap the write in `EventBridge::withoutMirroring()`. [INV-21](invariants.md#inv-21-a-faked-dispatcher-cannot-hide-a-mirrored-write) records the rule.
 
 ## Tests at transaction level 0

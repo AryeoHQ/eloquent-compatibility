@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Closure;
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -19,12 +20,14 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ExcludedListener;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Exceptions\Invalid;
@@ -41,7 +44,26 @@ use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetSite;
 use Tests\Fixtures\Support\Workbench\Journal;
+use Tests\Fixtures\Support\Workbench\Publication;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
+use Tests\Fixtures\Support\Workbench\PublicationState\PublicationState;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Credit;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Grade;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Release;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reopen;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Tag;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdraw;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Withdrawal;
+use Tests\Fixtures\Support\Workbench\ReviewState\Triggers\Approve;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -570,7 +592,7 @@ final class EventReplayerTest extends TestCase
         $after = $this->stored($record, ['state' => $written]);
         Event::listen(Transitioning::class, fn () => $this->seen[] = ['event' => 'before']);
 
-        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state']));
+        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state'], new Article));
 
         $this->assertStringContainsString("refused this write, because it changes status of Article, stored as state of Publication #{$record->keyValue}, in a way", $refusal->refused);
         $this->assertStringContainsString($because, $refusal->because);
@@ -587,12 +609,110 @@ final class EventReplayerTest extends TestCase
         $journal = $this->journal();
         [$record, $before] = $this->publication();
 
-        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, [...$before, 'state' => 1], 'pgsql', ['state']));
+        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, [...$before, 'state' => 1], 'pgsql', ['state'], new Article));
 
         $this->assertStringContainsString('[1] is not a case of [PublicationState].', $refusal->because);
         $this->assertInstanceOf(InvalidArgumentException::class, $refusal->getPrevious());
         $this->assertSame([], $journal->entries);
         $this->assertSame(['draft', null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_lists_each_trigger_of_the_state_machines_a_model_casts_once(): void
+    {
+        $twice = new class extends Model
+        {
+            protected $casts = ['state' => PublicationState::class, 'next_state' => PublicationState::class, 'locked' => 'boolean'];
+        };
+
+        $this->assertSame([Publish::class, Archive::class, Schedule::class, Pin::class, Embargo::class, Reserve::class, Tag::class, Credit::class, Grade::class, Feature::class, Withdraw::class, ReturnToPublished::class, Restore::class, Reopen::class, Release::class, Withdrawal\Release::class, Approve::class], EventReplayer::triggers(new Publication));
+        $this->assertSame([Publish::class, Archive::class, Schedule::class, Pin::class, Embargo::class, Reserve::class, Tag::class, Credit::class, Grade::class, Feature::class, Withdraw::class, ReturnToPublished::class, Restore::class, Reopen::class, Release::class, Withdrawal\Release::class], EventReplayer::triggers($twice));
+        $this->assertSame([], EventReplayer::triggers(new Gadget));
+    }
+
+    #[Test]
+    public function it_lists_no_triggers_without_eloquent_state_machines(): void
+    {
+        if (method_exists(Trigger::class, 'withoutTransition')) { // @phpstan-ignore function.alreadyNarrowedType
+            $this->markTestSkipped('aryeo/eloquent-state-machines is installed.');
+        }
+
+        $this->assertNull(EventReplayer::triggers(new Gadget));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_runs_the_trigger_with_the_arguments_the_map_builds_from_the_stored_row_with_the_source_state_and_from_the_source(): void
+    {
+        $received = [];
+        $this->bridge($this->archivedWith(['reason' => function (Publication $publication, Bulletin $bulletin) use (&$received): string {
+            $received = [$publication::class, $publication->getKey(), $bulletin, $publication->getAttributes()['state'] ?? null, $publication->getRawOriginal('state'), $publication->getAttribute('title'), DB::table('publications')->value('state')];
+
+            return 'retired';
+        }]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['status' => 'archived', 'title' => 'Renamed']);
+
+        $this->assertSame([Publication::class, $bulletin->publication_id, $bulletin, 'draft', 'draft', 'Renamed', 'archived'], $received);
+        $this->assertSame(['archived', 'Renamed (retired)'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_runs_a_trigger_the_map_declares_no_arguments_for_without_arguments(): void
+    {
+        $calls = 0;
+        $this->bridge($this->archivedWith(['reason' => function () use (&$calls): string {
+            $calls++;
+
+            return 'unused';
+        }]));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['status' => 'published']);
+
+        $this->assertSame(0, $calls);
+        $this->assertSame(['published', 'Draft bulletin', true], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at') !== null]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_builds_the_arguments_of_a_later_state_column_from_the_row_the_earlier_trigger_stored(): void
+    {
+        $received = [];
+        $publication = PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Approve::class, ['by' => function (Publication $publication) use (&$received): string {
+            $received = [$publication->getAttributes()['state'] ?? null, $publication->getAttributes()['review'] ?? null, $publication->getAttribute('published_at') !== null];
+
+            return 'the desk';
+        }]);
+        $this->bridge(new BulletinCompatibilityMap(publication: $publication));
+        $bulletin = Bulletin::query()->create(['title' => 'Draft bulletin', 'slot' => 'side'])->refresh();
+
+        $bulletin->update(['status' => 'published', 'review_status' => 'approved']);
+
+        $this->assertSame(['published', 'pending', true], $received);
+        $this->assertSame(['published', 'approved', 'front'], [DB::table('publications')->value('state'), DB::table('publications')->value('review'), DB::table('placements')->value('slot')]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_refuses_the_write_before_it_builds_the_trigger_when_a_declared_argument_throws(): void
+    {
+        $journal = $this->journal();
+        $thrown = new RuntimeException('No reason.');
+        [$record, $before] = $this->publication(map: $this->archivedWith(['reason' => fn (): string => throw $thrown]));
+        $after = $this->stored($record, ['state' => 'archived']);
+        Event::listen(Transitioning::class, fn () => $this->seen[] = ['event' => 'before']);
+
+        $refusal = $this->refusal(fn () => $this->eventReplayer->transition($record, $before, $after, 'pgsql', ['state'], new Bulletin));
+
+        $this->assertSame("Compatibility map 'bulletins' refused this write, because its triggerArguments() closure for argument 'reason' of ".Archive::class." threw for Publication #{$record->keyValue}", $refusal->refused);
+        $this->assertSame($thrown, $refusal->getPrevious());
+        $this->assertSame([], $journal->entries);
+        $this->assertSame([], $this->seen);
+        $this->assertSame(['archived', 'Draft publication'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
     }
 
     /**
@@ -624,13 +744,21 @@ final class EventReplayerTest extends TestCase
      * @param  array<string, mixed>  $attributes
      * @return array{AffectedRecord, array<string, mixed>}
      */
-    private function publication(array $attributes = []): array
+    private function publication(array $attributes = [], CompatibilityMap $map = new ArticleCompatibilityMap): array
     {
-        $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register(new ArticleCompatibilityMap), new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register($map), new CompatibilityMapEventMirror($map));
         $id = (string) Str::uuid();
         DB::table('publications')->insert(['id' => $id, 'title' => 'Draft publication', ...$attributes]);
 
-        return [$this->mirrorIndex->keyTranslator('articles')->currentRecord('publication', $id), $this->row('publications', $id)];
+        return [$this->mirrorIndex->keyTranslator($map->name())->currentRecord('publication', $id), $this->row('publications', $id)];
+    }
+
+    /**
+     * @param  array<string, Closure>  $arguments
+     */
+    private function archivedWith(array $arguments): BulletinCompatibilityMap
+    {
+        return new BulletinCompatibilityMap(publication: PrimaryCurrentModel::for(Publication::class)->aliasedAs('publication')->triggerArguments(Archive::class, $arguments));
     }
 
     /**

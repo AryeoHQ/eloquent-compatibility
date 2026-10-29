@@ -9,6 +9,7 @@ use Closure;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Bus\Dispatcher as BusDispatcher;
 use Illuminate\Contracts\Container\BindingResolutionException;
+use Illuminate\Contracts\Database\ConcurrencyErrorDetector;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher as EventDispatcher;
@@ -89,6 +90,30 @@ final class EventReplayer
     }
 
     /**
+     * @return null|list<class-string>
+     */
+    public static function triggers(Model $model): null|array
+    {
+        if (! method_exists(Trigger::class, 'withoutTransition')) { // @phpstan-ignore function.alreadyNarrowedType
+            return null;
+        }
+
+        $triggers = [];
+
+        foreach ($model->getCasts() as $cast) {
+            if (is_string($cast) && is_a($cast, StateMachineable::class, true) && is_a($cast, BackedEnum::class, true)) {
+                foreach ($cast::cases() as $case) {
+                    foreach ($case->transitions() as $transition) {
+                        $triggers[] = $transition->using;
+                    }
+                }
+            }
+        }
+
+        return array_values(array_unique($triggers));
+    }
+
+    /**
      * @param  null|array<string, mixed>  $rowBefore
      * @param  null|array<string, mixed>  $rowAfter
      */
@@ -148,7 +173,7 @@ final class EventReplayer
      * @param  array<string, mixed>  $rowAfter
      * @param  list<string>  $states
      */
-    public function transition(AffectedRecord $record, array $rowBefore, array $rowAfter, string $connectionName, array $states): void
+    public function transition(AffectedRecord $record, array $rowBefore, array $rowAfter, string $connectionName, array $states, Model $source): void
     {
         $class = $record->model;
         $template = (new $class)->setConnection($connectionName);
@@ -160,18 +185,24 @@ final class EventReplayer
                 $model = $template->newInstance([], true);
                 $model->setRawAttributes([...($this->read($record, $template) ?? $rowAfter), $state => $rowBefore[$state] ?? null], true);
                 $trigger = $this->trigger($record, $model, $state, $rowBefore[$state] ?? null, $rowAfter[$state] ?? null);
+                $arguments = $this->arguments($record, $model, $source, $trigger);
+
+                try {
+                    $pendingTrigger = $model->getAttribute($state)->{Str::camel(class_basename($trigger))}(...$arguments);
+                } catch (BindingResolutionException|TypeError|Duplicate $e) {
+                    throw $this->refusal($record, $model, $state, $e);
+                }
+
                 $this->transitioning[$model] = $excludedListeners;
 
                 try {
-                    $pendingTrigger = $model->getAttribute($state)->{$trigger}();
-
                     if ($this->fakes(Container::getInstance()->make(BusDispatcher::class), $pendingTrigger)) {
                         throw CompatibilityEventMirrorBypassed::byFakedBus($pendingTrigger::class, [$record->map]);
                     }
 
                     $pendingTrigger->withoutTransition()->now();
                     $saved = $this->saves[$model] ?? false;
-                } catch (Invalid|BindingResolutionException|Interrupted|Prevented|Duplicate $e) {
+                } catch (Invalid|BindingResolutionException|Interrupted|Prevented $e) {
                     throw $this->refusal($record, $model, $state, $e);
                 } finally {
                     unset($this->transitioning[$model], $this->dispatching[$model], $this->openSaves[$model], $this->saves[$model]);
@@ -409,6 +440,32 @@ final class EventReplayer
         }
     }
 
+    /**
+     * @param  class-string  $trigger
+     * @return array<string, mixed>
+     */
+    private function arguments(AffectedRecord $record, Model $model, Model $source, string $trigger): array
+    {
+        $arguments = [];
+
+        foreach ($this->mirrorIndex->resolvedMap($record->map)->triggerArguments($record->model, $trigger) as $name => $argument) {
+            try {
+                $arguments[$name] = $argument($model, $source);
+            } catch (Throwable $e) {
+                if (Container::getInstance()->make(ConcurrencyErrorDetector::class)->causedByConcurrencyError($e)) {
+                    throw $e;
+                }
+
+                throw CompatibilityWriteRefused::byTriggerArgument($record->map, $model, $trigger, $name, $e);
+            }
+        }
+
+        return $arguments;
+    }
+
+    /**
+     * @return class-string
+     */
     private function trigger(AffectedRecord $record, Model $model, string $state, mixed $before, mixed $after): string
     {
         $from = $this->state($model, $state, $before);
@@ -429,8 +486,12 @@ final class EventReplayer
         }
 
         $using = $transitions->sole()->using;
+        $declared = array_map(strtolower(...), array_keys($this->mirrorIndex->resolvedMap($record->map)->triggerArguments($record->model, $using)));
 
-        $parameter = array_find(new ReflectionClass($using)->getConstructor()?->getParameters() ?? [], self::buildsEmptyModel(...));
+        $parameter = array_find(
+            new ReflectionClass($using)->getConstructor()?->getParameters() ?? [],
+            fn (ReflectionParameter $parameter) => ! in_array(strtolower($parameter->getName()), $declared, true) && self::buildsEmptyModel($parameter),
+        );
 
         if ($parameter !== null) {
             throw $this->refusal($record, $model, $state, new InvalidArgumentException(
@@ -438,7 +499,7 @@ final class EventReplayer
             ));
         }
 
-        return Str::camel(class_basename($using));
+        return $using;
     }
 
     private function state(Model $model, string $state, mixed $value): null|BackedEnum

@@ -4,7 +4,14 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Closure;
+use Illuminate\Contracts\Container\ContextualAttribute;
 use Illuminate\Database\Eloquent\Model;
+use ReflectionAttribute;
+use ReflectionMethod;
+use ReflectionNamedType;
+use ReflectionParameter;
+use Support\Database\Eloquent\Compatibility\Bridge\EventReplayer;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
@@ -84,6 +91,10 @@ final readonly class ResolvedMap
             if (in_array($alias, self::VARIABLES, true) || str_starts_with($alias, 'key_')) {
                 throw InvalidCompatibilityMap::because($name, "alias '{$alias}' names a variable the compiled triggers declare; choose another alias");
             }
+        }
+
+        foreach ([$primary, ...$dependents] as $current) {
+            self::validateTriggerArguments($name, $current);
         }
 
         $attributes = array_map(fn (Attribute $attribute) => $attribute->resolve((string) $previous->alias), $map->attributes());
@@ -192,6 +203,20 @@ final readonly class ResolvedMap
         }
 
         return $models;
+    }
+
+    /**
+     * @return array<string, Closure>
+     */
+    public function triggerArguments(string $model, string $trigger): array
+    {
+        foreach ([$this->primaryCurrentModel, ...$this->dependentCurrentModels] as $current) {
+            if ($current->model === $model) {
+                return $current->triggerArguments[$trigger] ?? [];
+            }
+        }
+
+        return [];
     }
 
     public function functionName(TriggerFunction $function): string
@@ -345,6 +370,66 @@ final readonly class ResolvedMap
                 throw InvalidCompatibilityMap::because($this->name, "unrepresentable state '{$state->name}' checks unknown alias '{$state->checkedOn}'");
             }
         }
+    }
+
+    private static function validateTriggerArguments(string $map, PrimaryCurrentModel|DependentCurrentModel $current): void
+    {
+        if ($current->triggerArguments === []) {
+            return;
+        }
+
+        $triggers = EventReplayer::triggers(self::model($map, $current->model));
+
+        if ($triggers === null) {
+            throw InvalidCompatibilityMap::because($map, "current model '{$current->alias}' declares triggerArguments(), which needs aryeo/eloquent-state-machines with Trigger::withoutTransition()");
+        }
+
+        foreach ($current->triggerArguments as $trigger => $arguments) {
+            if (! in_array($trigger, $triggers, true)) {
+                throw InvalidCompatibilityMap::because($map, "{$trigger} is not the trigger of a #[Transition] on a state machine that current model '{$current->alias}' casts a column to");
+            }
+
+            $parameters = method_exists($trigger, '__construct') ? (new ReflectionMethod($trigger, '__construct'))->getParameters() : [];
+            $names = array_map(fn (ReflectionParameter $parameter) => strtolower($parameter->name), $parameters);
+            $supplied = array_map(fn (int|string $argument) => strtolower((string) $argument), array_keys($arguments));
+
+            foreach (array_diff_assoc($names, array_unique($names)) as $index => $name) {
+                $first = $parameters[(int) array_search($name, $names, true)]->name;
+
+                throw InvalidCompatibilityMap::because($map, "{$trigger} takes constructor parameters '{$first}' and '{$parameters[$index]->name}', whose names differ only in case, so triggerArguments() of current model '{$current->alias}' cannot tell them apart");
+            }
+
+            foreach (array_diff_assoc($supplied, array_unique($supplied)) as $argument) {
+                throw InvalidCompatibilityMap::because($map, "triggerArguments() of current model '{$current->alias}' passes '{$argument}' more than once for {$trigger}, in names that differ only in case");
+            }
+
+            foreach ($supplied as $argument) {
+                if (! in_array($argument, $names, true)) {
+                    throw InvalidCompatibilityMap::because($map, "triggerArguments() of current model '{$current->alias}' passes '{$argument}', which is not a constructor parameter of {$trigger}");
+                }
+            }
+
+            foreach ($parameters as $parameter) {
+                if ($parameter->isVariadic() && in_array(strtolower($parameter->name), $supplied, true)) {
+                    throw InvalidCompatibilityMap::because($map, "triggerArguments() of current model '{$current->alias}' passes '{$parameter->name}', a variadic constructor parameter of {$trigger}, which would take the value as a single element");
+                }
+
+                if (! in_array(strtolower($parameter->name), $supplied, true) && self::unresolvable($parameter)) {
+                    throw InvalidCompatibilityMap::because($map, "{$trigger} requires constructor parameter '{$parameter->name}', which the container cannot resolve, and triggerArguments() of current model '{$current->alias}' does not pass it");
+                }
+            }
+        }
+    }
+
+    private static function unresolvable(ReflectionParameter $parameter): bool
+    {
+        $type = $parameter->getType();
+        $enum = $type instanceof ReflectionNamedType && enum_exists($type->getName());
+
+        return EventReplayer::buildsEmptyModel($parameter) || (! $parameter->isDefaultValueAvailable()
+            && ! $parameter->isVariadic()
+            && ($enum || (! ($type !== null && $type->allowsNull()) && ! ($type instanceof ReflectionNamedType && ! $type->isBuiltin())))
+            && $parameter->getAttributes(ContextualAttribute::class, ReflectionAttribute::IS_INSTANCEOF) === []);
     }
 
     private static function previous(string $map, PreviousModel $previous): PreviousModel
