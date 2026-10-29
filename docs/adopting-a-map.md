@@ -47,6 +47,44 @@ Before the install, check which roles hold `CREATE` on the installation schema. 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ```
 
+## Before the install: prebuild the planner objects
+
+A mapped attribute is an expression in the compatibility view, so PostgreSQL holds no statistics for it, and no index serves it. A map declares what the planner needs with `Attribute::inTimeZone()` on each timestamp it converts and `PrimaryCurrentModel::indexedBy()` for each index. The install then creates a statistics object and the indexes, and runs `ANALYZE`. [Planner support](flows/compiling-and-installing-the-schema.md#planner-support) lists the statements.
+
+The install migration is the wrong place to build a large index. It runs in one transaction. The rename holds an `ACCESS EXCLUSIVE` lock on the previous model's table until the commit, and a plain `CREATE INDEX` inside the install holds a `SHARE` lock on the primary current model's table, which blocks every write to it, for as long as the build takes. So build the objects first, in a migration of their own that runs ahead of the install migration:
+
+```php
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+
+return new class extends Migration
+{
+    public $withinTransaction = false;
+
+    public function up(): void
+    {
+        (new Installer(DB::connection()))->prepare(new WidgetCompatibilityMap);
+    }
+};
+```
+
+1. Run it after the migration that creates the primary current model's table, and before the install migration. It needs only that table, so it runs before the rename.
+2. Set `public $withinTransaction = false`. `CREATE INDEX CONCURRENTLY` cannot run in a transaction, and `Installer::prepare()` throws `InvalidCompatibilityMap` inside one. That includes a test that wraps each test in a transaction, so such a test calls `Installer::install()` alone.
+3. Leave the install migration as it is. Its planner statements are `IF NOT EXISTS`, so it creates nothing the prebuild made.
+
+`php artisan compatibility:sql <map> --for=prepare` prints the statements before the migration runs them. Each statement of a prepare takes effect alone, so a failure part way keeps the objects already built, and running `Installer::prepare()` again builds the rest. The migration declares no `down()`, because no package method drops only the planner objects. `Installer::uninstall()` drops them with the rest of the map.
+
+These limits follow from `IF NOT EXISTS`, which matches by name alone:
+
+- **A failed `CREATE INDEX CONCURRENTLY` leaves an `INVALID` index.** A later `Installer::prepare()` or install skips it without a word, because an index of that name exists. Drop the invalid index, and run `Installer::prepare()` again.
+- **A changed definition is never rebuilt.** A statistics object or an index keeps the definition it had when it was created, and one removed from the map stays until an uninstall. To change one, rename it. A renamed index builds anew, and the old one stays until an uninstall drops it.
+- **`Installer::prepare()` cannot serve a partitioned primary current model's table.** PostgreSQL refuses `CREATE INDEX CONCURRENTLY` on a partitioned table. The install can build there, with the locks above.
+- **The install's planner statements still hold their locks longer.** `CREATE INDEX IF NOT EXISTS` takes a `SHARE` lock on the primary current model's table even when the index exists, and `ANALYZE` lengthens the transaction. An uninstall's `DROP INDEX` holds an `ACCESS EXCLUSIVE` lock until the commit. Prebuild with `Installer::prepare()`, so that the install creates nothing.
+- **An index needs immutable expressions.** An index that names an attribute over a `timestamp with time zone` column must declare `Attribute::inTimeZone()` on it. Without it, the cast to a `timestamp without time zone` depends on the session's time zone, and the install fails with PostgreSQL's 42P17. [INV-52](invariants.md#inv-52-every-planner-expression-comes-from-the-structured-parts-of-the-view-column) records where the expressions come from, and [0024](decisions/0024-planner-support-comes-from-structured-attributes.md) why the package builds them.
+
 ## What the install and the mirror refuse
 
 The install checks the tables before it changes anything, and `EventBridge::mirror()` checks the models before it registers a map. Each refusal is an `InvalidCompatibilityMap`.

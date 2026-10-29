@@ -12,7 +12,7 @@ The package serves the previous model from a PostgreSQL view, the compatibility 
 
 The package has two halves, and both read one `ResolvedMap`.
 
-- **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view and its trigger functions, and `Installer` runs that SQL. `compatibility:sql` prints the same SQL without running it. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
+- **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view, its trigger functions and the statistics and indexes a query on the view needs, and `Installer` runs that SQL. `compatibility:sql` prints the same SQL without running it. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
 - **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again, and replays the events for each record that changed. When a write through the previous model moves a current model's state column, the bridge first runs that state machine's trigger without its transition. That step needs `aryeo/eloquent-state-machines`, which the package suggests and does not require.
 
 A write that skips model events, such as a query builder update, still reaches the right tables through the triggers. Only the events are missing.
@@ -24,7 +24,7 @@ A write that skips model events, such as a query builder update, still reaches t
 | compatibility map | Contracts, Mapping | `CompatibilityMap` and the Mapping builders | the application's declaration |
 | resolved map | Mapping | `ResolvedMap::of()` | validates a map and answers every question about it |
 | registry | root | `CompatibilityMaps::register()`, `CompatibilityMaps::get()` | holds the application's maps by name |
-| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()`, `Installer::statements()` | reads the catalog, compiles SQL and installs it in one transaction |
+| schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()`, `Installer::prepare()`, `Installer::statements()` | reads the catalog, compiles SQL and installs it in one transaction, and prebuilds the planner support outside one |
 | model contract | Contracts, Provides | `Compatible`, `HasCompatibility` | marks each mapped model's own statement, and shows its model events to the event bridge |
 | PHPStan rules | Tooling\Database\Eloquent\Compatibility\PhpStan | `CompatibleMustUseHasCompatibility`, `HasCompatibilityMustImplementCompatible`, `HasCompatibilityMustOnlyBeOnModel`, `HasCompatibilityMustNotRedeclareWriteHooks` | report a model that breaks the model contract at analysis time |
 | event bridge | Bridge | `EventBridge::mirror()`, `EventBridge::withoutMirroring()` | mirrors model events across the two sides |
@@ -73,7 +73,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 The flows below take each step in depth:
 
 - [Declaring and registering a map](flows/declaring-and-registering-a-map.md)
-- [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md), and printing its statements with `compatibility:sql`
+- [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md), prebuilding the planner support with `Installer::prepare()`, and printing the statements with `compatibility:sql`
 - [Writing through the view](flows/writing-through-the-view.md), the database side of steps 6 and 7
 - [Mirroring a write](flows/mirroring-a-write.md), the PHP side of steps 1 to 5 and 8 to 10
 - [Replaying a transition](flows/replaying-a-transition.md), the trigger a state change runs inside step 9
@@ -86,10 +86,10 @@ Read the code in this order. Each step answers one question.
 
 1. [README.md](../README.md): what does a map look like, and how does an application install and mirror it?
 2. [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php) and [Tables](../tests/Fixtures/Support/Workbench/Tables.php): which builders does a real map use, over which tables?
-3. `CompatibilityMap`, `Attribute`, `DependentCurrentModel` and `UnrepresentableState`: what does each builder store?
+3. `CompatibilityMap`, `Attribute`, `DependentCurrentModel`, `PlannerIndex` and `UnrepresentableState`: what does each builder store?
 4. `ResolvedMap`: what does registration refuse, and how does a map locate a dependent row?
-5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first.
-6. `Installer`, `InstallerAction` and `SqlFragments`: which statements does each Installer method run, in what order, and how does it raise a refusal?
+5. `Compiler`: what SQL does a map compile to? Read `Compiler::view()`, `Compiler::updateFunction()`, `Compiler::updateDependent()` and `Compiler::conflict()` first. Then read `Attribute::plannerExpression()` and the private `Compiler::planner()`: what does a map's planner support build, and why do its expressions match the view's?
+6. `Installer`, `InstallerAction` and `SqlFragments`: which statements does each Installer method run, in what order, and how does it raise a refusal? `Installer::prepare()` is the one that runs outside a transaction.
 7. `CompatibilityWriteRefused`: how does a refusal become a PHP exception?
 8. `HasCompatibility`, `EventBridge`, `DispatchesQueryFailed` and `QueryFailed`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?

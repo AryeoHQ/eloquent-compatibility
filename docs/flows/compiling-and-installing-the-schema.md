@@ -1,17 +1,21 @@
 # Compiling and installing the schema
 
-This flow follows `Installer::install()` from a compatibility map to a compatibility view with its triggers. A migration calls it after it renames the previous model's table to the retained table. It then follows `compatibility:sql`, which prints the same statements without running them.
+This flow follows `Installer::install()` from a compatibility map to a compatibility view with its triggers and planner objects. A migration calls it after it renames the previous model's table to the retained table. It then follows `Installer::prepare()`, which builds the planner objects ahead of the install, and `compatibility:sql`, which prints the same statements without running them.
 
 ```mermaid
 flowchart LR
   Install["Installer::install()"] --> Statements["Installer::statements()"]
+  Prepare["Installer::prepare()"] --> Statements
   Print["CompileSql::handle()"] --> Statements
   Statements --> Resolve["ResolvedMap::of()"]
   Statements --> Compile["Compiler::compile()"]
+  Statements --> Planner["Compiler::prepare()"]
   Compile --> Catalog["ColumnCatalog"]
+  Planner --> Catalog
   Statements --> Drop["Installer::dropStatements()"]
   Statements --> Grants["Installer::grantStatements()"]
   Install --> Run["Installer::run()"]
+  Prepare --> Direct["Connection::unprepared()"]
   Print --> Output["stdout or --output"]
 ```
 
@@ -24,7 +28,7 @@ An install lists its statements from catalog reads alone, and then runs them, al
 3. It refuses when a relation with the view's name already exists in the current schema. A relation of that name in a later schema on the search path does not count. The message points at `Installer::recompile()`. [Before the rename](#before-the-rename) names the one exception.
 4. It refuses while another view or materialized view reads the retained table, and names each one. [INV-42](../invariants.md#inv-42-only-the-compatibility-view-reads-the-retained-table) records why, and [adopting a map](../adopting-a-map.md#before-the-install-views-on-the-old-table) how to redirect such a view.
 5. It refuses a retained or current table with row-level security, then compiles. [INV-38](../invariants.md#inv-38-the-schema-refuses-a-table-with-row-level-security) records the refusal.
-6. It lists a drop of every trigger whose name starts with the map's object prefix, and whose table and function are in the current schema. It then lists a drop of every function with that prefix in the current schema. The compiled statements follow the drops.
+6. It lists a drop of every trigger whose name starts with the map's object prefix, and whose table and function are in the current schema. It then lists a drop of every function with that prefix in the current schema. The compiled statements follow the drops. They end with the planner list, [described below](#planner-support).
 7. It lists one `DO` block that revokes every grant on the view except its owner's. The block reads the view's grants when it runs, so it also revokes a default privilege that another session adds after the list is built. The role's own privileges stay, because it owns the view. So the view keeps no grant the default privileges add, as [INV-48](../invariants.md#inv-48-the-new-view-carries-no-grant-its-default-privileges-add) records.
 8. It lists the grants the view takes from the retained table: the table's grants, and its column grants on the map's attribute columns, which are the view's columns. It leaves out the grants of the installing role, which owns the view. A retained table that was never granted gives its owner's default privileges, through `acldefault()`.
 9. It runs each listed statement with `Connection::unprepared()`.
@@ -41,9 +45,58 @@ A recompile replaces the installed map. It refuses no existing view, and copies 
 
 So a recompile can drop, retype or reorder an attribute, which `CREATE OR REPLACE VIEW` cannot. [INV-41](../invariants.md#inv-41-a-recompile-replaces-the-view-and-keeps-its-grants) and [0022](../decisions/0022-a-recompile-replaces-the-view-and-refuses-its-dependents.md) record the rule.
 
-An uninstall lists the drops of step 6, then a drop of the view when it finds one in the current schema. It leaves every table as it is.
+An uninstall lists the drops of step 6, then a drop of the view when it finds one in the current schema. It then lists a `DROP INDEX IF EXISTS` for every index in the current schema whose name starts with the map's object prefix, and a `DROP STATISTICS IF EXISTS` for every statistics object with that prefix. It leaves every table as it is.
+
+A recompile drops no index and no statistics object. Its planner list creates the ones the map now declares and the schema lacks, and [the limits below](#what-if-not-exists-leaves-alone) say what that leaves.
 
 Each of the three methods runs its list in one transaction, so a failed recompile or uninstall keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
+
+## Planner support
+
+A map that declares an index with `PrimaryCurrentModel::indexedBy()`, or a zoned attribute on the primary current model with `Attribute::inTimeZone()`, compiles a planner list. `Compiler::compile()` returns it as `CompiledSql::$planner`, after the triggers. A map that declares neither compiles an empty list, and install, recompile and prepare add nothing.
+
+Every expression in the list comes from `Attribute::plannerExpression()`, which builds it from the same parts as the view column: the stored column, the zone and the declared type. So the index expression and the view expression match, and a query on the view can use the index. `ResolvedMap::of()` checks names, attributes and zones without a database, and `Compiler` checks the stored columns against the catalog. [INV-52](../invariants.md#inv-52-every-planner-expression-comes-from-the-structured-parts-of-the-view-column) records the rule, and [0024](../decisions/0024-planner-support-comes-from-structured-attributes.md) the choice.
+
+The list has up to three kinds of statement, in this order:
+
+1. **One `CREATE STATISTICS IF NOT EXISTS`** over every zoned attribute that the primary current model's table stores, from `ResolvedMap::statisticsExpressions()`. A map with an index and no zoned attribute emits none.
+2. **One `CREATE INDEX IF NOT EXISTS` per declared index**, with the columns from `ResolvedMap::indexColumns()` and the filter from `ResolvedMap::indexFilter()`.
+3. **One `ANALYZE` of the primary current model's table**, so the new statistics have data. The list carries it only when it carries a statement before it.
+
+For the workbench map, [WidgetCompatibilityMap](../../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php), the list is:
+
+```sql
+CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON (CAST(("delivered_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)) FROM "gadgets"
+
+CREATE INDEX IF NOT EXISTS "compatibility__widgets__index_archived_newest" ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) DESC) WHERE CAST(("deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) IS NULL
+
+ANALYZE "gadgets"
+```
+
+### What each action emits
+
+```
+action     planner statements                                          transaction
+install    the list above, with CREATE INDEX                           one, with the rest of the install
+recompile  the same list, which creates only what is missing           one, with the rest of the recompile
+prepare    the list alone, with CREATE INDEX CONCURRENTLY              none: one statement at a time
+uninstall  a DROP INDEX and a DROP STATISTICS for each object          one, with the rest of the uninstall
+```
+
+`Installer::prepare()` runs `Compiler::prepare()`'s list. It throws `InvalidCompatibilityMap` inside a transaction, because `CREATE INDEX CONCURRENTLY` cannot run in one. It reads the primary current model's table and nothing else, so it works before the migration that renames the previous model's table. It refuses a map whose primary current model's table does not exist, and one whose zoned column is missing or is not a `timestamp with time zone`. A map with no planner statement makes it a no-op. [INV-24](../invariants.md#inv-24-each-installer-method-is-atomic) records why `prepare` stands outside the transaction.
+
+A concurrent build is the way to add an index to a live table. A plain `CREATE INDEX` takes a `SHARE` lock on the primary current model's table, which blocks its writes until the build ends. The adopter therefore runs `prepare` ahead of the install migration, and the install then finds each object and creates nothing, as [adopting a map](../adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes.
+
+### What `IF NOT EXISTS` leaves alone
+
+Install and recompile fill what is missing, and `IF NOT EXISTS` matches an object by name alone. That leaves four limits:
+
+- **A failed `CREATE INDEX CONCURRENTLY` leaves an `INVALID` index.** A later `prepare` or install skips it, because an index of that name exists. Drop the invalid index, and run `prepare` again.
+- **A changed definition is never rebuilt.** An index or statistics object keeps the definition it had when it was created, and one the map no longer declares stays until an uninstall. To change one, give it a new name. The old one stays until an uninstall drops it.
+- **`prepare` cannot serve a partitioned primary current model's table.** PostgreSQL refuses `CREATE INDEX CONCURRENTLY` on a partitioned table. Install can, with a plain `CREATE INDEX`.
+- **Install's planner statements hold their locks longer.** `CREATE INDEX IF NOT EXISTS` takes a `SHARE` lock on the primary current model's table even when the index exists, and `ANALYZE` lengthens the transaction. An uninstall's `DROP INDEX` holds an `ACCESS EXCLUSIVE` lock until the commit. Prebuild with `prepare`, so that install creates nothing.
+
+An index also needs an immutable expression. An attribute over a `timestamp with time zone` column that an index names must declare `Attribute::inTimeZone()`. Without it, the cast to `timestamp without time zone` is not immutable, and the install fails with PostgreSQL's 42P17. A statistics object is not affected, because it covers zoned attributes alone.
 
 ## The current schema
 
@@ -53,9 +106,9 @@ Each install, recompile and uninstall changes only the objects in `current_schem
 
 `php artisan compatibility:sql <map>` prints the statements an Installer method would run for a registered map, so a reviewer can read the SQL before a migration runs it. The command:
 
-1. Reads `--for` as an `InstallerAction`, `install` by default. Any other value exits non-zero and names the three values.
+1. Reads `--for` as an `InstallerAction`, `install` by default. Any other value exits non-zero and names the four values.
 2. Takes the map from the registry and asks `Installer::statements()` for that action's list. A refusal exits non-zero with its message: an unknown map, a missing retained table, an install over an existing relation, or any other refusal of the action. So the command refuses every map the Installer refuses, row-level security, readers of the retained table and dependents of the view included.
-3. Writes a header of `--` comment lines: the map and the action, the database, schema, search path, server version and role it read, and the time. For an install, the header says that the grants are derived, and that they leave out the grants of the role the command ran as. A line break in a value prints as `\r` or `\n`, so each header line stays one comment line.
+3. Writes a header of `--` comment lines: the map and the action, the database, schema, search path, server version and role it read, and the time. For an install, the header says that the grants are derived, and that they leave out the grants of the role the command ran as. A line break in a value prints as `\r` or `\n`, so each header line stays one comment line. A `--for=prepare` header never names a retained table, because a prepare reads none, and `--retained-table-is-currently` changes nothing in its list.
 4. Writes each statement with its closing semicolon on a line of its own, and a blank line between two statements, to stdout or to the `--output` file. So a statement that ends in a line comment, such as a default, keeps its semicolon. A file write that falls short exits non-zero.
 
 The command runs only catalog reads, through the write connection even when the connection has a read host, as the Installer reads inside its transaction. Each Installer method runs exactly the list `Installer::statements()` returns, so the printed statements are the statements that method runs against the same catalog. [INV-26](../invariants.md#inv-26-the-printed-statements-are-the-statements-that-run) states the rule. A trigger, function or grant that changes between the print and the install changes what the install runs.
@@ -113,3 +166,5 @@ compatibility__<name>__designate_<alias>  AFTER INSERT OR UPDATE                
 ```
 
 Each trigger shares its function's name. `Compiler::function()` writes every function as `SECURITY DEFINER` PL/pgSQL, quoted with the `$compatibility$` tag. Its first statement refuses with CM001 when `TG_RELID` names a relation other than the function's own or a partition of it. Every built-in function the bodies call is qualified with `pg_catalog`, as [INV-37](../invariants.md#inv-37-a-trigger-function-runs-only-for-its-own-relation) records. The insert, update and delete functions also carry a `SET` clause for the applying flag, as [INV-3](../invariants.md#inv-3-the-views-own-writes-skip-this-maps-current-side-triggers) requires. `Compiler::variables()` declares `previous_row`, `affected_rows` and one `key_<alias>` per current model.
+
+The planner list, from the private `Compiler::planner()`, comes last, after the triggers: the statistics, the indexes and an `ANALYZE`, when the map declares any. [Planner support](#planner-support) lists them, and `Compiler::prepare()` returns the same list with `CREATE INDEX CONCURRENTLY`.

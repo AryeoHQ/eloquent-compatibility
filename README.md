@@ -127,13 +127,42 @@ use Support\Database\Eloquent\Compatibility\Schema\Installer;
 resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 ```
 
+### Planner support
+A mapped attribute is a view expression, so PostgreSQL keeps no statistics for it and no index can serve it. A query that filters or sorts on the view then plans from guesses. The map declares what the planner needs, and the package builds it from the same parts that build the view column:
+
+```php
+use Support\Database\Eloquent\Compatibility\Mapping\PlannerIndex;
+
+PrimaryCurrentModel::for(Gadget::class)
+    ->aliasedAs('gadget')
+    ->indexedBy(
+        PlannerIndex::named('newest_first')
+            ->on('is_archived')
+            ->on('created_at', descending: true)
+            ->whereNull('deleted_at'),
+    );
+
+Attribute::mapped('created_at')
+    ->asType('timestamp(0) without time zone')
+    ->storedAs('gadget', 'created_at')
+    ->inTimeZone('UTC');
+```
+
+- `Attribute::inTimeZone()` says the stored column is a `timestamp with time zone` and the attribute is a `timestamp without time zone`. The view reads the column `AT TIME ZONE` that zone, and a write converts back. A plain cast between the two depends on the session's time zone, which PostgreSQL cannot index. The conversion is immutable, so the expression can carry an index.
+- `PrimaryCurrentModel::indexedBy()` declares one or more `PlannerIndex` values. `PlannerIndex::on()` adds a column, with `descending: true` for a descending one. `PlannerIndex::whereNull()` or `PlannerIndex::whereNotNull()` makes the index partial. Each name is an attribute of the map that `Attribute::storedAs()` stores on the primary current model.
+- Install creates one statistics object over every zoned attribute of the primary current model, each declared index, and then runs `ANALYZE` on the primary current model's table. A map that declares no index and no `Attribute::inTimeZone()` emits nothing.
+- `Installer::prepare()` builds the same statistics and indexes, with `CREATE INDEX CONCURRENTLY`, outside a transaction, ahead of the install. Install then finds each object and creates nothing. [Adopting a map](docs/adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes the migration.
+- `Installer::uninstall()` drops the map's indexes and statistics with the rest of its objects.
+
+[Compiling and installing the schema](docs/flows/compiling-and-installing-the-schema.md#planner-support) lists what each action emits and the limits of `IF NOT EXISTS`.
+
 `php artisan compatibility:check` names every record where the previous and current models disagree.
 
 `php artisan compatibility:sql` prints the statements the Installer runs for a registered compatibility map, so a reviewer or a database administrator can read them before a migration runs. It runs only catalog reads.
 
 ```bash
 php artisan compatibility:sql widgets                          # install, to stdout
-php artisan compatibility:sql widgets --for=recompile          # or --for=uninstall
+php artisan compatibility:sql widgets --for=recompile          # or --for=uninstall, or --for=prepare
 php artisan compatibility:sql widgets --retained-table-is-currently=widgets --output=widgets.sql
 ```
 

@@ -19,12 +19,13 @@ A map implements `CompatibilityMap`, whose six methods return builders. Every bu
 - `PrimaryCurrentModel::for()` and `DependentCurrentModel::for()` take the model class. Each needs an alias, and a dependent needs `DependentCurrentModel::primaryForeignKey()`.
 - `DependentCurrentModel::readableWhen()` defaults to `true`. `DependentCurrentModel::createdWhen()` and `DependentCurrentModel::designatedBy()` are optional.
 - `PrimaryCurrentModel::triggerArguments()` and `DependentCurrentModel::triggerArguments()` are optional. Each declares the constructor arguments of one state machine trigger, with one closure per argument name. A second call for the same trigger replaces the first. [Replaying a transition](replaying-a-transition.md) describes how the bridge calls the closures.
+- `PrimaryCurrentModel::indexedBy()` is optional. It takes one or more `PlannerIndex` values, each built with `PlannerIndex::named()`, `PlannerIndex::on()` and, for a partial index, `PlannerIndex::whereNull()` or `PlannerIndex::whereNotNull()`. A second call adds to the first. [Compiling and installing the schema](compiling-and-installing-the-schema.md#planner-support) describes what the installer builds from them.
 - `Attribute::retained()` keeps a column in the retained table. `Attribute::mapped()` stores it in a current model's table and needs `Attribute::asType()`.
 - `UnrepresentableState::refuse()`, `UnrepresentableState::degrade()` and `UnrepresentableState::hide()` declare the states one side holds and the other cannot.
 
 Each model builder stores the class name as Eloquent's events spell it. `ModelClass::canonical()` returns the declared name of a class that loads, so a leading backslash or another letter case still names the class. A name that loads no class stays as written, and resolution refuses it.
 
-`Attribute` orders its calls. `Attribute::storedAs()` sets the read and one `TargetColumn` together. `Attribute::readAs()` and `Attribute::readOnlyBecause()` clear the writes, so `Attribute::writesTo()` must follow `Attribute::readAs()`. The workbench `price` attribute shows that order. An insert through the view still stores a read-only attribute's `storedAs()` column, as [INV-49](../invariants.md#inv-49-an-insert-through-the-view-stores-a-read-only-attribute) records.
+`Attribute` orders its calls. `Attribute::storedAs()` sets the read and one `TargetColumn` together. `Attribute::readAs()` and `Attribute::readOnlyBecause()` clear the writes, so `Attribute::writesTo()` must follow `Attribute::readAs()`. The workbench `price` attribute shows that order. `Attribute::inTimeZone()` follows `Attribute::storedAs()`, or comes before it, and either order gives the same attribute. It says the stored column is a `timestamp with time zone` and the attribute a `timestamp without time zone`. It changes the read, the write and the view's default together, and so the expression an index or the statistics object uses. The workbench `created_at` attribute declares it. An insert through the view still stores a read-only attribute's `storedAs()` column, as [INV-49](../invariants.md#inv-49-an-insert-through-the-view-stores-a-read-only-attribute) records.
 
 ## Resolving
 
@@ -48,7 +49,10 @@ Each model builder stores the class name as Eloquent's events spell it. `ModelCl
 
 Registration cannot see a contextual binding such as `when()->needs('$reason')->give()`, because a provider may register it after the map. Such a parameter must come from a closure. [INV-32](../invariants.md#inv-32-registration-checks-every-declared-trigger-argument-against-the-triggers-constructor) records the trigger argument checks.
 
-Every failure throws `InvalidCompatibilityMap`, whose message names the map. Checks that need the catalog wait for compile time, which [compiling and installing the schema](compiling-and-installing-the-schema.md#compiling) lists. `ResolvedMap::validateAttributes()`, `ResolvedMap::validateLinks()` and `ResolvedMap::validateUnrepresentableStates()` hold steps 8 to 10.
+11. Each zoned attribute says `Attribute::storedAs()`, is not retained, has an `Attribute::asType()` of a `timestamp without time zone`, and is stored on the primary current model or the retained table, never on a dependent. `ResolvedMap::validateTimeZones()` holds this step.
+12. Each declared index has a name of lowercase words of at least three letters, joined by single underscores, and no other index has it. It names at least one column through `PlannerIndex::on()`. Each column, and the `PlannerIndex::whereNull()` or `PlannerIndex::whereNotNull()` attribute, is a mapped attribute that `Attribute::storedAs()` stores on the primary current model. Its object name, `ResolvedMap::indexName()`, fits in 63 characters. `ResolvedMap::validateIndexes()` holds this step.
+
+Every failure throws `InvalidCompatibilityMap`, whose message names the map. Checks that need the catalog wait for compile time, which [compiling and installing the schema](compiling-and-installing-the-schema.md#compiling) lists. A zoned attribute's column, for one, must be a `timestamp with time zone`, and `Compiler::prepare()` checks that too. `ResolvedMap::validateAttributes()`, `ResolvedMap::validateLinks()` and `ResolvedMap::validateUnrepresentableStates()` hold steps 8 to 10.
 
 ## Registering
 
