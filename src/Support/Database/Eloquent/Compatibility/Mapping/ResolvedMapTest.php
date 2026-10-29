@@ -6,6 +6,8 @@ namespace Support\Database\Eloquent\Compatibility\Mapping;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
@@ -15,6 +17,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Compiler;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
+use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\BulletinCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
@@ -195,7 +198,7 @@ final class ResolvedMapTest extends TestCase
     #[Test]
     public function it_accepts_read_only_attributes_stored_in_a_column_that_a_writable_attribute_owns(): void
     {
-        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['primaryCurrentModel' => $this->unindexedGadget(), 'attributes' => [
             Attribute::retained('id'),
             Attribute::retained('gadget_id')->readOnlyBecause('Linked.'),
             Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name'),
@@ -278,7 +281,7 @@ final class ResolvedMapTest extends TestCase
         ][$case['attributes']];
 
         $this->assertThrows(
-            fn () => (new Compiler(app('db.connection')))->compile($this->compatibilityMap(['attributes' => $attributes])),
+            fn () => (new Compiler(app('db.connection')))->compile($this->compatibilityMap(['primaryCurrentModel' => $this->unindexedGadget(), 'attributes' => $attributes])),
             InvalidCompatibilityMap::class,
             $message,
         );
@@ -380,6 +383,295 @@ final class ResolvedMapTest extends TestCase
         $this->expectInvalidTriggerArguments("current model 'publication' declares triggerArguments(), which needs aryeo/eloquent-state-machines", Archive::class, ['reason' => fn () => 'retired']);
     }
 
+    #[Test]
+    public function it_exposes_the_primary_table_with_its_statistics_and_indexes_and_runs_no_statement(): void
+    {
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        $resolvedMap = ResolvedMap::of(new WidgetCompatibilityMap);
+        [$index] = $resolvedMap->primaryCurrentModel->indexes;
+
+        $this->assertSame([
+            'gadgets',
+            'compatibility__widgets__statistics',
+            [
+                'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+                'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+                'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+                'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            ],
+            'compatibility__widgets__index_archived_newest',
+            ['CAST(("archived") AS boolean)', 'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC'],
+            'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) IS NULL',
+            [],
+        ], [
+            $resolvedMap->primaryTable(),
+            $resolvedMap->statisticsName(),
+            $resolvedMap->statisticsExpressions(),
+            $resolvedMap->indexName($index),
+            $resolvedMap->indexColumns($index),
+            $resolvedMap->indexFilter($index),
+            $statements,
+        ]);
+    }
+
+    #[Test]
+    public function it_exposes_each_planner_expression_as_the_view_reads_its_attribute_without_the_alias(): void
+    {
+        Tables::create();
+        $resolvedMap = ResolvedMap::of(new WidgetCompatibilityMap);
+        [$index] = $resolvedMap->primaryCurrentModel->indexes;
+        $view = (new Compiler(app('db.connection')))->compile($resolvedMap)->view[0];
+        $read = function (string $attribute) use ($view): string {
+            preg_match('/^  (.+) AS "'.$attribute.'",?$/m', $view, $column);
+
+            return str_replace('gadget.', '', $column[1] ?? '');
+        };
+
+        $this->assertSame(
+            [$read('created_at'), $read('deleted_at'), $read('delivered_at'), $read('updated_at'), $read('is_archived'), $read('created_at').' DESC', $read('deleted_at').' IS NULL'],
+            [...$resolvedMap->statisticsExpressions(), ...$resolvedMap->indexColumns($index), $resolvedMap->indexFilter($index)],
+        );
+    }
+
+    #[Test]
+    public function it_exposes_a_filter_on_an_attribute_that_is_not_null_and_none_for_an_index_without_one(): void
+    {
+        $delivered = PlannerIndex::named('delivered')->on('delivered_at')->whereNotNull('delivered_at');
+        $titled = PlannerIndex::named('titled')->on('title');
+
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['primaryCurrentModel' => $this->unindexedGadget()->indexedBy($delivered, $titled)]));
+
+        $this->assertSame([
+            ['CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)'],
+            'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) IS NOT NULL',
+            ['CAST(("name") AS character varying(255))'],
+            null,
+        ], [$resolvedMap->indexColumns($delivered), $resolvedMap->indexFilter($delivered), $resolvedMap->indexColumns($titled), $resolvedMap->indexFilter($titled)]);
+    }
+
+    #[Test]
+    public function it_exposes_no_statistics_expression_and_no_index_for_a_map_that_declares_neither(): void
+    {
+        $resolvedMap = ResolvedMap::of(new AccountCompatibilityMap);
+
+        $this->assertSame(['people', [], []], [$resolvedMap->primaryTable(), $resolvedMap->statisticsExpressions(), $resolvedMap->primaryCurrentModel->indexes]);
+    }
+
+    #[Test]
+    public function it_exposes_each_statistics_expression_once_and_sorted_when_two_zoned_attributes_read_one_column(): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+            $this->createdOn(),
+            ...(new WidgetCompatibilityMap)->attributes(),
+        ]]));
+
+        $this->assertSame([
+            'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+        ], $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
+    public function it_exposes_the_same_statistics_expressions_whatever_the_order_the_zoned_attributes_are_declared_in(): void
+    {
+        $attributes = (new WidgetCompatibilityMap)->attributes();
+
+        $this->assertSame(
+            ResolvedMap::of(new WidgetCompatibilityMap)->statisticsExpressions(),
+            ResolvedMap::of($this->compatibilityMap(['attributes' => array_reverse($attributes)]))->statisticsExpressions(),
+        );
+    }
+
+    #[Test]
+    public function it_refuses_more_distinct_statistics_expressions_than_one_postgresql_statistics_object_holds(): void
+    {
+        $this->expectInvalidMap(
+            "Compatibility map 'widgets' is declared wrongly: inTimeZone() gives primary current model 'gadget' 9 distinct statistics expressions, and a PostgreSQL statistics object holds at most 8; convert at most 8 of its columns.",
+            ['attributes' => [...(new WidgetCompatibilityMap)->attributes(), ...$this->zonedGadgetAttributes(['packed_at', 'shipped_at', 'invoiced_at', 'returned_at', 'audited_at'])]],
+        );
+    }
+
+    #[Test]
+    public function it_accepts_eight_distinct_statistics_expressions_from_more_zoned_attributes(): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            ...$this->zonedGadgetAttributes(['packed_at', 'shipped_at', 'invoiced_at', 'returned_at']),
+            $this->createdOn(),
+        ]]));
+
+        $this->assertCount(8, $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
+    #[TestWith(['delivered_at'])]
+    #[TestWith(['sku'])]
+    public function it_refuses_a_time_zone_on_an_attribute_without_a_stored_column(string $attribute): void
+    {
+        $replaced = $attribute === 'sku'
+            ? Attribute::retained('sku')->inTimeZone('UTC')
+            : Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at')->inTimeZone('UTC')->readAs('gadget', 'gadget.delivered_at')->writesTo('gadget', 'delivered_at', 'NEW.delivered_at');
+
+        $this->expectInvalidMap("attribute '{$attribute}' says inTimeZone() without storedAs(); only a mapped attribute stored in one column converts its time zone", ['attributes' => (new WidgetCompatibilityMap([$attribute => $replaced]))->attributes()]);
+    }
+
+    #[Test]
+    #[TestWith(['timestamp(0) with time zone'])]
+    #[TestWith(['timestamptz'])]
+    #[TestWith(['date'])]
+    #[TestWith(['text'])]
+    #[TestWith(['timestamp(0) without time zone) AS delivered_at, (SELECT 1'])]
+    public function it_refuses_a_time_zone_on_an_attribute_whose_type_is_not_a_timestamp_without_time_zone(string $type): void
+    {
+        $this->expectInvalidMap("attribute 'delivered_at' says inTimeZone(), which needs asType() of a timestamp without time zone, not '{$type}'", ['attributes' => (new WidgetCompatibilityMap([
+            'delivered_at' => Attribute::mapped('delivered_at')->asType($type)->storedAs('gadget', 'delivered_at')->inTimeZone('UTC'),
+        ]))->attributes()]);
+    }
+
+    #[Test]
+    #[TestWith(['timestamp'])]
+    #[TestWith(['timestamp(3)'])]
+    #[TestWith(['timestamp without time zone'])]
+    #[TestWith(['TIMESTAMP (0) WITHOUT TIME ZONE'])]
+    public function it_accepts_a_time_zone_on_an_attribute_of_any_timestamp_without_time_zone_type(string $type): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => (new WidgetCompatibilityMap([
+            'delivered_at' => Attribute::mapped('delivered_at')->asType($type)->storedAs('gadget', 'delivered_at')->inTimeZone('UTC'),
+        ]))->attributes()]));
+
+        $this->assertContains("CAST((\"delivered_at\" AT TIME ZONE 'UTC') AS {$type})", $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
+    #[TestWith(['place', 'created_at', "attribute 'placed_at' says inTimeZone() but is stored on dependent current model 'place'; only a column of primary current model 'gadget' converts its time zone, because the statistics object covers that table alone"])]
+    #[TestWith(['widget', 'retired_at', "attribute 'placed_at' says inTimeZone() but is stored on the retained table retained_widgets; only a column of primary current model 'gadget' converts its time zone, because the statistics object covers that table alone"])]
+    public function it_refuses_a_time_zone_on_an_attribute_stored_outside_the_primary_current_model(string $alias, string $column, string $message): void
+    {
+        $this->expectInvalidMap($message, ['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('placed_at')->asType('timestamp(0) without time zone')->storedAs($alias, $column)->inTimeZone('UTC'),
+        ]]);
+    }
+
+    #[Test]
+    #[TestWith(['nope', 'on', 'is on'])]
+    #[TestWith(['sku', 'on', 'is on'])]
+    #[TestWith(['price', 'on', 'is on'])]
+    #[TestWith(['street', 'on', 'is on'])]
+    #[TestWith(['retired_at', 'on', 'is on'])]
+    #[TestWith(['nope', 'whereNull', 'filters on'])]
+    #[TestWith(['sku', 'whereNotNull', 'filters on'])]
+    #[TestWith(['price', 'whereNull', 'filters on'])]
+    #[TestWith(['street', 'whereNotNull', 'filters on'])]
+    #[TestWith(['retired_at', 'whereNull', 'filters on'])]
+    public function it_refuses_an_index_on_an_attribute_that_is_not_mapped_and_stored_on_the_primary_current_model(string $attribute, string $declaration, string $role): void
+    {
+        $index = PlannerIndex::named('archived_newest')->on('is_archived');
+        $index = match ($declaration) {
+            'on' => $index->on($attribute),
+            'whereNull' => $index->whereNull($attribute),
+            default => $index->whereNotNull($attribute),
+        };
+
+        $this->expectInvalidMap("index 'archived_newest' {$role} '{$attribute}', which is not a mapped attribute that storedAs() stores on primary current model 'gadget'", [
+            'primaryCurrentModel' => $this->unindexedGadget()->indexedBy($index),
+            'attributes' => [
+                ...(new WidgetCompatibilityMap)->attributes(),
+                Attribute::mapped('retired_at')->asType('timestamp(0) without time zone')->storedAs('widget', 'retired_at'),
+            ],
+        ]);
+    }
+
+    #[Test]
+    public function it_refuses_an_index_that_says_no_column(): void
+    {
+        $this->expectInvalidMap("index 'archived_newest' says no on()", ['primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named('archived_newest')->whereNull('deleted_at'))]);
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_refuses_an_index_that_says_one_column_twice(bool $descending): void
+    {
+        $this->expectInvalidMap("index 'archived_newest' says on('created_at') twice; an index lists each column once, with one direction", [
+            'primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named('archived_newest')->on('created_at')->on('is_archived')->on('created_at', $descending)),
+        ]);
+    }
+
+    #[Test]
+    #[TestWith(['whereNotNull', "index 'archived_newest' says whereNull('deleted_at') and whereNotNull('delivered_at'); an index takes one filter at most, so declare one whereNull() or whereNotNull()"])]
+    #[TestWith(['whereNull', "index 'archived_newest' says whereNull('deleted_at') and whereNull('delivered_at'); an index takes one filter at most, so declare one whereNull() or whereNotNull()"])]
+    public function it_refuses_an_index_that_says_more_than_one_filter(string $second, string $message): void
+    {
+        $index = PlannerIndex::named('archived_newest')->on('created_at')->whereNull('deleted_at');
+        $index = $second === 'whereNull' ? $index->whereNull('delivered_at') : $index->whereNotNull('delivered_at');
+
+        $this->expectInvalidMap($message, ['primaryCurrentModel' => $this->unindexedGadget()->indexedBy($index)]);
+    }
+
+    #[Test]
+    #[TestWith(['by_newest'])]
+    #[TestWith(['newest2'])]
+    #[TestWith(['Newest'])]
+    #[TestWith(['archived__newest'])]
+    #[TestWith(['archived_'])]
+    #[TestWith(['_archived'])]
+    #[TestWith(['archived-newest'])]
+    #[TestWith([''])]
+    public function it_refuses_an_index_whose_name_is_not_full_words(string $name): void
+    {
+        $this->expectInvalidMap("index '{$name}' must be lowercase words of at least three letters, joined by single underscores", ['primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named($name)->on('created_at'))]);
+    }
+
+    #[Test]
+    public function it_refuses_two_indexes_of_one_name(): void
+    {
+        $this->expectInvalidMap("index 'archived_newest' is declared twice", ['primaryCurrentModel' => (new WidgetCompatibilityMap)->primaryCurrentModel()->indexedBy(PlannerIndex::named('archived_newest')->on('title'))]);
+    }
+
+    #[Test]
+    public function it_refuses_an_index_whose_object_name_exceeds_63_characters(): void
+    {
+        $this->expectInvalidMap('the database object name compatibility__widgets__index_archived_gadgets_with_newest_first exceeds 63 characters; shorten the compatibility map or index name', [
+            'primaryCurrentModel' => $this->unindexedGadget()->indexedBy(PlannerIndex::named('archived_gadgets_with_newest_first')->on('created_at')),
+        ]);
+    }
+
+    #[Test]
+    public function it_names_an_index_whose_object_name_has_exactly_63_characters(): void
+    {
+        $index = PlannerIndex::named('archived_gadget_with_newest_first')->on('created_at');
+
+        $name = ResolvedMap::of($this->compatibilityMap(['primaryCurrentModel' => $this->unindexedGadget()->indexedBy($index)]))->indexName($index);
+
+        $this->assertSame(['compatibility__widgets__index_archived_gadget_with_newest_first', 63], [$name, strlen($name)]);
+    }
+
+    private function unindexedGadget(): PrimaryCurrentModel
+    {
+        return PrimaryCurrentModel::for(Gadget::class)->aliasedAs('gadget')->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())']);
+    }
+
+    private function createdOn(): Attribute
+    {
+        return Attribute::mapped('created_on')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC')->readOnlyBecause('A widget shows the time it was created under a second name.');
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return list<Attribute>
+     */
+    private function zonedGadgetAttributes(array $columns): array
+    {
+        return array_map(fn (string $column) => Attribute::mapped($column)->asType('timestamp(0) without time zone')->storedAs('gadget', $column)->inTimeZone('UTC'), $columns);
+    }
+
     /**
      * @param  class-string  $trigger
      * @param  array<string, Closure>  $arguments
@@ -423,7 +715,7 @@ final class ResolvedMapTest extends TestCase
 
             public function primaryCurrentModel(): PrimaryCurrentModel
             {
-                return $this->base->primaryCurrentModel();
+                return $this->overrides['primaryCurrentModel'] ?? $this->base->primaryCurrentModel();
             }
 
             public function dependentCurrentModels(): array

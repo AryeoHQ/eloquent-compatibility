@@ -17,14 +17,19 @@ use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableStateKind;
 
 final class Compiler
 {
+    private const string TIMESTAMP_WITH_TIME_ZONE = '/^timestamp(?:\(\d+\))? with time zone$/';
+
     private readonly ColumnCatalog $columnCatalog;
 
     private readonly string $schema;
 
+    /** @var array<string, bool> */
+    private array $timeZones = [];
+
     /**
      * @param  array<string, string>  $sources
      */
-    public function __construct(ConnectionInterface $connection, array $sources = [])
+    public function __construct(private readonly ConnectionInterface $connection, array $sources = [])
     {
         $this->schema = (string) $connection->scalar('select current_schema()');
         $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath(), $sources);
@@ -65,7 +70,123 @@ final class Compiler
             [$this->view($resolvedMap), ...$this->defaults($resolvedMap)],
             $statements,
             $this->triggers($resolvedMap),
+            $this->planner($resolvedMap, false),
         );
+    }
+
+    /** @return list<string> */
+    public function prepare(CompatibilityMap|ResolvedMap $map): array
+    {
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
+
+        if ($resolvedMap->statisticsExpressions() === [] && $resolvedMap->primaryCurrentModel->indexes === []) {
+            return [];
+        }
+
+        $table = $resolvedMap->primaryTable();
+
+        if ($this->columnCatalog->of($table) === []) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the current table {$table} does not exist");
+        }
+
+        $planned = [];
+
+        foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
+            $planned = [...$planned, ...array_column($index->columns, 'attribute'), ...array_column($index->filters, 'attribute')];
+        }
+
+        foreach ($resolvedMap->attributes as $attribute) {
+            if ($attribute->alias !== $resolvedMap->primaryCurrentModel->alias) {
+                continue;
+            }
+
+            if ($attribute->timeZone !== null) {
+                $this->validateTimeZone($resolvedMap, $attribute);
+            } elseif (in_array($attribute->column, $planned, true)) {
+                $this->storedColumn($resolvedMap, $attribute);
+            }
+        }
+
+        return $this->planner($resolvedMap, true);
+    }
+
+    /** @return list<string> */
+    private function planner(ResolvedMap $resolvedMap, bool $concurrently): array
+    {
+        $table = SqlFragments::identifier($resolvedMap->primaryTable());
+        $present = $resolvedMap->primaryCurrentModel->indexes === [] ? [] : $this->plannerIndexes($resolvedMap);
+        $builds = [];
+        $markers = [];
+
+        foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
+            $name = $resolvedMap->indexName($index);
+            $existing = $present[$name] ?? null;
+            $filter = $resolvedMap->indexFilter($index);
+            $definition = 'ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
+
+            if ($existing !== null && ! $existing->valid) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, $existing->partitioned
+                    ? "partitioned index {$existing->relation} exists but is invalid, as it stays until an index of each partition is attached to it, so the planner cannot use it; attach each partition's index with ALTER INDEX {$existing->relation} ATTACH PARTITION, or DROP INDEX {$existing->relation} and install or recompile again, because prepare cannot build an index on a partitioned table"
+                    : "index {$existing->relation} exists but is invalid, as a failed or unfinished CREATE INDEX CONCURRENTLY leaves it, so the planner cannot use it; if no CREATE INDEX CONCURRENTLY is still running on it, DROP INDEX CONCURRENTLY {$existing->relation}, then prepare again");
+            }
+
+            if ($existing === null) {
+                $builds[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($name).' '.$definition;
+            }
+
+            if ($existing === null || ! $existing->marked) {
+                $markers[] = 'COMMENT ON INDEX '.SqlFragments::identifier($name).' IS '.SqlFragments::literal($definition);
+            }
+        }
+
+        $expressions = implode(', ', array_map(fn (string $expression) => '('.$expression.')', $resolvedMap->statisticsExpressions()));
+        $statistics = $expressions === '' ? [] : $this->statistics($resolvedMap, $table, $expressions);
+
+        if ($statistics !== []) {
+            $markers = ['COMMENT ON STATISTICS '.SqlFragments::identifier($resolvedMap->statisticsName()).' IS '.SqlFragments::literal($expressions), ...$markers];
+        }
+
+        return $markers === [] ? [] : [...$builds, ...$statistics, 'ANALYZE '.$table, ...$markers];
+    }
+
+    /** @return list<string> */
+    private function statistics(ResolvedMap $resolvedMap, string $table, string $expressions): array
+    {
+        $name = $resolvedMap->statisticsName();
+        $existing = $this->connection->selectOne(
+            "select quote_ident(statistics_namespace.nspname) || '.' || quote_ident(statistics.stxname) as name, obj_description(statistics.oid, 'pg_statistic_ext') as expressions,
+                    statistics.stxrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) as on_primary_table
+             from pg_statistic_ext statistics join pg_namespace statistics_namespace on statistics_namespace.oid = statistics.stxnamespace
+             where statistics.stxname = ? and statistics.stxnamespace = to_regnamespace(quote_ident(current_schema()))",
+            [$table, $name],
+        );
+
+        if ($existing !== null && $existing->on_primary_table === true && $existing->expressions === $expressions) {
+            return [];
+        }
+
+        return [
+            ...($existing === null ? [] : ['DROP STATISTICS IF EXISTS '.$existing->name]),
+            'CREATE STATISTICS '.SqlFragments::identifier($name).' ON '.$expressions.' FROM '.$table,
+        ];
+    }
+
+    /** @return array<string, object{relation: string, valid: bool, partitioned: bool, marked: bool}> */
+    private function plannerIndexes(ResolvedMap $resolvedMap): array
+    {
+        $indexes = [];
+        $rows = $this->connection->select(
+            "select index_relation.relname as name, index_relation.oid::regclass::text as relation, planner_index.indisvalid as valid,
+                    index_relation.relkind = 'I' as partitioned, obj_description(index_relation.oid, 'pg_class') is not null as marked
+             from pg_index planner_index join pg_class index_relation on index_relation.oid = planner_index.indexrelid
+             where index_relation.relname like ".SqlFragments::like($resolvedMap->objectPrefix()).' and index_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))',
+        );
+
+        foreach ($rows as $row) {
+            $indexes[(string) $row->name] = (object) ['relation' => (string) $row->relation, 'valid' => $row->valid === true, 'partitioned' => $row->partitioned === true, 'marked' => $row->marked === true];
+        }
+
+        return $indexes;
     }
 
     private function view(ResolvedMap $resolvedMap): string
@@ -113,6 +234,7 @@ final class Compiler
 
             if ($default === null && $attribute->storedAs !== null && $attribute->alias !== null && $resolvedMap->dependent($attribute->alias) === null) {
                 $default = $this->storedDefault($resolvedMap, $resolvedMap->table($attribute->alias), $attribute->storedAs);
+                $default = $default === null || $attribute->timeZone === null ? $default : SqlFragments::atTimeZone('('.$default.')', $attribute->timeZone);
             }
 
             $statements[] = 'ALTER VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view)
@@ -479,7 +601,7 @@ final class Compiler
             if (! $attribute->retained && $attribute->alias === $alias && $attribute->storedAs !== null && $attribute->writesTo === []
                 && ! $resolvedMap->writes($alias, $attribute->storedAs)
                 && ! ($this->columnCatalog->of($resolvedMap->table($alias))[$attribute->storedAs]->alwaysGenerated ?? false)) {
-                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, 'NEW.'.SqlFragments::identifier($attribute->column)));
+                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, SqlFragments::atTimeZone('NEW.'.SqlFragments::identifier($attribute->column), $attribute->timeZone)));
             }
         }
 
@@ -792,6 +914,45 @@ final class Compiler
                 throw InvalidCompatibilityMap::because($resolvedMap->name, $dependentTable.' has no column '.$resolvedMap->primaryForeignKey($dependent));
             }
         }
+
+        foreach ($resolvedMap->attributes as $attribute) {
+            $this->validateTimeZone($resolvedMap, $attribute);
+        }
+    }
+
+    private function validateTimeZone(ResolvedMap $resolvedMap, Attribute $attribute): void
+    {
+        if ($attribute->timeZone === null || $attribute->alias === null || $attribute->storedAs === null) {
+            return;
+        }
+
+        $column = $this->storedColumn($resolvedMap, $attribute);
+        $table = $resolvedMap->table($attribute->alias);
+
+        if (preg_match(self::TIMESTAMP_WITH_TIME_ZONE, $column->baseType ?? $column->type) !== 1) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone(), which needs {$table}.{$attribute->storedAs} to be a timestamp with time zone, not {$column->type}");
+        }
+
+        $known = $this->timeZones[$attribute->timeZone] ??= $this->connection->scalar(
+            'select exists (select 1 from pg_timezone_names where lower(name) = lower(?)) or exists (select 1 from pg_timezone_abbrevs where lower(abbrev) = lower(?))',
+            [$attribute->timeZone, $attribute->timeZone],
+        ) === true;
+
+        if (! $known) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone('{$attribute->timeZone}'), which neither pg_timezone_names nor pg_timezone_abbrevs holds");
+        }
+    }
+
+    private function storedColumn(ResolvedMap $resolvedMap, Attribute $attribute): Column
+    {
+        $table = $resolvedMap->table((string) $attribute->alias);
+        $column = $this->columnCatalog->of($table)[(string) $attribute->storedAs] ?? null;
+
+        if ($column === null) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has no column {$attribute->storedAs}");
+        }
+
+        return $column;
     }
 
     private function validateFills(ResolvedMap $resolvedMap): void

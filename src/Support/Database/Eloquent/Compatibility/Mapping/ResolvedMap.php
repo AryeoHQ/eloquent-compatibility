@@ -21,6 +21,12 @@ final readonly class ResolvedMap
 {
     private const string IDENTIFIER = '/^[a-z_][a-z0-9_]*$/';
 
+    private const string FULL_WORDS = '/^[a-z]{3,}(?:_[a-z]{3,})*$/';
+
+    private const string TIMESTAMP_WITHOUT_TIME_ZONE = '/^timestamp\s*(?:\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?$/i';
+
+    private const int MOST_STATISTICS_EXPRESSIONS = 8;
+
     private const array VARIABLES = ['previous_row', 'affected_rows', 'created_key'];
 
     /**
@@ -102,6 +108,8 @@ final readonly class ResolvedMap
         $resolvedMap->validateAttributes();
         $resolvedMap->validateLinks();
         $resolvedMap->validateUnrepresentableStates();
+        $resolvedMap->validateTimeZones();
+        $resolvedMap->validateIndexes();
 
         return $resolvedMap;
     }
@@ -120,6 +128,11 @@ final readonly class ResolvedMap
     public function aliases(): array
     {
         return array_keys($this->tables);
+    }
+
+    public function primaryTable(): string
+    {
+        return $this->table((string) $this->primaryCurrentModel->alias);
     }
 
     public function dependent(string $alias): null|DependentCurrentModel
@@ -234,20 +247,77 @@ final readonly class ResolvedMap
         return $this->object('designate_'.$dependent->alias);
     }
 
+    public function statisticsName(): string
+    {
+        return $this->object('statistics');
+    }
+
+    public function indexName(PlannerIndex $index): string
+    {
+        return $this->object('index_'.$index->name, 'index');
+    }
+
+    /** @return list<string> */
+    public function statisticsExpressions(): array
+    {
+        $expressions = [];
+
+        foreach ($this->attributes as $attribute) {
+            if ($attribute->timeZone !== null && $attribute->alias === $this->primaryCurrentModel->alias) {
+                $expressions[] = (string) $attribute->plannerExpression();
+            }
+        }
+
+        $expressions = array_values(array_unique($expressions));
+        sort($expressions, SORT_STRING);
+
+        return $expressions;
+    }
+
+    /** @return list<string> */
+    public function indexColumns(PlannerIndex $index): array
+    {
+        $columns = [];
+
+        foreach ($index->columns as $column) {
+            $columns[] = $this->plannerExpression($column['attribute']).($column['descending'] ? ' DESC' : '');
+        }
+
+        return $columns;
+    }
+
+    public function indexFilter(PlannerIndex $index): null|string
+    {
+        $filter = $index->filters[0] ?? null;
+
+        return $filter === null ? null : $this->plannerExpression($filter['attribute']).' '.$filter['filter']->predicate();
+    }
+
     public function objectPrefix(): string
     {
         return 'compatibility__'.$this->name.'__';
     }
 
-    private function object(string $suffix): string
+    private function object(string $suffix, string $shorten = 'unrepresentable state'): string
     {
         $object = $this->objectPrefix().$suffix;
 
         if (strlen($object) > 63) {
-            throw InvalidCompatibilityMap::because($this->name, "the database object name {$object} exceeds 63 characters; shorten the compatibility map or unrepresentable state name");
+            throw InvalidCompatibilityMap::because($this->name, "the database object name {$object} exceeds 63 characters; shorten the compatibility map or {$shorten} name");
         }
 
         return $object;
+    }
+
+    private function plannerExpression(string $column): null|string
+    {
+        foreach ($this->attributes as $attribute) {
+            if ($attribute->column === $column && $attribute->alias === $this->primaryCurrentModel->alias) {
+                return $attribute->plannerExpression();
+            }
+        }
+
+        return null;
     }
 
     private function validateAttributes(): void
@@ -369,6 +439,86 @@ final readonly class ResolvedMap
             if ($state->checkedOn !== null && ! array_key_exists($state->checkedOn, $this->tables)) {
                 throw InvalidCompatibilityMap::because($this->name, "unrepresentable state '{$state->name}' checks unknown alias '{$state->checkedOn}'");
             }
+        }
+    }
+
+    private function validateTimeZones(): void
+    {
+        foreach ($this->attributes as $attribute) {
+            if ($attribute->timeZone === null) {
+                continue;
+            }
+
+            if ($attribute->retained || $attribute->storedAs === null) {
+                throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone() without storedAs(); only a mapped attribute stored in one column converts its time zone");
+            }
+
+            if (preg_match(self::TIMESTAMP_WITHOUT_TIME_ZONE, (string) $attribute->type) !== 1) {
+                throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone(), which needs asType() of a timestamp without time zone, not '{$attribute->type}'");
+            }
+
+            if ($attribute->alias !== $this->primaryCurrentModel->alias) {
+                $owner = $this->dependent((string) $attribute->alias) === null ? "the retained table {$this->previousModel->table}" : "dependent current model '{$attribute->alias}'";
+
+                throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone() but is stored on {$owner}; only a column of primary current model '{$this->primaryCurrentModel->alias}' converts its time zone, because the statistics object covers that table alone");
+            }
+        }
+
+        $expressions = count($this->statisticsExpressions());
+
+        if ($expressions > self::MOST_STATISTICS_EXPRESSIONS) {
+            throw InvalidCompatibilityMap::because($this->name, "inTimeZone() gives primary current model '{$this->primaryCurrentModel->alias}' {$expressions} distinct statistics expressions, and a PostgreSQL statistics object holds at most ".self::MOST_STATISTICS_EXPRESSIONS.'; convert at most '.self::MOST_STATISTICS_EXPRESSIONS.' of its columns');
+        }
+    }
+
+    private function validateIndexes(): void
+    {
+        $names = [];
+
+        foreach ($this->primaryCurrentModel->indexes as $index) {
+            if (preg_match(self::FULL_WORDS, $index->name) !== 1) {
+                throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' must be lowercase words of at least three letters, joined by single underscores");
+            }
+
+            if (array_key_exists($index->name, $names)) {
+                throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' is declared twice");
+            }
+
+            $names[$index->name] = true;
+
+            if ($index->columns === []) {
+                throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says no on()");
+            }
+
+            $columns = [];
+
+            foreach ($index->columns as $column) {
+                if (array_key_exists($column['attribute'], $columns)) {
+                    throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says on('{$column['attribute']}') twice; an index lists each column once, with one direction");
+                }
+
+                $columns[$column['attribute']] = true;
+                $this->validateIndexed($index, 'is on', $column['attribute']);
+            }
+
+            if (count($index->filters) > 1) {
+                $filters = array_map(fn (array $filter) => "{$filter['filter']->value}('{$filter['attribute']}')", $index->filters);
+
+                throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' says ".implode(' and ', $filters).'; an index takes one filter at most, so declare one whereNull() or whereNotNull()');
+            }
+
+            foreach ($index->filters as $filter) {
+                $this->validateIndexed($index, 'filters on', $filter['attribute']);
+            }
+
+            $this->indexName($index);
+        }
+    }
+
+    private function validateIndexed(PlannerIndex $index, string $role, string $attribute): void
+    {
+        if ($this->plannerExpression($attribute) === null) {
+            throw InvalidCompatibilityMap::because($this->name, "index '{$index->name}' {$role} '{$attribute}', which is not a mapped attribute that storedAs() stores on primary current model '{$this->primaryCurrentModel->alias}'");
         }
     }
 

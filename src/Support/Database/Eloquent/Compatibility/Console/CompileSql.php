@@ -17,7 +17,7 @@ final class CompileSql extends Command
 {
     protected $signature = 'compatibility:sql
         {map : The name of a registered compatibility map}
-        {--for=install : Print the statements of install, recompile or uninstall}
+        {--for=install : Print the statements of install, recompile, uninstall or prepare}
         {--retained-table-is-currently= : Compile before the rename: read the retained table\'s columns and grants from its current name}
         {--output= : Write the statements to this file instead of stdout}';
 
@@ -53,7 +53,7 @@ final class CompileSql extends Command
             '-- Compiled at '.now()->toIso8601String(),
         ];
 
-        if ($current !== null) {
+        if ($current !== null && $for !== InstallerAction::Prepare) {
             $header[] = "-- The retained table {$table} was read from {$current}, its name before the rename";
         }
 

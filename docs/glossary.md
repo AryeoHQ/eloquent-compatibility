@@ -13,7 +13,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **column catalog**: the cached reader of each table's column types, defaults, `NOT NULL` and generated flags, and of whether a type has a btree equality; `ColumnCatalog`.
 - **compatibility map**: the class that declares how a previous model maps onto its current models; it implements `CompatibilityMap`.
 - **compatibility view**: the PostgreSQL view, named after the previous model's old table, that serves the previous model.
-- **compiled SQL**: the view, function and trigger statements a map compiles to; `CompiledSql`.
+- **compiled SQL**: the view, function, trigger and planner statements a map compiles to, in that order; `CompiledSql`.
 - **conflict check**: the update trigger's second read of every attribute, after it locks the dependent rows. It raises 40001 when the record changed after the statement's snapshot.
 - **created key**: the retained key of a record just created, which the triggers store in `Setting::Created` for the event bridge.
 - **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model. A map names each current model class once.
@@ -31,7 +31,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **immediate release**: the event bridge rolling back a failed level-0 write as soon as its statement fails, before the connection trait raises `QueryFailed`; see `EventBridge::handleFailure()`.
-- **installer action**: install, recompile or uninstall, the three Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.
+- **installer action**: install, recompile, uninstall or prepare, the four Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
 - **mapped attribute**: a previous model's attribute stored in a current model's table; see `Attribute::mapped()`.
@@ -42,9 +42,12 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **model contract**: what every model of a mirrored map carries, the interface `Compatible` and the trait `HasCompatibility`. The trait marks the model's own statement and shows the event bridge its model events.
 - **native write**: a write a model makes itself, as opposed to the events the event bridge replays for it.
 - **newcomer**: an affected record the event bridge finds only on its second pass, under its first locks.
-- **object prefix**: `compatibility__<name>__`, which starts the name of every trigger and function of a map; see `ResolvedMap::objectPrefix()`.
+- **object prefix**: `compatibility__<name>__`, which starts the name of every trigger, function, index and statistics object of a map; see `ResolvedMap::objectPrefix()`.
 - **own statement**: the statement a model's own write method sends, which `HasCompatibility` marks for the event bridge; see `EventBridge::markOwnStatement()`.
 - **pending mirrored write**: a write the event bridge has begun and not yet forgotten; a `PendingMirroredWrite`. The bridge opens its transaction or savepoint only when its statement starts; see `PendingMirroredWrite::$statementSent`. A completed write leaves at once.
+- **planner index**: an index a map declares over the primary current model's table, with `PrimaryCurrentModel::indexedBy()`. It names mapped attributes, and the package builds its expressions from them. It records every `PlannerIndex::on()` and filter call, each filter typed by `PlannerIndexFilter`, and `ResolvedMap::of()` refuses a repeated column or a second filter; a `PlannerIndex`.
+- **planner support**: the statistics object, the indexes and the `ANALYZE` that let PostgreSQL plan a query on the view from its mapped expressions. The compiler builds them from the map's attributes and declared indexes, and emits only what the catalog lacks, holds out of date or holds without its marker. The list ends with the `ANALYZE` and then a marker comment on each object it finished; see `CompiledSql::$planner`.
+- **prepare**: the Installer method that builds a map's missing planner support, rebuilds a statistics object whose expressions changed, and analyses and marks what a stopped prepare left, ahead of the install, with `CREATE INDEX CONCURRENTLY`, outside a transaction; see `Installer::prepare()`.
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.

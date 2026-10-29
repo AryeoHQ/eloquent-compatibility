@@ -127,13 +127,43 @@ use Support\Database\Eloquent\Compatibility\Schema\Installer;
 resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 ```
 
+### Planner support
+A mapped attribute read as its column's own type, such as a `boolean` column read as a `boolean`, keeps the column's statistics and indexes, because PostgreSQL drops that identity cast. A conversion does not: a `timestamp with time zone` column read as a `timestamp without time zone` is an expression with no statistics, and no index on the column serves it. A query that filters or sorts on it then plans from guesses. The map declares what the planner needs, and the package builds it from the same parts that build the view column:
+
+```php
+use Support\Database\Eloquent\Compatibility\Mapping\PlannerIndex;
+
+PrimaryCurrentModel::for(Gadget::class)
+    ->aliasedAs('gadget')
+    ->indexedBy(
+        PlannerIndex::named('newest_first')
+            ->on('is_archived')
+            ->on('created_at', descending: true)
+            ->whereNull('deleted_at'),
+    );
+
+Attribute::mapped('created_at')
+    ->asType('timestamp(0) without time zone')
+    ->storedAs('gadget', 'created_at')
+    ->inTimeZone('UTC');
+```
+
+- `Attribute::inTimeZone()` says the stored column is a `timestamp with time zone` and the attribute is a `timestamp without time zone`. The view reads the column `AT TIME ZONE` that zone, and a write converts back. A plain cast between the two depends on the session's time zone, which PostgreSQL cannot index. The conversion is immutable, so the expression can carry an index. Only that conversion needs a zone: an attribute of its column's own type, `timestamp with time zone` included, declares none. Only an attribute stored on the primary current model takes a zone, because the statistics object covers that table alone, so `ResolvedMap::of()` refuses one stored on the retained table or a dependent. The zone must be a name in `pg_timezone_names` or an abbreviation in `pg_timezone_abbrevs`, in any letter case, and the install refuses any other.
+- The view's default for a zoned attribute is the stored column's default converted to the zone. An `Attribute::defaultsTo()` expression is taken as written, so it must already be in the zone, such as `now() AT TIME ZONE 'UTC'`.
+- `PrimaryCurrentModel::indexedBy()` declares one or more `PlannerIndex` values. `PlannerIndex::on()` adds a column, with `descending: true` for a descending one. `PlannerIndex::whereNull()` or `PlannerIndex::whereNotNull()` makes the index partial. Each name is an attribute of the map that `Attribute::storedAs()` stores on the primary current model. The index records every call, so `ResolvedMap::of()` refuses a column named twice and a second filter rather than drop one.
+- Install and recompile plan the planner statements from the catalog. They build each declared index and the statistics object over the zoned attributes when the catalog lacks it, and rebuild the statistics object when its sorted expressions changed or another table holds it. They then run `ANALYZE` on the primary current model's table, and last mark each object with a comment. An object without its marker, such as one a stopped prepare left, gets the `ANALYZE` and its marker on the next run. A run whose objects all carry their markers emits nothing. They refuse an invalid index, with a hint for an ordinary or a partitioned one. The statistics object holds each distinct expression once, and PostgreSQL allows at most 8, so `ResolvedMap::of()` refuses a map whose zoned attributes give more. A map that declares no index and no `Attribute::inTimeZone()` emits nothing.
+- `Installer::prepare()` plans the same way and builds with `CREATE INDEX CONCURRENTLY`, outside a transaction, ahead of the install, and ahead of a recompile that adds or renames an index or changes a zoned attribute. The install or recompile then lists no planner statement and runs no `ANALYZE`. [Adopting a map](docs/adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes the migration.
+- `Installer::uninstall()` drops the map's indexes and statistics with the rest of its objects.
+
+[Compiling and installing the schema](docs/flows/compiling-and-installing-the-schema.md#planner-support) lists what each action emits, how the catalog decides it, and what that leaves alone.
+
 `php artisan compatibility:check` names every record where the previous and current models disagree.
 
 `php artisan compatibility:sql` prints the statements the Installer runs for a registered compatibility map, so a reviewer or a database administrator can read them before a migration runs. It runs only catalog reads.
 
 ```bash
 php artisan compatibility:sql widgets                          # install, to stdout
-php artisan compatibility:sql widgets --for=recompile          # or --for=uninstall
+php artisan compatibility:sql widgets --for=recompile          # or --for=uninstall, or --for=prepare
 php artisan compatibility:sql widgets --retained-table-is-currently=widgets --output=widgets.sql
 ```
 

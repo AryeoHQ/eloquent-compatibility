@@ -47,6 +47,46 @@ Before the install, check which roles hold `CREATE` on the installation schema. 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ```
 
+## Before the install: prebuild the planner objects
+
+A mapped attribute read as its column's own type, such as a `boolean` column read as a `boolean`, keeps the column's statistics and indexes, because PostgreSQL drops that identity cast. A conversion is an expression in the compatibility view, so PostgreSQL holds no statistics for it, and no index on the column serves it. A map declares what the planner needs with `Attribute::inTimeZone()` on each `timestamp with time zone` column it reads as a `timestamp without time zone`, and `PrimaryCurrentModel::indexedBy()` for each index. Each zoned attribute must be stored on the primary current model, because the statistics object covers that table alone. The install then creates the statistics object and the indexes the catalog lacks, and runs `ANALYZE` when it creates something. [Planner support](flows/compiling-and-installing-the-schema.md#planner-support) lists the statements.
+
+The install migration is the wrong place to build a large index. It runs in one transaction. The rename holds an `ACCESS EXCLUSIVE` lock on the previous model's table until the commit, and a plain `CREATE INDEX` inside the install holds a `SHARE` lock on the primary current model's table, which blocks every write to it, for as long as the build takes. A recompile is worse. Its `DROP TRIGGER` takes an `ACCESS EXCLUSIVE` lock on the primary current model's table and holds it until the commit, so an index the recompile builds blocks every read of that table too. So build the objects first, in a migration of their own that runs ahead of the install migration:
+
+```php
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+
+return new class extends Migration
+{
+    public $withinTransaction = false;
+
+    public function up(): void
+    {
+        (new Installer(DB::connection()))->prepare(new WidgetCompatibilityMap);
+    }
+};
+```
+
+1. Run it after the migration that creates the primary current model's table, and before the install migration. It needs only that table, so it runs before the rename.
+2. Set `public $withinTransaction = false`. `CREATE INDEX CONCURRENTLY` cannot run in a transaction, and `Installer::prepare()` throws `InvalidCompatibilityMap` inside one. That includes a test that wraps each test in a transaction, so such a test calls `Installer::install()` alone.
+3. Leave the install migration as it is. It plans its planner statements from the catalog, and the prebuild marks each object it finished with a comment, so after the prebuild the install lists none: it builds nothing, takes no `SHARE` lock for an index and runs no `ANALYZE`.
+4. Do the same before a recompile that adds or renames an index, or adds, drops or changes a zoned attribute: a `$withinTransaction = false` migration calls `Installer::prepare()` with the changed map, ahead of the migration that calls `Installer::recompile()`. The prepare rebuilds a statistics object whose expressions changed, and the recompile then lists no planner statement.
+
+`php artisan compatibility:sql <map> --for=prepare` prints the statements before the migration runs them. Each statement of a prepare takes effect alone, so a failure part way keeps the objects already built. A prepare writes each object's marker comment last, after its `ANALYZE`, so the objects a stopped prepare left lack their markers. Running `Installer::prepare()` again, or the install, analyses them, rebuilds the statistics object, builds the rest and writes the markers. It builds no index twice. The migration declares no `down()`, because no package method drops only the planner objects. `Installer::uninstall()` drops them with the rest of the map.
+
+The install, a recompile and a prepare plan from the catalog alike. Each one creates only a missing object, rebuilds a statistics object whose expressions changed or that another table holds, analyses and marks an object without its marker, and refuses an invalid index. These limits remain:
+
+- **A failed `CREATE INDEX CONCURRENTLY` leaves an `INVALID` index, which every later run refuses.** `Installer::prepare()`, the install and a recompile each throw `InvalidCompatibilityMap` before they run anything. The message ends with `if no CREATE INDEX CONCURRENTLY is still running on it, DROP INDEX CONCURRENTLY <name>, then prepare again`. Do that, and the next prepare builds the index anew. A partitioned index made with `CREATE INDEX ... ON ONLY` is invalid until each partition's index is attached, and its message says to attach them, or to `DROP INDEX <name>` without `CONCURRENTLY` and install or recompile again.
+- **A changed index definition is never rebuilt.** An index is matched by name alone, so it keeps the definition it had when it was created. To change one, rename it. A renamed index builds anew, so prepare it before the recompile, and the old one stays until an uninstall drops it. The statistics object differs: its expressions are compared, and it is rebuilt when they change.
+- **`Installer::prepare()` cannot serve a partitioned primary current model's table.** PostgreSQL refuses `CREATE INDEX CONCURRENTLY` on a partitioned table. The install can build there, with the locks above.
+- **An unprepared run holds its locks longer.** An install that builds an index takes a `SHARE` lock on the primary current model's table while it builds, and its `ANALYZE` lengthens the transaction. A recompile and an uninstall hold an `ACCESS EXCLUSIVE` lock on that table from their `DROP TRIGGER` until the commit, so reads wait too. A recompile that creates or analyses something runs its `CREATE` and its `ANALYZE` under that lock, and an uninstall's `DROP INDEX` and `DROP STATISTICS` run under it. Prebuild with `Installer::prepare()`, so that an install or a recompile runs no planner statement at all.
+- **An index needs immutable expressions.** An index that names an attribute reading a `timestamp with time zone` column as a `timestamp without time zone` must declare `Attribute::inTimeZone()` on it. Without it, that cast depends on the session's time zone, and the install fails with PostgreSQL's 42P17. An attribute of its column's own type needs no zone, and an ordinary index on the column already serves it. [INV-52](invariants.md#inv-52-every-planner-expression-comes-from-the-structured-parts-of-the-view-column) records where the expressions come from, and [0024](decisions/0024-planner-support-comes-from-structured-attributes.md) why the package builds them.
+- **One statistics object holds at most 8 expressions.** Each distinct expression of the primary current model's zoned attributes counts once, and `ResolvedMap::of()` refuses a map that gives more, before anything runs.
+
 ## What the install and the mirror refuse
 
 The install checks the tables before it changes anything, and `EventBridge::mirror()` checks the models before it registers a map. Each refusal is an `InvalidCompatibilityMap`.
@@ -57,6 +97,7 @@ The install refuses:
 - **A required column nothing fills.** Every `NOT NULL` column without a default needs a value on each insert path. Fill a retained column with `PreviousModel::fillWhenCreatedFromCurrent()`, and a current column with an attribute or `PrimaryCurrentModel::fillWhenCreatedFromPrevious()`. See [INV-39](invariants.md#inv-39-every-insert-fills-each-required-column).
 - **A writable attribute on a generated column.** The database rejects every write to a generated column and to a `GENERATED ALWAYS` identity column. Declare such an attribute read-only with `Attribute::readOnlyBecause()`, and the insert leaves it out. A `GENERATED BY DEFAULT` identity stays writable, and an insert through the view that omits it takes the identity's next value. See [INV-45](invariants.md#inv-45-a-generated-column-is-read-only-through-the-view).
 - **A table outside the installation schema.** The compiled functions run in `current_schema()`, so every mapped table must be there. A table found only further down the search path refuses with "does not exist". Run the migration with that schema first on the search path. See [INV-47](invariants.md#inv-47-a-maps-tables-resolve-in-the-current-schema-alone).
+- **An invalid index of the map.** A failed or unfinished `CREATE INDEX CONCURRENTLY` leaves one, and the planner cannot use it. When no build is still running on it, drop it with `DROP INDEX CONCURRENTLY`, then prepare again. A partitioned index made `ON ONLY` the table is invalid until each partition's index is attached: attach them, or drop it with `DROP INDEX` and install again. See [the prebuild's limits](#before-the-install-prebuild-the-planner-objects).
 
 The mirror refuses:
 
