@@ -4,8 +4,13 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\TestWith;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Tests\Fixtures\Support\Workbench\Tables;
+use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
 #[CoversClass(Attribute::class)]
@@ -21,6 +26,7 @@ final class AttributeTest extends TestCase
         'readOnlyBecause' => null,
         'defaultsTo' => null,
         'storedAs' => null,
+        'timeZone' => null,
     ];
 
     #[Test]
@@ -146,6 +152,7 @@ final class AttributeTest extends TestCase
             'readOnlyBecause' => null,
             'defaultsTo' => "'none'",
             'storedAs' => 'sku',
+            'timeZone' => null,
         ], $resolved);
         $this->assertState(['column' => 'sku', 'retained' => true, 'type' => 'text', 'defaultsTo' => "'none'"] + self::MAPPED_TITLE, $original);
     }
@@ -157,6 +164,152 @@ final class AttributeTest extends TestCase
 
         $this->assertSame([], $resolved->writesTo);
         $this->assertSame(['widget', 'widget."id"', 'id', 'Other records hold the id.'], [$resolved->alias, $resolved->readAs, $resolved->storedAs, $resolved->readOnlyBecause]);
+    }
+
+    #[Test]
+    #[TestWith(['before storedAs()'])]
+    #[TestWith(['after storedAs()'])]
+    public function it_converts_the_read_and_the_write_of_a_stored_attribute_to_its_time_zone(string $order): void
+    {
+        $typed = Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone');
+
+        $zoned = $order === 'before storedAs()'
+            ? $typed->inTimeZone('UTC')->storedAs('gadget', 'delivered_at')
+            : $typed->storedAs('gadget', 'delivered_at')->inTimeZone('UTC');
+
+        $this->assertState([
+            'column' => 'delivered_at',
+            'type' => 'timestamp(0) without time zone',
+            'alias' => 'gadget',
+            'readAs' => 'gadget."delivered_at" AT TIME ZONE \'UTC\'',
+            'writesTo' => [['alias' => 'gadget', 'column' => 'delivered_at', 'expression' => 'NEW."delivered_at" AT TIME ZONE \'UTC\'']],
+            'storedAs' => 'delivered_at',
+            'timeZone' => 'UTC',
+        ] + self::MAPPED_TITLE, $zoned);
+    }
+
+    #[Test]
+    public function it_sets_the_time_zone_on_a_copy_and_keeps_the_original_unconverted(): void
+    {
+        $original = Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at');
+
+        $original->inTimeZone('UTC');
+
+        $this->assertSame([null, 'gadget."delivered_at"', 'NEW."delivered_at"'], [$original->timeZone, $original->readAs, $original->writesTo[0]->expression]);
+    }
+
+    #[Test]
+    public function it_replaces_an_earlier_time_zone_rather_than_converting_twice(): void
+    {
+        $zoned = Attribute::mapped('delivered_at')->storedAs('gadget', 'delivered_at')->inTimeZone('UTC')->inTimeZone('America/Chicago');
+
+        $this->assertSame(
+            ['America/Chicago', 'gadget."delivered_at" AT TIME ZONE \'America/Chicago\'', ['NEW."delivered_at" AT TIME ZONE \'America/Chicago\'']],
+            [$zoned->timeZone, $zoned->readAs, array_map(fn (TargetColumn $targetColumn) => $targetColumn->expression, $zoned->writesTo)],
+        );
+    }
+
+    #[Test]
+    public function it_converts_only_the_stored_write_and_keeps_a_later_write_as_written(): void
+    {
+        $zoned = Attribute::mapped('delivered_at')->storedAs('gadget', 'delivered_at')->writesTo('gadget', 'delivered_on', 'NEW."delivered_at"::date')->inTimeZone('UTC');
+
+        $this->assertSame([
+            ['alias' => 'gadget', 'column' => 'delivered_at', 'expression' => 'NEW."delivered_at" AT TIME ZONE \'UTC\''],
+            ['alias' => 'gadget', 'column' => 'delivered_on', 'expression' => 'NEW."delivered_at"::date'],
+        ], $this->state($zoned)['writesTo']);
+    }
+
+    #[Test]
+    public function it_converts_the_read_of_a_read_only_attribute_and_adds_no_write(): void
+    {
+        $zoned = Attribute::mapped('created_at')->storedAs('gadget', 'created_at')->readOnlyBecause('A widget keeps the time it was created.')->inTimeZone('UTC');
+
+        $this->assertSame(['gadget."created_at" AT TIME ZONE \'UTC\'', []], [$zoned->readAs, $zoned->writesTo]);
+    }
+
+    #[Test]
+    public function it_quotes_a_time_zone_that_contains_a_single_quote(): void
+    {
+        $zoned = Attribute::mapped('delivered_at')->asType('timestamp')->storedAs('gadget', 'delivered_at')->inTimeZone("Mars/O'Neill");
+
+        $this->assertSame(
+            ['gadget."delivered_at" AT TIME ZONE \'Mars/O\'\'Neill\'', 'NEW."delivered_at" AT TIME ZONE \'Mars/O\'\'Neill\'', 'CAST(("delivered_at" AT TIME ZONE \'Mars/O\'\'Neill\') AS timestamp)'],
+            [$zoned->readAs, $zoned->writesTo[0]->expression, $zoned->plannerExpression()],
+        );
+    }
+
+    #[Test]
+    public function it_keeps_the_time_zone_through_every_other_builder(): void
+    {
+        $zoned = Attribute::mapped('delivered_at')->inTimeZone('UTC');
+
+        $this->assertSame(['UTC', 'UTC', 'UTC', 'UTC', 'UTC', 'UTC', 'UTC'], [
+            $zoned->asType('timestamp')->timeZone,
+            $zoned->storedAs('gadget', 'delivered_at')->timeZone,
+            $zoned->readAs('gadget', 'gadget.delivered_at')->timeZone,
+            $zoned->writesTo('gadget', 'delivered_at', 'NEW.delivered_at')->timeZone,
+            $zoned->readOnlyBecause('A gadget records it.')->timeZone,
+            $zoned->defaultsTo('now()')->timeZone,
+            Attribute::retained('delivered_at')->inTimeZone('UTC')->resolve('widget')->timeZone,
+        ]);
+    }
+
+    #[Test]
+    public function it_keeps_the_time_zone_but_drops_the_stored_column_when_the_attribute_is_read_through_an_expression(): void
+    {
+        $read = Attribute::mapped('delivered_at')->storedAs('gadget', 'delivered_at')->inTimeZone('UTC')->readAs('gadget', 'gadget.delivered_at');
+
+        $this->assertSame(['UTC', null, 'gadget.delivered_at', []], [$read->timeZone, $read->storedAs, $read->readAs, $read->writesTo]);
+    }
+
+    #[Test]
+    public function it_exposes_the_planner_expression_of_a_stored_attribute_without_its_alias(): void
+    {
+        $this->assertSame([
+            'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("archived") AS boolean)',
+            'CAST(("na""me") AS text)',
+        ], [
+            Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at')->inTimeZone('UTC')->plannerExpression(),
+            Attribute::mapped('is_archived')->asType('boolean')->storedAs('gadget', 'archived')->plannerExpression(),
+            Attribute::mapped('title')->asType('text')->storedAs('gadget', 'na"me')->plannerExpression(),
+        ]);
+    }
+
+    #[Test]
+    public function it_exposes_no_planner_expression_for_an_attribute_not_stored_in_one_typed_column(): void
+    {
+        $this->assertSame([null, null, null, null], [
+            Attribute::mapped('price')->asType('text')->readAs('gadget', 'gadget.price_cents / 100.0')->plannerExpression(),
+            Attribute::retained('sku')->asType('text')->resolve('widget')->plannerExpression(),
+            Attribute::mapped('title')->storedAs('gadget', 'name')->plannerExpression(),
+            Attribute::mapped('title')->asType('text')->plannerExpression(),
+        ]);
+    }
+
+    #[Test]
+    public function it_converts_between_the_view_and_its_column_in_its_own_time_zone_whatever_the_session_time_zone(): void
+    {
+        Tables::create();
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::statement("set local time zone 'America/Chicago'");
+
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'delivered_at' => '2026-10-28 12:00:00']);
+        $inserted = $this->deliveredInUtc();
+        DB::table('widgets')->where('id', $id)->update(['delivered_at' => '2026-10-29 08:30:00']);
+        $updated = $this->deliveredInUtc();
+        DB::table('gadgets')->update(['delivered_at' => '2026-10-30 09:15:00+00']);
+
+        $this->assertSame(
+            ['2026-10-28 12:00:00', '2026-10-29 08:30:00', '2026-10-30 09:15:00'],
+            [$inserted, $updated, DB::table('widgets')->value('delivered_at')],
+        );
+    }
+
+    private function deliveredInUtc(): string
+    {
+        return (string) DB::scalar("select to_char(delivered_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') from gadgets");
     }
 
     /**

@@ -7,6 +7,7 @@ namespace Tests\Fixtures\Support\Workbench;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PlannerIndex;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
@@ -37,7 +38,8 @@ final class WidgetCompatibilityMap implements CompatibilityMap
     {
         return PrimaryCurrentModel::for(Gadget::class)
             ->aliasedAs('gadget')
-            ->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())']);
+            ->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())'])
+            ->indexedBy(PlannerIndex::named('archived_newest')->on('is_archived')->on('created_at', descending: true)->whereNull('deleted_at'));
     }
 
     public function dependentCurrentModels(): array
@@ -64,14 +66,14 @@ final class WidgetCompatibilityMap implements CompatibilityMap
             Attribute::mapped('price')->asType('character varying(255)')
                 ->readAs('gadget', "to_char(gadget.price_cents / 100.0, 'FM999999990.00')")
                 ->writesTo('gadget', 'price_cents', 'round(NEW.price::numeric * 100)'),
-            Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at'),
+            Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at')->inTimeZone('UTC'),
             Attribute::mapped('is_archived')->asType('boolean')->storedAs('gadget', 'archived'),
             Attribute::mapped('street')->asType('character varying(255)')->storedAs('place', 'street'),
             Attribute::mapped('latitude')->asType('double precision')->storedAs('site', 'latitude'),
             Attribute::retained('gadget_id')->readOnlyBecause('A widget stays tied to the gadget that stores its mapped attributes.'),
-            Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at'),
-            Attribute::mapped('updated_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'updated_at'),
-            Attribute::mapped('deleted_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'deleted_at'),
+            Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC'),
+            Attribute::mapped('updated_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'updated_at')->inTimeZone('UTC'),
+            Attribute::mapped('deleted_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'deleted_at')->inTimeZone('UTC'),
         ]);
     }
 
