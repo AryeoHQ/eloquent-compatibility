@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Bridge;
 
 use Closure;
 use Illuminate\Database\Connection;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -30,8 +31,11 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
+use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
 use Tests\Fixtures\Support\Workbench\Account;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Article;
+use Tests\Fixtures\Support\Workbench\ArticleCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
 use Tests\Fixtures\Support\Workbench\CompatibleModel;
 use Tests\Fixtures\Support\Workbench\Gadget;
@@ -40,6 +44,9 @@ use Tests\Fixtures\Support\Workbench\GadgetSite;
 use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\Profile;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
+use Tests\Fixtures\Support\Workbench\Publication;
+use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
+use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -99,6 +106,82 @@ final class EventBridgeOutsideTransactionTest extends TestCase
         $this->assertMirrored(Gadget::class, ModelEvent::Updated);
         $this->assertSame(0, DB::transactionLevel());
         $this->assertSame('Committed', DB::table('gadgets')->value('name'));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_runs_the_trigger_of_a_state_change_made_outside_a_transaction_and_fires_its_after_event_after_the_commit(): void
+    {
+        resolve(Installer::class)->install(new ArticleCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $article = Article::query()->create(['title' => 'Draft article']);
+        DB::connection()->setTransactionManager(new DatabaseTransactionsManager);
+        $after = [];
+        Event::listen(Transitioned::class, function () use (&$after): void {
+            $after[] = [DB::transactionLevel(), DB::table('publications')->value('state')];
+        });
+
+        $article->update(['status' => 'published']);
+
+        $this->assertSame([[0, 'published']], $after);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertNotNull(DB::table('publications')->value('published_at'));
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    public function it_mirrors_an_explicit_save_inside_a_trigger_run_outside_a_transaction_on_its_own_statement_and_commits_both(): void
+    {
+        resolve(Installer::class)->install(new ArticleCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $article = Article::query()->create(['title' => 'Draft article']);
+        DB::table('publications')->update(['state' => 'published']);
+        $article->refresh();
+        $this->recordMirroredEvents();
+        $levels = [];
+        Event::listen('eloquent.updating: '.Publication::class, function () use (&$levels): void {
+            $levels[] = DB::transactionLevel();
+        });
+
+        $article->update(['status' => 'featured']);
+
+        $this->assertSame([2, 1], $levels);
+        $this->assertMirrored(Article::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->getAttribute('featured_at') !== null);
+        $this->assertMirrored(Publication::class, ModelEvent::Updated, fn (Model $mirrored) => $mirrored->wasChanged('state'));
+        $this->assertCount(2, $this->mirroredEvents());
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['featured', true], [DB::table('publications')->value('state'), DB::table('publications')->value('featured_at') !== null]);
+    }
+
+    #[RequiresMethod(Trigger::class, 'withoutTransition')]
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_rolls_back_a_state_change_made_outside_a_transaction_and_fires_no_after_event_when_its_trigger_throws_or_refuses(bool $refuses): void
+    {
+        resolve(Installer::class)->install(new ArticleCompatibilityMap);
+        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror(new ArticleCompatibilityMap));
+        $article = Article::query()->create(['title' => 'Draft article']);
+        DB::connection()->setTransactionManager(new DatabaseTransactionsManager);
+        $after = [];
+        Event::listen(Transitioned::class, function () use (&$after): void {
+            $after[] = DB::transactionLevel();
+        });
+
+        if ($refuses) {
+            DB::table('publications')->update(['locked' => true]);
+        } else {
+            Event::listen(Transitioning::class, fn () => throw new RuntimeException('The before event failed.'));
+        }
+
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => $article->update(['title' => 'Rolled back', 'status' => 'published']), $refuses ? CompatibilityWriteRefused::class : RuntimeException::class);
+
+        $this->assertSame([], $after);
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame(['draft', 'Draft article', null], [DB::table('publications')->value('state'), DB::table('publications')->value('title'), DB::table('publications')->value('published_at')]);
     }
 
     #[Test]

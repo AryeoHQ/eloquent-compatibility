@@ -13,7 +13,7 @@ The package serves the previous model from a PostgreSQL view, the compatibility 
 The package has two halves, and both read one `ResolvedMap`.
 
 - **The database half compiles SQL.** `Compiler` turns a compatibility map into the compatibility view and its trigger functions, and `Installer` runs that SQL. `compatibility:sql` prints the same SQL without running it. The triggers route every write to the table that owns the value, whatever client sends it: Eloquent, the query builder or raw SQL.
-- **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again, and replays the events for each record that changed.
+- **The PHP half mirrors events.** `EventBridge` raises the other side's model events for each write through a model, so listeners on both sides run. It stores no data. When a write's statement starts, it locks the records the write can change and reads them. After the statement it reads them again, and replays the events for each record that changed. When a write through the previous model moves a current model's state column, the bridge first runs that state machine's trigger without its transition. That step needs `aryeo/eloquent-state-machines`, which the package suggests and does not require.
 
 A write that skips model events, such as a query builder update, still reaches the right tables through the triggers. Only the events are missing.
 
@@ -63,7 +63,7 @@ Take `$widget->update(['title' => 'Renamed'])` on the workbench map, [WidgetComp
 6. The statement reaches the compatibility view. The update trigger checks every refusal, locks the gadget row, the retained row and the dependent rows, and runs the conflict check.
 7. The trigger writes each changed attribute to the table that owns it, here `gadgets.name`.
 8. `QueryExecuted` reaches the bridge, which completes the open write. It knows the statement by the SQL and bindings it recorded at the open, and parses no SQL.
-9. The bridge reads each record again, and replays the gadget's `saving`, `updating`, `updated` and `saved` events.
+9. The bridge reads each record again, and replays the gadget's `saving`, `updating`, `updated` and `saved` events. A write that moves a state column first runs the state machine's trigger, which this write does not.
 10. The bridge commits or releases its savepoint, and forgets the write. Eloquent then fires the widget's own `updated` and `saved`, and the bridge finds no write of the widget left at their dispatch depth.
 
 The flows below take each step in depth:
@@ -72,6 +72,7 @@ The flows below take each step in depth:
 - [Compiling and installing the schema](flows/compiling-and-installing-the-schema.md), and printing its statements with `compatibility:sql`
 - [Writing through the view](flows/writing-through-the-view.md), the database side of steps 6 and 7
 - [Mirroring a write](flows/mirroring-a-write.md), the PHP side of steps 1 to 5 and 8 to 10
+- [Replaying a transition](flows/replaying-a-transition.md), the trigger a state change runs inside step 9
 - [Failure and rollback](flows/failure-and-rollback.md)
 - [Checking for drift](flows/checking-for-drift.md)
 
@@ -89,15 +90,16 @@ Read the code in this order. Each step answers one question.
 8. `HasCompatibility` and `EventBridge`: how does a model mark its own statement and show its events? When does a pending mirrored write begin, complete, finish and fail?
 9. `AffectedRecords` and `KeyTranslator`: which records does a write change, and in what order does the bridge lock them?
 10. `EventReplayer`: how does the bridge reproduce native model events, and how does it exclude listeners?
-11. `DriftQueries`: which five kinds of drift does the check find?
-12. `CompileSql`: how does a reviewer read the statements before a migration runs them?
-13. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?
+11. `EventReplayer::states()`, `EventReplayer::transition()` and the private `EventBridge::transitions()`: how does a mirrored state change run its trigger?
+12. `DriftQueries`: which five kinds of drift does the check find?
+13. `CompileSql`: how does a reviewer read the statements before a migration runs them?
+14. The colocated tests, starting with `InstallerTest` and `EventBridgeTest`: what does each write do, end to end?
 
 Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once. [Adopting a map](adopting-a-map.md) lists what changes for an application's code and tests once a model is mapped.
 
 ## Keeping these docs true
 
-These docs name classes and methods, never line numbers. CI runs [check-doc-names.php](../bin/check-doc-names.php) in the static-analysis job, over `README.md`, every page under `docs/` and every `README.md` under `src/`. It fails when:
+These docs name classes and methods, never line numbers. CI runs [check-doc-names.php](../bin/check-doc-names.php) in the static-analysis job, and again without `aryeo/eloquent-state-machines` in the `tests-without-state-machines` job. It reads `README.md`, every page under `docs/` and every `README.md` under `src/`. It fails when:
 
 - a backticked class name, or a backticked method, case, constant or property on a class, names nothing in the code;
 - a page cites a line, such as `Compiler.php` followed by a colon and a number;
@@ -105,4 +107,4 @@ These docs name classes and methods, never line numbers. CI runs [check-doc-name
 - a relative link points at a file that does not exist;
 - an `INV-` reference names no `## INV-` heading in the [invariants](invariants.md).
 
-The check skips fenced code. A fence closes only on a marker of its own character and at least its own length, as in Markdown. A short name resolves to a class in `src/` or `tests/`, or through the script's small allowlist of Laravel classes. Write any other outside class by its fully qualified name. Run the check locally with `docker compose run --rm --no-deps php php bin/check-doc-names.php`.
+The check skips fenced code. A fence closes only on a marker of its own character and at least its own length, as in Markdown. A short name resolves to a class in `src/` or `tests/`, or through the script's small allowlist of Laravel classes. A second list names classes of `aryeo/eloquent-state-machines`, which the package suggests. The check resolves them when that package is installed, and accepts them unchecked without it. It then prints how many it left unchecked. Write any other outside class by its fully qualified name. Run the check locally with `docker compose run --rm --no-deps php php bin/check-doc-names.php`.

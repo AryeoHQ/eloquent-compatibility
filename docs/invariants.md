@@ -160,7 +160,7 @@ A record that already exists at install time has no designation. [Adopting a map
 
 **Why.** The write has already reached the database when mirrored events fire, so a listener's change has nowhere to go.
 
-**Code that must agree.** `EventReplayer::ing()` refuses, through `CompatibilityWriteRefused::byMirroredListener()` and `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::changed()` reads the column type through `ColumnCatalog` only when a value changed. `EventReplayer::equivalent()` applies the comparisons, with `EventReplayer::number()` for numbers and the private `EventReplayer::json()` for JSON. The class cast compares on a copy of the model whose original holds the value from before the listener.
+**Code that must agree.** `EventReplayer::ing()` refuses, through `CompatibilityWriteRefused::byMirroredListener()` and `CompatibilityWriteRefused::byMirroredChange()`. `EventReplayer::changed()` reads the column type through `ColumnCatalog` only when a value changed. `EventReplayer::equivalent()` applies the comparisons, with `EventReplayer::number()` for numbers and the private `EventReplayer::json()` for JSON. The class cast compares on a copy of the model whose original holds the value from before the listener. A replay tells a moved state column, and a column a trigger's save changed, through `EventReplayer::changed()` too.
 
 ## INV-16: A mirrored listener's write begins its own pending mirrored write
 
@@ -180,11 +180,11 @@ A record that already exists at install time has no designation. [Adopting a map
 
 ## INV-18: An excluded listener skips mirrored dispatches only
 
-**Rule.** The bridge skips an excluded listener only while it dispatches for the instance it replays. The listener runs for every native event, one raised inside a mirrored listener included. That holds for a listener registered under the event's name, and for one registered by a wildcard such as `eloquent.updated: *` on Laravel's own dispatcher.
+**Rule.** The bridge skips an excluded listener only while it dispatches for the instance it replays, or while a state machine's trigger runs on the instance the bridge built for it. The listener runs for every other native event, one raised inside a mirrored listener or inside `handle()` included. That holds for a listener registered under the event's name, for one registered on the model's custom event class, and for one registered by a wildcard such as `eloquent.updated: *` on Laravel's own dispatcher.
 
-**Why.** An event mirror excludes a listener from writes through the other side, not from the model's own writes. Laravel keeps wildcard listeners apart from the listeners of each name. A mask of the name alone would therefore leave a wildcard listener running for mirrored events.
+**Why.** An event mirror excludes a listener from writes through the other side, not from the model's own writes. A trigger that the bridge runs for a write through the other side saves natively, so its excluded listeners would otherwise run for exactly that write. Laravel keeps wildcard listeners apart from the listeners of each name. A mask of the name alone would therefore leave a wildcard listener running for mirrored events.
 
-**Code that must agree.** `EventReplayer::dispatch()`, `EventReplayer::mask()`, `EventReplayer::guard()` and `EventReplayer::unmask()`, with the `Exclusion` held per subject. `ExcludedListener::matches()` matches the listener. `EventReplayer::dispatch()` masks the listeners on the real dispatcher behind an `EventFake`, and dispatches through the model's dispatcher. So a faked event is recorded, and none of its listeners runs. The private `EventReplayer::maskWildcards()` wraps each listener of every matching wildcard in place, through the dispatcher's protected `$wildcards`. Its wrapper passes on the wildcard arguments, the event name and the payload. The private `EventReplayer::unmaskWildcards()` restores them, so the wildcards keep their order. Both need an `Illuminate\Events\Dispatcher`, so a decorating dispatcher's wildcard listeners stay unmasked.
+**Code that must agree.** `EventReplayer::dispatch()`, `EventReplayer::mask()`, `EventReplayer::guard()` and `EventReplayer::unmask()`, with the `Exclusion` held per subject. `ExcludedListener::matches()` matches the listener. `EventReplayer::dispatch()` masks the listeners on the real dispatcher behind an `EventFake`, and dispatches through the model's dispatcher. So a faked event is recorded, and none of its listeners runs. The private `EventReplayer::maskWildcards()` wraps each listener of every matching wildcard in place, through the dispatcher's protected `$wildcards`. Its wrapper passes on the wildcard arguments, the event name and the payload. The private `EventReplayer::unmaskWildcards()` restores them, so the wildcards keep their order. Both need an `Illuminate\Events\Dispatcher`, so a decorating dispatcher's wildcard listeners stay unmasked. `EventReplayer::transition()` masks every model event of the record's model through the private `EventReplayer::maskModelEvents()`, until its last trigger returns. A wrapper then finds the trigger's instance through the private `EventReplayer::transitioning()`, as the payload or as a property of a custom event. It reads the model event from the event's name. `EventBridge::fireModelEvent()` runs each dispatch through `EventReplayer::dispatching()`, which keeps a stack of the model events the instance dispatches. For a custom event, the wrapper reads the top of that stack when `Model::dispatchesEvents()` maps that event to the custom event's class. So a class the model maps to two events skips a listener only for the event it excludes.
 
 ## INV-19: A failed write at level 0 releases its transaction
 
@@ -208,9 +208,11 @@ A statement can also start while the write's own statement runs. A `beforeExecut
 
 **Rule.** Under a faked dispatcher, a mirrored model's own write throws `CompatibilityEventMirrorBypassed` before its statement. That holds when the model dispatcher is an `EventFake` that recorded the write's beginning event for that instance, during that event's own dispatch. The fake recorded the event instead of running its listeners, so the bridge forgets the write it began. An event the fake recorded earlier does not count, so a write after `EventFake::except()` mirrors.
 
+A state change through the previous model throws `CompatibilityEventMirrorBypassed` too, when the bound bus dispatcher is a bus fake that would record the trigger. The statement has run by then, so the bridge rolls the whole write back.
+
 **Why.** A test that fakes every event and writes through a mirrored model proves nothing about the other side. `EventFake::except()` changes which events the fake records, and keeps the events it recorded. A check of the whole record would therefore refuse every later write of the same instance.
 
-**Code that must agree.** `EventBridge::fireModelEvent()` counts the fake's recorded beginning events for the instance through the private `EventBridge::recorded()`, before and after the dispatch. It forgets the write when the count grew. `EventBridge::markOwnStatement()` calls the private `EventBridge::guard()` when the model has no pending mirrored write to claim. The guard reads `MirrorIndex::forModel()` and asks `EventBridge::recorded()` about each of `ModelEvent::beginning()`, and ignores a model in no mirrored map. Inside `EventBridge::withoutMirroring()`, `EventBridge::markOwnStatement()` returns before the guard. A raw write runs no model method, so it never throws.
+**Code that must agree.** `EventBridge::fireModelEvent()` counts the fake's recorded beginning events for the instance through the private `EventBridge::recorded()`, before and after the dispatch. It forgets the write when the count grew. `EventBridge::markOwnStatement()` calls the private `EventBridge::guard()` when the model has no pending mirrored write to claim. The guard reads `MirrorIndex::forModel()` and asks `EventBridge::recorded()` about each of `ModelEvent::beginning()`, and ignores a model in no mirrored map. Inside `EventBridge::withoutMirroring()`, `EventBridge::markOwnStatement()` returns before the guard. A raw write runs no model method, so it never throws. `EventReplayer::transition()` asks the private `EventReplayer::fakes()` before `Trigger::now()`. It calls the protected `Illuminate\Support\Testing\Fakes\BusFake::shouldFakeJob()` through a closure bound to the fake, so a fake of other jobs runs the trigger.
 
 ## INV-22: Compiled identifiers are full words
 
@@ -263,6 +265,61 @@ The list has this order. An install lists the drops of the map's prefixed trigge
 - Before a recompile, the private `Installer::viewGrants()` saves the view's grants. A column grant returns only for a column the map still has an attribute for, because the map's attribute columns are the new view's columns.
 - Under `--retained-table-is-currently`, `Installer::statements()` passes the current name to all three actions. The private `Installer::dropStatements()` names a trigger on the retained table by the map's table name for each of them, so a printed uninstall drops the triggers the uninstall after the rename drops. `CompileSql::handle()` names the current name in a header line for every action.
 - The refusals for row-level security, for views that read the retained table and for the view's dependents run while the list is built. So no statement may depend on a catalog read made after an earlier statement runs.
+
+## INV-27: A moved state runs its trigger without its transition
+
+**Rule.** A write through the previous model can move a current model's state column. Before any mirrored event, the bridge then runs the trigger of the one `#[Transition]` that leads from the stored state to the new one, once per state column. It calls the trigger through that column's proxy with `Trigger::withoutTransition()` and `Trigger::now()`. The bridge never calls `handle()` itself, never writes the state column again, and writes nothing else.
+
+**Why.** The trigger owns the transition's checks, its before and after events and its side effects. A listener on the current model must see what a native transition gives it. The statement already stored the state, so the trigger must not store it a second time.
+
+**Code that must agree.**
+
+- `EventBridge::complete()` calls the private `EventBridge::transitions()` before `EventReplayer::replay()`. `EventBridge::transitions()` asks `EventReplayer::states()` about current records only.
+- `EventReplayer::transition()` builds a fresh instance for each moved state column, from a read of the record just before that column's trigger. That column is back at its stored value in the attribute and the raw original.
+- The private `EventReplayer::trigger()` names the trigger as the column's proxy does.
+- `Trigger::now()` runs the trigger's lifecycle at once, and the bridge never dispatches it to a queue.
+
+## INV-28: Retired
+
+**Retired.** This invariant held the state guard's scope during a replay. eloquent-state-machines ships no state guard, so nothing refuses a mirrored event or a previous model's own write to a column it casts to a state machine. [0017](decisions/0017-a-cast-previous-model-changes-its-state-only-inside-the-guards-scopes.md) is retired with it. The number stays, so INV-29 to INV-31 keep theirs.
+
+## INV-29: A moved state whose trigger cannot run refuses the whole write
+
+**Rule.** The bridge refuses the whole write with `CompatibilityWriteRefused` and rolls it back when a moved state's trigger cannot run. That covers a stored or new value that is no case of the enum, no `#[Transition]` or more than one to the new state, a transition the trigger refuses, a trigger the container cannot build, and a trigger whose constructor takes a model argument without a default. The container would build such a model without attributes, even for a nullable argument. The rule also covers a trigger that one of its own middleware does not pass on, which throws the Interrupted exception of aryeo/actions. It covers a unique trigger whose lock another run holds, which throws the Prevented exception of aryeo/actions. It covers two transitions of the stored state whose triggers share a class basename, for which the proxy throws the Duplicate exception of eloquent-state-machines. It also covers a trigger whose last save of its instance a `saving` or `updating` listener vetoes. A save or an `increment()` that a listener makes inside that save does not count, and neither does an earlier save from `handle()`, vetoed or completed. An `Invalid` or a `BindingResolutionException` from `handle()` refuses it too. Any other exception from the trigger rolls the write back and reaches the caller unchanged.
+
+**Why.** The statement already stored a state no trigger reached. Keeping it would leave the current model in a state its state machine forbids.
+
+**Code that must agree.**
+
+- The private `EventReplayer::trigger()` checks the cases and the transitions. It then reflects the constructor of the one trigger, and refuses a parameter that `EventReplayer::buildsEmptyModel()` accepts: no default, and a named type that is a subclass of `Model`, nullable or not. The private `EventReplayer::state()` counts a value of a type the enum cannot take as no case.
+- `EventReplayer::transition()` turns an `Invalid`, a `BindingResolutionException`, the Interrupted or Prevented exception of aryeo/actions from the trigger, or the Duplicate exception of eloquent-state-machines from the proxy into `CompatibilityWriteRefused::byTransition()`, which keeps it as the previous exception. It refuses when the last outermost save of the instance during `Trigger::now()` did not complete, or when no save ran. `EventBridge::fireModelEvent()` passes every model event to `EventReplayer::trackSave()` before any listener runs, and every result to `EventReplayer::trackSaveResult()` after the dispatch. For an instance a trigger runs on, the replayer keeps the open saves as a stack, each in a phase. `saving` opens a save, and a result other than false moves it to writing. A `creating` or `updating` belongs to the top save only while that save is writing, and it moves the save out of writing. `saved` moves the save out of writing too, before its dispatch. So a `creating` or `updating` of an `increment()` belongs to no save, and its veto changes nothing. A false result from `saving`, or from a `creating` or `updating` that belongs to the save, closes the save as vetoed. `saved` closes it as completed after its dispatch, so a save that a `saved` listener makes sits inside it. The save that closes the last open one sets the outcome of the instance. A `saved` listener that returns false still lets the dispatch return, so the save counts. A faked `saved` event passes through the hook too, so it counts as well.
+- `CompatibilityWriteRefused::byTransition()` names the previous model's attribute and the current model's column.
+- The trigger's lifecycle transaction is a savepoint inside the write's transaction, and `EventBridge::complete()` rolls the write back on any throw.
+
+**Limit.** When a save inside `handle()` or a listener throws and the surrounding code catches the exception, the tracking cannot detect whether that save completed or failed. The frame stays on the stack. A later successful save, or the enclosing save, cannot empty the stack, and the bridge refuses a write that commits natively. Eloquent's `touchOwners()` runs after the trigger's save closes, so a vetoed save of the instance from a touched owner's `saved` listener refuses such a write too. This is a limit of the interim guard. [eloquent-state-machines#60](https://github.com/AryeoHQ/eloquent-state-machines/pull/60) makes `Trigger::after()` throw on a vetoed save. Once that ships, the bridge catches that exception, and this tracking is deleted.
+
+## INV-30: A replay reports each change once on each side
+
+**Rule.** The trigger saves what `handle()` changed, and the bridge mirrors that save as a native write. The bridge's own events, on the current model and on the previous model's instance, leave those changes out. They report the new state and the write's other changes.
+
+A column that both the write and `handle()` change is reported once on each side, from the value the write stored, not from the value before the write. The trigger's save reports it on the current model, and the mirror of that save reports it on the previous model. The caller's own `getChanges()` does not list that column. A row that the trigger removes reports only the statement's own change to it.
+
+**Why.** A native transition reports each change once on each side. Two reports of one change would run a listener twice for it.
+
+**Code that must agree.** The private `EventBridge::transitions()` reads the source model's own record before the first trigger, and every record and that own record after the last. For a row the second read no longer finds, it keeps the row after the statement. The private `EventBridge::replayedBefore()` builds a current record's row from before, and the private `EventBridge::copy()` updates the source model's instance. Both tell a changed column through `EventReplayer::changed()`, by the rule [INV-15](#inv-15-a-mirrored-listener-may-refuse-a-write-never-change-it) states. `EventBridge::copy()` writes each changed column into the attribute and the raw original through a closure bound to the model. It drops only those columns from the model's cast caches.
+
+## INV-31: The state machine package stays optional
+
+**Rule.** Without `aryeo/eloquent-state-machines`, or with a release that has no `Trigger::withoutTransition()`, every write mirrors as it did before state changes ran a trigger. `EventReplayer` is the only production class that names the package.
+
+**Why.** Composer suggests the package and does not require it. [0018](decisions/0018-the-state-machine-package-is-suggested-not-required.md) records the choice.
+
+**Code that must agree.**
+
+- `EventReplayer::states()` checks `Trigger::withoutTransition()` before it loads any other class of the package.
+- `composer-dependency-analyser.php` allows the development dependency in `EventReplayer` alone.
+- Each test that needs the package carries `#[RequiresMethod(Trigger::class, 'withoutTransition')]`, and the CI job `tests-without-state-machines` runs the suite without it.
+- `bin/check-doc-names.php` accepts the package's names unchecked when it is absent.
 
 ## INV-33: A pending mirrored write completes only on its own statement
 

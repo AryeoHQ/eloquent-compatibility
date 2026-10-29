@@ -22,6 +22,11 @@
     },
     "minimum-stability": "stable",
     "repositories": {
+        "eloquent-state-machines": {
+            "type": "vcs",
+            "url": "https://github.com/AryeoHQ/eloquent-state-machines",
+            "no-api": true
+        },
         "artifactory": {
             "type": "composer",
             "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/",
@@ -37,11 +42,15 @@
         "phpstan/phpstan": "^2.1"
     },
     "require-dev": {
-        "aryeo/tooling-laravel": "0.0.41",
+        "aryeo/eloquent-state-machines": "0.0.36",
+        "aryeo/tooling-laravel": "0.0.43",
         "brianium/paratest": "^7.14",
         "orchestra/testbench": "^10.6 || ^11",
         "orchestra/testbench-core": "^10.7 || ^11",
         "phpunit/phpunit": "^12.4.1 || ^13"
+    },
+    "suggest": {
+        "aryeo/eloquent-state-machines": "Replays a state machine's transition for a mirrored write that changes its state column."
     },
     "config": {
         "allow-plugins": {

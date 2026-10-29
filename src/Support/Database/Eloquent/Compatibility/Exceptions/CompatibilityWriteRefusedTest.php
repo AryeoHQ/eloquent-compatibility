@@ -12,6 +12,7 @@ use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Tests\Fixtures\Support\Workbench\Article;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
@@ -110,6 +111,25 @@ final class CompatibilityWriteRefusedTest extends TestCase
         $this->assertSame('Mirrored events fire after the write through the other side has reached the database, so a change a listener makes to the mirrored record cannot be stored.', $refusal->because);
         $this->assertSame("Make the change through Gadget itself, or exclude the listener in the map's event mirror.", $refusal->instead);
         $this->assertStringContainsString("a 'created' listener of Gadget (new) changed name.", CompatibilityWriteRefused::byMirroredChange('widgets', new Gadget, ModelEvent::Created, ['name'])->getMessage());
+    }
+
+    #[Test]
+    public function it_names_the_previous_models_attribute_and_the_state_column_a_replay_could_not_change_and_keeps_the_replay_failure(): void
+    {
+        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
+        $previous = new RuntimeException('Invalid transition from [Published] to [Draft] on [Gadget].');
+
+        $refusal = CompatibilityWriteRefused::byTransition('articles', $gadget, 'state', Article::class, 'status', $previous);
+
+        $this->assertSame("Compatibility map 'articles' refused this write, because it changes status of Article, stored as state of Gadget #{$gadget->id}, in a way its state machine cannot replay", $refusal->refused);
+        $this->assertSame('A state changes only through the trigger its #[Transition] names, so the event bridge replays that trigger for a write through the other side, and the replay failed: Invalid transition from [Published] to [Draft] on [Gadget].', $refusal->because);
+        $this->assertSame('Change status of Article to a state the stored state has a #[Transition] to, whose trigger allows the change and needs no constructor argument the container cannot resolve, or run the trigger on Gadget itself.', $refusal->instead);
+        $this->assertSame($previous, $refusal->getPrevious());
+
+        $unsaved = CompatibilityWriteRefused::byTransition('articles', new Gadget, 'review', Article::class, 'review_status', new RuntimeException('Unresolvable dependency'));
+
+        $this->assertStringContainsString('because it changes review_status of Article, stored as review of Gadget (new), in a way', $unsaved->refused);
+        $this->assertStringEndsWith('the replay failed: Unresolvable dependency.', $unsaved->because);
     }
 
     private function secondRootPlace(): QueryException

@@ -27,7 +27,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **event mirror**: the class that names a map and the listeners to exclude; it implements `EventMirror`.
 - **event replayer**: the part of the event bridge that raises one record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the event bridge skips for mirrored events; `ExcludedListener`.
-- **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
+- **exclusion**: the excluded listeners in force for one mirrored dispatch, or for one model event of the instance a trigger runs on; an `Exclusion`.
 - **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **installer action**: install, recompile or uninstall, the three Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.
@@ -57,6 +57,9 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
 - **savepoint mode**: how the event bridge works inside a caller's transaction, in a `compatibility_<n>` savepoint.
+- **state column**: a column a model casts to a state machine enum, one that implements `StateMachineable`.
+- **state machine trigger**: the class that performs one transition of a state machine, a subclass of `Trigger`. It is not a database trigger.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
+- **transition replay**: the event bridge running the state machine trigger of a state change made through the other side, with `Trigger::withoutTransition()` so that the trigger does not store the state again; see `EventReplayer::transition()`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.
 - **unrepresentable state**: a state one side can hold and the other cannot express; an `UnrepresentableState`.

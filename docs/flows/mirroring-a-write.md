@@ -129,7 +129,7 @@ The bridge completes the write on the `QueryExecuted` of its own statement. `Eve
 1. Marks the write as no longer pending.
 2. Adds the records it finds only after the write, such as the current records of a new previous record. These have no row from before.
 3. Reads every record again, without locks.
-4. Replays each record's events, with its row from before and after.
+4. Runs the state machine trigger of each state change, then replays each record's events, with its row from before and after. [Replaying a transition](replaying-a-transition.md) follows the first half of this step.
 5. Commits at level 0, or releases its savepoint, then forgets the write. A failed commit rolls back to the write's level, forgets the write and rethrows, as [failure and rollback](failure-and-rollback.md#a-failed-commit) describes.
 
 The commit runs outside the bridge's own statements. So a mapped write in the after-commit work Laravel runs inside `Connection::commit()` mirrors too.

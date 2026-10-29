@@ -125,6 +125,12 @@ The pull request that adds each map moves every test it touches to one of two fo
 - `Event::fake()` given a list of only the events the test asserts, which leaves the model events alone.
 - `EventBridge::withoutMirroring()` around the write, or `InteractsWithCompatibilityMaps::withoutEventMirroring()` in a test, which switches the mirror off on purpose.
 
+## State changes and eloquent-state-machines
+
+A write through the previous model that moves a current model's state column runs that state machine's trigger, as the [README](../README.md) describes. The bridge does that only when the installed `aryeo/eloquent-state-machines` has `Trigger::withoutTransition()`. So the upgrade to the first such release changes what those writes do, and the pull request that makes it reviews them as a behaviour change.
+
+A test that writes such a state under a bus fake that fakes the trigger throws `CompatibilityEventMirrorBypassed`, and the bridge rolls the write back. `Illuminate\Support\Facades\Bus::fake()` with no list fakes every trigger. Give it a list of only the jobs the test asserts, or wrap the write in `EventBridge::withoutMirroring()`. [INV-21](invariants.md#inv-21-a-faked-dispatcher-cannot-hide-a-mirrored-write) records the rule.
+
 ## Tests at transaction level 0
 
 `Illuminate\Foundation\Testing\RefreshDatabase` wraps each test in a transaction. Inside it, the bridge always works in savepoint mode, so a suite that uses only that trait never runs the level-0 path. That path opens the bridge's own transaction, commits it, and releases it after a failed statement. Production web requests and queue jobs usually take it.

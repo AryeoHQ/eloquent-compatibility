@@ -458,6 +458,46 @@ final class AffectedRecordsTest extends TestCase
         $this->assertSame([], $this->affectedRecords->snapshots(DB::connection(), []));
     }
 
+    #[Test]
+    public function it_names_the_own_record_of_a_model_in_each_role_it_has_in_a_mirrored_map(): void
+    {
+        $widget = $this->widget();
+        [$gadget, $place] = $this->currentKeys($widget);
+
+        $records = [
+            $this->affectedRecords->native(DB::connection(), $widget),
+            $this->affectedRecords->native(DB::connection(), Gadget::query()->findOrFail($gadget)),
+            $this->affectedRecords->native(DB::connection(), GadgetPlace::query()->findOrFail($place)),
+        ];
+
+        $this->assertSame([
+            ['widgets#'.$widget->getKey(), RecordRole::Previous, 'retained_widgets'],
+            ['gadgets#'.$gadget, RecordRole::Primary, 'gadgets'],
+            ['gadget_places#'.$place, RecordRole::Dependent, 'gadget_places'],
+        ], array_map(fn (null|AffectedRecord $record) => [$record?->id(), $record?->role, $record?->lockedTable], $records));
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_names_the_own_record_of_a_model_loaded_without_its_mapped_key_from_the_persisted_key(bool $strict): void
+    {
+        $widget = $this->widget();
+        Widget::query()->create(['title' => 'Second gadget']);
+        Model::preventAccessingMissingAttributes($strict);
+        $loaded = Widget::query()->select(['uuid', 'title'])->where('title', 'Blue gadget')->firstOrFail();
+        $loaded->setKeyName('uuid')->setKeyType('string')->setIncrementing(false);
+
+        $this->assertSame('widgets#'.$widget->getKey(), $this->affectedRecords->native(DB::connection(), $loaded)?->id());
+    }
+
+    #[Test]
+    public function it_names_no_own_record_for_a_model_without_a_persisted_key_or_outside_every_mirrored_map(): void
+    {
+        $this->assertNull($this->affectedRecords->native(DB::connection(), new Widget(['title' => 'Unsaved gadget'])));
+        $this->assertNull($this->affectedRecords->native(DB::connection(), Person::query()->create(['email' => 'one@example.test'])));
+    }
+
     private function add(CompatibilityMap $map): void
     {
         $this->mirrorIndex->add(resolve(CompatibilityMaps::class)->register($map), new CompatibilityMapEventMirror($map));

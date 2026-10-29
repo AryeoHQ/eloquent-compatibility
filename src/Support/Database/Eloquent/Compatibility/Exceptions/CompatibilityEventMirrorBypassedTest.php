@@ -36,6 +36,20 @@ final class CompatibilityEventMirrorBypassedTest extends TestCase
     }
 
     #[Test]
+    public function it_names_the_trigger_a_faked_bus_would_have_recorded_and_its_compatibility_map(): void
+    {
+        $bypassed = CompatibilityEventMirrorBypassed::byFakedBus('App\\States\\Triggers\\Publish', ['articles']);
+
+        $this->assertSame(
+            'A write that runs the Publish trigger was rolled back, because Bus::fake() fakes that trigger and the event bridge could not run it. '
+            ."Why: compatibility map 'articles' runs a state machine's trigger for a state change through the other side, so a faked bus would store the new state without the trigger and the test would prove nothing about compatibility. "
+            .'Instead: fake only the jobs the test asserts, such as Bus::fake([ShipOrder::class]), or wrap the write in EventBridge::withoutMirroring() to switch the mirror off on purpose.',
+            $bypassed->getMessage(),
+        );
+        $this->assertInstanceOf(CompatibilityException::class, $bypassed);
+    }
+
+    #[Test]
     public function it_names_the_model_and_the_event_of_a_write_whose_statement_carried_no_mark(): void
     {
         $bypassed = CompatibilityEventMirrorBypassed::byUnmarkedStatement('App\\Models\\Widget', ModelEvent::Updated, ['widgets', 'gizmos']);

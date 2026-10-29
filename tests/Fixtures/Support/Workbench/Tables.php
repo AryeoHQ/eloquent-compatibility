@@ -69,6 +69,34 @@ final class Tables
             $table->foreignUuid('person_id')->nullable()->constrained('people');
             $table->text('bio')->nullable();
         });
+
+        Schema::create('publications', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('title');
+            $table->string('state')->nullable()->default('draft');
+            $table->string('review')->default('pending');
+            $table->boolean('locked')->default(false);
+            $table->timestampTz('published_at')->nullable();
+            $table->timestampTz('featured_at')->nullable();
+            $table->timestampsTz();
+        });
+
+        Schema::create('retained_articles', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->foreignUuid('publication_id')->nullable()->constrained('publications');
+        });
+
+        Schema::create('placements', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->foreignUuid('publication_id')->unique()->constrained('publications');
+            $table->string('slot')->nullable();
+            $table->timestampsTz();
+        });
+
+        Schema::create('retained_bulletins', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->foreignUuid('publication_id')->nullable()->constrained('publications');
+        });
     }
 
     public static function createItems(): void
@@ -86,15 +114,15 @@ final class Tables
 
     public static function drop(): void
     {
-        foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
+        foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap, new ArticleCompatibilityMap, new BulletinCompatibilityMap] as $map) {
             Schema::getConnection()->unprepared('DROP VIEW IF EXISTS "'.$map->previousModel()->view.'" CASCADE');
         }
 
-        foreach (['retained_widgets', 'gadget_sites', 'gadget_places', 'gadgets', 'retained_accounts', 'retained_profiles', 'people'] as $table) {
+        foreach (['retained_widgets', 'gadget_sites', 'gadget_places', 'gadgets', 'retained_accounts', 'retained_profiles', 'people', 'retained_articles', 'retained_bulletins', 'placements', 'publications'] as $table) {
             Schema::dropIfExists($table);
         }
 
-        foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
+        foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap, new ArticleCompatibilityMap, new BulletinCompatibilityMap] as $map) {
             $prefix = SqlFragments::like(ResolvedMap::of($map)->objectPrefix());
 
             Schema::getConnection()->unprepared(
