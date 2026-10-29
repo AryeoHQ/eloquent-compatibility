@@ -616,6 +616,161 @@ final class EventBridgeTransitionTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_a_saving_listener_saves_the_instance_and_then_vetoes_the_triggers_save(): void
+    {
+        $article = $this->article();
+        $saved = false;
+        Event::listen('eloquent.saving: '.Publication::class, function (Publication $publication) use (&$saved): null|false {
+            if ($saved || ! $publication->isDirty('published_at')) {
+                return null;
+            }
+
+            $saved = true;
+
+            return $publication->save() ? false : null;
+        });
+
+        $refusal = $this->assertWriteRefused(fn () => $article->update(['status' => 'published']), "state of Publication #{$article->publication_id}");
+
+        $this->assertTrue($saved);
+        $this->assertStringEndsWith("the replay failed: The trigger's save of Publication was vetoed, as a saving or updating listener that returns false does.", $refusal->because);
+        $this->assertSame(['draft', null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
+        $this->assertSame(['draft', null], [DB::table('articles')->value('status'), DB::table('articles')->value('published_at')]);
+        $this->assertSame(['before draft'], $this->seen);
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    #[TestWith(['saving'])]
+    #[TestWith(['updating'])]
+    public function it_keeps_a_write_whose_trigger_saves_the_instance_once_vetoed_and_then_completes_its_own_save_as_a_native_trigger_does(string $vetoingEvent): void
+    {
+        $native = $this->article();
+        $article = $this->article();
+        DB::table('publications')->update(['state' => 'published']);
+        $article->refresh();
+        $vetoed = [];
+        Event::listen("eloquent.{$vetoingEvent}: ".Publication::class, function (Publication $publication) use (&$vetoed): null|false {
+            if (in_array($publication->getKey(), $vetoed, true) || ! $publication->isDirty('featured_at')) {
+                return null;
+            }
+
+            $vetoed[] = $publication->getKey();
+
+            return false;
+        });
+
+        Publication::query()->findOrFail($native->publication_id)->state->feature()->now();
+        $this->seen = [];
+        DB::transaction(fn () => $article->update(['status' => 'featured']));
+
+        $this->assertSame([$native->publication_id, $article->publication_id], $vetoed);
+        $this->assertSame(['before published', 'after featured'], $this->seen);
+
+        foreach ([$native, $article] as $written) {
+            $stored = DB::table('publications')->where('id', $written->publication_id);
+            $this->assertSame(['featured', true], [$stored->value('state'), $stored->value('featured_at') !== null]);
+        }
+    }
+
+    #[Test]
+    public function it_keeps_a_write_whose_saved_listener_saves_the_instance_again_and_has_that_save_vetoed_as_a_native_trigger_does(): void
+    {
+        $native = $this->article();
+        $article = $this->article();
+        $resaves = [];
+        Event::listen('eloquent.saved: '.Publication::class, function (Publication $publication) use (&$resaves): void {
+            if (array_key_exists($publication->getKey(), $resaves) || ! $publication->wasChanged('published_at')) {
+                return;
+            }
+
+            $resaves[$publication->getKey()] = null;
+            $resaves[$publication->getKey()] = $publication->save();
+        });
+        Event::listen('eloquent.saving: '.Publication::class, function (Publication $publication) use (&$resaves): null|false {
+            return array_key_exists($publication->getKey(), $resaves) && $resaves[$publication->getKey()] === null ? false : null;
+        });
+
+        Publication::query()->findOrFail($native->publication_id)->state->publish()->now();
+        $this->seen = [];
+        DB::transaction(fn () => $article->update(['status' => 'published']));
+
+        $this->assertSame([$native->publication_id => false, $article->publication_id => false], $resaves);
+        $this->assertSame(['before draft', 'after published'], $this->seen);
+
+        foreach ([$native, $article] as $written) {
+            $stored = DB::table('publications')->where('id', $written->publication_id);
+            $this->assertSame(['published', true], [$stored->value('state'), $stored->value('published_at') !== null]);
+        }
+    }
+
+    #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_a_saving_listener_saves_the_instance_through_a_vetoed_increment_and_then_vetoes_the_triggers_save(): void
+    {
+        $article = $this->article();
+        $step = 'final save';
+        $results = [];
+        Event::listen('eloquent.saving: '.Publication::class, function (Publication $publication) use (&$step, &$results): null|false {
+            if ($step === 'final save' && $publication->isDirty('published_at')) {
+                $step = 'nested save';
+                $results[] = $publication->save();
+                $step = 'done';
+
+                return false;
+            }
+
+            if ($step === 'nested save') {
+                $step = 'increment';
+                $results[] = $publication->increment('locked', 0);
+                $step = 'nested write';
+            }
+
+            return null;
+        });
+        Event::listen('eloquent.updating: '.Publication::class, function () use (&$step): null|false {
+            return $step === 'increment' ? false : null;
+        });
+
+        $refusal = $this->assertWriteRefused(fn () => $article->update(['status' => 'published']), "state of Publication #{$article->publication_id}");
+
+        $this->assertSame([false, true], $results);
+        $this->assertStringEndsWith("the replay failed: The trigger's save of Publication was vetoed, as a saving or updating listener that returns false does.", $refusal->because);
+        $this->assertSame(['draft', null], [DB::table('publications')->value('state'), DB::table('publications')->value('published_at')]);
+        $this->assertSame(['draft', null], [DB::table('articles')->value('status'), DB::table('articles')->value('published_at')]);
+        $this->assertSame(['before draft'], $this->seen);
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_keeps_a_write_whose_saved_listener_after_a_clean_trigger_save_has_an_increment_vetoed_as_a_native_trigger_does(): void
+    {
+        $native = $this->article();
+        $article = $this->article();
+        DB::table('publications')->update(['state' => 'featured']);
+        $article->refresh();
+        $increments = [];
+        Event::listen('eloquent.saved: '.Publication::class, function (Publication $publication) use (&$increments): void {
+            if (array_key_exists($publication->getKey(), $increments)) {
+                return;
+            }
+
+            $increments[$publication->getKey()] = null;
+            $increments[$publication->getKey()] = $publication->increment('locked', 0);
+        });
+        Event::listen('eloquent.updating: '.Publication::class, function (Publication $publication) use (&$increments): null|false {
+            return array_key_exists($publication->getKey(), $increments) && $increments[$publication->getKey()] === null ? false : null;
+        });
+
+        Publication::query()->findOrFail($native->publication_id)->state->returnToPublished()->now();
+        $this->seen = [];
+        DB::transaction(fn () => $article->update(['status' => 'published']));
+
+        $this->assertSame([$native->publication_id => false, $article->publication_id => false], $increments);
+        $this->assertSame(['before featured', 'after published'], $this->seen);
+        $this->assertSame(['published', 'published'], DB::table('publications')->orderBy('id')->pluck('state')->all());
+    }
+
+    #[Test]
     public function it_keeps_a_write_whose_saved_listeners_return_false_as_a_native_trigger_does(): void
     {
         $native = $this->article();

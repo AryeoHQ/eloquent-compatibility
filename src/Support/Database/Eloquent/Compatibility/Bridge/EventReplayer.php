@@ -46,6 +46,16 @@ final class EventReplayer
 
     private const array ENCRYPTED_CASTS = ['encrypted', 'encrypted:array', 'encrypted:collection', 'encrypted:json', 'encrypted:object'];
 
+    private const string SAVING = 'saving';
+
+    private const string WRITING = 'writing';
+
+    private const string WRITTEN = 'written';
+
+    private const string OWN_WRITE = 'own write';
+
+    private const string OTHER_WRITE = 'other write';
+
     /** @var list<ModelEvent> */
     private array $fired = [];
 
@@ -55,6 +65,9 @@ final class EventReplayer
     /** @var WeakMap<Model, list<ExcludedListener>> */
     private WeakMap $transitioning;
 
+    /** @var WeakMap<Model, list<string>> */
+    private WeakMap $openSaves;
+
     /** @var WeakMap<Model, bool> */
     private WeakMap $saves;
 
@@ -62,6 +75,7 @@ final class EventReplayer
     {
         $this->excluded = new WeakMap;
         $this->transitioning = new WeakMap;
+        $this->openSaves = new WeakMap;
         $this->saves = new WeakMap;
     }
 
@@ -151,7 +165,7 @@ final class EventReplayer
                 } catch (Invalid|BindingResolutionException $e) {
                     throw $this->refusal($record, $model, $state, $e);
                 } finally {
-                    unset($this->transitioning[$model], $this->saves[$model]);
+                    unset($this->transitioning[$model], $this->openSaves[$model], $this->saves[$model]);
                 }
 
                 if (! $saved) {
@@ -165,9 +179,59 @@ final class EventReplayer
 
     public function trackSave(Model $model, string $event): void
     {
-        if ($this->transitioning->offsetExists($model) && in_array($event, [ModelEvent::Saving->value, ModelEvent::Saved->value], true)) {
-            $this->saves[$model] = $event === ModelEvent::Saved->value;
+        if (! $this->transitioning->offsetExists($model)) {
+            return;
         }
+
+        $frames = $this->openSaves[$model] ?? [];
+        $top = array_key_last($frames);
+        $writing = $top !== null && $frames[$top] === self::WRITING;
+
+        if ($event === ModelEvent::Saving->value) {
+            $frames[] = self::SAVING;
+        } elseif (in_array($event, [ModelEvent::Creating->value, ModelEvent::Updating->value], true)) {
+            if ($writing) {
+                $frames[$top] = self::WRITTEN;
+            }
+
+            $frames[] = $writing ? self::OWN_WRITE : self::OTHER_WRITE;
+        } elseif ($event === ModelEvent::Saved->value && $writing) {
+            $frames[$top] = self::WRITTEN;
+        }
+
+        $this->openSaves[$model] = $frames;
+    }
+
+    public function trackSaveResult(Model $model, string $event, mixed $result): mixed
+    {
+        if (! $this->transitioning->offsetExists($model)) {
+            return $result;
+        }
+
+        $frames = $this->openSaves[$model] ?? [];
+        $top = array_key_last($frames);
+        $phase = $top === null ? null : $frames[$top];
+
+        if ($event === ModelEvent::Saving->value && $phase === self::SAVING) {
+            if ($result === false) {
+                $this->closeSave($model, $frames, false);
+            } else {
+                $frames[$top] = self::WRITING;
+                $this->openSaves[$model] = $frames;
+            }
+        } elseif (in_array($event, [ModelEvent::Creating->value, ModelEvent::Updating->value], true) && in_array($phase, [self::OWN_WRITE, self::OTHER_WRITE], true)) {
+            array_pop($frames);
+
+            if ($phase === self::OWN_WRITE && $result === false) {
+                $this->closeSave($model, $frames, false);
+            } else {
+                $this->openSaves[$model] = $frames;
+            }
+        } elseif ($event === ModelEvent::Saved->value && $phase === self::WRITTEN) {
+            $this->closeSave($model, $frames, true);
+        }
+
+        return $result;
     }
 
     /**
@@ -195,6 +259,19 @@ final class EventReplayer
         }
 
         return $changed;
+    }
+
+    /**
+     * @param  list<string>  $frames
+     */
+    private function closeSave(Model $model, array $frames, bool $completed): void
+    {
+        array_pop($frames);
+        $this->openSaves[$model] = $frames;
+
+        if (array_intersect($frames, [self::SAVING, self::WRITING, self::WRITTEN]) === []) {
+            $this->saves[$model] = $completed;
+        }
     }
 
     /**

@@ -148,7 +148,7 @@ final class EventBridge
         $modelEvent = ModelEvent::tryFrom($event);
 
         if ($modelEvent === null || ! $this->sees($model)) {
-            return $fire();
+            return $this->eventReplayer->trackSaveResult($model, $event, $fire());
         }
 
         $connection = $model->getConnection();
@@ -178,7 +178,7 @@ final class EventBridge
             $this->forget($connection, $pendingWrite);
         }
 
-        return $result;
+        return $this->eventReplayer->trackSaveResult($model, $event, $result);
     }
 
     public function markOwnStatement(Model&Compatible $model, null|Builder $query = null): void
