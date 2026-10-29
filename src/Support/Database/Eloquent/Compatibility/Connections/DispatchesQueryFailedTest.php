@@ -96,8 +96,10 @@ final class DispatchesQueryFailedTest extends TestCase
 
                     return null;
                 },
-                function () use ($bridge, &$calls): void {
+                function () use ($bridge, &$calls): null {
                     $calls[] = "{$bridge} open";
+
+                    return null;
                 },
                 function () use ($bridge, &$calls): void {
                     $calls[] = "{$bridge} release";

@@ -49,9 +49,6 @@ final class EventBridge
     /** @var WeakMap<Connection, true> */
     private WeakMap $watched;
 
-    /** @var WeakMap<Connection, null|PendingMirroredWrite> */
-    private WeakMap $started;
-
     private int $internal = 0;
 
     private int $disabled = 0;
@@ -68,7 +65,6 @@ final class EventBridge
         $this->affectedRecords = new AffectedRecords($this->mirrorIndex);
         $this->eventReplayer = new EventReplayer($this->mirrorIndex);
         $this->watched = new WeakMap;
-        $this->started = new WeakMap;
     }
 
     public function mirror(EventMirror $mirror): void
@@ -322,7 +318,7 @@ final class EventBridge
             throw CompatibilityConnectionUnsupported::byMissingTrait($this->maps($model), $connection);
         }
 
-        foreach (['beforeExecuting', 'handleQueryException', 'registerEventBridge'] as $method) {
+        foreach (['beforeExecuting', 'handleQueryException', 'registerEventBridge', 'runQueryCallback'] as $method) {
             $resolved = new ReflectionMethod($connection, $method);
             $trait = new ReflectionMethod(DispatchesQueryFailed::class, $method);
 
@@ -349,7 +345,6 @@ final class EventBridge
             return null;
         }
 
-        $this->started[$connection] = null;
         $name = (string) $connection->getName();
         $armed = $this->armed[$name] ?? null;
         $armed = $armed !== null && $this->writesTo($query, $armed) ? $armed : null;
@@ -366,12 +361,12 @@ final class EventBridge
     /**
      * @param  array<array-key, mixed>  $bindings
      */
-    private function openStatement(null|PendingMirroredWrite $taken, string $query, array $bindings, Connection $connection): void
+    private function openStatement(null|PendingMirroredWrite $taken, string $query, array $bindings, Connection $connection): null|PendingMirroredWrite
     {
         $name = (string) $connection->getName();
 
         if ($taken === null || ! in_array($taken, $this->pendingWrites[$name] ?? [], true)) {
-            return;
+            return null;
         }
 
         $this->closeFailedAbove($connection, $taken);
@@ -384,22 +379,16 @@ final class EventBridge
             }
 
             $this->open($connection, $taken, $query, $bindings);
-            $this->started[$connection] = $taken;
+
+            return $taken;
         }
+
+        return null;
     }
 
-    /**
-     * @param  array<array-key, mixed>  $bindings
-     */
-    private function handleFailure(string $query, array $bindings, Connection $connection): void
+    private function handleFailure(null|PendingMirroredWrite $pendingWrite, Connection $connection): void
     {
-        if ($this->internal > 0) {
-            return;
-        }
-
-        $pendingWrite = $this->top($connection->getName());
-
-        if ($pendingWrite === null || ! $pendingWrite->pending || ! $pendingWrite->statementSent || $pendingWrite->failed || $pendingWrite->statement !== $query || $pendingWrite->bindings !== $bindings || $pendingWrite->source->getConnection() !== $connection || ($this->started[$connection] ?? null) !== $pendingWrite) {
+        if ($pendingWrite === null || $this->internal > 0 || ! $pendingWrite->pending || ! $pendingWrite->statementSent || $pendingWrite->failed || $this->top($connection->getName()) !== $pendingWrite || $pendingWrite->source->getConnection() !== $connection) {
             return;
         }
 

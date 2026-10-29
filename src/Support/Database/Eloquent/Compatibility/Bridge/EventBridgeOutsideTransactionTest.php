@@ -10,6 +10,7 @@ use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\StatementPrepared;
 use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\PostgresConnection;
@@ -44,6 +45,7 @@ use Tests\Fixtures\Support\Connections\FailingRollBackConnection;
 use Tests\Fixtures\Support\Connections\OverridesBeforeExecutingConnection;
 use Tests\Fixtures\Support\Connections\OverridesHandleQueryExceptionConnection;
 use Tests\Fixtures\Support\Connections\OverridesRegisterEventBridgeConnection;
+use Tests\Fixtures\Support\Connections\OverridesRunQueryCallbackConnection;
 use Tests\Fixtures\Support\Connections\QueryFailedConnection;
 use Tests\Fixtures\Support\Connections\WrappedChildConnection;
 use Tests\Fixtures\Support\Workbench\Account;
@@ -65,6 +67,7 @@ use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
+use WeakReference;
 
 #[CoversClass(EventBridge::class)]
 final class EventBridgeOutsideTransactionTest extends TestCase
@@ -242,6 +245,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     #[TestWith([OverridesHandleQueryExceptionConnection::class, 'handleQueryException'])]
     #[TestWith([OverridesBeforeExecutingConnection::class, 'beforeExecuting'])]
     #[TestWith([OverridesRegisterEventBridgeConnection::class, 'registerEventBridge'])]
+    #[TestWith([OverridesRunQueryCallbackConnection::class, 'runQueryCallback'])]
     public function it_refuses_every_mirrored_write_on_a_connection_whose_class_replaces_a_method_of_the_trait_and_names_that_class(string $class, string $method): void
     {
         $default = (string) config('database.default');
@@ -419,6 +423,44 @@ final class EventBridgeOutsideTransactionTest extends TestCase
     }
 
     #[Test]
+    public function it_fails_and_rolls_back_at_once_an_incrementing_create_whose_statement_prepared_listener_reads_before_its_insert_fails_outside_a_transaction(): void
+    {
+        $reads = 0;
+        Event::listen(StatementPrepared::class, function (StatementPrepared $prepared) use (&$reads): void {
+            if ($prepared->connection === DB::connection() && str_starts_with($prepared->statement->queryString, 'insert into "widgets"')) {
+                DB::select('select 1');
+                $reads++;
+            }
+        });
+        $this->recordMirroredEvents();
+
+        $this->assertThrows(fn () => Widget::query()->create(['title' => null, 'street' => '1 Main St']), QueryException::class, '23502');
+
+        $this->assertSame(1, $reads);
+        $this->assertNothingMirrored();
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertAfterCommitRunsAtOnce();
+        $this->assertSame(0, DB::table('widgets')->count());
+    }
+
+    #[Test]
+    #[TestWith([false])]
+    #[TestWith([true])]
+    public function it_holds_no_reference_to_the_model_of_a_write_it_forgot_when_no_statement_follows_outside_a_transaction(bool $fails): void
+    {
+        $widget = new Widget(['title' => $fails ? null : 'Forgotten', 'street' => '1 Main St']);
+        $model = WeakReference::create($widget);
+
+        $saved = rescue(fn () => $widget->save(), false, false);
+        unset($widget);
+        gc_collect_cycles();
+
+        $this->assertSame(! $fails, $saved);
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertNull($model->get());
+    }
+
+    #[Test]
     public function it_dispatches_query_failed_as_a_write_when_a_rolled_back_listener_reads_on_a_read_write_connection_outside_a_transaction(): void
     {
         $default = (string) config('database.default');
@@ -432,7 +474,7 @@ final class EventBridgeOutsideTransactionTest extends TestCase
             $reads++;
         });
         $failures = [];
-        DB::connection()->listenForFailures(function (QueryFailed $failure) use (&$failures): void {
+        Event::listen(QueryFailed::class, function (QueryFailed $failure) use (&$failures): void {
             $failures[] = $failure;
         });
 

@@ -10,6 +10,7 @@ use Illuminate\Database\QueryException;
 use Support\Database\Eloquent\Compatibility\Bridge\PendingMirroredWrite;
 use Support\Database\Eloquent\Compatibility\Connections\Events\QueryFailed;
 use Throwable;
+use WeakMap;
 use WeakReference;
 
 /**
@@ -22,8 +23,14 @@ trait DispatchesQueryFailed
     /** @var null|WeakReference<QueryException> */
     private null|WeakReference $compatibilityDispatchedQueryFailure = null;
 
-    /** @var null|Closure(string, array<array-key, mixed>, Connection): void */
+    /** @var null|Closure(null|PendingMirroredWrite, Connection): void */
     private null|Closure $compatibilityEventBridgeRelease = null;
+
+    /** @var null|WeakReference<PendingMirroredWrite> */
+    private null|WeakReference $compatibilityStatementWrite = null;
+
+    /** @var null|WeakMap<QueryException, WeakReference<PendingMirroredWrite>> */
+    private null|WeakMap $compatibilityFailedWrites = null;
 
     /** @var list<Closure> */
     private array $compatibilityBeforeExecutingCallbacks = [];
@@ -38,8 +45,8 @@ trait DispatchesQueryFailed
 
     /**
      * @param  Closure(string, array<array-key, mixed>, Connection): (null|PendingMirroredWrite)  $start
-     * @param  Closure(null|PendingMirroredWrite, string, array<array-key, mixed>, Connection): void  $open
-     * @param  Closure(string, array<array-key, mixed>, Connection): void  $release
+     * @param  Closure(null|PendingMirroredWrite, string, array<array-key, mixed>, Connection): (null|PendingMirroredWrite)  $open
+     * @param  Closure(null|PendingMirroredWrite, Connection): void  $release
      */
     public function registerEventBridge(Closure $start, Closure $open, Closure $release): void
     {
@@ -56,7 +63,8 @@ trait DispatchesQueryFailed
                     $callback($query, $bindings, $connection);
                 }
 
-                $open($taken, $query, $bindings, $connection);
+                $opened = $open($taken, $query, $bindings, $connection);
+                $this->compatibilityStatementWrite = $opened === null ? null : WeakReference::create($opened);
             },
         ];
     }
@@ -81,6 +89,29 @@ trait DispatchesQueryFailed
      *
      * @throws QueryException
      */
+    protected function runQueryCallback($query, $bindings, Closure $callback)
+    {
+        $statementWrite = $this->compatibilityStatementWrite;
+        $this->compatibilityStatementWrite = null;
+
+        try {
+            return parent::runQueryCallback($query, $bindings, $callback);
+        } catch (QueryException $e) {
+            if ($statementWrite !== null) {
+                $this->compatibilityFailedWrites ??= new WeakMap;
+                $this->compatibilityFailedWrites[$e] = $statementWrite;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * @param  string  $query
+     * @param  array<array-key, mixed>  $bindings
+     *
+     * @throws QueryException
+     */
     protected function handleQueryException(QueryException $e, $query, $bindings, Closure $callback)
     {
         try {
@@ -93,7 +124,7 @@ trait DispatchesQueryFailed
             $readWriteType = $this->latestReadWriteTypeUsed();
 
             if ($this->compatibilityEventBridgeRelease !== null) {
-                ($this->compatibilityEventBridgeRelease)($query, $bindings, $this);
+                ($this->compatibilityEventBridgeRelease)(($this->compatibilityFailedWrites[$e] ?? null)?->get(), $this);
             }
 
             if (! $this->compatibilityDispatchingQueryFailed && $failure !== $this->compatibilityDispatchedQueryFailure?->get()) {

@@ -202,7 +202,7 @@ The trait raises `Connections\Events\QueryFailed` once for each statement that f
 - `listenForFailures()` registers a listener, as `listen()` does for `QueryExecuted`.
 - The event carries the SQL, the bindings, the connection and its name, the exception, and the read/write type. Its `time` is null.
 - A listener's throwable does not replace the statement's `QueryException`. The trait reports it, and throws the `QueryException`. A throw from that report does not replace it either.
-- The trait overrides `handleQueryException()` and `beforeExecuting()`. It therefore composes with a connection that overrides `run()` or `tryAgainIfCausedByLostConnection()`. The event bridge refuses a connection class that declares either method itself, or the trait's `registerEventBridge()`.
+- The trait overrides `handleQueryException()`, `beforeExecuting()` and `runQueryCallback()`. It therefore composes with a connection that overrides `run()` or `tryAgainIfCausedByLostConnection()`. The event bridge refuses a connection class that declares any of those methods itself, or the trait's `registerEventBridge()`.
 - Its `beforeExecuting()` keeps the event bridge's two callbacks first and last. So every other `beforeExecuting` callback runs before a mirrored write opens, and its statements never take the write's place.
 - Before it raises `QueryFailed`, the trait calls the event bridge, which rolls back a mirrored write whose own statement failed. No listener can stop that.
 
