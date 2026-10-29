@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 
 final readonly class Installer
@@ -15,76 +16,99 @@ final readonly class Installer
 
     public function install(CompatibilityMap $map): void
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $this->run($map, InstallerAction::Install);
+    }
 
-        if ($this->relation($resolvedMap->previousModel->view) !== null) {
-            throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$resolvedMap->previousModel->view} already exists; use recompile() to recompile the compatibility map");
+    public function recompile(CompatibilityMap $map): void
+    {
+        $this->run($map, InstallerAction::Recompile);
+    }
+
+    public function uninstall(CompatibilityMap $map): void
+    {
+        $this->run($map, InstallerAction::Uninstall);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function statements(CompatibilityMap|ResolvedMap $map, InstallerAction $for, null|string $retainedTableIsCurrently = null): array
+    {
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
+
+        return match ($for) {
+            InstallerAction::Install => $this->installStatements($resolvedMap, $retainedTableIsCurrently),
+            InstallerAction::Recompile => $this->recompileStatements($resolvedMap, $retainedTableIsCurrently),
+            InstallerAction::Uninstall => $this->uninstallStatements($resolvedMap, $retainedTableIsCurrently),
+        };
+    }
+
+    private function run(CompatibilityMap $map, InstallerAction $for): void
+    {
+        $this->connection->transaction(function () use ($map, $for): void {
+            foreach ($this->statements($map, $for) as $statement) {
+                $this->connection->unprepared($statement);
+            }
+        });
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function installStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
+    {
+        $view = $resolvedMap->previousModel->view;
+        $kind = $this->relationKind($view);
+
+        if ($kind !== null && ($view !== $retainedTableIsCurrently || ! in_array($kind, ['r', 'p'], true))) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$view} already exists; use recompile() to recompile the compatibility map");
         }
 
+        $table = $retainedTableIsCurrently ?? (string) $resolvedMap->previousModel->table;
         $readers = $this->connection->select(
             "select distinct rule.ev_class::regclass::text as name
              from pg_depend dependency join pg_rewrite rule on rule.oid = dependency.objid
              where dependency.classid = 'pg_rewrite'::regclass and dependency.refclassid = 'pg_class'::regclass
                and dependency.refobjid = to_regclass(quote_ident(current_schema()) || '.' || ?) and rule.ev_class <> dependency.refobjid
              order by 1",
-            [SqlFragments::identifier((string) $resolvedMap->previousModel->table)],
+            [SqlFragments::identifier($table)],
         );
 
         if ($readers !== []) {
-            throw InvalidCompatibilityMap::because($resolvedMap->name, "install() cannot serve {$resolvedMap->previousModel->table} through the compatibility view while other views read it directly: "
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "install() cannot serve {$table} through the compatibility view while other views read it directly: "
                 .implode(', ', array_map(fn (object $reader) => (string) $reader->name, $readers)).'; drop them first and create them again over the compatibility view after the install');
         }
 
-        $this->connection->transaction(function () use ($resolvedMap): void {
-            $this->apply($resolvedMap);
-            $this->copyPrivileges($resolvedMap);
-        });
+        return [...$this->applyStatements($resolvedMap, $retainedTableIsCurrently, null), ...$this->grantStatements($resolvedMap, $retainedTableIsCurrently)];
     }
 
-    public function recompile(CompatibilityMap $map): void
+    /**
+     * @return list<string>
+     */
+    private function recompileStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $view = $resolvedMap->previousModel->view === $retainedTableIsCurrently ? null : $this->relation($resolvedMap->previousModel->view);
+        $grants = $view === null ? [] : $this->viewGrants($resolvedMap, $view);
+        $columns = array_map(fn (Attribute $attribute) => $attribute->column, $resolvedMap->attributes);
+        $regrants = array_filter($grants, fn (object $grant) => $grant->column === null || in_array($grant->column, $columns, true));
 
-        $this->connection->transaction(function () use ($resolvedMap): void {
-            $grants = $this->viewGrants($resolvedMap);
-            $this->apply($resolvedMap);
-            $columns = array_map(fn (object $column) => (string) $column->name, $this->connection->select(
-                "select attname as name from pg_attribute where attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attnum > 0 and not attisdropped",
-                [SqlFragments::identifier($resolvedMap->previousModel->view)],
-            ));
-
-            foreach ($grants as $grant) {
-                if ($grant->column === null || in_array($grant->column, $columns, true)) {
-                    $this->connection->unprepared('GRANT '.$grant->statement);
-                }
-            }
-        });
+        return [...$this->applyStatements($resolvedMap, $retainedTableIsCurrently, $view), ...array_map(fn (object $grant) => 'GRANT '.$grant->statement, array_values($regrants))];
     }
 
-    public function uninstall(CompatibilityMap $map): void
+    /**
+     * @return list<string>
+     */
+    private function applyStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently, null|string $view): array
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $sources = $this->sources($resolvedMap, $retainedTableIsCurrently);
 
-        $this->connection->transaction(function () use ($resolvedMap): void {
-            $this->dropObjects($resolvedMap);
-            $view = $this->relation($resolvedMap->previousModel->view);
-
-            if ($view !== null) {
-                $this->connection->unprepared('DROP VIEW '.$view);
-            }
-        });
-    }
-
-    private function apply(ResolvedMap $resolvedMap): void
-    {
-        foreach (array_unique([(string) $resolvedMap->previousModel->table, ...array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))]) as $table) {
+        foreach (array_unique([$retainedTableIsCurrently ?? (string) $resolvedMap->previousModel->table, ...array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))]) as $table) {
             if ($this->connection->scalar("select relrowsecurity from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($table)]) === true) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has row-level security enabled, and the compatibility view and its SECURITY DEFINER triggers would bypass its policies; map only tables without row-level security");
             }
         }
 
-        $compiledSql = (new Compiler($this->connection))->compile($resolvedMap);
-        $view = $this->relation($resolvedMap->previousModel->view);
+        $compiledSql = (new Compiler($this->connection, $sources))->compile($resolvedMap);
 
         if ($view !== null) {
             $dependents = $this->connection->select(
@@ -108,50 +132,56 @@ final readonly class Installer
             }
         }
 
-        $this->dropObjects($resolvedMap);
-
-        if ($view !== null) {
-            $this->connection->unprepared('DROP VIEW '.$view);
-        }
-
-        foreach ($compiledSql->statements() as $statement) {
-            $this->connection->unprepared($statement);
-        }
-
-        $this->revokeDefaultPrivileges($resolvedMap);
+        return [...$this->dropStatements($resolvedMap, $sources), ...($view === null ? [] : ['DROP VIEW '.$view]), ...$compiledSql->statements(), $this->revokeStatement($resolvedMap)];
     }
 
-    private function revokeDefaultPrivileges(ResolvedMap $resolvedMap): void
+    /**
+     * @return list<string>
+     */
+    private function uninstallStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
-        $view = (string) $this->relation($resolvedMap->previousModel->view);
+        $view = $resolvedMap->previousModel->view === $retainedTableIsCurrently ? null : $this->relation($resolvedMap->previousModel->view);
+        $drops = $this->dropStatements($resolvedMap, $this->sources($resolvedMap, $retainedTableIsCurrently));
 
-        $grantees = $this->connection->select(
-            "select distinct CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END as grantee
-             from pg_class relation, aclexplode(relation.relacl) privilege
-             where relation.oid = ?::regclass and privilege.grantee <> relation.relowner",
-            [$view],
-        );
-
-        foreach ($grantees as $grantee) {
-            $this->connection->unprepared('REVOKE ALL ON '.$view.' FROM '.$grantee->grantee);
-        }
+        return $view === null ? $drops : [...$drops, 'DROP VIEW '.$view];
     }
 
-    private function dropObjects(ResolvedMap $resolvedMap): void
+    /**
+     * @return array<string, string>
+     */
+    private function sources(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
+    {
+        return $retainedTableIsCurrently === null ? [] : [(string) $resolvedMap->previousModel->table => $retainedTableIsCurrently];
+    }
+
+    /**
+     * @param  array<string, string>  $sources
+     * @return list<string>
+     */
+    private function dropStatements(ResolvedMap $resolvedMap, array $sources): array
     {
         $prefix = SqlFragments::like($resolvedMap->objectPrefix());
+        $statements = [];
+        $relation = 'table_trigger.tgrelid::regclass::text';
+        $bindings = [];
+
+        foreach ($sources as $table => $source) {
+            $relation = "case when trigger_relation.relname = ? then quote_ident(?) else {$relation} end";
+            $bindings = [$source, $table, ...$bindings];
+        }
 
         $triggers = $this->connection->select(
-            "select table_trigger.tgname as name, table_trigger.tgrelid::regclass::text as relation
+            "select table_trigger.tgname as name, {$relation} as relation
              from pg_trigger table_trigger join pg_proc trigger_function on trigger_function.oid = table_trigger.tgfoid
              join pg_class trigger_relation on trigger_relation.oid = table_trigger.tgrelid
              where not table_trigger.tgisinternal and table_trigger.tgname like {$prefix}
                and trigger_function.pronamespace = to_regnamespace(quote_ident(current_schema()))
                and trigger_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))",
+            $bindings,
         );
 
         foreach ($triggers as $trigger) {
-            $this->connection->unprepared('DROP TRIGGER IF EXISTS '.SqlFragments::identifier((string) $trigger->name).' ON '.$trigger->relation);
+            $statements[] = 'DROP TRIGGER IF EXISTS '.SqlFragments::identifier((string) $trigger->name).' ON '.$trigger->relation;
         }
 
         $functions = $this->connection->select(
@@ -159,47 +189,60 @@ final readonly class Installer
         );
 
         foreach ($functions as $function) {
-            $this->connection->unprepared('DROP FUNCTION IF EXISTS '.$function->signature);
+            $statements[] = 'DROP FUNCTION IF EXISTS '.$function->signature;
         }
+
+        return $statements;
     }
 
-    private function copyPrivileges(ResolvedMap $resolvedMap): void
+    private function revokeStatement(ResolvedMap $resolvedMap): string
+    {
+        $view = SqlFragments::literal(SqlFragments::identifier($resolvedMap->previousModel->view)).'::regclass';
+
+        return "DO \$compatibility\$\nDECLARE\n  revoked text;\nBEGIN\n"
+            ."  FOR revoked IN SELECT DISTINCT CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(privilege.grantee)) END\n"
+            ."    FROM pg_catalog.pg_class relation, pg_catalog.aclexplode(relation.relacl) privilege\n"
+            ."    WHERE relation.oid = {$view} AND privilege.grantee <> relation.relowner\n"
+            ."  LOOP\n    EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s', {$view}, revoked);\n  END LOOP;\nEND;\n\$compatibility\$";
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function grantStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
         $grantee = "CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END";
         $option = "CASE WHEN privilege.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END";
+        $installer = '(select oid from pg_roles where rolname = current_user)';
         $view = SqlFragments::identifier($resolvedMap->previousModel->view);
-        $table = SqlFragments::identifier((string) $resolvedMap->previousModel->table);
-
-        $grants = $this->connection->select(
-            "select privilege.privilege_type || ' ON ' || ? || ' TO ' || {$grantee} || {$option} as statement
+        $table = SqlFragments::identifier($retainedTableIsCurrently ?? (string) $resolvedMap->previousModel->table);
+        $columns = array_map(fn (Attribute $attribute) => $attribute->column, $resolvedMap->attributes);
+        $placeholders = implode(', ', array_fill(0, count($columns), '?'));
+        $query = "select privilege.privilege_type || ' ON ' || ? || ' TO ' || {$grantee} || {$option} as statement
              from pg_class relation, aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) privilege
-             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?))
+             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and privilege.grantee <> {$installer}";
+        $bindings = [$view, $table];
+
+        if ($columns !== []) {
+            $query .= "
              union all
              select privilege.privilege_type || ' (' || quote_ident(table_column.attname) || ') ON ' || ? || ' TO ' || {$grantee} || {$option}
-             from pg_attribute table_column
-             join pg_attribute view_column on view_column.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and view_column.attname = table_column.attname and not view_column.attisdropped,
-             aclexplode(table_column.attacl) privilege
+             from pg_attribute table_column, aclexplode(table_column.attacl) privilege
              where table_column.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and table_column.attnum > 0 and not table_column.attisdropped
-               and privilege.grantee <> (select relowner from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?))",
-            [$view, $table, $view, $view, $view, $table, $view],
-        );
-
-        foreach ($grants as $grant) {
-            $this->connection->unprepared('GRANT '.$grant->statement);
+               and table_column.attname in ({$placeholders}) and privilege.grantee <> {$installer}";
+            $bindings = [...$bindings, $view, $table, ...$columns];
         }
+
+        $grants = $this->connection->select($query, $bindings);
+
+        return array_map(fn (object $grant) => 'GRANT '.$grant->statement, array_values($grants));
     }
 
     /**
      * @return list<object{statement: string, column: null|string}>
      */
-    private function viewGrants(ResolvedMap $resolvedMap): array
+    private function viewGrants(ResolvedMap $resolvedMap, string $view): array
     {
-        $view = $this->relation($resolvedMap->previousModel->view);
-
-        if ($view === null) {
-            return [];
-        }
-
         $grantee = "CASE WHEN privilege.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END";
         $option = "CASE WHEN privilege.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END";
         $recompiler = '(select oid from pg_roles where rolname = current_user)';
@@ -224,5 +267,12 @@ final readonly class Installer
         $relation = $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?)::text", [SqlFragments::identifier($name)]);
 
         return is_string($relation) ? $relation : null;
+    }
+
+    private function relationKind(string $name): null|string
+    {
+        $kind = $this->connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($name)]);
+
+        return is_string($kind) ? $kind : null;
     }
 }

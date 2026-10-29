@@ -139,6 +139,24 @@ final class ColumnCatalogTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['retained_widgets', 'widgets'])]
+    #[TestWith(['gadgets', 'gadgets'])]
+    public function it_reads_a_table_from_its_source_or_else_from_its_own_name(string $table, string $source): void
+    {
+        $this->assertSame($source, (new ColumnCatalog(DB::connection(), sources: ['retained_widgets' => 'widgets']))->source($table));
+    }
+
+    #[Test]
+    public function it_reads_the_columns_of_a_table_from_the_source_it_is_currently_named(): void
+    {
+        DB::statement('alter table retained_widgets rename to widgets');
+        $columnCatalog = new ColumnCatalog(DB::connection(), sources: ['retained_widgets' => 'widgets']);
+
+        $this->assertSame(['id', 'uuid', 'sku', 'status', 'gadget_id', 'place_id'], array_keys($columnCatalog->of('retained_widgets')));
+        $this->assertSame('character varying(255)', $columnCatalog->type('retained_widgets', 'sku'));
+    }
+
+    #[Test]
     public function it_reads_the_catalog_once_for_each_table(): void
     {
         $columnCatalog = new ColumnCatalog(DB::connection());

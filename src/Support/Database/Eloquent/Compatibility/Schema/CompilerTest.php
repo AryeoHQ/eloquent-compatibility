@@ -334,6 +334,26 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_compiles_the_retained_table_from_the_name_it_has_before_the_rename(): void
+    {
+        DB::statement('alter table retained_widgets rename to legacy_widgets');
+        $beforeRename = (new Compiler(DB::connection(), ['retained_widgets' => 'legacy_widgets']))->compile(new WidgetCompatibilityMap);
+        DB::statement('alter table legacy_widgets rename to retained_widgets');
+
+        $this->assertEquals($this->compiler()->compile(new WidgetCompatibilityMap), $beforeRename);
+    }
+
+    #[Test]
+    public function it_names_the_retained_table_by_the_name_it_was_read_from_when_that_table_does_not_exist(): void
+    {
+        $this->assertThrows(
+            fn () => (new Compiler(DB::connection(), ['retained_widgets' => 'legacy_widgets']))->compile(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: the retained table legacy_widgets does not exist",
+        );
+    }
+
+    #[Test]
     #[TestWith(['missing_retained_table', 'the retained table no_such_table does not exist'])]
     #[TestWith(['missing_key', 'retained_widgets has no column nope'])]
     #[TestWith(['missing_primary_foreign_key', 'retained_widgets has no column nope'])]

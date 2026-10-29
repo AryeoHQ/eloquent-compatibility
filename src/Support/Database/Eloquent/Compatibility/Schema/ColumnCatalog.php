@@ -14,7 +14,14 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null) {}
+    /**
+     * @param  array<string, string>  $sources
+     */
+    public function __construct(
+        private readonly ConnectionInterface $connection,
+        private readonly null|string $searchPath = null,
+        private readonly array $sources = [],
+    ) {}
 
     /**
      * @return array<string, Column>
@@ -36,6 +43,8 @@ final class ColumnCatalog
                 $row->generated === true,
                 $row->always_generated === true,
                 $row->base_type === null ? null : (string) $row->base_type,
+                $row->default_references_source === true,
+                $row->type_references_source === true,
             );
         }
 
@@ -49,12 +58,14 @@ final class ColumnCatalog
     {
         return $this->connection->select(
             'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
-                    case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, table_relation.relname), table_column.attname)
+                    case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, ?::text), table_column.attname)
                          when table_column.attgenerated = \'\' then coalesce(pg_get_expr(column_default.adbin, column_default.adrelid), column_domain.inherited_default) end as "default",
                     table_column.attnotnull or column_domain.inherited_not_null as not_null,
                     table_column.attidentity <> \'\' or table_column.attgenerated <> \'\' as generated,
                     table_column.attidentity = \'a\' or table_column.attgenerated <> \'\' as always_generated,
-                    column_domain.base_type
+                    column_domain.base_type,
+                    '.$this->referencesSource().' as default_references_source,
+                    '.$this->typeReferencesSource().' as type_references_source
              from pg_attribute table_column
              join pg_class table_relation on table_relation.oid = table_column.attrelid
              join pg_namespace table_schema on table_schema.oid = table_relation.relnamespace
@@ -68,14 +79,63 @@ final class ColumnCatalog
                      where declared.typtype = \'d\'
                  )
                  select (array_agg(pg_get_expr(declared.typdefaultbin, 0) order by domain_chain.depth) filter (where declared.typdefaultbin is not null))[1] as inherited_default,
+                        (array_agg(declared.oid order by domain_chain.depth) filter (where declared.typdefaultbin is not null))[1] as default_domain,
                         coalesce(bool_or(declared.typnotnull), false) as inherited_not_null,
-                        (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type
+                        (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type,
+                        array_agg(declared.typbasetype) as underlying_types
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = \'d\'
              ) column_domain
              where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [SqlFragments::identifier($table)],
+            [$table, ...$this->sourceBindings(), ...$this->sourceBindings(), SqlFragments::identifier($this->source($table))],
         );
+    }
+
+    private function referencesSource(): string
+    {
+        if ($this->sources === []) {
+            return 'false';
+        }
+
+        $sources = $this->sourceRelations();
+
+        return "table_column.attidentity <> 'd' and table_column.attgenerated = '' and exists (
+                 select 1
+                 from pg_depend default_dependency
+                 join pg_class source_relation on source_relation.oid in ({$sources})
+                 left join pg_type source_type on source_type.oid = source_relation.reltype
+                 where default_dependency.deptype = 'n'
+                   and case when column_default.oid is null then default_dependency.classid = 'pg_type'::regclass and default_dependency.objid = column_domain.default_domain
+                            else default_dependency.classid = 'pg_attrdef'::regclass and default_dependency.objid = column_default.oid end
+                   and ((default_dependency.refclassid = 'pg_class'::regclass and default_dependency.refobjid = source_relation.oid)
+                        or (default_dependency.refclassid = 'pg_type'::regclass and default_dependency.refobjid in (source_relation.reltype, source_type.typarray))))";
+    }
+
+    private function typeReferencesSource(): string
+    {
+        if ($this->sources === []) {
+            return 'false';
+        }
+
+        return "exists (
+                 select 1
+                 from pg_class source_relation
+                 join pg_type source_type on source_type.oid = source_relation.reltype
+                 where source_relation.oid in ({$this->sourceRelations()})
+                   and array[source_type.oid, source_type.typarray] && array_prepend(table_column.atttypid, column_domain.underlying_types))";
+    }
+
+    private function sourceRelations(): string
+    {
+        return implode(', ', array_fill(0, count($this->sources), "to_regclass(quote_ident(current_schema()) || '.' || ?)"));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function sourceBindings(): array
+    {
+        return array_map(SqlFragments::identifier(...), array_values($this->sources));
     }
 
     /**
@@ -93,6 +153,11 @@ final class ColumnCatalog
         } finally {
             $this->connection->rollBack();
         }
+    }
+
+    public function source(string $table): string
+    {
+        return $this->sources[$table] ?? $table;
     }
 
     public function type(string $table, string $column): null|string

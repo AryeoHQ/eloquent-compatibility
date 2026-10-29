@@ -21,10 +21,13 @@ final class Compiler
 
     private readonly string $schema;
 
-    public function __construct(ConnectionInterface $connection)
+    /**
+     * @param  array<string, string>  $sources
+     */
+    public function __construct(ConnectionInterface $connection, array $sources = [])
     {
         $this->schema = (string) $connection->scalar('select current_schema()');
-        $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath());
+        $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath(), $sources);
     }
 
     public function compile(CompatibilityMap|ResolvedMap $map): CompiledSql
@@ -109,7 +112,7 @@ final class Compiler
             $default = $attribute->defaultsTo;
 
             if ($default === null && $attribute->storedAs !== null && $attribute->alias !== null && $resolvedMap->dependent($attribute->alias) === null) {
-                $default = $this->columnCatalog->of($resolvedMap->table($attribute->alias))[$attribute->storedAs]->default ?? null;
+                $default = $this->storedDefault($resolvedMap, $resolvedMap->table($attribute->alias), $attribute->storedAs);
             }
 
             $statements[] = 'ALTER VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view)
@@ -117,6 +120,17 @@ final class Compiler
         }
 
         return $statements;
+    }
+
+    private function storedDefault(ResolvedMap $resolvedMap, string $table, string $name): null|string
+    {
+        $column = $this->columnCatalog->of($table)[$name] ?? null;
+
+        if ($column?->defaultReferencesSource === true) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the default of {$table}.{$name} references the retained table by its name before the rename, {$this->columnCatalog->source((string) $resolvedMap->previousModel->table)}; compile the compatibility map after the rename");
+        }
+
+        return $column?->default;
     }
 
     private function insertFunction(ResolvedMap $resolvedMap): string
@@ -484,11 +498,13 @@ final class Compiler
         foreach ($assignments as $assignment) {
             if (! $mappedOnly || ! $assignment->attribute->retained) {
                 $value = $this->value($resolvedMap, $alias, $assignment->targetColumn);
-                $column = $this->columnCatalog->of($resolvedMap->table($alias))[$assignment->targetColumn->column];
+                $table = $resolvedMap->table($alias);
+                $column = $this->columnCatalog->of($table)[$assignment->targetColumn->column];
+                $default = $column->notNull ? $this->storedDefault($resolvedMap, $table, $assignment->targetColumn->column) : null;
                 $values[$assignment->targetColumn->column] = match (true) {
-                    ! $column->notNull || $column->default === null => $value,
-                    $column->baseType === null => 'COALESCE('.$value.', '.$column->default.')',
-                    default => 'CAST((COALESCE(CAST(('.$assignment->targetColumn->expression.') AS '.$column->baseType.'), '.$column->default.')) AS '.$column->type.')',
+                    $default === null => $value,
+                    $column->baseType === null => 'COALESCE('.$value.', '.$default.')',
+                    default => 'CAST((COALESCE(CAST(('.$assignment->targetColumn->expression.') AS '.$column->baseType.'), '.$default.')) AS '.$column->type.')',
                 };
             }
         }
@@ -541,13 +557,17 @@ final class Compiler
     private function value(ResolvedMap $resolvedMap, string $alias, TargetColumn $targetColumn): string
     {
         $table = $resolvedMap->table($alias);
-        $type = $this->columnCatalog->type($table, $targetColumn->column);
+        $column = $this->columnCatalog->of($table)[$targetColumn->column] ?? null;
 
-        if ($type === null) {
+        if ($column === null) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has no column {$targetColumn->column}");
         }
 
-        return 'CAST(('.$targetColumn->expression.') AS '.$type.')';
+        if ($column->typeReferencesSource) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the type of {$table}.{$targetColumn->column} references the retained table by its name before the rename, {$this->columnCatalog->source((string) $resolvedMap->previousModel->table)}; compile the compatibility map after the rename");
+        }
+
+        return 'CAST(('.$targetColumn->expression.') AS '.$column->type.')';
     }
 
     /** @return list<string> */
@@ -726,7 +746,7 @@ final class Compiler
         $columns = $this->columnCatalog->of($table);
 
         if ($columns === []) {
-            throw InvalidCompatibilityMap::because($resolvedMap->name, "the retained table {$table} does not exist");
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the retained table {$this->columnCatalog->source($table)} does not exist");
         }
 
         foreach (array_unique(array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))) as $currentTable) {

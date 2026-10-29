@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Closure;
 use Illuminate\Database\Connection;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
@@ -883,6 +884,69 @@ final class InstallerTest extends TestCase
 
         $this->assertSame('widgets', DB::scalar("select to_regclass('widgets')::text"));
         $this->assertSame('Blue gadget', DB::table('widgets')->where('id', $this->widget())->sole()->title);
+    }
+
+    #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    #[TestWith(['uninstall'])]
+    public function it_runs_the_statements_it_lists_for_each_action_inside_one_transaction(string $for): void
+    {
+        if ($for === 'install') {
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        }
+
+        $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::from($for));
+        $executed = [];
+        DB::listen(function (QueryExecuted $query) use (&$executed): void {
+            if (preg_match('/^(?:select|with recursive) /', $query->sql) !== 1) {
+                $executed[] = [$query->sql, $query->connection->transactionLevel()];
+            }
+        });
+
+        resolve(Installer::class)->{$for}(new WidgetCompatibilityMap);
+
+        $this->assertNotEmpty($listed);
+        $this->assertSame(array_map(fn (string $statement) => [$statement, 1], $listed), $executed);
+    }
+
+    #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    #[TestWith(['uninstall'])]
+    public function it_lists_the_same_statements_for_a_compatibility_map_and_its_resolved_map(string $for): void
+    {
+        if ($for === 'install') {
+            resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        }
+
+        $this->assertSame(
+            resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::from($for)),
+            resolve(Installer::class)->statements(ResolvedMap::of(new WidgetCompatibilityMap), InstallerAction::from($for)),
+        );
+    }
+
+    #[Test]
+    public function it_lists_an_install_from_the_name_the_retained_table_has_before_the_rename(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('alter table retained_widgets rename to widgets');
+        $beforeRename = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Install, 'widgets');
+        DB::statement('alter table widgets rename to retained_widgets');
+
+        $this->assertSame(resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Install), $beforeRename);
+    }
+
+    #[Test]
+    #[TestWith([null])]
+    #[TestWith(['widgets'])]
+    public function it_refuses_to_list_an_install_while_a_view_has_the_compatibility_views_name(null|string $retainedTableIsCurrently): void
+    {
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Install, $retainedTableIsCurrently),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: a relation named widgets already exists; use recompile() to recompile the compatibility map",
+        );
     }
 
     #[Test]
