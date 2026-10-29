@@ -39,7 +39,7 @@ final readonly class Installer
         return match ($for) {
             InstallerAction::Install => $this->installStatements($resolvedMap, $retainedTableIsCurrently),
             InstallerAction::Recompile => $this->recompileStatements($resolvedMap, $retainedTableIsCurrently),
-            InstallerAction::Uninstall => $this->uninstallStatements($resolvedMap),
+            InstallerAction::Uninstall => $this->uninstallStatements($resolvedMap, $retainedTableIsCurrently),
         };
     }
 
@@ -100,7 +100,7 @@ final readonly class Installer
      */
     private function applyStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently, null|string $view): array
     {
-        $sources = $retainedTableIsCurrently === null ? [] : [(string) $resolvedMap->previousModel->table => $retainedTableIsCurrently];
+        $sources = $this->sources($resolvedMap, $retainedTableIsCurrently);
 
         foreach (array_unique([$retainedTableIsCurrently ?? (string) $resolvedMap->previousModel->table, ...array_map($resolvedMap->table(...), array_values($resolvedMap->currentModels()))]) as $table) {
             if ($this->connection->scalar("select relrowsecurity from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($table)]) === true) {
@@ -138,11 +138,20 @@ final readonly class Installer
     /**
      * @return list<string>
      */
-    private function uninstallStatements(ResolvedMap $resolvedMap): array
+    private function uninstallStatements(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
-        $view = $this->relation($resolvedMap->previousModel->view);
+        $view = $resolvedMap->previousModel->view === $retainedTableIsCurrently ? null : $this->relation($resolvedMap->previousModel->view);
+        $drops = $this->dropStatements($resolvedMap, $this->sources($resolvedMap, $retainedTableIsCurrently));
 
-        return $view === null ? $this->dropStatements($resolvedMap, []) : [...$this->dropStatements($resolvedMap, []), 'DROP VIEW '.$view];
+        return $view === null ? $drops : [...$drops, 'DROP VIEW '.$view];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function sources(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
+    {
+        return $retainedTableIsCurrently === null ? [] : [(string) $resolvedMap->previousModel->table => $retainedTableIsCurrently];
     }
 
     /**

@@ -162,6 +162,24 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_compiles_an_uninstall_before_the_rename_with_the_name_the_retained_table_takes_after_it(): void
+    {
+        $map = $this->widgetsRefusedOnTheRetainedTable();
+        resolve(CompatibilityMaps::class)->register($map);
+        resolve(Installer::class)->install($map);
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO legacy_widgets');
+
+        $output = $this->compile(['--for' => 'uninstall', '--retained-table-is-currently' => 'legacy_widgets']);
+
+        DB::unprepared('ALTER TABLE legacy_widgets RENAME TO retained_widgets');
+        $executed = $this->executed(fn () => resolve(Installer::class)->uninstall($map));
+
+        $this->assertStringContainsString('-- The retained table retained_widgets was read from legacy_widgets, its name before the rename', $output);
+        $this->assertContains('DROP TRIGGER IF EXISTS "compatibility__widgets__refuse_blocked_sku" ON retained_widgets', $executed);
+        $this->assertSame($executed, $this->statements($output));
+    }
+
+    #[Test]
     public function it_compiles_a_recompile_before_the_initial_rename_without_taking_the_retained_table_for_the_view(): void
     {
         DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
@@ -441,6 +459,25 @@ final class CompileSqlTest extends TestCase
         $this->artisan('compatibility:sql', ['map' => 'widgets', '--retained-table-is-currently' => 'widgets'])
             ->expectsOutputToContain("Compatibility map 'widgets' is declared wrongly: the default of gadgets.name references the retained table by its name before the rename, widgets; compile the compatibility map after the rename")
             ->assertFailed();
+    }
+
+    #[Test]
+    #[TestWith(['ALTER TABLE gadgets ADD COLUMN snapshot retained_widgets[]'])]
+    #[TestWith(['ALTER TABLE gadgets ADD COLUMN snapshot retained_widgets'])]
+    #[TestWith(['CREATE DOMAIN widget_snapshot AS retained_widgets[]; CREATE DOMAIN gadget_snapshot AS widget_snapshot; ALTER TABLE gadgets ADD COLUMN snapshot gadget_snapshot'])]
+    public function it_refuses_to_compile_before_the_rename_a_column_whose_type_references_the_retained_table(string $column): void
+    {
+        DB::unprepared($column);
+        resolve(CompatibilityMaps::class)->register(new WidgetCompatibilityMap(['delivered_at' => Attribute::mapped('snapshot')->asType('text')->storedAs('gadget', 'snapshot')]));
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+
+        $this->artisan('compatibility:sql', ['map' => 'widgets', '--retained-table-is-currently' => 'widgets'])
+            ->expectsOutputToContain("Compatibility map 'widgets' is declared wrongly: the type of gadgets.snapshot references the retained table by its name before the rename, widgets; compile the compatibility map after the rename")
+            ->assertFailed();
+
+        DB::unprepared('ALTER TABLE widgets RENAME TO retained_widgets');
+
+        $this->assertNotEmpty($this->statements($this->compile()));
     }
 
     #[Test]

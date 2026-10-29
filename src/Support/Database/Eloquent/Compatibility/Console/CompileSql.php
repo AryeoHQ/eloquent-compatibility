@@ -53,7 +53,7 @@ final class CompileSql extends Command
             '-- Compiled at '.now()->toIso8601String(),
         ];
 
-        if ($current !== null && $for !== InstallerAction::Uninstall) {
+        if ($current !== null) {
             $header[] = "-- The retained table {$table} was read from {$current}, its name before the rename";
         }
 

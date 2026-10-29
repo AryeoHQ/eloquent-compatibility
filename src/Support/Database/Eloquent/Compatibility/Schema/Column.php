@@ -14,6 +14,7 @@ final readonly class Column
         public bool $alwaysGenerated = false,
         public null|string $baseType = null,
         public bool $defaultReferencesSource = false,
+        public bool $typeReferencesSource = false,
     ) {}
 
     public function needsAValue(): bool

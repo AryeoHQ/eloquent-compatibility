@@ -557,13 +557,17 @@ final class Compiler
     private function value(ResolvedMap $resolvedMap, string $alias, TargetColumn $targetColumn): string
     {
         $table = $resolvedMap->table($alias);
-        $type = $this->columnCatalog->type($table, $targetColumn->column);
+        $column = $this->columnCatalog->of($table)[$targetColumn->column] ?? null;
 
-        if ($type === null) {
+        if ($column === null) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has no column {$targetColumn->column}");
         }
 
-        return 'CAST(('.$targetColumn->expression.') AS '.$type.')';
+        if ($column->typeReferencesSource) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the type of {$table}.{$targetColumn->column} references the retained table by its name before the rename, {$this->columnCatalog->source((string) $resolvedMap->previousModel->table)}; compile the compatibility map after the rename");
+        }
+
+        return 'CAST(('.$targetColumn->expression.') AS '.$column->type.')';
     }
 
     /** @return list<string> */
