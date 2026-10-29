@@ -29,6 +29,19 @@ final readonly class Installer
         $this->run($map, InstallerAction::Uninstall);
     }
 
+    public function prepare(CompatibilityMap|ResolvedMap $map): void
+    {
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
+
+        if ($this->connection->transactionLevel() > 0) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, 'prepare() builds its indexes with CREATE INDEX CONCURRENTLY, which cannot run inside a transaction; call it outside one, as a migration that sets $withinTransaction = false does');
+        }
+
+        foreach ($this->statements($resolvedMap, InstallerAction::Prepare) as $statement) {
+            $this->connection->unprepared($statement);
+        }
+    }
+
     /**
      * @return list<string>
      */
@@ -40,6 +53,7 @@ final readonly class Installer
             InstallerAction::Install => $this->installStatements($resolvedMap, $retainedTableIsCurrently),
             InstallerAction::Recompile => $this->recompileStatements($resolvedMap, $retainedTableIsCurrently),
             InstallerAction::Uninstall => $this->uninstallStatements($resolvedMap, $retainedTableIsCurrently),
+            InstallerAction::Prepare => (new Compiler($this->connection))->prepare($resolvedMap),
         };
     }
 
@@ -143,7 +157,7 @@ final readonly class Installer
         $view = $resolvedMap->previousModel->view === $retainedTableIsCurrently ? null : $this->relation($resolvedMap->previousModel->view);
         $drops = $this->dropStatements($resolvedMap, $this->sources($resolvedMap, $retainedTableIsCurrently));
 
-        return $view === null ? $drops : [...$drops, 'DROP VIEW '.$view];
+        return [...$drops, ...($view === null ? [] : ['DROP VIEW '.$view]), ...$this->plannerDropStatements($resolvedMap)];
     }
 
     /**
@@ -152,6 +166,31 @@ final readonly class Installer
     private function sources(ResolvedMap $resolvedMap, null|string $retainedTableIsCurrently): array
     {
         return $retainedTableIsCurrently === null ? [] : [(string) $resolvedMap->previousModel->table => $retainedTableIsCurrently];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function plannerDropStatements(ResolvedMap $resolvedMap): array
+    {
+        $prefix = SqlFragments::like($resolvedMap->objectPrefix());
+        $indexes = $this->connection->select(
+            "select index_relation.oid::regclass::text as name
+             from pg_index planner_index join pg_class index_relation on index_relation.oid = planner_index.indexrelid
+             where index_relation.relname like {$prefix} and index_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))
+             order by index_relation.relname",
+        );
+        $statistics = $this->connection->select(
+            "select quote_ident(statistics_namespace.nspname) || '.' || quote_ident(statistics.stxname) as name
+             from pg_statistic_ext statistics join pg_namespace statistics_namespace on statistics_namespace.oid = statistics.stxnamespace
+             where statistics.stxname like {$prefix} and statistics.stxnamespace = to_regnamespace(quote_ident(current_schema()))
+             order by statistics.stxname",
+        );
+
+        return [
+            ...array_map(fn (object $index) => 'DROP INDEX IF EXISTS '.$index->name, $indexes),
+            ...array_map(fn (object $statistic) => 'DROP STATISTICS IF EXISTS '.$statistic->name, $statistics),
+        ];
     }
 
     /**

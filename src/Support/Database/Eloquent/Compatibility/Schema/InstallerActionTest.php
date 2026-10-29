@@ -14,6 +14,6 @@ final class InstallerActionTest extends TestCase
     #[Test]
     public function it_names_each_action_by_the_installer_method_it_lists(): void
     {
-        $this->assertSame(['Install' => 'install', 'Recompile' => 'recompile', 'Uninstall' => 'uninstall'], array_column(InstallerAction::cases(), 'value', 'name'));
+        $this->assertSame(['Install' => 'install', 'Recompile' => 'recompile', 'Uninstall' => 'uninstall', 'Prepare' => 'prepare'], array_column(InstallerAction::cases(), 'value', 'name'));
     }
 }

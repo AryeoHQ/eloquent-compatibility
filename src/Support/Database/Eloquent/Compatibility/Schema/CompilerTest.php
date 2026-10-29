@@ -18,6 +18,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
+use Support\Database\Eloquent\Compatibility\Mapping\PlannerIndex;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
@@ -25,6 +26,7 @@ use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Gadget;
+use Tests\Fixtures\Support\Workbench\Person;
 use Tests\Fixtures\Support\Workbench\ProfileCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
@@ -72,11 +74,11 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['widgets', 6])]
-    #[TestWith(['accounts', 5])]
-    #[TestWith(['profiles', 5])]
-    #[TestWith(['designated', 7])]
-    public function it_compiles_the_view_before_its_trigger_functions_and_the_functions_before_their_triggers(string $map, int $functions): void
+    #[TestWith(['widgets', 6, 1, 1])]
+    #[TestWith(['accounts', 5, 0, 0])]
+    #[TestWith(['profiles', 5, 0, 0])]
+    #[TestWith(['designated', 7, 1, 1])]
+    public function it_compiles_the_view_before_its_trigger_functions_the_functions_before_their_triggers_and_the_triggers_before_the_planner_statements(string $map, int $functions, int $indexes, int $statistics): void
     {
         $compatibilityMap = $this->workbenchMap($map);
         $compiledSql = $this->compiler()->compile($compatibilityMap);
@@ -85,6 +87,8 @@ final class CompilerTest extends TestCase
             DB::scalar('select to_regclass(?) is not null', [SqlFragments::identifier($compatibilityMap->previousModel()->view)]),
             $this->objects('pg_proc', 'proname', $prefix),
             $this->objects('pg_trigger', 'tgname', $prefix),
+            $this->objects('pg_indexes', 'indexname', $prefix),
+            $this->objects('pg_statistic_ext', 'stxname', $prefix),
         ];
 
         $this->runInOrder($compiledSql->view);
@@ -92,8 +96,119 @@ final class CompilerTest extends TestCase
         $this->runInOrder($compiledSql->functions);
         $afterFunctions = $installed();
         $this->runInOrder($compiledSql->triggers);
+        $afterTriggers = $installed();
+        $this->runInOrder($compiledSql->planner);
 
-        $this->assertSame([[true, 0, 0], [true, $functions, 0], [true, $functions, $functions]], [$afterView, $afterFunctions, $installed()]);
+        $this->assertSame(
+            [[true, 0, 0, 0, 0], [true, $functions, 0, 0, 0], [true, $functions, $functions, 0, 0], [true, $functions, $functions, $indexes, $statistics]],
+            [$afterView, $afterFunctions, $afterTriggers, $installed()],
+        );
+    }
+
+    #[Test]
+    public function it_compiles_the_statistics_the_indexes_and_an_analyze_of_the_primary_table_and_builds_the_indexes_concurrently_for_prepare(): void
+    {
+        $statistics = 'CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON '
+            .'(CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), '
+            .'(CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)) FROM "gadgets"';
+        $index = 'IF NOT EXISTS "compatibility__widgets__index_archived_newest" ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC) '
+            .'WHERE CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) IS NULL';
+
+        $this->assertSame([
+            [$statistics, 'CREATE INDEX '.$index, 'ANALYZE "gadgets"'],
+            [$statistics, 'CREATE INDEX CONCURRENTLY '.$index, 'ANALYZE "gadgets"'],
+        ], [$this->compiler()->compile(new WidgetCompatibilityMap)->planner, $this->compiler()->prepare(new WidgetCompatibilityMap)]);
+    }
+
+    #[Test]
+    public function it_compiles_an_index_and_no_statistics_for_a_map_that_converts_no_time_zone(): void
+    {
+        $map = $this->compatibilityMap(['primaryCurrentModel' => PrimaryCurrentModel::for(Person::class)->aliasedAs('person')->indexedBy(PlannerIndex::named('with_email')->on('email')->whereNotNull('email'))], new AccountCompatibilityMap);
+
+        resolve(Installer::class)->install($map);
+
+        $this->assertSame([
+            'CREATE INDEX IF NOT EXISTS "compatibility__accounts__index_with_email" ON "people" (CAST(("email") AS character varying(255))) WHERE CAST(("email") AS character varying(255)) IS NOT NULL',
+            'ANALYZE "people"',
+        ], $this->compiler()->compile($map)->planner);
+        $this->assertSame([1, 0], [$this->objects('pg_indexes', 'indexname', 'compatibility__accounts__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__accounts__')]);
+    }
+
+    #[Test]
+    public function it_compiles_no_planner_statement_for_a_map_that_declares_no_index_and_converts_no_time_zone(): void
+    {
+        $this->assertSame([[], []], [$this->compiler()->compile(new AccountCompatibilityMap)->planner, $this->compiler()->prepare(new AccountCompatibilityMap)]);
+    }
+
+    #[Test]
+    public function it_stores_a_zoned_read_only_attribute_on_an_insert_through_the_view_in_its_time_zone_whatever_the_session_time_zone(): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap([
+            'created_at' => Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC')->readOnlyBecause('A widget keeps the time it was created.'),
+        ]));
+        DB::beginTransaction();
+        DB::statement("set local time zone 'America/Chicago'");
+
+        $id = DB::table('widgets')->insertGetId(['title' => 'Stamped', 'created_at' => '2026-10-28 12:00:00']);
+
+        $this->assertSame(
+            ['2026-10-28 12:00:00', '2026-10-28 12:00:00'],
+            [DB::scalar("select to_char(created_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') from gadgets"), DB::table('widgets')->where('id', $id)->value('created_at')],
+        );
+    }
+
+    #[Test]
+    public function it_defaults_a_zoned_view_column_to_the_default_of_its_column_in_its_time_zone_whatever_the_session_time_zone(): void
+    {
+        DB::statement('alter table gadgets alter column created_at set default now()');
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::beginTransaction();
+        DB::statement("set local time zone 'America/Chicago'");
+
+        DB::table('widgets')->insert(['title' => 'Defaulted']);
+
+        $this->assertSame(
+            ["(now() AT TIME ZONE 'UTC'::text)", true],
+            [
+                DB::scalar("select column_default from information_schema.columns where table_schema = current_schema() and table_name = 'widgets' and column_name = 'created_at'"),
+                DB::scalar('select abs(extract(epoch from created_at - now())) < 1 from gadgets'),
+            ],
+        );
+    }
+
+    #[Test]
+    #[TestWith(['install', 'alter table gadgets alter column delivered_at type timestamp(0) without time zone', 'attribute delivered_at says inTimeZone(), which needs gadgets.delivered_at to be a timestamp with time zone, not timestamp(0) without time zone'])]
+    #[TestWith(['prepare', 'alter table gadgets alter column delivered_at type timestamp(0) without time zone', 'attribute delivered_at says inTimeZone(), which needs gadgets.delivered_at to be a timestamp with time zone, not timestamp(0) without time zone'])]
+    #[TestWith(['install', 'alter table gadgets alter column deleted_at type text', 'attribute deleted_at says inTimeZone(), which needs gadgets.deleted_at to be a timestamp with time zone, not text'])]
+    #[TestWith(['install', 'alter table gadgets drop column updated_at', 'gadgets has no column updated_at'])]
+    #[TestWith(['prepare', 'alter table gadgets drop column updated_at', 'gadgets has no column updated_at'])]
+    #[TestWith(['prepare', 'drop table gadgets cascade', 'the current table gadgets does not exist'])]
+    public function it_refuses_while_it_lists_the_statements_a_zoned_attribute_whose_column_is_missing_or_not_a_timestamp_with_time_zone(string $action, string $change, string $message): void
+    {
+        DB::unprepared($change);
+
+        $this->assertThrows(fn () => resolve(Installer::class)->{$action}(new WidgetCompatibilityMap), InvalidCompatibilityMap::class, "Compatibility map 'widgets' is declared wrongly: {$message}");
+
+        $this->assertSame(
+            [null, 0, 0],
+            [DB::scalar("select to_regclass('widgets')"), $this->objects('pg_indexes', 'indexname', 'compatibility__widgets__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__widgets__')],
+        );
+    }
+
+    #[Test]
+    public function it_converts_a_zoned_attribute_whose_column_is_a_domain_over_a_timestamp_with_time_zone(): void
+    {
+        DB::statement('drop domain if exists delivery_moment cascade');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop domain if exists delivery_moment cascade');
+        });
+        DB::statement('create domain delivery_moment as timestamp(0) with time zone');
+        DB::statement('alter table gadgets alter column delivered_at type delivery_moment');
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        DB::table('widgets')->insert(['title' => 'Delivered', 'delivered_at' => '2026-10-28 12:00:00']);
+
+        $this->assertSame('2026-10-28 12:00:00', DB::table('widgets')->value('delivered_at'));
     }
 
     /**
@@ -452,7 +567,7 @@ final class CompilerTest extends TestCase
         DB::statement('alter table gadgets add column serial_number integer generated always as identity');
         DB::statement('alter table gadget_places add column kind text not null');
         resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
-            ...(new WidgetCompatibilityMap(['created_at' => Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->readOnlyBecause('A widget keeps the time it was created.')]))->attributes(),
+            ...(new WidgetCompatibilityMap(['created_at' => Attribute::mapped('created_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC')->readOnlyBecause('A widget keeps the time it was created.')]))->attributes(),
             Attribute::mapped('grade')->asType('integer')->storedAs('gadget', 'grade')->readOnlyBecause('Grading assigns it.'),
             Attribute::mapped('serial_number')->asType('integer')->storedAs('gadget', 'serial_number')->readOnlyBecause('The database numbers it.'),
             Attribute::mapped('longitude')->asType('numeric(24,12)')->storedAs('site', 'longitude')->readOnlyBecause('A survey sets it.'),

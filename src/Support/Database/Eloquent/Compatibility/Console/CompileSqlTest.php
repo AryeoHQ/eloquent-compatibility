@@ -21,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\InstallerAction;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Tests\Fixtures\Support\Workbench\AccountCompatibilityMap;
 use Tests\Fixtures\Support\Workbench\ItemCompatibilityMap;
@@ -65,11 +66,14 @@ final class CompileSqlTest extends TestCase
     #[TestWith([ItemCompatibilityMap::class, 'install'])]
     #[TestWith([ItemCompatibilityMap::class, 'recompile'])]
     #[TestWith([ItemCompatibilityMap::class, 'uninstall'])]
+    #[TestWith([WidgetCompatibilityMap::class, 'prepare'])]
     public function it_prints_exactly_the_statements_the_installer_then_runs(string $map, string $for): void
     {
         $compatibilityMap = new $map;
 
-        if ($for !== 'install') {
+        if ($for === 'prepare') {
+            $this->leaveTheTestTransaction();
+        } elseif ($for !== 'install') {
             resolve(Installer::class)->install($compatibilityMap);
         }
 
@@ -290,7 +294,7 @@ final class CompileSqlTest extends TestCase
     #[Test]
     #[TestWith(['missing', [], "Compatibility map 'missing' is declared wrongly: no compatibility map with this name is registered."])]
     #[TestWith(['widgets', ['--retained-table-is-currently' => 'listings'], "Compatibility map 'widgets' is declared wrongly: the retained table listings does not exist."])]
-    #[TestWith(['widgets', ['--for' => 'replace'], '--for must be install, recompile, uninstall, not replace.'])]
+    #[TestWith(['widgets', ['--for' => 'replace'], '--for must be install, recompile, uninstall, prepare, not replace.'])]
     public function it_exits_non_zero_with_the_reason_a_compatibility_map_cannot_compile(string $map, array $options, string $message): void
     {
         $this->artisan('compatibility:sql', ['map' => $map, ...$options])
@@ -529,12 +533,25 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_the_statements_of_a_prepare_before_the_rename_without_reading_the_retained_table(): void
+    {
+        DB::unprepared('ALTER TABLE retained_widgets RENAME TO widgets');
+
+        $output = $this->compile(['--for' => 'prepare', '--retained-table-is-currently' => 'widgets']);
+
+        $this->assertStringContainsString('-- compatibility:sql widgets --for=prepare: the statements Installer::prepare() runs for the compatibility map widgets', $output);
+        $this->assertStringNotContainsString('-- The retained table', $output);
+        $this->assertSame(resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Prepare), $this->statements($output));
+    }
+
+    #[Test]
     #[TestWith(['install'])]
     #[TestWith(['recompile'])]
     #[TestWith(['uninstall'])]
+    #[TestWith(['prepare'])]
     public function it_runs_only_catalog_selects(string $for): void
     {
-        if ($for !== 'install') {
+        if (in_array($for, ['recompile', 'uninstall'], true)) {
             resolve(Installer::class)->install(new WidgetCompatibilityMap);
         }
 
@@ -597,6 +614,17 @@ final class CompileSqlTest extends TestCase
                 ];
             }
         };
+    }
+
+    private function leaveTheTestTransaction(): void
+    {
+        DB::rollBack(0);
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::rollBack(0);
+            Tables::drop();
+        });
+        Tables::drop();
+        Tables::create();
     }
 
     /**

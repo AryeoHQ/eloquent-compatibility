@@ -791,6 +791,10 @@ final class InstallerTest extends TestCase
         DB::table('elsewhere.gadgets')->insert(['name' => 'Elsewhere']);
 
         $this->assertSame([1, 1], [$here, DB::table('elsewhere.retained_widgets')->count()]);
+        $this->assertSame([1, 1], [
+            (int) DB::scalar("select count(*) from pg_indexes where schemaname = 'elsewhere' and indexname like 'compatibility\\_\\_widgets\\_\\_%'"),
+            (int) DB::scalar("select count(*) from pg_statistic_ext where stxnamespace = 'elsewhere'::regnamespace and stxname like 'compatibility\\_\\_widgets\\_\\_%'"),
+        ]);
     }
 
     #[Test]
@@ -887,33 +891,155 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['install'])]
-    #[TestWith(['recompile'])]
-    #[TestWith(['uninstall'])]
-    public function it_runs_the_statements_it_lists_for_each_action_inside_one_transaction(string $for): void
+    #[TestWith(['install', 'ANALYZE "gadgets"'])]
+    #[TestWith(['recompile', 'ANALYZE "gadgets"'])]
+    #[TestWith(['uninstall', 'DROP INDEX IF EXISTS compatibility__widgets__index_archived_newest'])]
+    public function it_runs_the_statements_it_lists_for_each_action_inside_one_transaction(string $for, string $planner): void
     {
         if ($for === 'install') {
             resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
         }
 
         $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::from($for));
-        $executed = [];
-        DB::listen(function (QueryExecuted $query) use (&$executed): void {
-            if (preg_match('/^(?:select|with recursive) /', $query->sql) !== 1) {
-                $executed[] = [$query->sql, $query->connection->transactionLevel()];
-            }
-        });
+        $executed = $this->executedWithLevel();
 
         resolve(Installer::class)->{$for}(new WidgetCompatibilityMap);
 
-        $this->assertNotEmpty($listed);
-        $this->assertSame(array_map(fn (string $statement) => [$statement, 1], $listed), $executed);
+        $this->assertContains($planner, $listed);
+        $this->assertSame(array_map(fn (string $statement) => [$statement, 1], $listed), $executed());
+    }
+
+    #[Test]
+    public function it_prepares_each_statement_it_lists_outside_a_transaction_on_the_primary_table_alone(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::statement('alter table retained_widgets rename to widgets');
+
+        try {
+            $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Prepare);
+            $executed = $this->executedWithLevel();
+            resolve(Installer::class)->prepare(new WidgetCompatibilityMap);
+            $prepared = $executed();
+        } finally {
+            DB::statement('alter table widgets rename to retained_widgets');
+        }
+
+        $this->assertContains('ANALYZE "gadgets"', $listed);
+        $this->assertSame(array_map(fn (string $statement) => [$statement, 0], $listed), $prepared);
+        $this->assertSame(['indexes' => 1, 'statistics' => 1], array_map(count(...), $this->plannerObjects()));
+    }
+
+    #[Test]
+    public function it_refuses_to_prepare_inside_a_transaction_and_runs_nothing(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::beginTransaction();
+        $executed = $this->executedWithLevel();
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->prepare(new WidgetCompatibilityMap),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: prepare() builds its indexes with CREATE INDEX CONCURRENTLY, which cannot run inside a transaction; call it outside one, as a migration that sets \$withinTransaction = false does.",
+        );
+
+        $this->assertSame([], $executed());
+        $this->assertSame(['indexes' => [], 'statistics' => []], $this->plannerObjects());
+    }
+
+    #[Test]
+    public function it_creates_nothing_new_when_it_installs_after_a_prepare(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        resolve(Installer::class)->prepare(new WidgetCompatibilityMap);
+        $prepared = $this->plannerObjects();
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $this->assertSame(['indexes' => 1, 'statistics' => 1], array_map(count(...), $prepared));
+        $this->assertSame($prepared, $this->plannerObjects());
+    }
+
+    #[Test]
+    public function it_creates_the_statistics_of_each_zoned_attribute_on_the_primary_table_and_analyzes_it_when_it_installs(): void
+    {
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+        DB::table('gadgets')->insert([['name' => 'Delivered', 'delivered_at' => '2026-10-28 12:00:00+00'], ['name' => 'Waiting', 'delivered_at' => null]]);
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $this->assertSame('gadgets', DB::scalar("select stxrelid::regclass::text from pg_statistic_ext where stxname = 'compatibility__widgets__statistics' and stxnamespace = current_schema()::regnamespace"));
+        $this->assertSame([
+            ['expression' => "((created_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone", 'analyzed' => true],
+            ['expression' => "((deleted_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone", 'analyzed' => true],
+            ['expression' => "((delivered_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone", 'analyzed' => true],
+            ['expression' => "((updated_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone", 'analyzed' => true],
+        ], array_map(fn (object $row) => (array) $row, DB::select(
+            "select expr as expression, null_frac is not null as analyzed from pg_stats_ext_exprs
+             where statistics_schemaname = current_schema() and statistics_name = 'compatibility__widgets__statistics' and tablename = 'gadgets' order by expr",
+        )));
+    }
+
+    #[Test]
+    public function it_creates_each_declared_index_on_the_primary_table_when_it_installs(): void
+    {
+        $this->assertSame(
+            ['indexes' => 1, 'statistics' => 1],
+            array_map(count(...), $this->plannerObjects()),
+        );
+        $this->assertSame(
+            "CREATE INDEX compatibility__widgets__index_archived_newest ON public.gadgets USING btree (archived, (((created_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone) DESC) WHERE (((deleted_at AT TIME ZONE 'UTC'::text))::timestamp(0) without time zone IS NULL)",
+            DB::scalar("select indexdef from pg_indexes where schemaname = current_schema() and indexname = 'compatibility__widgets__index_archived_newest'"),
+        );
+    }
+
+    #[Test]
+    public function it_lets_a_query_on_the_view_that_filters_and_sorts_on_the_indexed_attributes_use_the_index(): void
+    {
+        DB::beginTransaction();
+        DB::statement('set local enable_seqscan = off');
+
+        $plan = array_map(fn (object $line) => (string) $line->{'QUERY PLAN'}, DB::select('explain select * from widgets where is_archived = false and deleted_at is null order by created_at desc limit 25'));
+
+        $this->assertStringContainsString('compatibility__widgets__index_archived_newest on gadgets', implode("\n", $plan));
+    }
+
+    #[Test]
+    public function it_drops_the_maps_statistics_and_indexes_and_no_other_index_when_it_uninstalls(): void
+    {
+        DB::statement('create index gadgets_name_index on gadgets (name)');
+        $listed = resolve(Installer::class)->statements(new WidgetCompatibilityMap, InstallerAction::Uninstall);
+
+        resolve(Installer::class)->uninstall(new WidgetCompatibilityMap);
+
+        $this->assertSame(
+            ['DROP VIEW widgets', 'DROP INDEX IF EXISTS compatibility__widgets__index_archived_newest', 'DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics'],
+            array_slice($listed, -3),
+        );
+        $this->assertSame(['indexes' => [], 'statistics' => []], $this->plannerObjects());
+        $this->assertSame(['gadgets_name_index', 'gadgets_pkey'], array_map(fn (object $index) => (string) $index->indexname, DB::select("select indexname from pg_indexes where schemaname = current_schema() and tablename = 'gadgets' order by 1")));
+    }
+
+    #[Test]
+    #[TestWith(['indexes', 'drop index compatibility__widgets__index_archived_newest', 'statistics'])]
+    #[TestWith(['statistics', 'drop statistics compatibility__widgets__statistics', 'indexes'])]
+    public function it_keeps_the_maps_statistics_and_indexes_and_creates_a_missing_one_when_it_recompiles(string $missing, string $drop, string $kept): void
+    {
+        $installed = $this->plannerObjects();
+        DB::statement($drop);
+
+        resolve(Installer::class)->recompile(new WidgetCompatibilityMap);
+        $recompiled = $this->plannerObjects();
+
+        $this->assertSame($installed[$kept], $recompiled[$kept]);
+        $this->assertCount(1, $recompiled[$missing]);
+        $this->assertNotSame($installed[$missing], $recompiled[$missing]);
     }
 
     #[Test]
     #[TestWith(['install'])]
     #[TestWith(['recompile'])]
     #[TestWith(['uninstall'])]
+    #[TestWith(['prepare'])]
     public function it_lists_the_same_statements_for_a_compatibility_map_and_its_resolved_map(string $for): void
     {
         if ($for === 'install') {
@@ -1005,11 +1131,18 @@ final class InstallerTest extends TestCase
     public function it_compiles_only_full_word_aliases_variables_and_object_names(): void
     {
         foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
-            $sql = implode("\n", (new Compiler(DB::connection()))->compile($map)->statements());
+            $resolvedMap = ResolvedMap::of($map);
+            $sql = implode("\n", [...(new Compiler(DB::connection()))->compile($map)->statements(), ...(new Compiler(DB::connection()))->prepare($map)]);
             preg_match_all('/\b(?:FROM|JOIN|UPDATE)\s+"?[a-z_][a-z0-9_]*"?\s+(?:AS\s+)?([a-z_][a-z0-9_]*)/i', $sql, $relations);
             preg_match_all('/\)\s+AS\s+([a-z_][a-z0-9_]*)\s+WHERE/', $sql, $rows);
             preg_match_all('/^\s+([a-z_][a-z0-9_]*)\s+(?:\S+%(?:ROW)?TYPE|integer);$/m', $sql, $variables);
             preg_match_all('/"(compatibility__[a-z0-9_]+)"/', $sql, $objects);
+            $planner = [
+                ...($resolvedMap->statisticsExpressions() === [] ? [] : [$resolvedMap->statisticsName()]),
+                ...array_map($resolvedMap->indexName(...), $resolvedMap->primaryCurrentModel->indexes),
+            ];
+
+            $this->assertSame($planner, array_values(array_intersect($planner, $objects[1])));
 
             $identifiers = [
                 ...ResolvedMap::of($map)->aliases(),
@@ -1179,6 +1312,37 @@ final class InstallerTest extends TestCase
     private function objects(string $catalog, string $column): int
     {
         return (int) DB::scalar("select count(*) from {$catalog} where {$column} like 'compatibility\\_\\_widgets\\_\\_%'");
+    }
+
+    /**
+     * @return array{indexes: list<int>, statistics: list<int>}
+     */
+    private function plannerObjects(): array
+    {
+        $oids = fn (string $query) => array_map(fn (object $row) => (int) $row->oid, DB::select($query));
+
+        return [
+            'indexes' => $oids("select index_relation.oid from pg_index planner_index join pg_class index_relation on index_relation.oid = planner_index.indexrelid
+                where index_relation.relname like 'compatibility\\_\\_widgets\\_\\_%' and index_relation.relnamespace = current_schema()::regnamespace order by 1"),
+            'statistics' => $oids("select oid from pg_statistic_ext where stxname like 'compatibility\\_\\_widgets\\_\\_%' and stxnamespace = current_schema()::regnamespace order by 1"),
+        ];
+    }
+
+    /**
+     * @return Closure(): list<array{string, int}>
+     */
+    private function executedWithLevel(): Closure
+    {
+        $executed = [];
+        DB::listen(function (QueryExecuted $query) use (&$executed): void {
+            if (preg_match('/^(?:select|with recursive) /', $query->sql) !== 1) {
+                $executed[] = [$query->sql, $query->connection->transactionLevel()];
+            }
+        });
+
+        return function () use (&$executed): array {
+            return $executed;
+        };
     }
 
     private function lockOutcome(Connection $concurrent, string $table): string

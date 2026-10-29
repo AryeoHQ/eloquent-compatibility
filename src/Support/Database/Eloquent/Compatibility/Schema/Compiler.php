@@ -17,6 +17,8 @@ use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableStateKind;
 
 final class Compiler
 {
+    private const string TIMESTAMP_WITH_TIME_ZONE = '/^timestamp(?:\(\d+\))? with time zone$/';
+
     private readonly ColumnCatalog $columnCatalog;
 
     private readonly string $schema;
@@ -65,7 +67,52 @@ final class Compiler
             [$this->view($resolvedMap), ...$this->defaults($resolvedMap)],
             $statements,
             $this->triggers($resolvedMap),
+            $this->planner($resolvedMap, false),
         );
+    }
+
+    /** @return list<string> */
+    public function prepare(CompatibilityMap|ResolvedMap $map): array
+    {
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
+        $statements = $this->planner($resolvedMap, true);
+
+        if ($statements === []) {
+            return [];
+        }
+
+        $table = $resolvedMap->primaryTable();
+
+        if ($this->columnCatalog->of($table) === []) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "the current table {$table} does not exist");
+        }
+
+        foreach ($resolvedMap->attributes as $attribute) {
+            if ($attribute->alias === $resolvedMap->primaryCurrentModel->alias) {
+                $this->validateTimeZone($resolvedMap, $attribute);
+            }
+        }
+
+        return $statements;
+    }
+
+    /** @return list<string> */
+    private function planner(ResolvedMap $resolvedMap, bool $concurrently): array
+    {
+        $table = SqlFragments::identifier($resolvedMap->primaryTable());
+        $expressions = $resolvedMap->statisticsExpressions();
+        $statements = $expressions === [] ? [] : [
+            'CREATE STATISTICS IF NOT EXISTS '.SqlFragments::identifier($resolvedMap->statisticsName())
+                .' ON '.implode(', ', array_map(fn (string $expression) => '('.$expression.')', $expressions)).' FROM '.$table,
+        ];
+
+        foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
+            $filter = $resolvedMap->indexFilter($index);
+            $statements[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($resolvedMap->indexName($index))
+                .' ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
+        }
+
+        return $statements === [] ? [] : [...$statements, 'ANALYZE '.$table];
     }
 
     private function view(ResolvedMap $resolvedMap): string
@@ -113,6 +160,7 @@ final class Compiler
 
             if ($default === null && $attribute->storedAs !== null && $attribute->alias !== null && $resolvedMap->dependent($attribute->alias) === null) {
                 $default = $this->storedDefault($resolvedMap, $resolvedMap->table($attribute->alias), $attribute->storedAs);
+                $default = $default === null || $attribute->timeZone === null ? $default : $this->inTimeZone($attribute, '('.$default.')');
             }
 
             $statements[] = 'ALTER VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view)
@@ -479,7 +527,7 @@ final class Compiler
             if (! $attribute->retained && $attribute->alias === $alias && $attribute->storedAs !== null && $attribute->writesTo === []
                 && ! $resolvedMap->writes($alias, $attribute->storedAs)
                 && ! ($this->columnCatalog->of($resolvedMap->table($alias))[$attribute->storedAs]->alwaysGenerated ?? false)) {
-                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, 'NEW.'.SqlFragments::identifier($attribute->column)));
+                $assignments[] = new Assignment($attribute, new TargetColumn($alias, $attribute->storedAs, $this->inTimeZone($attribute, 'NEW.'.SqlFragments::identifier($attribute->column))));
             }
         }
 
@@ -716,6 +764,11 @@ final class Compiler
         return SqlFragments::identifier($this->schema).', pg_temp';
     }
 
+    private function inTimeZone(Attribute $attribute, string $expression): string
+    {
+        return $attribute->timeZone === null ? $expression : $expression.' AT TIME ZONE '.SqlFragments::literal($attribute->timeZone);
+    }
+
     private function compared(ResolvedMap $resolvedMap, Attribute $attribute, string $expression): string
     {
         return $this->comparesAsText($resolvedMap, $attribute) ? '('.$expression.')::text' : $expression;
@@ -791,6 +844,28 @@ final class Compiler
             if ($this->columnCatalog->type($dependentTable, $resolvedMap->primaryForeignKey($dependent)) === null) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, $dependentTable.' has no column '.$resolvedMap->primaryForeignKey($dependent));
             }
+        }
+
+        foreach ($resolvedMap->attributes as $attribute) {
+            $this->validateTimeZone($resolvedMap, $attribute);
+        }
+    }
+
+    private function validateTimeZone(ResolvedMap $resolvedMap, Attribute $attribute): void
+    {
+        if ($attribute->timeZone === null || $attribute->alias === null || $attribute->storedAs === null) {
+            return;
+        }
+
+        $table = $resolvedMap->table($attribute->alias);
+        $column = $this->columnCatalog->of($table)[$attribute->storedAs] ?? null;
+
+        if ($column === null) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has no column {$attribute->storedAs}");
+        }
+
+        if (preg_match(self::TIMESTAMP_WITH_TIME_ZONE, $column->baseType ?? $column->type) !== 1) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone(), which needs {$table}.{$attribute->storedAs} to be a timestamp with time zone, not {$column->type}");
         }
     }
 

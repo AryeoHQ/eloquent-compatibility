@@ -9,4 +9,5 @@ enum InstallerAction: string
     case Install = 'install';
     case Recompile = 'recompile';
     case Uninstall = 'uninstall';
+    case Prepare = 'prepare';
 }
