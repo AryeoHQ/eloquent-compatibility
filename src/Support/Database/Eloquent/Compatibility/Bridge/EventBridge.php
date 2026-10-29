@@ -15,8 +15,10 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use ReflectionMethod;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Connections\DispatchesQueryFailed;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityConnectionUnsupported;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
@@ -245,7 +247,7 @@ final class EventBridge
 
     private function begin(Connection $connection, Model $model, Operation $operation): PendingMirroredWrite
     {
-        $this->watch($connection);
+        $this->watch($connection, $model);
         $this->finishFailed($connection);
         unset($this->armed[(string) $connection->getName()]);
         $pendingWrite = new PendingMirroredWrite($model, $operation, Model::getEventDispatcher(), $this->depth);
@@ -306,10 +308,23 @@ final class EventBridge
         }
     }
 
-    private function watch(Connection $connection): void
+    private function watch(Connection $connection, Model $model): void
     {
         if ($this->watched[$connection] ?? false) {
             return;
+        }
+
+        if (! in_array(DispatchesQueryFailed::class, class_uses_recursive($connection), true) || ! method_exists($connection, 'registerEventBridge')) {
+            throw CompatibilityConnectionUnsupported::byMissingTrait($this->maps($model), $connection);
+        }
+
+        foreach (['beforeExecuting', 'handleQueryException', 'registerEventBridge', 'runQueryCallback'] as $method) {
+            $resolved = new ReflectionMethod($connection, $method);
+            $trait = new ReflectionMethod(DispatchesQueryFailed::class, $method);
+
+            if ($resolved->getFileName() !== $trait->getFileName() || $resolved->getStartLine() !== $trait->getStartLine()) {
+                throw CompatibilityConnectionUnsupported::byOverride($this->maps($model), $connection, $method, $resolved->getDeclaringClass()->getName());
+            }
         }
 
         $this->watched[$connection] = true;
@@ -318,41 +333,88 @@ final class EventBridge
                 $this->finishFailed($connection);
             }
         });
-        $connection->beforeExecuting(function (string $query, array $bindings, Connection $connection): void {
-            if ($this->internal > 0) {
-                return;
+        $connection->registerEventBridge($this->startStatement(...), $this->openStatement(...), $this->handleFailure(...));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $bindings
+     */
+    private function startStatement(string $query, array $bindings, Connection $connection): null|PendingMirroredWrite
+    {
+        if ($this->internal > 0) {
+            return null;
+        }
+
+        $name = (string) $connection->getName();
+        $armed = $this->armed[$name] ?? null;
+        $armed = $armed !== null && $this->writesTo($query, $armed) ? $armed : null;
+
+        if ($armed !== null) {
+            unset($this->armed[$name]);
+        }
+
+        $this->closeFailedAbove($connection, $armed);
+
+        return $armed;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $bindings
+     */
+    private function openStatement(null|PendingMirroredWrite $taken, string $query, array $bindings, Connection $connection): null|PendingMirroredWrite
+    {
+        $name = (string) $connection->getName();
+
+        if ($taken === null || ! in_array($taken, $this->pendingWrites[$name] ?? [], true)) {
+            return null;
+        }
+
+        $this->closeFailedAbove($connection, $taken);
+
+        if ($this->top($name) === $taken) {
+            foreach ($this->pendingWrites[$name] ?? [] as $stale) {
+                if ($stale !== $taken && $stale->source === $taken->source && $stale->operation === $taken->operation && $stale->depth === $taken->depth && ! $stale->claimed && ! $stale->statementSent) {
+                    $this->forget($connection, $stale);
+                }
             }
 
-            $name = (string) $connection->getName();
-            $armed = $this->armed[$name] ?? null;
-            $armed = $armed !== null && $this->writesTo($query, $armed) ? $armed : null;
+            $this->open($connection, $taken, $query, $bindings);
 
-            if ($armed !== null) {
-                unset($this->armed[$name]);
-            }
+            return $taken;
+        }
 
-            while (($pendingWrite = $this->top($name)) !== null && $pendingWrite !== $armed) {
-                if ($pendingWrite->pending && $pendingWrite->statementSent) {
-                    if (! $this->closeFailed($connection, $pendingWrite, false)) {
-                        break;
-                    }
-                } elseif ($armed !== null) {
-                    $this->forget($connection, $pendingWrite);
-                } else {
+        return null;
+    }
+
+    private function handleFailure(null|PendingMirroredWrite $pendingWrite, Connection $connection): void
+    {
+        if ($pendingWrite === null || $this->internal > 0 || ! $pendingWrite->pending || ! $pendingWrite->statementSent || $pendingWrite->failed || $this->top($connection->getName()) !== $pendingWrite || $pendingWrite->source->getConnection() !== $connection) {
+            return;
+        }
+
+        $pendingWrite->failed = true;
+
+        try {
+            $this->closeFailed($connection, $pendingWrite, false);
+        } catch (Throwable) {
+        }
+    }
+
+    private function closeFailedAbove(Connection $connection, null|PendingMirroredWrite $armed): void
+    {
+        $name = (string) $connection->getName();
+
+        while (($pendingWrite = $this->top($name)) !== null && $pendingWrite !== $armed) {
+            if ($pendingWrite->pending && $pendingWrite->statementSent) {
+                if (! $this->closeFailed($connection, $pendingWrite, false)) {
                     return;
                 }
+            } elseif ($armed !== null) {
+                $this->forget($connection, $pendingWrite);
+            } else {
+                return;
             }
-
-            if ($armed !== null && $this->top($name) === $armed) {
-                foreach ($this->pendingWrites[$name] ?? [] as $stale) {
-                    if ($stale !== $armed && $stale->source === $armed->source && $stale->operation === $armed->operation && $stale->depth === $armed->depth && ! $stale->claimed && ! $stale->statementSent) {
-                        $this->forget($connection, $stale);
-                    }
-                }
-
-                $this->open($connection, $armed, $query, $bindings);
-            }
-        });
+        }
     }
 
     private function writesTo(string $query, PendingMirroredWrite $armed): bool
@@ -514,7 +576,7 @@ final class EventBridge
             }
 
             if ($pendingWrite->pending && $pendingWrite->statementSent) {
-                $this->endTransaction($connection, $pendingWrite, true);
+                $this->endTransaction($connection, $pendingWrite, ! $pendingWrite->failed);
             }
 
             $this->forget($connection, $pendingWrite);
@@ -545,7 +607,7 @@ final class EventBridge
             return false;
         }
 
-        $healthy = $this->internally(function () use ($connection): bool {
+        $healthy = ($pendingWrite->savepoint !== null || ! $pendingWrite->failed) && $this->internally(function () use ($connection): bool {
             try {
                 $connection->select('select 1');
 
@@ -555,14 +617,18 @@ final class EventBridge
             }
         });
 
-        if ($healthy && ! $releasing) {
-            return false;
-        }
-
         if ($pendingWrite->savepoint === null) {
+            if ($healthy && ! $releasing) {
+                return false;
+            }
+
             $this->close($connection, $pendingWrite, $healthy);
-        } else {
+        } elseif (! $healthy) {
             $this->forget($connection, $pendingWrite);
+        } elseif ($pendingWrite->failed && $level === $held) {
+            $this->close($connection, $pendingWrite, false);
+        } else {
+            return false;
         }
 
         return true;
@@ -604,11 +670,16 @@ final class EventBridge
             }
         } catch (Throwable $e) {
             try {
-                if ($pendingWrite->savepoint === null && $connection->transactionLevel() > $pendingWrite->transactionLevel) {
+                if ($commit && $pendingWrite->savepoint === null && $connection->transactionLevel() > $pendingWrite->transactionLevel) {
                     $connection->rollBack($pendingWrite->transactionLevel);
                 }
             } finally {
-                $this->forget($connection, $pendingWrite);
+                if ($pendingWrite->savepoint === null && $connection->transactionLevel() > $pendingWrite->transactionLevel) {
+                    $pendingWrite->pending = true;
+                    $pendingWrite->failed = true;
+                } else {
+                    $this->forget($connection, $pendingWrite);
+                }
             }
 
             throw $e;

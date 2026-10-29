@@ -42,7 +42,7 @@ Any other result keeps the write. That covers a direct listener that returns a v
 
 The dispatch depth tells a write's own events from those of a write its listeners make. Eloquent fires a write's beginning event and its created, updated, deleted or saved event from one method, so they see the same depth. A listener's write runs inside a dispatch, at least one level deeper. The write records the depth of its beginning event in `PendingMirroredWrite::$depth`. The depth goes back down in a `finally` block, so a throw cannot leave it raised.
 
-Besides the model events, the bridge listens only for `QueryExecuted`.
+Besides the model events, the bridge listens only for `QueryExecuted`. The connection trait calls the bridge directly when a statement fails, before it raises `QueryFailed`, as [failure and rollback](failure-and-rollback.md#the-immediate-release) describes.
 
 ## The model contract
 
@@ -57,7 +57,7 @@ Each method hands the model to `EventBridge::markOwnStatement()`, with the save 
 
 At the start of a beginning event, before any listener runs, the private `EventBridge::begin()` prepares the connection and records the write:
 
-1. It adds a `Connection::beforeExecuting()` callback, once per connection, through `EventBridge::watch()`.
+1. Once per connection, `EventBridge::watch()` hands the connection trait two `beforeExecuting` callbacks and a release, through `DispatchesQueryFailed::registerEventBridge()`. Before that, it refuses a connection whose class does not use `Connections\DispatchesQueryFailed`, or replaces one of its methods, with `CompatibilityConnectionUnsupported`. [INV-19](../invariants.md#inv-19-a-failed-write-at-level-0-releases-its-transaction) records the rule.
 2. It closes any write a failed statement left behind, through `EventBridge::finishFailed()`. It closes only a write whose statement started.
 3. It drops the connection's armed write, whose statement never came.
 4. It pushes a `PendingMirroredWrite` onto the connection's stack, with the model dispatcher and the dispatch depth. It opens nothing yet.
@@ -72,22 +72,26 @@ Each connection holds one armed write at a time. An insert arms its write at onc
 
 ## Opening at the statement
 
-The bridge opens the armed write when the connection starts the write's statement. Its `beforeExecuting` callback sees each statement before it runs. It takes the armed write only for an `INSERT`, `UPDATE` or `DELETE` on the model's own table, written as the model's query grammar writes that table. Any other statement leaves the write armed. A `SELECT` or an audit insert into another table that an earlier `beforeExecuting` callback runs first is one example. That callback's write to the model's own table would still take the armed write, a limit [INV-33](../invariants.md#inv-33-a-pending-mirrored-write-completes-only-on-its-own-statement) records.
+The bridge opens the armed write when the connection starts the write's statement, through two `beforeExecuting` callbacks. The connection trait holds every other `beforeExecuting` callback in a list of its own, and gives Laravel one callback. For each statement, that callback runs `EventBridge::startStatement()`, then every other callback in registration order, then `EventBridge::openStatement()`. `EventBridge::startStatement()` takes the armed write for its statement. It takes it only for an `INSERT`, `UPDATE` or `DELETE` on the model's own table, written as the model's query grammar writes that table. Any other statement leaves the write armed, such as a `SELECT` a later `beforeQuery` callback runs first. `EventBridge::openStatement()` opens the write that `EventBridge::startStatement()` took in the same call. So every other `beforeExecuting` callback runs before the bridge's transaction exists, as it would without the bridge. A statement such a callback runs finds no armed write, even a write to the model's own table. [INV-33](../invariants.md#inv-33-a-pending-mirrored-write-completes-only-on-its-own-statement) records the limits.
 
-First, the callback cleans the top of the stack. For each write there whose statement started, the private `EventBridge::closeFailed()` runs `select 1`:
+First, `EventBridge::startStatement()` cleans the top of the stack. For each write there whose statement started, the private `EventBridge::closeFailed()` runs `select 1`:
 
 - A failure means the write's statement failed, so the callback closes or forgets the write and goes on.
-- A healthy transaction means the write's own statement is still running, and the callback stops. A later `beforeExecuting` callback, or a `QueryExecuted` listener registered before the bridge's, runs such a statement. The write stays open.
+- A healthy transaction means the write's own statement is still running, and the callback stops. A `QueryExecuted` listener registered before the bridge's runs such a statement. The write stays open.
 
-With an armed write, the callback also forgets each other write above it. Each of those is a write whose method has returned without its statement, such as a write whose cast threw after its beginning event. It also forgets each unclaimed, unsent write of the armed write's instance and operation at its depth. Such a write is an earlier attempt that threw before its mark, such as a delete whose `touchOwners()` failed. Without an armed write, the statement belongs to a listener or another write, and the stack stays as it is.
+With a taken write, the callback also forgets each other write above it. Each of those is a write whose method has returned without its statement, such as a write whose cast threw after its beginning event. Without a taken write, the statement belongs to a listener or another write, and the stack stays as it is. The callback then returns the taken write, or null, and the trait's callback holds it for the rest of the call.
 
-The private `EventBridge::open()` then opens the armed write:
+Every other `beforeExecuting` callback runs next, with the same SQL and bindings. One can rewrite them by reference, and Laravel then runs the rewritten statement. One can make a mirrored write of its own, such as an insert of another mapped model. That inner write replaces the armed write. Its statement makes a call of its own, so the inner write opens and closes on that statement. It commits before the outer write opens, outside the outer write's transaction, as it would without the bridge.
 
-1. It records that the statement started, with its SQL and bindings.
+`EventBridge::openStatement()` then receives the taken write from the same call, with the final SQL and bindings. A throw before then ends the call, so a stopped statement leaves no taken write for a later statement. It cleans the top of the stack again, because another callback can leave a write there. It also forgets each unclaimed, unsent write of the taken write's instance and operation at its depth. Such a write is an earlier attempt that threw before its mark, such as a delete whose `touchOwners()` failed.
+
+The private `EventBridge::open()` then opens the taken write:
+
+1. It records that the statement started, with its final SQL and bindings.
 2. At transaction level 0, it opens a transaction. Above it, it issues `SAVEPOINT compatibility_<n>`, which Laravel's transaction level does not count.
 3. It finds the affected records, locks them and reads each into a record snapshot, as the next two sections describe.
 
-A throw in step 3 rolls the transaction or savepoint back and rethrows, so the statement never runs. A throw between the beginning event and the statement, such as a cast or a later listener, opens nothing at all. [INV-34](../invariants.md#inv-34-a-pending-mirrored-write-opens-at-its-statement) records the rule.
+A throw in step 3 rolls the transaction or savepoint back and rethrows, so the statement never runs. A throw between the beginning event and the statement opens nothing at all. A cast, a later listener and another `beforeExecuting` callback can throw there. [INV-34](../invariants.md#inv-34-a-pending-mirrored-write-opens-at-its-statement) records the rule.
 
 A listener on the beginning event can write another mapped model. That write begins, opens, completes and closes on top of the stack, before the outer write's statement starts. The cleanup leaves the outer write alone, because its statement has not started. A `QueryExecuted` listener registered before the bridge's can also write another mapped model after the outer statement. The cleanup then finds the outer transaction healthy, and leaves the outer write open.
 
@@ -184,4 +188,4 @@ A native write inside a mirrored listener begins its own write, on top of the st
 
 The private `EventBridge::guard()` catches a test that fakes model events. The mark runs it when the model has no write to claim. It throws `CompatibilityEventMirrorBypassed::byFakedDispatcher()` when `Model::getEventDispatcher()` is an `EventFake` that recorded this instance's beginning event. The throw comes before the statement, so the write never reaches the database. A model in no mirrored map writes freely, and a raw write runs no model method, so neither throws.
 
-The bridge marks its own statements through `EventBridge::internally()`, and its `QueryExecuted` handler and `beforeExecuting` callback ignore them. The bridge's commit and rollback run outside that mark.
+The bridge marks its own statements through `EventBridge::internally()`, and its `QueryExecuted` handler, its `beforeExecuting` callbacks and its release ignore them. The bridge's commit and rollback run outside that mark.

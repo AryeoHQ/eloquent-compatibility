@@ -30,6 +30,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **exclusion**: the excluded listeners in force for one mirrored dispatch, or for one model event of the instance a trigger runs on; an `Exclusion`.
 - **finishing event**: a created, saved, updated or deleted model event. The event bridge pairs it with the instance's pending mirrored write at the same dispatch depth, or with none. `ModelEvent::finishing()` leaves created out, and the bridge adds it.
 - **hide**: an unrepresentable state the view and the drift check leave out.
+- **immediate release**: the event bridge rolling back a failed level-0 write as soon as its statement fails, before the connection trait raises `QueryFailed`; see `EventBridge::handleFailure()`.
 - **installer action**: install, recompile or uninstall, the three Installer methods whose statements `Installer::statements()` lists; an `InstallerAction`.
 - **key translator**: the part of the event bridge that turns a previous key into current keys and back; `KeyTranslator`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
@@ -47,6 +48,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.
+- **query failed event**: the event `QueryFailed`, which a connection that uses `DispatchesQueryFailed` raises once for each statement that fails with a `QueryException`.
 - **readable condition**: the SQL condition a dependent row meets for the previous model to read it; see `DependentCurrentModel::readableWhen()`.
 - **record role**: whether an affected record is primary, previous or dependent, which sets its lock order; `RecordRole`.
 - **record snapshot**: an affected record with its row at one moment, as the event bridge read it; a `RecordSnapshot`. The statement's snapshot is a different thing: the committed data PostgreSQL shows a statement.
@@ -59,6 +61,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **savepoint mode**: how the event bridge works inside a caller's transaction, in a `compatibility_<n>` savepoint.
 - **state column**: a column a model casts to a state machine enum, one that implements `StateMachineable`.
 - **state machine trigger**: the class that performs one transition of a state machine, a subclass of `Trigger`. It is not a database trigger.
+- **taken write**: the armed write that the event bridge's first `beforeExecuting` callback takes for its statement, and its last opens in the same call; see `EventBridge::startStatement()`.
 - **target column**: a column an attribute writes, with the SQL expression for its value; a `TargetColumn`.
 - **transition replay**: the event bridge running the state machine trigger of a state change made through the other side, with `Trigger::withoutTransition()` so that the trigger does not store the state again; see `EventReplayer::transition()`.
 - **trigger function**: one of the five fixed PL/pgSQL functions every map compiles to; a `TriggerFunction` case.

@@ -15,6 +15,8 @@ final class PendingMirroredWrite
 
     public bool $statementSent = false;
 
+    public bool $failed = false;
+
     public null|string $table = null;
 
     public null|string $statement = null;
