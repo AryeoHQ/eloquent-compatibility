@@ -474,6 +474,43 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    public function it_exposes_each_statistics_expression_once_in_the_order_first_seen_when_two_zoned_attributes_read_one_column(): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+            $this->createdOn(),
+            ...(new WidgetCompatibilityMap)->attributes(),
+        ]]));
+
+        $this->assertSame([
+            'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+        ], $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
+    public function it_refuses_more_distinct_statistics_expressions_than_one_postgresql_statistics_object_holds(): void
+    {
+        $this->expectInvalidMap(
+            "Compatibility map 'widgets' is declared wrongly: inTimeZone() gives primary current model 'gadget' 9 distinct statistics expressions, and a PostgreSQL statistics object holds at most 8; convert at most 8 of its columns.",
+            ['attributes' => [...(new WidgetCompatibilityMap)->attributes(), ...$this->zonedGadgetAttributes(['packed_at', 'shipped_at', 'invoiced_at', 'returned_at', 'audited_at'])]],
+        );
+    }
+
+    #[Test]
+    public function it_accepts_eight_distinct_statistics_expressions_from_more_zoned_attributes(): void
+    {
+        $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            ...$this->zonedGadgetAttributes(['packed_at', 'shipped_at', 'invoiced_at', 'returned_at']),
+            $this->createdOn(),
+        ]]));
+
+        $this->assertCount(8, $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
     #[TestWith(['delivered_at'])]
     #[TestWith(['sku'])]
     public function it_refuses_a_time_zone_on_an_attribute_without_a_stored_column(string $attribute): void
@@ -597,6 +634,20 @@ final class ResolvedMapTest extends TestCase
     private function unindexedGadget(): PrimaryCurrentModel
     {
         return PrimaryCurrentModel::for(Gadget::class)->aliasedAs('gadget')->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())']);
+    }
+
+    private function createdOn(): Attribute
+    {
+        return Attribute::mapped('created_on')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC')->readOnlyBecause('A widget shows the time it was created under a second name.');
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return list<Attribute>
+     */
+    private function zonedGadgetAttributes(array $columns): array
+    {
+        return array_map(fn (string $column) => Attribute::mapped($column)->asType('timestamp(0) without time zone')->storedAs('gadget', $column)->inTimeZone('UTC'), $columns);
     }
 
     /**

@@ -25,6 +25,8 @@ final readonly class ResolvedMap
 
     private const string TIMESTAMP_WITHOUT_TIME_ZONE = '/^timestamp\s*(?:\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?$/i';
 
+    private const int MOST_STATISTICS_EXPRESSIONS = 8;
+
     private const array VARIABLES = ['previous_row', 'affected_rows', 'created_key'];
 
     /**
@@ -104,9 +106,9 @@ final readonly class ResolvedMap
         $attributes = array_map(fn (Attribute $attribute) => $attribute->resolve((string) $previous->alias), $map->attributes());
         $resolvedMap = new self($name, $previous, $primary, $dependents, $attributes, $map->unrepresentableStates(), $tables);
         $resolvedMap->validateAttributes();
-        $resolvedMap->validateTimeZones();
         $resolvedMap->validateLinks();
         $resolvedMap->validateUnrepresentableStates();
+        $resolvedMap->validateTimeZones();
         $resolvedMap->validateIndexes();
 
         return $resolvedMap;
@@ -266,7 +268,7 @@ final readonly class ResolvedMap
             }
         }
 
-        return $expressions;
+        return array_values(array_unique($expressions));
     }
 
     /** @return list<string> */
@@ -457,6 +459,12 @@ final readonly class ResolvedMap
             if ($this->dependent((string) $attribute->alias) !== null) {
                 throw InvalidCompatibilityMap::because($this->name, "attribute '{$attribute->column}' says inTimeZone() but is stored on dependent current model '{$attribute->alias}'; only a column of the primary current model or the retained table converts its time zone");
             }
+        }
+
+        $expressions = count($this->statisticsExpressions());
+
+        if ($expressions > self::MOST_STATISTICS_EXPRESSIONS) {
+            throw InvalidCompatibilityMap::because($this->name, "inTimeZone() gives primary current model '{$this->primaryCurrentModel->alias}' {$expressions} distinct statistics expressions, and a PostgreSQL statistics object holds at most ".self::MOST_STATISTICS_EXPRESSIONS.'; convert at most '.self::MOST_STATISTICS_EXPRESSIONS.' of its columns');
         }
     }
 

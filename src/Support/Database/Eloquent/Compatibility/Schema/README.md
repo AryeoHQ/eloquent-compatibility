@@ -5,7 +5,7 @@ This namespace is the database half of the package. `Compiler` turns a resolved 
 Entry points:
 
 - `Installer::install()`, `Installer::recompile()` and `Installer::uninstall()` change the database, each in one transaction. Install and recompile emit a map's planner statistics and indexes with the rest, and an uninstall drops them.
-- `Installer::prepare()` builds only the planner statistics and indexes, with `CREATE INDEX CONCURRENTLY`. It runs outside a transaction, one statement at a time, ahead of the install migration, so install finds each object and creates nothing.
+- `Installer::prepare()` builds only the planner statistics and indexes, with `CREATE INDEX CONCURRENTLY`. It runs outside a transaction, one statement at a time, ahead of the install migration or of a recompile that adds or renames an index, so the install or recompile finds each object and creates nothing.
 - `Installer::statements()` returns the statements one of those methods runs, named by an `InstallerAction`, without running them. The `compatibility:sql` command prints them, with `--for=prepare` among its actions.
 - `Compiler::compile()` returns the `CompiledSql` without running it. Its `CompiledSql::$planner` holds the planner list, after the triggers. `Compiler::prepare()` returns that list for a prepare.
 

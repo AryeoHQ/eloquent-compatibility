@@ -23,10 +23,13 @@ final class Compiler
 
     private readonly string $schema;
 
+    /** @var array<string, bool> */
+    private array $timeZones = [];
+
     /**
      * @param  array<string, string>  $sources
      */
-    public function __construct(ConnectionInterface $connection, array $sources = [])
+    public function __construct(private readonly ConnectionInterface $connection, array $sources = [])
     {
         $this->schema = (string) $connection->scalar('select current_schema()');
         $this->columnCatalog = new ColumnCatalog($connection, $this->searchPath(), $sources);
@@ -87,9 +90,21 @@ final class Compiler
             throw InvalidCompatibilityMap::because($resolvedMap->name, "the current table {$table} does not exist");
         }
 
+        $planned = [];
+
+        foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
+            $planned = [...$planned, ...array_keys($index->columns), $index->whereNull, $index->whereNotNull];
+        }
+
         foreach ($resolvedMap->attributes as $attribute) {
-            if ($attribute->alias === $resolvedMap->primaryCurrentModel->alias) {
+            if ($attribute->alias !== $resolvedMap->primaryCurrentModel->alias) {
+                continue;
+            }
+
+            if ($attribute->timeZone !== null) {
                 $this->validateTimeZone($resolvedMap, $attribute);
+            } elseif (in_array($attribute->column, $planned, true)) {
+                $this->storedColumn($resolvedMap, $attribute);
             }
         }
 
@@ -857,16 +872,33 @@ final class Compiler
             return;
         }
 
+        $column = $this->storedColumn($resolvedMap, $attribute);
         $table = $resolvedMap->table($attribute->alias);
-        $column = $this->columnCatalog->of($table)[$attribute->storedAs] ?? null;
+
+        if (preg_match(self::TIMESTAMP_WITH_TIME_ZONE, $column->baseType ?? $column->type) !== 1) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone(), which needs {$table}.{$attribute->storedAs} to be a timestamp with time zone, not {$column->type}");
+        }
+
+        $known = $this->timeZones[$attribute->timeZone] ??= $this->connection->scalar(
+            'select exists (select 1 from pg_timezone_names where lower(name) = lower(?)) or exists (select 1 from pg_timezone_abbrevs where lower(abbrev) = lower(?))',
+            [$attribute->timeZone, $attribute->timeZone],
+        ) === true;
+
+        if (! $known) {
+            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone('{$attribute->timeZone}'), which neither pg_timezone_names nor pg_timezone_abbrevs holds");
+        }
+    }
+
+    private function storedColumn(ResolvedMap $resolvedMap, Attribute $attribute): Column
+    {
+        $table = $resolvedMap->table((string) $attribute->alias);
+        $column = $this->columnCatalog->of($table)[(string) $attribute->storedAs] ?? null;
 
         if ($column === null) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table} has no column {$attribute->storedAs}");
         }
 
-        if (preg_match(self::TIMESTAMP_WITH_TIME_ZONE, $column->baseType ?? $column->type) !== 1) {
-            throw InvalidCompatibilityMap::because($resolvedMap->name, "attribute {$attribute->column} says inTimeZone(), which needs {$table}.{$attribute->storedAs} to be a timestamp with time zone, not {$column->type}");
-        }
+        return $column;
     }
 
     private function validateFills(ResolvedMap $resolvedMap): void

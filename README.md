@@ -128,7 +128,7 @@ resolve(EventBridge::class)->mirror(new WidgetEventMirror);
 ```
 
 ### Planner support
-A mapped attribute is a view expression, so PostgreSQL keeps no statistics for it and no index can serve it. A query that filters or sorts on the view then plans from guesses. The map declares what the planner needs, and the package builds it from the same parts that build the view column:
+A mapped attribute read as its column's own type, such as a `boolean` column read as a `boolean`, keeps the column's statistics and indexes, because PostgreSQL drops that identity cast. A conversion does not: a `timestamp with time zone` column read as a `timestamp without time zone` is an expression with no statistics, and no index on the column serves it. A query that filters or sorts on it then plans from guesses. The map declares what the planner needs, and the package builds it from the same parts that build the view column:
 
 ```php
 use Support\Database\Eloquent\Compatibility\Mapping\PlannerIndex;
@@ -148,10 +148,11 @@ Attribute::mapped('created_at')
     ->inTimeZone('UTC');
 ```
 
-- `Attribute::inTimeZone()` says the stored column is a `timestamp with time zone` and the attribute is a `timestamp without time zone`. The view reads the column `AT TIME ZONE` that zone, and a write converts back. A plain cast between the two depends on the session's time zone, which PostgreSQL cannot index. The conversion is immutable, so the expression can carry an index.
+- `Attribute::inTimeZone()` says the stored column is a `timestamp with time zone` and the attribute is a `timestamp without time zone`. The view reads the column `AT TIME ZONE` that zone, and a write converts back. A plain cast between the two depends on the session's time zone, which PostgreSQL cannot index. The conversion is immutable, so the expression can carry an index. Only that conversion needs a zone: an attribute of its column's own type, `timestamp with time zone` included, declares none. The zone must be a name in `pg_timezone_names` or an abbreviation in `pg_timezone_abbrevs`, in any letter case, and the install refuses any other.
+- The view's default for a zoned attribute is the stored column's default converted to the zone. An `Attribute::defaultsTo()` expression is taken as written, so it must already be in the zone, such as `now() AT TIME ZONE 'UTC'`.
 - `PrimaryCurrentModel::indexedBy()` declares one or more `PlannerIndex` values. `PlannerIndex::on()` adds a column, with `descending: true` for a descending one. `PlannerIndex::whereNull()` or `PlannerIndex::whereNotNull()` makes the index partial. Each name is an attribute of the map that `Attribute::storedAs()` stores on the primary current model.
-- Install creates one statistics object over every zoned attribute of the primary current model, each declared index, and then runs `ANALYZE` on the primary current model's table. A map that declares no index and no `Attribute::inTimeZone()` emits nothing.
-- `Installer::prepare()` builds the same statistics and indexes, with `CREATE INDEX CONCURRENTLY`, outside a transaction, ahead of the install. Install then finds each object and creates nothing. [Adopting a map](docs/adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes the migration.
+- Install creates one statistics object over the zoned attributes of the primary current model, each declared index, and then runs `ANALYZE` on the primary current model's table. The statistics object holds each distinct expression once, and PostgreSQL allows at most 8, so `ResolvedMap::of()` refuses a map whose zoned attributes give more. A map that declares no index and no `Attribute::inTimeZone()` emits nothing.
+- `Installer::prepare()` builds the same statistics and indexes, with `CREATE INDEX CONCURRENTLY`, outside a transaction, ahead of the install, and ahead of a recompile that adds or renames an index. Install then finds each object and creates nothing. [Adopting a map](docs/adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes the migration.
 - `Installer::uninstall()` drops the map's indexes and statistics with the rest of its objects.
 
 [Compiling and installing the schema](docs/flows/compiling-and-installing-the-schema.md#planner-support) lists what each action emits and the limits of `IF NOT EXISTS`.

@@ -211,6 +211,73 @@ final class CompilerTest extends TestCase
         $this->assertSame('2026-10-28 12:00:00', DB::table('widgets')->value('delivered_at'));
     }
 
+    #[Test]
+    public function it_installs_one_statistics_expression_for_two_zoned_attributes_that_read_one_column(): void
+    {
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('created_on')->asType('timestamp(0) without time zone')->storedAs('gadget', 'created_at')->inTimeZone('UTC')->readOnlyBecause('A widget shows the time it was created under a second name.'),
+        ]]));
+
+        $this->assertSame(4, (int) DB::scalar("select count(*) from pg_stats_ext_exprs where statistics_schemaname = current_schema() and statistics_name = 'compatibility__widgets__statistics'"));
+    }
+
+    #[Test]
+    #[TestWith(['install'])]
+    #[TestWith(['recompile'])]
+    #[TestWith(['prepare'])]
+    public function it_refuses_while_it_lists_the_statements_a_time_zone_the_catalog_does_not_hold(string $action): void
+    {
+        if ($action === 'recompile') {
+            resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        }
+
+        $this->assertThrows(
+            fn () => resolve(Installer::class)->{$action}(new WidgetCompatibilityMap(['delivered_at' => $this->deliveredIn('America/Chicgo')])),
+            InvalidCompatibilityMap::class,
+            "Compatibility map 'widgets' is declared wrongly: attribute delivered_at says inTimeZone('America/Chicgo'), which neither pg_timezone_names nor pg_timezone_abbrevs holds.",
+        );
+
+        $this->assertSame(
+            $action === 'recompile' ? [true, 1, 1] : [false, 0, 0],
+            [DB::scalar("select to_regclass('widgets') is not null"), $this->objects('pg_indexes', 'indexname', 'compatibility__widgets__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__widgets__')],
+        );
+
+        if ($action === 'recompile') {
+            DB::table('widgets')->insert(['title' => 'After a refused recompile', 'delivered_at' => '2026-10-28 12:00:00']);
+
+            $this->assertSame('2026-10-28 12:00:00', DB::scalar("select to_char(delivered_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') from gadgets"));
+        }
+    }
+
+    #[Test]
+    #[TestWith(['america/chicago'])]
+    #[TestWith(['cdt'])]
+    public function it_converts_through_a_time_zone_name_or_abbreviation_the_catalog_holds_in_any_letter_case(string $zone): void
+    {
+        resolve(Installer::class)->install(new WidgetCompatibilityMap(['delivered_at' => $this->deliveredIn($zone)]));
+
+        DB::table('widgets')->insert(['title' => 'Delivered', 'delivered_at' => '2026-10-28 12:00:00']);
+
+        $this->assertSame('2026-10-28 17:00:00', DB::scalar("select to_char(delivered_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') from gadgets"));
+    }
+
+    #[Test]
+    #[TestWith(['on', 'archived'])]
+    #[TestWith(['whereNotNull', 'name'])]
+    public function it_refuses_to_prepare_a_map_whose_indexed_or_filtered_column_is_missing_before_it_builds_anything(string $declaration, string $column): void
+    {
+        $map = $declaration === 'on' ? new WidgetCompatibilityMap : $this->compatibilityMap([
+            'primaryCurrentModel' => PrimaryCurrentModel::for(Gadget::class)->aliasedAs('gadget')->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())'])
+                ->indexedBy(PlannerIndex::named('titled_newest')->on('created_at', descending: true)->whereNotNull('title')),
+        ]);
+        DB::statement("alter table gadgets drop column {$column}");
+
+        $this->assertThrows(fn () => resolve(Installer::class)->prepare($map), InvalidCompatibilityMap::class, "Compatibility map 'widgets' is declared wrongly: gadgets has no column {$column}.");
+
+        $this->assertSame([0, 0], [$this->objects('pg_indexes', 'indexname', 'compatibility__widgets__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__widgets__')]);
+    }
+
     /**
      * @param  array<string, string>  $triggers
      */
@@ -937,6 +1004,11 @@ final class CompilerTest extends TestCase
     private function compiler(): Compiler
     {
         return new Compiler(DB::connection());
+    }
+
+    private function deliveredIn(string $zone): Attribute
+    {
+        return Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at')->inTimeZone($zone);
     }
 
     /**
