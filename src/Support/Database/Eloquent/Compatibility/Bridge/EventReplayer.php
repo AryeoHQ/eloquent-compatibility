@@ -16,9 +16,14 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\BusFake;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use InvalidArgumentException;
+use ReflectionClass;
+use ReflectionNamedType;
+use ReflectionParameter;
 use ReflectionProperty;
 use RuntimeException;
 use stdClass;
+use Support\Actions\Bus\Exceptions\Prevented;
+use Support\Actions\Pipeline\Exceptions\Interrupted;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -162,7 +167,7 @@ final class EventReplayer
 
                     $pendingTrigger->withoutTransition()->now();
                     $saved = $this->saves[$model] ?? false;
-                } catch (Invalid|BindingResolutionException $e) {
+                } catch (Invalid|BindingResolutionException|Interrupted|Prevented $e) {
                     throw $this->refusal($record, $model, $state, $e);
                 } finally {
                     unset($this->transitioning[$model], $this->openSaves[$model], $this->saves[$model]);
@@ -175,6 +180,13 @@ final class EventReplayer
         } finally {
             $unmask();
         }
+    }
+
+    public static function buildsEmptyModel(ReflectionParameter $parameter): bool
+    {
+        $type = $parameter->getType();
+
+        return ! $parameter->isDefaultValueAvailable() && $type instanceof ReflectionNamedType && is_subclass_of($type->getName(), Model::class);
     }
 
     public function trackSave(Model $model, string $event): void
@@ -390,7 +402,17 @@ final class EventReplayer
             throw $this->refusal($record, $model, $state, $transitions->isEmpty() ? new Invalid($model, $to, $state) : new Duplicate($to->name, $from));
         }
 
-        return Str::camel(class_basename($transitions->sole()->using));
+        $using = $transitions->sole()->using;
+
+        $parameter = array_find(new ReflectionClass($using)->getConstructor()?->getParameters() ?? [], self::buildsEmptyModel(...));
+
+        if ($parameter !== null) {
+            throw $this->refusal($record, $model, $state, new InvalidArgumentException(
+                '['.class_basename($using).'] takes the model argument [$'.$parameter->getName().'] without a default, and the container builds it as an empty ['.class_basename(ltrim((string) $parameter->getType(), '?')).'].',
+            ));
+        }
+
+        return Str::camel(class_basename($using));
     }
 
     private function state(Model $model, string $state, mixed $value): null|BackedEnum

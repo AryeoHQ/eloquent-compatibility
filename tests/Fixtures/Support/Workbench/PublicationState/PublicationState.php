@@ -11,11 +11,15 @@ use Support\Database\Eloquent\StateMachines\Provides\ManagesState;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Archive;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reopen;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule;
 
 /**
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Publish publish()
@@ -24,6 +28,10 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\ReturnToPublished returnToPublished()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Restore restore()
  * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reopen reopen()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Schedule schedule(\Tests\Fixtures\Support\Workbench\Placement $placement)
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Pin pin(null|\Tests\Fixtures\Support\Workbench\Placement $placement)
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Embargo embargo()
+ * @method \Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve reserve()
  */
 enum PublicationState: string implements StateMachineable
 {
@@ -32,6 +40,10 @@ enum PublicationState: string implements StateMachineable
     #[Events(before: Transitioning::class, after: Transitioned::class)]
     #[Transition(to: self::Published, using: Publish::class)]
     #[Transition(to: self::Archived, using: Archive::class)]
+    #[Transition(to: self::Scheduled, using: Schedule::class)]
+    #[Transition(to: self::Pinned, using: Pin::class)]
+    #[Transition(to: self::Embargoed, using: Embargo::class)]
+    #[Transition(to: self::Reserved, using: Reserve::class)]
     case Draft = 'draft';
 
     #[Events(before: Transitioning::class, after: Transitioned::class)]
@@ -46,4 +58,16 @@ enum PublicationState: string implements StateMachineable
     #[Transition(to: self::Draft, using: Restore::class)]
     #[Transition(to: self::Draft, using: Reopen::class)]
     case Archived = 'archived';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Scheduled = 'scheduled';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Pinned = 'pinned';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Embargoed = 'embargoed';
+
+    #[Events(before: Transitioning::class, after: Transitioned::class)]
+    case Reserved = 'reserved';
 }

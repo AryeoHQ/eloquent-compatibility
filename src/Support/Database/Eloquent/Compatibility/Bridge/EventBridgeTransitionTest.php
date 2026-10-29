@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Bridge;
 
+use Illuminate\Bus\UniqueLock;
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use InvalidArgumentException;
@@ -17,6 +19,8 @@ use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use RuntimeException;
+use Support\Actions\Bus\Exceptions\Prevented;
+use Support\Actions\Pipeline\Exceptions\Interrupted;
 use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityEventMirrorBypassed;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -42,6 +46,7 @@ use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioned;
 use Tests\Fixtures\Support\Workbench\PublicationState\Events\Transitioning;
 use Tests\Fixtures\Support\Workbench\PublicationState\PublicationState;
 use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Feature;
+use Tests\Fixtures\Support\Workbench\PublicationState\Triggers\Reserve;
 use Tests\Fixtures\Support\Workbench\ReviewState\Events\Reviewed;
 use Tests\Fixtures\Support\Workbench\StatefulBulletin;
 use Tests\Fixtures\Support\Workbench\Tables;
@@ -147,6 +152,9 @@ final class EventBridgeTransitionTest extends TestCase
             'two matching transitions' => ['archived', false, 'draft', 'Multiple [Draft] triggers defined on [Archived]', Duplicate::class],
             'a blocked transition' => ['draft', true, 'published', 'Invalid transition from [Draft] to [Published] on [Publication].', Invalid::class],
             'a trigger the container cannot build' => ['draft', false, 'archived', 'Unresolvable dependency resolving', BindingResolutionException::class],
+            'a trigger that takes a model argument without a default' => ['draft', false, 'scheduled', '[Schedule] takes the model argument [$placement] without a default, and the container builds it as an empty [Placement].', InvalidArgumentException::class],
+            'a trigger that takes a nullable model argument without a default' => ['draft', false, 'pinned', '[Pin] takes the model argument [$placement] without a default, and the container builds it as an empty [Placement].', InvalidArgumentException::class],
+            'a trigger whose middleware declines' => ['draft', false, 'embargoed', 'The [Embargo] operation was interrupted by the [Decline] middleware.', Interrupted::class],
             'a state the enum has no case for' => ['draft', false, 'pending_review', "['pending_review'] is not a case of [PublicationState].", InvalidArgumentException::class],
             'no state' => ['draft', false, null, '[NULL] is not a case of [PublicationState].', InvalidArgumentException::class],
         ];
@@ -169,6 +177,23 @@ final class EventBridgeTransitionTest extends TestCase
         $this->assertStringContainsString($because, $refusal->because);
         $this->assertInstanceOf($previous, $refusal->getPrevious());
         $this->assertSame([$stored, 'Draft article'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
+        $this->assertSame([], $this->seen);
+        $this->assertSame([], $this->journal->entries);
+        $this->assertNothingMirrored();
+        $this->assertSame(1, DB::transactionLevel());
+    }
+
+    #[Test]
+    public function it_refuses_and_rolls_back_the_whole_write_when_another_run_holds_the_unique_lock_of_the_trigger(): void
+    {
+        $article = $this->article();
+        $this->recordMirroredEvents();
+        Cache::lock(UniqueLock::getKey(new Reserve), 10)->get();
+
+        $refusal = $this->assertWriteRefused(fn () => $article->update(['title' => 'Refused', 'status' => 'reserved']), "state of Publication #{$article->publication_id}");
+
+        $this->assertInstanceOf(Prevented::class, $refusal->getPrevious());
+        $this->assertSame(['draft', 'Draft article'], [DB::table('publications')->value('state'), DB::table('publications')->value('title')]);
         $this->assertSame([], $this->seen);
         $this->assertSame([], $this->journal->entries);
         $this->assertNothingMirrored();
