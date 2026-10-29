@@ -44,10 +44,18 @@ Review found three costs of name-only `IF NOT EXISTS`. A recompile that added a 
 
 The compiler now plans the planner list from the catalog while it lists the statements, before anything runs, for install, recompile and prepare alike:
 
-- It emits a `CREATE` only for an object the catalog lacks, and the `ANALYZE` only after a `CREATE`. So an install after a prepare lists no planner statement.
-- It writes the statistics object's expression list into a `COMMENT ON STATISTICS`, and drops and creates the object again when the declared list differs from the comment, or the comment is missing. `DROP STATISTICS` and `CREATE STATISTICS` take only a `SHARE UPDATE EXCLUSIVE` lock on the table. The comment is compared, not `pg_get_statisticsobjdef_expressions()`, because PostgreSQL deparses an expression in its own form, and normalising both sides would copy its deparser.
-- It refuses an index whose `pg_index.indisvalid` is false, with the hint `DROP INDEX CONCURRENTLY <name>, then prepare again`.
-- Each `CREATE` keeps `IF NOT EXISTS`, as a guard against a concurrent session.
+- It emits a `CREATE` only for an object the catalog lacks. So an install after a prepare lists no planner statement.
+- It writes the statistics object's expression list, sorted, into a `COMMENT ON STATISTICS`. It drops and creates the object again when the declared list differs from the comment, the comment is missing, or `pg_statistic_ext.stxrelid` names another table. The sort means a map that reorders its zoned attributes rebuilds nothing. `DROP STATISTICS` and `CREATE STATISTICS` take only a `SHARE UPDATE EXCLUSIVE` lock on the table. The comment is compared, not `pg_get_statisticsobjdef_expressions()`, because PostgreSQL deparses an expression in its own form, and normalising both sides would copy its deparser.
+- It refuses an index whose `pg_index.indisvalid` is false. For an ordinary index the hint is `if no CREATE INDEX CONCURRENTLY is still running on it, DROP INDEX CONCURRENTLY <name>, then prepare again`. A partitioned index, which PostgreSQL leaves invalid until each partition's index is attached, cannot be dropped concurrently, and prepare cannot build on its table, so its hint says to attach the partition indexes, or to `DROP INDEX <name>` and install or recompile again.
+
+A second review found that this order could lose work. A prepare stopped after `CREATE STATISTICS` and its comment, but before `ANALYZE`, left an object that every later run accepted, so its expressions never got data. And two prepares of one map could leave one session's statistics marked with the other's fingerprint, because `CREATE STATISTICS IF NOT EXISTS` skipped the other's object and the comment followed anyway. So the list now runs in this order:
+
+1. the index builds, each `CREATE INDEX [CONCURRENTLY] IF NOT EXISTS`;
+2. the statistics: `DROP STATISTICS IF EXISTS` when it rebuilds, then `CREATE STATISTICS` without `IF NOT EXISTS`, so an object another session creates meanwhile fails the run, and the next run plans again;
+3. `ANALYZE` of the primary current model's table;
+4. the comments, as completion markers: the statistics fingerprint, and on each index that the list built or found without a comment, its definition.
+
+An object without its marker therefore means the run that made it stopped before its `ANALYZE`. The next run rebuilds such a statistics object, and analyses and marks such an index without building it again. An object the pre-change code built carries no comment, so it gets one rebuild or one `ANALYZE`, then its marker.
 
 Declined: a statistics name derived from a hash of its expressions, which a recompile would drop and replace by name. The hash's digits would break the full-word rule of [0010](0010-compiled-identifiers-are-full-words.md). A changed index definition under the same name is still never rebuilt, and the adopter still renames it.
 

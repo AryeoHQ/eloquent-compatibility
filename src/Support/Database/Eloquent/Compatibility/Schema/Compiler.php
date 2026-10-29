@@ -114,66 +114,76 @@ final class Compiler
     private function planner(ResolvedMap $resolvedMap, bool $concurrently): array
     {
         $table = SqlFragments::identifier($resolvedMap->primaryTable());
-        $statements = $this->statistics($resolvedMap, $table);
-        $indexes = $resolvedMap->primaryCurrentModel->indexes === [] ? [] : $this->plannerIndexes($resolvedMap);
+        $present = $resolvedMap->primaryCurrentModel->indexes === [] ? [] : $this->plannerIndexes($resolvedMap);
+        $builds = [];
+        $markers = [];
 
         foreach ($resolvedMap->primaryCurrentModel->indexes as $index) {
             $name = $resolvedMap->indexName($index);
-            $existing = $indexes[$name] ?? null;
+            $existing = $present[$name] ?? null;
+            $filter = $resolvedMap->indexFilter($index);
+            $definition = 'ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
+
+            if ($existing !== null && ! $existing->valid) {
+                throw InvalidCompatibilityMap::because($resolvedMap->name, $existing->partitioned
+                    ? "partitioned index {$existing->relation} exists but is invalid, as it stays until an index of each partition is attached to it, so the planner cannot use it; attach each partition's index with ALTER INDEX {$existing->relation} ATTACH PARTITION, or DROP INDEX {$existing->relation} and install or recompile again, because prepare cannot build an index on a partitioned table"
+                    : "index {$existing->relation} exists but is invalid, as a failed or unfinished CREATE INDEX CONCURRENTLY leaves it, so the planner cannot use it; if no CREATE INDEX CONCURRENTLY is still running on it, DROP INDEX CONCURRENTLY {$existing->relation}, then prepare again");
+            }
 
             if ($existing === null) {
-                $filter = $resolvedMap->indexFilter($index);
-                $statements[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($name)
-                    .' ON '.$table.' ('.implode(', ', $resolvedMap->indexColumns($index)).')'.($filter === null ? '' : ' WHERE '.$filter);
-            } elseif (! $existing->valid) {
-                throw InvalidCompatibilityMap::because($resolvedMap->name, "index {$existing->relation} exists but is invalid, as a failed or unfinished CREATE INDEX CONCURRENTLY leaves it, so the planner cannot use it; DROP INDEX CONCURRENTLY {$existing->relation}, then prepare again");
+                $builds[] = 'CREATE INDEX '.($concurrently ? 'CONCURRENTLY ' : '').'IF NOT EXISTS '.SqlFragments::identifier($name).' '.$definition;
+            }
+
+            if ($existing === null || ! $existing->marked) {
+                $markers[] = 'COMMENT ON INDEX '.SqlFragments::identifier($name).' IS '.SqlFragments::literal($definition);
             }
         }
 
-        return $statements === [] ? [] : [...$statements, 'ANALYZE '.$table];
+        $expressions = implode(', ', array_map(fn (string $expression) => '('.$expression.')', $resolvedMap->statisticsExpressions()));
+        $statistics = $expressions === '' ? [] : $this->statistics($resolvedMap, $table, $expressions);
+
+        if ($statistics !== []) {
+            $markers = ['COMMENT ON STATISTICS '.SqlFragments::identifier($resolvedMap->statisticsName()).' IS '.SqlFragments::literal($expressions), ...$markers];
+        }
+
+        return $markers === [] ? [] : [...$builds, ...$statistics, 'ANALYZE '.$table, ...$markers];
     }
 
     /** @return list<string> */
-    private function statistics(ResolvedMap $resolvedMap, string $table): array
+    private function statistics(ResolvedMap $resolvedMap, string $table, string $expressions): array
     {
-        $expressions = $resolvedMap->statisticsExpressions();
-
-        if ($expressions === []) {
-            return [];
-        }
-
         $name = $resolvedMap->statisticsName();
-        $declared = implode(', ', array_map(fn (string $expression) => '('.$expression.')', $expressions));
         $existing = $this->connection->selectOne(
-            "select quote_ident(statistics_namespace.nspname) || '.' || quote_ident(statistics.stxname) as name, obj_description(statistics.oid, 'pg_statistic_ext') as expressions
+            "select quote_ident(statistics_namespace.nspname) || '.' || quote_ident(statistics.stxname) as name, obj_description(statistics.oid, 'pg_statistic_ext') as expressions,
+                    statistics.stxrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) as on_primary_table
              from pg_statistic_ext statistics join pg_namespace statistics_namespace on statistics_namespace.oid = statistics.stxnamespace
              where statistics.stxname = ? and statistics.stxnamespace = to_regnamespace(quote_ident(current_schema()))",
-            [$name],
+            [$table, $name],
         );
 
-        if ($existing !== null && $existing->expressions === $declared) {
+        if ($existing !== null && $existing->on_primary_table === true && $existing->expressions === $expressions) {
             return [];
         }
 
         return [
             ...($existing === null ? [] : ['DROP STATISTICS IF EXISTS '.$existing->name]),
-            'CREATE STATISTICS IF NOT EXISTS '.SqlFragments::identifier($name).' ON '.$declared.' FROM '.$table,
-            'COMMENT ON STATISTICS '.SqlFragments::identifier($name).' IS '.SqlFragments::literal($declared),
+            'CREATE STATISTICS '.SqlFragments::identifier($name).' ON '.$expressions.' FROM '.$table,
         ];
     }
 
-    /** @return array<string, object{relation: string, valid: bool}> */
+    /** @return array<string, object{relation: string, valid: bool, partitioned: bool, marked: bool}> */
     private function plannerIndexes(ResolvedMap $resolvedMap): array
     {
         $indexes = [];
         $rows = $this->connection->select(
-            'select index_relation.relname as name, index_relation.oid::regclass::text as relation, planner_index.indisvalid as valid
+            "select index_relation.relname as name, index_relation.oid::regclass::text as relation, planner_index.indisvalid as valid,
+                    index_relation.relkind = 'I' as partitioned, obj_description(index_relation.oid, 'pg_class') is not null as marked
              from pg_index planner_index join pg_class index_relation on index_relation.oid = planner_index.indexrelid
-             where index_relation.relname like '.SqlFragments::like($resolvedMap->objectPrefix()).' and index_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))',
+             where index_relation.relname like ".SqlFragments::like($resolvedMap->objectPrefix()).' and index_relation.relnamespace = to_regnamespace(quote_ident(current_schema()))',
         );
 
         foreach ($rows as $row) {
-            $indexes[(string) $row->name] = (object) ['relation' => (string) $row->relation, 'valid' => $row->valid === true];
+            $indexes[(string) $row->name] = (object) ['relation' => (string) $row->relation, 'valid' => $row->valid === true, 'partitioned' => $row->partitioned === true, 'marked' => $row->marked === true];
         }
 
         return $indexes;

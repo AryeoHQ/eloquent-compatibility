@@ -107,19 +107,25 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
-    public function it_compiles_the_statistics_the_indexes_and_an_analyze_of_the_primary_table_and_builds_the_indexes_concurrently_for_prepare(): void
+    public function it_compiles_the_index_builds_then_the_statistics_then_an_analyze_of_the_primary_table_then_the_markers_and_builds_the_indexes_concurrently_for_prepare(): void
     {
-        $expressions = '(CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), '
-            .'(CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone))';
-        $statistics = 'CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON '.$expressions.' FROM "gadgets"';
-        $comment = 'COMMENT ON STATISTICS "compatibility__widgets__statistics" IS \''.str_replace("'", "''", $expressions).'\'';
-        $index = 'IF NOT EXISTS "compatibility__widgets__index_archived_newest" ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC) '
+        $expressions = '(CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), '
+            .'(CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone))';
+        $definition = 'ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC) '
             .'WHERE CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) IS NULL';
+        $index = 'IF NOT EXISTS "compatibility__widgets__index_archived_newest" '.$definition;
+        $planner = fn (string $build) => [
+            $build.$index,
+            'CREATE STATISTICS "compatibility__widgets__statistics" ON '.$expressions.' FROM "gadgets"',
+            'ANALYZE "gadgets"',
+            'COMMENT ON STATISTICS "compatibility__widgets__statistics" IS \''.str_replace("'", "''", $expressions).'\'',
+            'COMMENT ON INDEX "compatibility__widgets__index_archived_newest" IS \''.str_replace("'", "''", $definition).'\'',
+        ];
 
-        $this->assertSame([
-            [$statistics, $comment, 'CREATE INDEX '.$index, 'ANALYZE "gadgets"'],
-            [$statistics, $comment, 'CREATE INDEX CONCURRENTLY '.$index, 'ANALYZE "gadgets"'],
-        ], [$this->compiler()->compile(new WidgetCompatibilityMap)->planner, $this->compiler()->prepare(new WidgetCompatibilityMap)]);
+        $this->assertSame(
+            [$planner('CREATE INDEX '), $planner('CREATE INDEX CONCURRENTLY ')],
+            [$this->compiler()->compile(new WidgetCompatibilityMap)->planner, $this->compiler()->prepare(new WidgetCompatibilityMap)],
+        );
     }
 
     #[Test]
@@ -133,6 +139,7 @@ final class CompilerTest extends TestCase
         $this->assertSame([
             'CREATE INDEX IF NOT EXISTS "compatibility__accounts__index_with_email" ON "people" (CAST(("email") AS character varying(255))) WHERE CAST(("email") AS character varying(255)) IS NOT NULL',
             'ANALYZE "people"',
+            'COMMENT ON INDEX "compatibility__accounts__index_with_email" IS \'ON "people" (CAST(("email") AS character varying(255))) WHERE CAST(("email") AS character varying(255)) IS NOT NULL\'',
         ], $planner);
         $this->assertSame([1, 0], [$this->objects('pg_indexes', 'indexname', 'compatibility__accounts__'), $this->objects('pg_statistic_ext', 'stxname', 'compatibility__accounts__')]);
     }

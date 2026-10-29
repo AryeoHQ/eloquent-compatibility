@@ -47,7 +47,7 @@ So a recompile can drop, retype or reorder an attribute, which `CREATE OR REPLAC
 
 An uninstall lists the drops of step 6, then a drop of the view when it finds one in the current schema. It then lists a `DROP INDEX IF EXISTS` for every index in the current schema whose name starts with the map's object prefix, and a `DROP STATISTICS IF EXISTS` for every statistics object with that prefix. It leaves every table as it is.
 
-A recompile drops no index. Its planner list creates each object the map now declares and the schema lacks, and rebuilds the statistics object when the map's zoned attributes changed. [Planning from the catalog](#planning-from-the-catalog) says how it decides, and [the limits below](#what-the-planning-leaves-alone) what that leaves.
+A recompile drops no index. Its planner list creates each object the map now declares and the schema lacks, rebuilds the statistics object when the map's zoned attributes changed, and analyses and marks an object a stopped prepare left unmarked. [Planning from the catalog](#planning-from-the-catalog) says how it decides, and [the limits below](#what-the-planning-leaves-alone) what that leaves.
 
 Each of the three methods runs its list in one transaction, so a failed recompile or uninstall keeps the installed map, triggers included. A concurrent writer waits on the dropped triggers' locks until the commit, so it never meets the view without its triggers.
 
@@ -59,43 +59,51 @@ Every expression in the list comes from `Attribute::plannerExpression()`, which 
 
 ### Planning from the catalog
 
-The compiler plans the list from the catalog while it lists the statements, before anything runs, as [INV-26](../invariants.md#inv-26-the-printed-statements-are-the-statements-that-run) requires. It looks up each declared object by name in the current schema: the statistics object in `pg_statistic_ext`, and each index in `pg_index`. Install, recompile and prepare plan alike:
+The compiler plans the list from the catalog while it lists the statements, before anything runs, as [INV-26](../invariants.md#inv-26-the-printed-statements-are-the-statements-that-run) requires. It looks up each declared object by name in the current schema: the statistics object in `pg_statistic_ext`, and each index in `pg_index`. Each object carries a comment that the list writes last, as a marker that the object was built and analysed. Install, recompile and prepare plan alike:
 
 ```
-object in the catalog                               install and recompile              prepare
-missing                                             its CREATE                         its CREATE, an index CONCURRENTLY
-present and current                                 nothing                            nothing
-an index whose pg_index.indisvalid is false         refuse                             refuse
-a statistics object whose expressions differ        DROP STATISTICS, then its CREATE   DROP STATISTICS, then its CREATE
+object in the catalog                                 the list
+missing                                               its CREATE, the ANALYZE and its marker; prepare builds an index CONCURRENTLY
+present with its marker                               nothing
+an index whose pg_index.indisvalid is false           refuse
+an index, valid and without a comment                 the ANALYZE and its marker, and no build
+a statistics object without its fingerprint comment,  DROP STATISTICS, then its CREATE, the ANALYZE and its marker
+  or with another one, or on another table
 ```
 
-The list ends with an `ANALYZE` of the primary current model's table only when it creates something. So an install after a prepare, and a recompile that changes nothing in the planner support, list no planner statement and run no `ANALYZE`.
+So an install after a prepare, and a recompile that changes nothing in the planner support, list no planner statement and run no `ANALYZE`. A prepare stopped part way always leaves an object without its marker, and the next prepare, install or recompile finishes it. An object the pre-change code built carries no comment, so it gets one `ANALYZE`, or one rebuild for the statistics object, and then its marker.
 
-- **The statistics object records its expressions.** A `COMMENT ON STATISTICS` follows each `CREATE STATISTICS`, and holds the expression list exactly as the `CREATE` writes it. A comment that differs from the declared list, or none at all, means the expressions changed, so the list drops the object and creates it again. The compiler compares that comment, not `pg_get_statisticsobjdef_expressions()`, because PostgreSQL deparses an expression in its own form: it drops an identity cast, adds `::text` to the zone and quotes an identifier only where it must. `DROP STATISTICS`, `CREATE STATISTICS` and the comment each take a `SHARE UPDATE EXCLUSIVE` lock on the table, which blocks no read and no write.
-- **An invalid index refuses.** A failed or unfinished `CREATE INDEX CONCURRENTLY` leaves an index whose `pg_index.indisvalid` is false, and the planner cannot use it. Install, recompile and prepare refuse it with `InvalidCompatibilityMap`, before they run anything, and the message ends with the hint `DROP INDEX CONCURRENTLY <name>, then prepare again`.
-- **Each `CREATE` keeps `IF NOT EXISTS`, and the drop `IF EXISTS`.** Another session that builds or drops the object between the catalog read and the statement then fails nothing.
+- **The statistics object's marker is its fingerprint.** `COMMENT ON STATISTICS` holds the object's expression list exactly as its `CREATE STATISTICS` writes it. `ResolvedMap::statisticsExpressions()` sorts the expressions, so the order the map declares its zoned attributes in changes neither the list nor the fingerprint. The compiler accepts the object only when the comment equals the declared list and `pg_statistic_ext.stxrelid` is the primary current model's table, and otherwise drops it and creates it again. It compares the comment, not `pg_get_statisticsobjdef_expressions()`, because PostgreSQL deparses an expression in its own form: it drops an identity cast, adds `::text` to the zone and quotes an identifier only where it must. `DROP STATISTICS`, `CREATE STATISTICS` and the comment each take a `SHARE UPDATE EXCLUSIVE` lock on the table, which blocks no read and no write.
+- **An index's marker is its definition.** `COMMENT ON INDEX` holds the definition the list declares for it, from `ON` to the filter. Any comment on a valid index counts as its marker, so a comment the package wrote for an earlier declaration stays as it is.
+- **An invalid index refuses.** Install, recompile and prepare refuse it with `InvalidCompatibilityMap` before they run anything, and the message ends with a hint for the kind of index.
+  - A failed or unfinished `CREATE INDEX CONCURRENTLY` leaves an ordinary index invalid. The hint reads `if no CREATE INDEX CONCURRENTLY is still running on it, DROP INDEX CONCURRENTLY <name>, then prepare again`.
+  - A partitioned index, `relkind` `I`, stays invalid until an index of each partition is attached to it. The hint says to attach each partition's index with `ALTER INDEX <name> ATTACH PARTITION`, or to `DROP INDEX <name>` and install or recompile again, because prepare cannot build an index on a partitioned table.
+- **`CREATE STATISTICS` carries no `IF NOT EXISTS`.** When another session creates the object between the catalog read and the statement, the statement fails, rather than skip that object and mark it with this list's fingerprint. The next run plans again and rebuilds it. Each `CREATE INDEX` keeps `IF NOT EXISTS`, and the drop `IF EXISTS`.
 
-The list has up to five kinds of statement, in this order:
+The list has up to six kinds of statement, in this order:
 
-1. **One `DROP STATISTICS IF EXISTS`**, when the statistics object's expressions differ from the declared ones.
-2. **One `CREATE STATISTICS IF NOT EXISTS`**, when the object is missing or was dropped, over the zoned attributes from `ResolvedMap::statisticsExpressions()`. It lists each distinct expression once, in the order first seen, because PostgreSQL rejects a duplicate with 42701. Two attributes that convert one column with one type and zone give one expression. PostgreSQL allows at most 8 in one statistics object, so `ResolvedMap::of()` refuses a map that gives more. A map with an index and no zoned attribute emits none.
-3. **One `COMMENT ON STATISTICS`** after the `CREATE STATISTICS`, holding its expression list.
-4. **One `CREATE INDEX IF NOT EXISTS` per missing index**, with the columns from `ResolvedMap::indexColumns()` and the filter from `ResolvedMap::indexFilter()`.
-5. **One `ANALYZE` of the primary current model's table**, so the new statistics and the new index expressions have data. The list carries it only when it carries a `CREATE`.
+1. **One `CREATE INDEX IF NOT EXISTS` per missing index**, with the columns from `ResolvedMap::indexColumns()` and the filter from `ResolvedMap::indexFilter()`.
+2. **One `DROP STATISTICS IF EXISTS`**, when the statistics object needs a rebuild.
+3. **One `CREATE STATISTICS`**, when the object is missing or was dropped, over the zoned attributes from `ResolvedMap::statisticsExpressions()`. It lists each distinct expression once, sorted, because PostgreSQL rejects a duplicate with 42701. Two attributes that convert one column with one type and zone give one expression. PostgreSQL allows at most 8 in one statistics object, so `ResolvedMap::of()` refuses a map that gives more. A map with an index and no zoned attribute emits none.
+4. **One `ANALYZE` of the primary current model's table**, so the new statistics and the new index expressions have data. The list carries it only when it carries a marker.
+5. **One `COMMENT ON STATISTICS`** with the fingerprint, after a `CREATE STATISTICS`.
+6. **One `COMMENT ON INDEX` per index the list built or found without a marker.**
 
 For the workbench map, [WidgetCompatibilityMap](../../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php), a fresh install lists:
 
 ```sql
-CREATE STATISTICS IF NOT EXISTS "compatibility__widgets__statistics" ON (CAST(("delivered_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)) FROM "gadgets"
-
-COMMENT ON STATISTICS "compatibility__widgets__statistics" IS '(CAST(("delivered_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("created_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone))'
-
 CREATE INDEX IF NOT EXISTS "compatibility__widgets__index_archived_newest" ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) DESC) WHERE CAST(("deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) IS NULL
 
+CREATE STATISTICS "compatibility__widgets__statistics" ON (CAST(("created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("delivered_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)) FROM "gadgets"
+
 ANALYZE "gadgets"
+
+COMMENT ON STATISTICS "compatibility__widgets__statistics" IS '(CAST(("created_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("deleted_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("delivered_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone)), (CAST(("updated_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone))'
+
+COMMENT ON INDEX "compatibility__widgets__index_archived_newest" IS 'ON "gadgets" (CAST(("archived") AS boolean), CAST(("created_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone) DESC) WHERE CAST(("deleted_at" AT TIME ZONE ''UTC'') AS timestamp(0) without time zone) IS NULL'
 ```
 
-An install after a prepare lists none of them. A recompile that adds a zoned attribute lists `DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics`, the `CREATE STATISTICS` and the comment with the new expression last, and `ANALYZE "gadgets"`, and no `CREATE INDEX`.
+An install after a prepare lists none of them. A recompile that adds a zoned attribute lists `DROP STATISTICS IF EXISTS public.compatibility__widgets__statistics`, the `CREATE STATISTICS` with the new expression in its sorted place, `ANALYZE "gadgets"` and the statistics comment, and nothing for the index.
 
 ### What each action emits
 
@@ -107,17 +115,17 @@ prepare    the planned list alone, with CREATE INDEX CONCURRENTLY      none: one
 uninstall  a DROP INDEX and a DROP STATISTICS for each object          one, with the rest of the uninstall
 ```
 
-`Installer::prepare()` runs `Compiler::prepare()`'s list. It throws `InvalidCompatibilityMap` inside a transaction, because `CREATE INDEX CONCURRENTLY` cannot run in one. It reads the primary current model's table and nothing else, so it works before the migration that renames the previous model's table. Before it runs anything, it refuses a map whose primary current model's table does not exist, one whose zoned column is missing or is not a `timestamp with time zone`, one whose zone the catalog does not hold, one whose indexed or filtered column is missing, and an invalid index of the map. A map that declares no planner support makes it a no-op, and so does one whose planner objects are all present and current. [INV-24](../invariants.md#inv-24-each-installer-method-is-atomic) records why `prepare` stands outside the transaction.
+`Installer::prepare()` runs `Compiler::prepare()`'s list. It throws `InvalidCompatibilityMap` inside a transaction, because `CREATE INDEX CONCURRENTLY` cannot run in one. It reads the primary current model's table and nothing else, so it works before the migration that renames the previous model's table. Before it runs anything, it refuses a map whose primary current model's table does not exist, one whose zoned column is missing or is not a `timestamp with time zone`, one whose zone the catalog does not hold, one whose indexed or filtered column is missing, and an invalid index of the map. A map that declares no planner support makes it a no-op, and so does one whose planner objects all carry their markers. [INV-24](../invariants.md#inv-24-each-installer-method-is-atomic) records why `prepare` stands outside the transaction.
 
-A concurrent build is the way to add an index to a live table. In an install, a plain `CREATE INDEX` takes a `SHARE` lock on the primary current model's table, which blocks its writes until the build ends. In a recompile, the build runs under the `ACCESS EXCLUSIVE` lock that the recompile's `DROP TRIGGER` takes on that table, so it blocks reads as well. The adopter therefore runs `prepare` ahead of the install migration, and ahead of each recompile that adds or renames an index or changes a zoned attribute. The install or recompile then finds each object present and current, and lists no planner statement and no `ANALYZE`, as [adopting a map](../adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes.
+A concurrent build is the way to add an index to a live table. In an install, a plain `CREATE INDEX` takes a `SHARE` lock on the primary current model's table, which blocks its writes until the build ends. In a recompile, the build runs under the `ACCESS EXCLUSIVE` lock that the recompile's `DROP TRIGGER` takes on that table, so it blocks reads as well. The adopter therefore runs `prepare` ahead of the install migration, and ahead of each recompile that adds or renames an index or changes a zoned attribute. The install or recompile then finds each object with its marker, and lists no planner statement and no `ANALYZE`, as [adopting a map](../adopting-a-map.md#before-the-install-prebuild-the-planner-objects) describes.
 
 ### What the planning leaves alone
 
 Three limits remain:
 
-- **A changed index definition is never rebuilt.** The compiler matches an index by name alone, so an index keeps the definition it had when it was created. To change one, give it a new name, and prepare it before the recompile. An object the map no longer declares stays until an uninstall drops it: a renamed index's old name, and the statistics object of a map that no longer converts a zone.
+- **A changed index definition is never rebuilt.** The compiler matches an index by name alone, so an index keeps the definition it had when it was created, and its marker keeps that definition too. To change one, give it a new name, and prepare it before the recompile. An object the map no longer declares stays until an uninstall drops it: a renamed index's old name, and the statistics object of a map that no longer converts a zone.
 - **`prepare` cannot serve a partitioned primary current model's table.** PostgreSQL refuses `CREATE INDEX CONCURRENTLY` on a partitioned table. Install can, with a plain `CREATE INDEX`.
-- **The planner statements that run hold their locks longer.** In an install, a `CREATE INDEX` takes a `SHARE` lock on the primary current model's table while it builds, and the `ANALYZE` lengthens the transaction. A recompile and an uninstall take an `ACCESS EXCLUSIVE` lock on that table with their `DROP TRIGGER` and hold it until the commit, so reads wait too. A recompile that creates something runs its `CREATE` and its `ANALYZE` under that lock, and an uninstall runs its `DROP INDEX` and `DROP STATISTICS` under it. Prebuild with `prepare`, so that an install or a recompile runs no planner statement at all.
+- **The planner statements that run hold their locks longer.** In an install, a `CREATE INDEX` takes a `SHARE` lock on the primary current model's table while it builds, and the `ANALYZE` lengthens the transaction. A recompile and an uninstall take an `ACCESS EXCLUSIVE` lock on that table with their `DROP TRIGGER` and hold it until the commit, so reads wait too. A recompile that creates or analyses something runs its `CREATE` and its `ANALYZE` under that lock, and an uninstall runs its `DROP INDEX` and `DROP STATISTICS` under it. Prebuild with `prepare`, so that an install or a recompile runs no planner statement at all.
 
 An index also needs an immutable expression. An attribute that an index names, and that reads a `timestamp with time zone` column as a `timestamp without time zone`, must declare `Attribute::inTimeZone()`. Without it, that cast is not immutable, and the install fails with PostgreSQL's 42P17. An attribute of its column's own type, such as `timestamp with time zone` or `boolean`, needs no zone: PostgreSQL drops the identity cast, so the column's own statistics and indexes serve the view. A statistics object is not affected, because it covers zoned attributes alone.
 
@@ -192,4 +200,4 @@ compatibility__<name>__designate_<alias>  AFTER INSERT OR UPDATE                
 
 Each trigger shares its function's name. `Compiler::function()` writes every function as `SECURITY DEFINER` PL/pgSQL, quoted with the `$compatibility$` tag. Its first statement refuses with CM001 when `TG_RELID` names a relation other than the function's own or a partition of it. Every built-in function the bodies call is qualified with `pg_catalog`, as [INV-37](../invariants.md#inv-37-a-trigger-function-runs-only-for-its-own-relation) records. The insert, update and delete functions also carry a `SET` clause for the applying flag, as [INV-3](../invariants.md#inv-3-the-views-own-writes-skip-this-maps-current-side-triggers) requires. `Compiler::variables()` declares `previous_row`, `affected_rows` and one `key_<alias>` per current model.
 
-The planner list, from the private `Compiler::planner()`, comes last, after the triggers. It holds the statistics and index statements that the catalog lacks or holds out of date, and an `ANALYZE` when it creates something. [Planner support](#planner-support) lists them, and `Compiler::prepare()` plans the same list with `CREATE INDEX CONCURRENTLY`.
+The planner list, from the private `Compiler::planner()`, comes last, after the triggers. It holds the index builds and the statistics statements that the catalog lacks or holds out of date, then an `ANALYZE`, then the markers, whenever an object lacks its marker. [Planner support](#planner-support) lists them, and `Compiler::prepare()` plans the same list with `CREATE INDEX CONCURRENTLY`.

@@ -268,7 +268,10 @@ final readonly class ResolvedMap
             }
         }
 
-        return array_values(array_unique($expressions));
+        $expressions = array_values(array_unique($expressions));
+        sort($expressions, SORT_STRING);
+
+        return $expressions;
     }
 
     /** @return list<string> */

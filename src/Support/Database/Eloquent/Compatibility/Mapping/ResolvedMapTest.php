@@ -398,10 +398,10 @@ final class ResolvedMapTest extends TestCase
             'gadgets',
             'compatibility__widgets__statistics',
             [
-                'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
                 'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
-                'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
                 'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+                'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+                'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
             ],
             'compatibility__widgets__index_archived_newest',
             ['CAST(("archived") AS boolean)', 'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) DESC'],
@@ -432,7 +432,7 @@ final class ResolvedMapTest extends TestCase
         };
 
         $this->assertSame(
-            [$read('delivered_at'), $read('created_at'), $read('updated_at'), $read('deleted_at'), $read('is_archived'), $read('created_at').' DESC', $read('deleted_at').' IS NULL'],
+            [$read('created_at'), $read('deleted_at'), $read('delivered_at'), $read('updated_at'), $read('is_archived'), $read('created_at').' DESC', $read('deleted_at').' IS NULL'],
             [...$resolvedMap->statisticsExpressions(), ...$resolvedMap->indexColumns($index), $resolvedMap->indexFilter($index)],
         );
     }
@@ -462,7 +462,7 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
-    public function it_exposes_each_statistics_expression_once_in_the_order_first_seen_when_two_zoned_attributes_read_one_column(): void
+    public function it_exposes_each_statistics_expression_once_and_sorted_when_two_zoned_attributes_read_one_column(): void
     {
         $resolvedMap = ResolvedMap::of($this->compatibilityMap(['attributes' => [
             $this->createdOn(),
@@ -471,10 +471,21 @@ final class ResolvedMapTest extends TestCase
 
         $this->assertSame([
             'CAST(("created_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
+            'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
             'CAST(("delivered_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
             'CAST(("updated_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
-            'CAST(("deleted_at" AT TIME ZONE \'UTC\') AS timestamp(0) without time zone)',
         ], $resolvedMap->statisticsExpressions());
+    }
+
+    #[Test]
+    public function it_exposes_the_same_statistics_expressions_whatever_the_order_the_zoned_attributes_are_declared_in(): void
+    {
+        $attributes = (new WidgetCompatibilityMap)->attributes();
+
+        $this->assertSame(
+            ResolvedMap::of(new WidgetCompatibilityMap)->statisticsExpressions(),
+            ResolvedMap::of($this->compatibilityMap(['attributes' => array_reverse($attributes)]))->statisticsExpressions(),
+        );
     }
 
     #[Test]
@@ -534,7 +545,7 @@ final class ResolvedMapTest extends TestCase
             'delivered_at' => Attribute::mapped('delivered_at')->asType($type)->storedAs('gadget', 'delivered_at')->inTimeZone('UTC'),
         ]))->attributes()]));
 
-        $this->assertSame("CAST((\"delivered_at\" AT TIME ZONE 'UTC') AS {$type})", $resolvedMap->statisticsExpressions()[0]);
+        $this->assertContains("CAST((\"delivered_at\" AT TIME ZONE 'UTC') AS {$type})", $resolvedMap->statisticsExpressions());
     }
 
     #[Test]
