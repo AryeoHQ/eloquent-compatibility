@@ -13,7 +13,9 @@ Entry points:
 
 ## Concurrency revision handling
 
-The compiler owns the `concurrency_revision` column of every table a map writes. A compiled mirror `INSERT` into such a table sets that column to 1, whatever a mapped attribute, a retained attribute or a fill gives it. A compiled mirror `UPDATE` drops any assignment to the column. It raises the revision by 1 only when the statement changes a stored value. That includes the `UPDATE` that sets a designation column.
+The compiler owns the `concurrency_revision` column of every table a map writes. A compiled mirror `INSERT` into such a table sets that column to 1, whatever a mapped attribute, a retained attribute or a fill gives it. So the column may be `NOT NULL` without a default. A compiled mirror `UPDATE` drops any assignment to the column. It raises the revision by 1 only when the statement changes a stored value. That includes the `UPDATE` that sets a designation column.
+
+The `UPDATE` compares each stored value by its `to_jsonb()` form, as the refusing trigger does. So an `interval` that changes from `1 mon` to `30 days` raises the revision, although SQL calls the two values equal. The `UPDATE` computes each mapped value once per row, so a volatile mapping such as `nextval()` runs once.
 
 A change to `updated_at` or to a `*_concurrency_revision` column alone raises nothing. A change to `deleted_at` raises the revision. A value that a mapping stores as the same number, such as a rounded price, raises nothing. A map may still expose the column through the view, and a write through the view cannot set it. So the mirrored write passes a refusing trigger that enforces application-raised revisions, as `refuse_unraised_concurrency_revision()` from eloquent-concurrency does.
 

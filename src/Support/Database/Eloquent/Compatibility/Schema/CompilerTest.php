@@ -1044,6 +1044,63 @@ final class CompilerTest extends TestCase
         $this->assertSame([DB::table('gadget_places')->value('id'), 2], [$retained->place_id, $retained->concurrency_revision]);
     }
 
+    #[Test]
+    public function it_raises_the_concurrency_revision_when_a_stored_value_changes_its_jsonb_form_although_sql_calls_the_two_values_equal(): void
+    {
+        DB::statement('alter table gadgets add column lead_time interval');
+        $this->refuseUnraisedRevisions('gadgets');
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('lead_time')->asType('text')->storedAs('gadget', 'lead_time'),
+        ]]));
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'lead_time' => '1 mon']);
+
+        DB::table('widgets')->where('id', $id)->update(['lead_time' => '30 days']);
+
+        $this->assertSame(['30 days', 2], array_values((array) DB::table('gadgets')->sole([DB::raw('lead_time::text as lead_time'), 'concurrency_revision'])));
+    }
+
+    #[Test]
+    public function it_evaluates_a_volatile_mapping_once_per_mirrored_update_and_compares_the_value_it_stores(): void
+    {
+        DB::statement('create sequence gadget_serials');
+        DB::statement('alter table gadgets add column serial bigint');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop sequence if exists gadget_serials cascade');
+        });
+        $this->refuseUnraisedRevisions('gadgets');
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('serial')->asType('bigint')->readAs('gadget', 'gadget.serial')->writesTo('gadget', 'serial', "nextval('gadget_serials')"),
+        ]]));
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'serial' => 0]);
+        $observed = [];
+
+        foreach ([10, 20] as $serial) {
+            DB::table('widgets')->where('id', $id)->update(['serial' => $serial]);
+            $gadget = DB::table('gadgets')->sole(['serial', 'concurrency_revision']);
+            $observed[] = [$gadget->serial, DB::scalar('select last_value from gadget_serials'), $gadget->concurrency_revision];
+        }
+
+        $this->assertSame([[2, 2, 2], [3, 3, 3]], $observed);
+    }
+
+    #[Test]
+    public function it_counts_the_concurrency_revision_it_owns_as_filled_on_every_insert(): void
+    {
+        foreach (['retained_widgets', 'gadgets', 'gadget_places', 'gadget_sites'] as $table) {
+            DB::statement("alter table {$table} add column concurrency_revision bigint not null");
+        }
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $this->widget();
+
+        $this->assertSame(
+            [[1], [1], [1], [1]],
+            array_map(fn (string $table) => DB::table($table)->pluck('concurrency_revision')->all(), ['retained_widgets', 'gadgets', 'gadget_places', 'gadget_sites']),
+        );
+    }
+
     /**
      * @param  array<string, string>  $previousFills
      */

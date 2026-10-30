@@ -579,8 +579,16 @@ final class Compiler
         }
 
         $table = $resolvedMap->table($alias);
+        $converted = 'converted_'.$alias;
+        $columns = array_keys($values);
+        $revision = $this->revision($table, array_combine($columns, array_map(fn (string $column) => $converted.'.'.SqlFragments::identifier($column), $columns)), $alias.'.');
+        $sets = $revision === null
+            ? $this->sets($table, $values, $alias.'.')
+            : '('.implode(', ', array_map(SqlFragments::identifier(...), [...$columns, self::CONCURRENCY_REVISION])).') = (SELECT '
+                .implode(', ', [...array_map(fn (string $column) => $converted.'.'.SqlFragments::identifier($column), $columns), $revision])
+                .' FROM (SELECT '.implode(', ', array_map(fn (string $column, string $value) => $value.' AS '.SqlFragments::identifier($column), $columns, $values)).') AS '.$converted.')';
 
-        return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.$this->sets($table, $values, $alias.'.')
+        return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.$sets
             .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key.';';
     }
 
@@ -590,20 +598,33 @@ final class Compiler
     private function sets(string $table, array $values, string $old): string
     {
         $sets = array_map(fn (string $column, string $value) => SqlFragments::identifier($column).' = '.$value, array_keys($values), $values);
-        $columns = $this->columnCatalog->of($table);
-        $observed = array_values(array_filter(array_keys($values), fn (string $column) => $column !== 'updated_at' && ! str_ends_with($column, '_'.self::CONCURRENCY_REVISION)));
+        $revision = $this->revision($table, $values, $old);
 
-        if ($this->revisioned($table) && $observed !== []) {
-            $compared = fn (string $column, string $expression) => $this->columnCatalog->equatable($columns[$column]->type) ? $expression : '('.$expression.')::text';
-            $revision = SqlFragments::identifier(self::CONCURRENCY_REVISION);
-            $sets[] = $revision.' = '.$revision.' + CASE WHEN ROW('
-                .implode(', ', array_map(fn (string $column) => $compared($column, $old.SqlFragments::identifier($column)), $observed))
-                .') IS DISTINCT FROM ROW('
-                .implode(', ', array_map(fn (string $column) => $compared($column, '('.$values[$column].')'), $observed))
-                .') THEN 1 ELSE 0 END';
+        if ($revision !== null) {
+            $sets[] = SqlFragments::identifier(self::CONCURRENCY_REVISION).' = '.$revision;
         }
 
         return implode(', ', $sets);
+    }
+
+    /**
+     * @param  array<string, string>  $values
+     */
+    private function revision(string $table, array $values, string $old): null|string
+    {
+        $observed = array_values(array_filter(array_keys($values), fn (string $column) => $column !== 'updated_at' && ! str_ends_with($column, '_'.self::CONCURRENCY_REVISION)));
+
+        if (! $this->revisioned($table) || $observed === []) {
+            return null;
+        }
+
+        $row = fn (callable $expression) => 'ROW('.implode(', ', array_map(fn (string $column) => 'to_jsonb('.$expression($column).')', $observed)).')';
+
+        return $old.SqlFragments::identifier(self::CONCURRENCY_REVISION).' + CASE WHEN '
+            .$row(fn (string $column) => $old.SqlFragments::identifier($column))
+            .' IS DISTINCT FROM '
+            .$row(fn (string $column) => $values[$column])
+            .' THEN 1 ELSE 0 END';
     }
 
     private function revisioned(string $table): bool
@@ -1038,7 +1059,7 @@ final class Compiler
     private function refuseEmpty(ResolvedMap $resolvedMap, string $table, array $filled, string $problem): void
     {
         foreach ($this->columnCatalog->of($table) as $name => $column) {
-            if ($column->needsAValue() && ! in_array($name, $filled, true)) {
+            if ($column->needsAValue() && $name !== self::CONCURRENCY_REVISION && ! in_array($name, $filled, true)) {
                 throw InvalidCompatibilityMap::because($resolvedMap->name, "{$table}.{$name} is NOT NULL without a default, and {$problem}");
             }
         }
