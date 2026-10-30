@@ -28,7 +28,7 @@ The insert, update and delete functions hold the applying flag at the map's name
 The update trigger runs once per row. `Compiler::updateFunction()` builds its body, which runs in this order:
 
 1. Each read-only attribute refuses a change with CM001, with the reason from `Attribute::readOnlyBecause()`.
-2. A mapped attribute whose same-named retained column is `NOT NULL` refuses a change to null, because the previous model never stored one. A record that already reads null keeps it, so a write to its other attributes still succeeds. A current model can create such a record.
+2. A mapped attribute whose same-named retained column is `NOT NULL` refuses a change to null, because the previous model never stored one. A record that already reads null keeps it, so a write to its other attributes still succeeds. A current model can create such a record. An attribute that writes only a `concurrency_revision` column the compiler owns is exempt, because the trigger drops that assignment.
 3. The trigger locks the primary row with `FOR UPDATE`.
 4. It locks the retained row and loads it into `previous_row`. A missing row refuses with CM001, and the hint names `compatibility:check`.
 5. Each refused state with `UnrepresentableState::checkedOnPreviousUpdate()` refuses with CM001 when its condition holds.
@@ -36,7 +36,8 @@ The update trigger runs once per row. `Compiler::updateFunction()` builds its bo
 7. It updates the primary row when one of its attributes changed. Any row count other than one refuses with CM001.
 8. It updates the retained row the same way, with no row count check.
 9. It writes each dependent whose attributes changed, as the next section describes.
-10. It returns `NEW`.
+10. It reads each attribute that writes only a compiler-owned `concurrency_revision` column back into `NEW` from the stored rows. So `UPDATE ... RETURNING` reports the stored revision, not the value the caller sent.
+11. It returns `NEW`.
 
 `Compiler::update()` writes each column as `CASE WHEN NEW.x IS DISTINCT FROM OLD.x THEN ... ELSE <stored value> END`. A column whose attribute did not change keeps the value stored now. It still sits in the `SET` list, so an `UPDATE OF` trigger on it fires, as [INV-7](../invariants.md#inv-7-the-update-trigger-writes-only-what-changed) records. Each written value is cast to the column's type in the catalog.
 
@@ -56,7 +57,7 @@ The trigger writes only the dependent row the conflict check locked in step 6, b
 
 The insert trigger takes no locks. `Compiler::insertFunction()` builds it:
 
-1. A mapped attribute whose same-named retained column is `NOT NULL` refuses a null.
+1. A mapped attribute whose same-named retained column is `NOT NULL` refuses a null. An attribute that writes only a `concurrency_revision` column the compiler owns is exempt, because the insert stores 1 there.
 2. The trigger inserts the primary row, and `PrimaryCurrentModel::fillWhenCreatedFromPrevious()` fills the columns no attribute writes.
 3. It inserts the retained row, linked to the primary row. A read-only retained attribute over a column the database always generates stays out of the insert, so the table fills it.
 4. It inserts each dependent row whose `DependentCurrentModel::createdWhen()` condition holds, linked to the primary row, and designates it where the dependent has a designation.
