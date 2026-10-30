@@ -1074,6 +1074,20 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_designates_a_dependent_row_an_update_creates_while_it_changes_a_writable_retained_key(): void
+    {
+        resolve(Installer::class)->install($this->compatibilityMap([
+            'dependentCurrentModels' => $this->dependents(place: fn (DependentCurrentModel $place) => $place->designatedBy('place_id')),
+            'attributes' => (new WidgetCompatibilityMap(['id' => Attribute::retained('id')]))->attributes(),
+        ]));
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'price' => '12.50', 'latitude' => 47.5]);
+
+        DB::table('widgets')->where('id', $id)->update(['id' => $id + 100, 'street' => '1 Main St']);
+
+        $this->assertSame([$id + 100, DB::table('gadget_places')->value('id')], [DB::table('retained_widgets')->value('id'), DB::table('retained_widgets')->value('place_id')]);
+    }
+
+    #[Test]
     public function it_lets_an_insert_omit_and_an_update_null_a_not_null_concurrency_revision_the_map_exposes(): void
     {
         foreach (['retained_widgets', 'gadgets'] as $table) {

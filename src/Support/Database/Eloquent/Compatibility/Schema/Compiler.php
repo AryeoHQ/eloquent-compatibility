@@ -545,7 +545,7 @@ final class Compiler
         }
 
         $cases['('.$this->createdWhen($dependent, $assignments).')'] = $this->insert($table, $this->dependentValues($resolvedMap, $dependent, $assignments, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
-            .$this->designate($resolvedMap, $dependent, 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn), "\n        ");
+            .$this->designate($resolvedMap, $dependent, $this->storedPreviousKey($resolvedMap), "\n        ");
         $branches = '';
 
         foreach ($cases as $condition => $statement) {
