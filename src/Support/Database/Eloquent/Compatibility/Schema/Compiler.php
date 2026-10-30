@@ -618,7 +618,7 @@ final class Compiler
             return null;
         }
 
-        $row = fn (callable $expression) => 'ROW('.implode(', ', array_map(fn (string $column) => 'to_jsonb('.$expression($column).')', $observed)).')';
+        $row = fn (callable $expression) => 'ROW('.implode(', ', array_map(fn (string $column) => 'pg_catalog.to_jsonb('.$expression($column).')', $observed)).')';
 
         return $old.SqlFragments::identifier(self::CONCURRENCY_REVISION).' + CASE WHEN '
             .$row(fn (string $column) => $old.SqlFragments::identifier($column))

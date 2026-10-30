@@ -949,6 +949,22 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_compares_a_revisioned_value_with_the_built_in_to_jsonb_whatever_overload_the_installation_schema_holds(): void
+    {
+        $this->refuseUnraisedRevisions('gadgets');
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        DB::unprepared("create function to_jsonb(character varying) returns jsonb language plpgsql as \$overload\$ begin raise exception 'The installation schema''s to_jsonb(character varying) ran'; end \$overload\$");
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop function if exists to_jsonb(character varying)');
+        });
+        $id = $this->widget();
+
+        DB::table('widgets')->where('id', $id)->update(['title' => 'Renamed']);
+
+        $this->assertSame(['Renamed', 2], array_values((array) DB::table('gadgets')->sole(['name', 'concurrency_revision'])));
+    }
+
+    #[Test]
     public function it_inserts_a_mirrored_primary_row_at_concurrency_revision_one_and_raises_it_only_when_a_stored_value_other_than_updated_at_changes(): void
     {
         $this->refuseUnraisedRevisions('gadgets');
