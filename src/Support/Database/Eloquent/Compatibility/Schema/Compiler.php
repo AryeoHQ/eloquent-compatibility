@@ -19,6 +19,8 @@ final class Compiler
 {
     private const string TIMESTAMP_WITH_TIME_ZONE = '/^timestamp(?:\(\d+\))? with time zone$/';
 
+    private const string CONCURRENCY_REVISION = 'concurrency_revision';
+
     private readonly ColumnCatalog $columnCatalog;
 
     private readonly string $schema;
@@ -386,6 +388,10 @@ final class Compiler
             $values[$column] = $this->value($resolvedMap, $previousAlias, new TargetColumn($previousAlias, $column, $expression));
         }
 
+        if ($this->revisioned((string) $previous->table)) {
+            $values[self::CONCURRENCY_REVISION] = '1';
+        }
+
         return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::PrimaryInsert), $resolvedMap->table((string) $resolvedMap->primaryCurrentModel->alias), '  created_key '.SqlFragments::identifier((string) $previous->table).'.'.SqlFragments::identifier((string) $previous->keyColumn)."%TYPE;\n", [
             $this->skipWhileApplying($resolvedMap, 'NEW'),
             '  '.$this->insert((string) $previous->table, $values, (string) $previous->keyColumn, 'created_key'),
@@ -403,7 +409,7 @@ final class Compiler
         return $this->function($resolvedMap, $resolvedMap->designateFunctionName($dependent), $resolvedMap->table($alias), '', [
             $this->skipWhileApplying($resolvedMap, 'NEW'),
             '  IF EXISTS (SELECT 1 FROM (SELECT NEW.*) AS '.$alias.' WHERE COALESCE(('.$dependent->readableWhen.'), false)) THEN'."\n    "
-                .'UPDATE '.SqlFragments::identifier((string) $previous->table).' SET '.$designation.' = NEW.'.SqlFragments::identifier($resolvedMap->keyColumn($alias))
+                .'UPDATE '.SqlFragments::identifier((string) $previous->table).' SET '.$this->sets((string) $previous->table, [(string) $dependent->designationColumn => 'NEW.'.SqlFragments::identifier($resolvedMap->keyColumn($alias))], '')
                 .' WHERE '.SqlFragments::identifier((string) $previous->primaryForeignKey).' = NEW.'.SqlFragments::identifier($resolvedMap->primaryForeignKey($dependent)).' AND '.$designation." IS NULL;\n  END IF;",
             '  RETURN NEW;',
         ]);
@@ -482,7 +488,7 @@ final class Compiler
 
     private function updateTable(ResolvedMap $resolvedMap, string $alias, string $key, bool $mustExist): string
     {
-        $assignments = $resolvedMap->assignmentsTo($alias);
+        $assignments = $this->updateAssignmentsTo($resolvedMap, $alias);
 
         if ($assignments === []) {
             return '';
@@ -502,7 +508,7 @@ final class Compiler
     private function updateDependent(ResolvedMap $resolvedMap, DependentCurrentModel $dependent, string $primaryKey): string
     {
         $alias = (string) $dependent->alias;
-        $assignments = $resolvedMap->assignmentsTo($alias);
+        $assignments = $this->updateAssignmentsTo($resolvedMap, $alias);
 
         if ($assignments === []) {
             return '';
@@ -554,7 +560,7 @@ final class Compiler
 
         $previous = $resolvedMap->previousModel;
 
-        return $indent.'UPDATE '.SqlFragments::identifier((string) $previous->table).' SET '.SqlFragments::identifier($dependent->designationColumn).' = key_'.$dependent->alias
+        return $indent.'UPDATE '.SqlFragments::identifier((string) $previous->table).' SET '.$this->sets((string) $previous->table, [$dependent->designationColumn => 'key_'.$dependent->alias], '')
             .' WHERE '.SqlFragments::identifier((string) $previous->keyColumn).' = '.$previousKey.';';
     }
 
@@ -563,22 +569,46 @@ final class Compiler
      */
     private function update(ResolvedMap $resolvedMap, string $alias, array $assignments, string $key): string
     {
-        $sets = array_map(
-            fn (Assignment $assignment) => SqlFragments::identifier($assignment->targetColumn->column).' = CASE WHEN '.$this->compared($resolvedMap, $assignment->attribute, 'NEW.'.SqlFragments::identifier($assignment->attribute->column))
+        $values = [];
+
+        foreach ($assignments as $assignment) {
+            $values[$assignment->targetColumn->column] = 'CASE WHEN '.$this->compared($resolvedMap, $assignment->attribute, 'NEW.'.SqlFragments::identifier($assignment->attribute->column))
                 .' IS DISTINCT FROM '.$this->compared($resolvedMap, $assignment->attribute, 'OLD.'.SqlFragments::identifier($assignment->attribute->column))
                 .' THEN '.$this->value($resolvedMap, $alias, $assignment->targetColumn)
-                .' ELSE '.$alias.'.'.SqlFragments::identifier($assignment->targetColumn->column).' END',
-            $assignments,
-        );
+                .' ELSE '.$alias.'.'.SqlFragments::identifier($assignment->targetColumn->column).' END';
+        }
 
         $table = $resolvedMap->table($alias);
 
-        if (array_key_exists('concurrency_revision', $this->columnCatalog->of($table))) {
-            $sets[] = '"concurrency_revision" = "concurrency_revision" + 1';
+        return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.$this->sets($table, $values, $alias.'.')
+            .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key.';';
+    }
+
+    /**
+     * @param  array<string, string>  $values
+     */
+    private function sets(string $table, array $values, string $old): string
+    {
+        $sets = array_map(fn (string $column, string $value) => SqlFragments::identifier($column).' = '.$value, array_keys($values), $values);
+        $columns = $this->columnCatalog->of($table);
+        $observed = array_values(array_filter(array_keys($values), fn (string $column) => $column !== 'updated_at' && ! str_ends_with($column, '_'.self::CONCURRENCY_REVISION)));
+
+        if ($this->revisioned($table) && $observed !== []) {
+            $compared = fn (string $column, string $expression) => $this->columnCatalog->equatable($columns[$column]->type) ? $expression : '('.$expression.')::text';
+            $revision = SqlFragments::identifier(self::CONCURRENCY_REVISION);
+            $sets[] = $revision.' = '.$revision.' + CASE WHEN ROW('
+                .implode(', ', array_map(fn (string $column) => $compared($column, $old.SqlFragments::identifier($column)), $observed))
+                .') IS DISTINCT FROM ROW('
+                .implode(', ', array_map(fn (string $column) => $compared($column, '('.$values[$column].')'), $observed))
+                .') THEN 1 ELSE 0 END';
         }
 
-        return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.implode(', ', $sets)
-            .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key.';';
+        return implode(', ', $sets);
+    }
+
+    private function revisioned(string $table): bool
+    {
+        return array_key_exists(self::CONCURRENCY_REVISION, $this->columnCatalog->of($table));
     }
 
     /**
@@ -615,6 +645,20 @@ final class Compiler
     }
 
     /**
+     * @return list<Assignment>
+     */
+    private function updateAssignmentsTo(ResolvedMap $resolvedMap, string $alias): array
+    {
+        $assignments = $resolvedMap->assignmentsTo($alias);
+
+        if (! $this->revisioned($resolvedMap->table($alias))) {
+            return $assignments;
+        }
+
+        return array_values(array_filter($assignments, fn (Assignment $assignment) => $assignment->targetColumn->column !== self::CONCURRENCY_REVISION));
+    }
+
+    /**
      * @param  list<Assignment>  $assignments
      * @param  array<string, string>  $extra
      * @return array<string, string>
@@ -645,10 +689,8 @@ final class Compiler
             $values[$column] = $this->value($resolvedMap, $alias, new TargetColumn($alias, $column, $expression));
         }
 
-        $table = $resolvedMap->table($alias);
-
-        if (array_key_exists('concurrency_revision', $this->columnCatalog->of($table)) && ! array_key_exists('concurrency_revision', $values)) {
-            $values['concurrency_revision'] = '1';
+        if ($this->revisioned($resolvedMap->table($alias))) {
+            $values[self::CONCURRENCY_REVISION] = '1';
         }
 
         return $values;

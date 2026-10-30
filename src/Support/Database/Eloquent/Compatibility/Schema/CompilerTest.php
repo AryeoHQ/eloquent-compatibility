@@ -949,80 +949,99 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
-    public function it_raises_the_concurrency_revision_when_mirroring_into_a_revisioned_table(): void
+    public function it_inserts_a_mirrored_primary_row_at_concurrency_revision_one_and_raises_it_only_when_a_stored_value_other_than_updated_at_changes(): void
     {
-        Schema::table('gadgets', function (Blueprint $table): void {
-            $table->bigInteger('concurrency_revision')->default(1);
-        });
-
-        DB::unprepared(<<<'SQL'
-            CREATE OR REPLACE FUNCTION refuse_unraised_concurrency_revision() RETURNS trigger LANGUAGE plpgsql AS $$
-            DECLARE
-                ignored text[];
-                changed text;
-            BEGIN
-                IF TG_OP = 'INSERT' THEN
-                    IF NEW.concurrency_revision IS DISTINCT FROM 1 THEN
-                        RAISE EXCEPTION '[%] inserts a row at concurrency revision %, not 1.', TG_TABLE_NAME, NEW.concurrency_revision
-                            USING ERRCODE = '23514';
-                    END IF;
-                    RETURN NEW;
-                END IF;
-
-                IF NEW.concurrency_revision = OLD.concurrency_revision + 1 THEN
-                    RETURN NEW;
-                END IF;
-
-                IF NEW.concurrency_revision IS DISTINCT FROM OLD.concurrency_revision THEN
-                    RAISE EXCEPTION '[%] changes the concurrency revision from % to %, not by 1.', TG_TABLE_NAME, OLD.concurrency_revision, NEW.concurrency_revision
-                        USING ERRCODE = '23514';
-                END IF;
-
-                ignored := COALESCE(TG_ARGV, '{}') || '{concurrency_revision,updated_at,deleted_at}' || ARRAY(
-                    SELECT key FROM jsonb_object_keys(to_jsonb(NEW)) AS key WHERE key LIKE '%\_concurrency\_revision'
-                ) || ARRAY(
-                    SELECT attname::text FROM pg_attribute
-                    WHERE attrelid = TG_RELID AND attnum > 0 AND NOT attisdropped AND attgenerated <> ''
-                );
-
-                SELECT string_agg(n.key, '], [' ORDER BY n.key) INTO changed
-                FROM jsonb_each(to_jsonb(NEW) - ignored) AS n
-                WHERE n.value IS DISTINCT FROM (to_jsonb(OLD) - ignored) -> n.key;
-
-                IF changed IS NOT NULL THEN
-                    RAISE EXCEPTION '[%] changes [%] without raising the concurrency revision.', TG_TABLE_NAME, changed
-                        USING ERRCODE = '23514';
-                END IF;
-
-                RETURN NEW;
-            END $$;
-        SQL);
-
-        DB::unprepared('CREATE TRIGGER refuse_unraised_revision BEFORE INSERT OR UPDATE ON gadgets FOR EACH ROW EXECUTE FUNCTION refuse_unraised_concurrency_revision()');
-
-        $this->beforeApplicationDestroyed(function (): void {
-            DB::unprepared('DROP TRIGGER IF EXISTS refuse_unraised_revision ON gadgets');
-            DB::unprepared('DROP FUNCTION IF EXISTS refuse_unraised_concurrency_revision()');
-            if (Schema::hasTable('gadgets') && Schema::hasColumn('gadgets', 'concurrency_revision')) {
-                Schema::table('gadgets', function (Blueprint $table): void {
-                    $table->dropColumn('concurrency_revision');
-                });
-            }
-        });
-
+        $this->refuseUnraisedRevisions('gadgets');
         resolve(Installer::class)->install(new WidgetCompatibilityMap);
-
         $id = $this->widget();
-        $gadgetId = DB::table('retained_widgets')->where('id', $id)->value('gadget_id');
-        $revision = DB::table('gadgets')->where('id', $gadgetId)->value('concurrency_revision');
+        $revisions = [DB::table('gadgets')->value('concurrency_revision')];
 
-        $this->assertSame(1, $revision);
+        foreach ([['price' => '12.504'], ['updated_at' => '2026-10-29 12:00:00'], ['deleted_at' => '2026-10-29 12:00:00'], ['title' => 'Renamed']] as $change) {
+            DB::table('widgets')->where('id', $id)->update($change);
+            $revisions[] = DB::table('gadgets')->value('concurrency_revision');
+        }
 
-        DB::table('widgets')->where('id', $id)->update(['title' => 'Updated Widget']);
+        $this->assertSame([1, 1, 1, 2, 3], $revisions);
+    }
 
-        $newRevision = DB::table('gadgets')->where('id', $gadgetId)->value('concurrency_revision');
+    #[Test]
+    public function it_inserts_a_mirrored_dependent_row_at_concurrency_revision_one_and_raises_it_only_when_a_stored_value_changes(): void
+    {
+        $this->refuseUnraisedRevisions('gadget_sites');
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'price' => '12.50', 'street' => '1 Main St']);
+        $revisions = [];
 
-        $this->assertSame(2, $newRevision);
+        foreach (['47.5', '47.5000000000001', '48.25'] as $latitude) {
+            DB::table('widgets')->where('id', $id)->update(['latitude' => $latitude]);
+            $revisions[] = DB::table('gadget_sites')->value('concurrency_revision');
+        }
+
+        $this->widget();
+        $revisions[] = DB::table('gadget_sites')->where('latitude', 47.5)->value('concurrency_revision');
+
+        $this->assertSame([1, 1, 2, 1], $revisions);
+    }
+
+    #[Test]
+    public function it_inserts_a_mirrored_retained_row_at_concurrency_revision_one_from_either_side_and_raises_it_when_a_retained_value_changes(): void
+    {
+        $this->refuseUnraisedRevisions('retained_widgets');
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+        $id = $this->widget();
+        DB::table('widgets')->where('id', $id)->update(['sku' => 'SKU-1']);
+        $gadget = DB::table('gadgets')->insertGetId(['name' => 'Created through its own model']);
+
+        $this->assertSame(
+            [2, 1],
+            [DB::table('retained_widgets')->where('id', $id)->value('concurrency_revision'), DB::table('retained_widgets')->where('gadget_id', $gadget)->value('concurrency_revision')],
+        );
+    }
+
+    #[Test]
+    #[TestWith(['gadgets', 'mapped'])]
+    #[TestWith(['retained_widgets', 'retained'])]
+    public function it_sets_and_raises_a_concurrency_revision_the_map_exposes_whatever_value_the_write_gives_it(string $table, string $attribute): void
+    {
+        $this->refuseUnraisedRevisions($table);
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            $attribute === 'mapped' ? Attribute::mapped('concurrency_revision')->asType('bigint')->storedAs('gadget', 'concurrency_revision') : Attribute::retained('concurrency_revision'),
+        ]]));
+        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'price' => '12.50', 'street' => '1 Main St', 'latitude' => 47.5, 'concurrency_revision' => 7]);
+        $revisions = [DB::table('widgets')->where('id', $id)->value('concurrency_revision')];
+
+        foreach ([['sku' => 'SKU-1', 'title' => 'Renamed', 'concurrency_revision' => 9], ['concurrency_revision' => 5]] as $change) {
+            DB::table('widgets')->where('id', $id)->update($change);
+            $revisions[] = DB::table('widgets')->where('id', $id)->value('concurrency_revision');
+        }
+
+        $this->assertSame([1, 2, 2], $revisions);
+        $this->assertSame(2, DB::table($table)->value('concurrency_revision'));
+    }
+
+    #[Test]
+    #[TestWith(['an insert through the view'])]
+    #[TestWith(['an update through the view'])]
+    #[TestWith(['an insert through the current model'])]
+    public function it_raises_the_concurrency_revision_of_the_retained_row_when_it_designates_a_dependent_row(string $write): void
+    {
+        $this->refuseUnraisedRevisions('retained_widgets');
+        resolve(Installer::class)->install($this->workbenchMap('designated'));
+        $row = ['title' => 'Blue gadget', 'price' => '12.50', 'latitude' => 47.5];
+
+        if ($write === 'an insert through the view') {
+            DB::table('widgets')->insert([...$row, 'street' => '1 Main St']);
+        } elseif ($write === 'an update through the view') {
+            DB::table('widgets')->where('id', DB::table('widgets')->insertGetId($row))->update(['street' => '1 Main St']);
+        } else {
+            DB::table('widgets')->insert($row);
+            DB::table('gadget_places')->insert(['gadget_id' => DB::table('retained_widgets')->value('gadget_id'), 'street' => '1 Main St']);
+        }
+
+        $retained = DB::table('retained_widgets')->sole();
+
+        $this->assertSame([DB::table('gadget_places')->value('id'), 2], [$retained->place_id, $retained->concurrency_revision]);
     }
 
     /**
@@ -1101,6 +1120,61 @@ final class CompilerTest extends TestCase
         $this->assertSame(SqlState::Refused->value, $state);
         $this->assertStringContainsString("ERROR:  Compatibility map 'widgets' refused a write to widgets record {$id}: its gadgets row is missing", $error);
         $this->assertSame('Blue gadget', DB::table('gadgets')->value('name'));
+    }
+
+    private function refuseUnraisedRevisions(string $table): void
+    {
+        Schema::table($table, function (Blueprint $blueprint): void {
+            $blueprint->bigInteger('concurrency_revision')->default(0);
+        });
+
+        DB::unprepared(<<<'SQL'
+            CREATE OR REPLACE FUNCTION refuse_unraised_concurrency_revision() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE
+                ignored text[];
+                changed text;
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    IF NEW.concurrency_revision IS DISTINCT FROM 1 THEN
+                        RAISE EXCEPTION '[%] inserts a row at concurrency revision %, not 1.', TG_TABLE_NAME, NEW.concurrency_revision
+                            USING ERRCODE = '23514';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+
+                IF NEW.concurrency_revision = OLD.concurrency_revision + 1 THEN
+                    RETURN NEW;
+                END IF;
+
+                IF NEW.concurrency_revision IS DISTINCT FROM OLD.concurrency_revision THEN
+                    RAISE EXCEPTION '[%] changes the concurrency revision from % to %, not by 1.', TG_TABLE_NAME, OLD.concurrency_revision, NEW.concurrency_revision
+                        USING ERRCODE = '23514';
+                END IF;
+
+                ignored := COALESCE(TG_ARGV, '{}') || '{concurrency_revision,updated_at,deleted_at}' || ARRAY(
+                    SELECT key FROM jsonb_object_keys(to_jsonb(NEW)) AS key WHERE key LIKE '%\_concurrency\_revision'
+                ) || ARRAY(
+                    SELECT attname::text FROM pg_attribute
+                    WHERE attrelid = TG_RELID AND attnum > 0 AND NOT attisdropped AND attgenerated <> ''
+                );
+
+                SELECT string_agg(n.key, '], [' ORDER BY n.key) INTO changed
+                FROM jsonb_each(to_jsonb(NEW) - ignored) AS n
+                WHERE n.value IS DISTINCT FROM (to_jsonb(OLD) - ignored) -> n.key;
+
+                IF changed IS NOT NULL THEN
+                    RAISE EXCEPTION '[%] changes [%] without raising the concurrency revision.', TG_TABLE_NAME, changed
+                        USING ERRCODE = '23514';
+                END IF;
+
+                RETURN NEW;
+            END $$;
+        SQL);
+
+        DB::unprepared("CREATE TRIGGER refuse_unraised_revision BEFORE INSERT OR UPDATE ON {$table} FOR EACH ROW EXECUTE FUNCTION refuse_unraised_concurrency_revision()");
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::unprepared('DROP FUNCTION IF EXISTS refuse_unraised_concurrency_revision() CASCADE');
+        });
     }
 
     private function compiler(): Compiler
