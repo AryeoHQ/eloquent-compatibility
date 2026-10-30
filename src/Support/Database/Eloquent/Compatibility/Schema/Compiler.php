@@ -298,12 +298,7 @@ final class Compiler
                 ."\n  END IF;";
         }
 
-        $body[] = '  SELECT '.implode(', ', array_map(fn (Attribute $attribute) => $this->read($resolvedMap, $attribute), $resolvedMap->attributes))
-            ."\n    INTO ".implode(', ', array_map(fn (Attribute $attribute) => 'NEW.'.SqlFragments::identifier($attribute->column), $resolvedMap->attributes))
-            ."\n    FROM ".SqlFragments::identifier((string) $previous->table).' '.$previousAlias
-            .' JOIN '.SqlFragments::identifier($resolvedMap->table($primaryAlias)).' '.$primaryAlias
-            .' ON '.$primaryAlias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primaryAlias)).' = '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
-            .' WHERE '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).';';
+        $body[] = $this->reload($resolvedMap, $resolvedMap->attributes, 'previous_row.'.SqlFragments::identifier((string) $previous->keyColumn));
         $body[] = '  PERFORM pg_catalog.set_config('.SqlFragments::literal(Setting::Created->for($resolvedMap)).', previous_row.'.SqlFragments::identifier((string) $previous->keyColumn).'::text, true);';
         $body[] = '  RETURN NEW;';
 
@@ -350,9 +345,28 @@ final class Compiler
             $body[] = $this->updateDependent($resolvedMap, $dependent, $primaryKey);
         }
 
+        $revisions = array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $this->ownsRevision($resolvedMap, $attribute)));
+        $body[] = $revisions === [] ? '' : $this->reload($resolvedMap, $revisions, 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn));
         $body[] = '  RETURN NEW;';
 
         return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')), true);
+    }
+
+    /**
+     * @param  list<Attribute>  $attributes
+     */
+    private function reload(ResolvedMap $resolvedMap, array $attributes, string $previousKey): string
+    {
+        $previous = $resolvedMap->previousModel;
+        $previousAlias = (string) $previous->alias;
+        $primaryAlias = (string) $resolvedMap->primaryCurrentModel->alias;
+
+        return '  SELECT '.implode(', ', array_map(fn (Attribute $attribute) => $this->read($resolvedMap, $attribute), $attributes))
+            ."\n    INTO ".implode(', ', array_map(fn (Attribute $attribute) => 'NEW.'.SqlFragments::identifier($attribute->column), $attributes))
+            ."\n    FROM ".SqlFragments::identifier((string) $previous->table).' '.$previousAlias
+            .' JOIN '.SqlFragments::identifier($resolvedMap->table($primaryAlias)).' '.$primaryAlias
+            .' ON '.$primaryAlias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primaryAlias)).' = '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey)
+            .' WHERE '.$previousAlias.'.'.SqlFragments::identifier((string) $previous->keyColumn).' = '.$previousKey.';';
     }
 
     private function deleteFunction(ResolvedMap $resolvedMap): string
@@ -632,6 +646,14 @@ final class Compiler
         return array_key_exists(self::CONCURRENCY_REVISION, $this->columnCatalog->of($table));
     }
 
+    private function ownsRevision(ResolvedMap $resolvedMap, Attribute $attribute): bool
+    {
+        return $attribute->writesTo !== [] && array_all(
+            $attribute->writesTo,
+            fn (TargetColumn $targetColumn) => $targetColumn->column === self::CONCURRENCY_REVISION && $this->revisioned($resolvedMap->table($targetColumn->alias)),
+        );
+    }
+
     /**
      * @param  array<string, string>  $values
      */
@@ -775,7 +797,7 @@ final class Compiler
         $checks = [];
 
         foreach ($resolvedMap->attributes as $attribute) {
-            if ($attribute->retained || ! $this->columnCatalog->notNull((string) $previous->table, $attribute->column)) {
+            if ($attribute->retained || $this->ownsRevision($resolvedMap, $attribute) || ! $this->columnCatalog->notNull((string) $previous->table, $attribute->column)) {
                 continue;
             }
 

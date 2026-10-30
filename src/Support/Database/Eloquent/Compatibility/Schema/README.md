@@ -19,6 +19,8 @@ The `UPDATE` compares each stored value by its `to_jsonb()` form, as the refusin
 
 A change to `updated_at` or to a `*_concurrency_revision` column alone raises nothing. A change to `deleted_at` raises the revision. A value that a mapping stores as the same number, such as a rounded price, raises nothing. A map may still expose the column through the view, and a write through the view cannot set it. So the mirrored write passes a refusing trigger that enforces application-raised revisions, as `refuse_unraised_concurrency_revision()` from eloquent-concurrency does.
 
+An insert through the view may omit an exposed revision, and an update may set it to null, even where the retained column is `NOT NULL`. `UPDATE ... RETURNING` through the view reports the revision the trigger stored, not the value the write gave.
+
 The compiler reads the catalog when it compiles a map. Recompile the map with `Installer::recompile()` after a mapped table gains or loses `concurrency_revision`, and after you upgrade to this release. Until then, every mirrored write into a table that gained the column fails its refusing trigger.
 
 Mirroring into an ordered item table's watched columns is refused at commit by eloquent-ordering's deferred check, because the compatibility map does not raise the order revision.

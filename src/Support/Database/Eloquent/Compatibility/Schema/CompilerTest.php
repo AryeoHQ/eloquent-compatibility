@@ -1037,6 +1037,45 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['gadgets', 'mapped', 'title'])]
+    #[TestWith(['retained_widgets', 'retained', 'sku'])]
+    public function it_returns_the_stored_concurrency_revision_the_map_exposes_from_an_update_through_the_view(string $table, string $attribute, string $changed): void
+    {
+        $this->refuseUnraisedRevisions($table);
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            $attribute === 'mapped' ? Attribute::mapped('concurrency_revision')->asType('bigint')->storedAs('gadget', 'concurrency_revision') : Attribute::retained('concurrency_revision'),
+        ]]));
+        $id = $this->widget();
+        $returned = [];
+
+        foreach (["{$changed} = 'Changed'", 'concurrency_revision = 99', "{$changed} = 'Changed again', concurrency_revision = 99"] as $sets) {
+            $returned[] = DB::selectOne("update widgets set {$sets} where id = ? returning concurrency_revision", [$id])?->concurrency_revision;
+        }
+
+        $this->assertSame([2, 2, 3], $returned);
+        $this->assertSame(3, DB::table($table)->value('concurrency_revision'));
+    }
+
+    #[Test]
+    public function it_lets_an_insert_omit_and_an_update_null_a_not_null_concurrency_revision_the_map_exposes(): void
+    {
+        foreach (['retained_widgets', 'gadgets'] as $table) {
+            DB::statement("alter table {$table} add column concurrency_revision bigint not null");
+        }
+
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap)->attributes(),
+            Attribute::mapped('concurrency_revision')->asType('bigint')->storedAs('gadget', 'concurrency_revision'),
+        ]]));
+        $id = $this->widget();
+
+        DB::table('widgets')->where('id', $id)->update(['concurrency_revision' => null]);
+
+        $this->assertSame([1, 1, 1], [DB::table('widgets')->value('concurrency_revision'), DB::table('gadgets')->value('concurrency_revision'), DB::table('retained_widgets')->value('concurrency_revision')]);
+    }
+
+    #[Test]
     #[TestWith(['an insert through the view'])]
     #[TestWith(['an update through the view'])]
     #[TestWith(['an insert through the current model'])]
