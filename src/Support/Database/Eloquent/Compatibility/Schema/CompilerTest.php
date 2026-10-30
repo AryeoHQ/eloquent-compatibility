@@ -948,6 +948,83 @@ final class CompilerTest extends TestCase
         $this->assertSame([0, 0, 0], [DB::table('widgets')->count(), DB::table('retained_widgets')->count(), DB::table('gadgets')->count()]);
     }
 
+    #[Test]
+    public function it_raises_the_concurrency_revision_when_mirroring_into_a_revisioned_table(): void
+    {
+        Schema::table('gadgets', function (Blueprint $table): void {
+            $table->bigInteger('concurrency_revision')->default(1);
+        });
+
+        DB::unprepared(<<<'SQL'
+            CREATE OR REPLACE FUNCTION refuse_unraised_concurrency_revision() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE
+                ignored text[];
+                changed text;
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    IF NEW.concurrency_revision IS DISTINCT FROM 1 THEN
+                        RAISE EXCEPTION '[%] inserts a row at concurrency revision %, not 1.', TG_TABLE_NAME, NEW.concurrency_revision
+                            USING ERRCODE = '23514';
+                    END IF;
+                    RETURN NEW;
+                END IF;
+
+                IF NEW.concurrency_revision = OLD.concurrency_revision + 1 THEN
+                    RETURN NEW;
+                END IF;
+
+                IF NEW.concurrency_revision IS DISTINCT FROM OLD.concurrency_revision THEN
+                    RAISE EXCEPTION '[%] changes the concurrency revision from % to %, not by 1.', TG_TABLE_NAME, OLD.concurrency_revision, NEW.concurrency_revision
+                        USING ERRCODE = '23514';
+                END IF;
+
+                ignored := COALESCE(TG_ARGV, '{}') || '{concurrency_revision,updated_at,deleted_at}' || ARRAY(
+                    SELECT key FROM jsonb_object_keys(to_jsonb(NEW)) AS key WHERE key LIKE '%\_concurrency\_revision'
+                ) || ARRAY(
+                    SELECT attname::text FROM pg_attribute
+                    WHERE attrelid = TG_RELID AND attnum > 0 AND NOT attisdropped AND attgenerated <> ''
+                );
+
+                SELECT string_agg(n.key, '], [' ORDER BY n.key) INTO changed
+                FROM jsonb_each(to_jsonb(NEW) - ignored) AS n
+                WHERE n.value IS DISTINCT FROM (to_jsonb(OLD) - ignored) -> n.key;
+
+                IF changed IS NOT NULL THEN
+                    RAISE EXCEPTION '[%] changes [%] without raising the concurrency revision.', TG_TABLE_NAME, changed
+                        USING ERRCODE = '23514';
+                END IF;
+
+                RETURN NEW;
+            END $$;
+        SQL);
+
+        DB::unprepared('CREATE TRIGGER refuse_unraised_revision BEFORE INSERT OR UPDATE ON gadgets FOR EACH ROW EXECUTE FUNCTION refuse_unraised_concurrency_revision()');
+
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::unprepared('DROP TRIGGER IF EXISTS refuse_unraised_revision ON gadgets');
+            DB::unprepared('DROP FUNCTION IF EXISTS refuse_unraised_concurrency_revision()');
+            if (Schema::hasTable('gadgets') && Schema::hasColumn('gadgets', 'concurrency_revision')) {
+                Schema::table('gadgets', function (Blueprint $table): void {
+                    $table->dropColumn('concurrency_revision');
+                });
+            }
+        });
+
+        resolve(Installer::class)->install(new WidgetCompatibilityMap);
+
+        $id = $this->widget();
+        $gadgetId = DB::table('retained_widgets')->where('id', $id)->value('gadget_id');
+        $revision = DB::table('gadgets')->where('id', $gadgetId)->value('concurrency_revision');
+
+        $this->assertSame(1, $revision);
+
+        DB::table('widgets')->where('id', $id)->update(['title' => 'Updated Widget']);
+
+        $newRevision = DB::table('gadgets')->where('id', $gadgetId)->value('concurrency_revision');
+
+        $this->assertSame(2, $newRevision);
+    }
+
     /**
      * @param  array<string, string>  $previousFills
      */

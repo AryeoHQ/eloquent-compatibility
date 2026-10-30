@@ -11,6 +11,12 @@ Entry points:
 
 `ColumnCatalog` reads the catalog, and `SqlFragments` quotes names, converts `AT TIME ZONE` and raises refusals. `SqlState`, `Setting` and `TriggerFunction` name the codes, settings and function suffixes the SQL uses.
 
+## Concurrency revision handling
+
+A compiled mirror `INSERT` into a table with a `concurrency_revision` column sets that column to 1. A compiled mirror `UPDATE` into such a table raises the revision by exactly 1. This allows the mirrored write to pass a refusing trigger that enforces application-raised revisions, as `refuse_unraised_concurrency_revision()` from eloquent-concurrency does.
+
+Mirroring into an ordered item table's watched columns is refused at commit by eloquent-ordering's deferred check, because the compatibility map does not raise the order revision.
+
 Flows: [compiling and installing the schema](../../../../../../docs/flows/compiling-and-installing-the-schema.md), [writing through the view](../../../../../../docs/flows/writing-through-the-view.md) and the refusals in [failure and rollback](../../../../../../docs/flows/failure-and-rollback.md).
 
 [Invariants](../../../../../../docs/invariants.md) held here: INV-1 on the trigger side, INV-3, INV-4, INV-5, INV-7, INV-9 on the cleanup side, INV-11, INV-13, INV-14, INV-23, INV-24, INV-26, INV-36 to INV-42, INV-44 and INV-52.

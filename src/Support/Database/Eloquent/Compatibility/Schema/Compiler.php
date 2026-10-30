@@ -571,7 +571,13 @@ final class Compiler
             $assignments,
         );
 
-        return 'UPDATE '.SqlFragments::identifier($resolvedMap->table($alias)).' AS '.$alias.' SET '.implode(', ', $sets)
+        $table = $resolvedMap->table($alias);
+
+        if (array_key_exists('concurrency_revision', $this->columnCatalog->of($table))) {
+            $sets[] = '"concurrency_revision" = "concurrency_revision" + 1';
+        }
+
+        return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.implode(', ', $sets)
             .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key.';';
     }
 
@@ -637,6 +643,12 @@ final class Compiler
             }
 
             $values[$column] = $this->value($resolvedMap, $alias, new TargetColumn($alias, $column, $expression));
+        }
+
+        $table = $resolvedMap->table($alias);
+
+        if (array_key_exists('concurrency_revision', $this->columnCatalog->of($table)) && ! array_key_exists('concurrency_revision', $values)) {
+            $values['concurrency_revision'] = '1';
         }
 
         return $values;

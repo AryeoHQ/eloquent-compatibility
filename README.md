@@ -261,6 +261,12 @@ The trait raises `Connections\Events\QueryFailed` once for each statement that f
 - Its `beforeExecuting()` keeps the event bridge's two callbacks first and last. So every other `beforeExecuting` callback runs before a mirrored write opens, and its statements never take the write's place.
 - Before it raises `QueryFailed`, the trait calls the event bridge, which rolls back a mirrored write whose own statement failed. No listener can stop that.
 
+### Concurrency revision handling
+
+A compiled mirror `INSERT` into a table with a `concurrency_revision` column sets that column to 1. A compiled mirror `UPDATE` into such a table raises the revision by exactly 1. This allows the mirrored write to pass a refusing trigger that enforces application-raised revisions, as `refuse_unraised_concurrency_revision()` from eloquent-concurrency does.
+
+Mirroring into an ordered item table's watched columns is refused at commit by eloquent-ordering's deferred check, because the compatibility map does not raise the order revision.
+
 ## Documentation
 The full documentation is on the PHP Archetype standards site, on the eloquent-compatibility package page.
 
