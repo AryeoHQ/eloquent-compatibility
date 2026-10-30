@@ -309,7 +309,8 @@ final class Compiler
     {
         $previous = $resolvedMap->previousModel;
         $primaryKey = 'key_'.$resolvedMap->primaryCurrentModel->alias;
-        $record = ' || OLD.'.SqlFragments::identifier((string) $previous->keyColumn).'::text';
+        $oldKey = 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn);
+        $record = ' || '.$oldKey.'::text';
         $body = [];
 
         foreach ($resolvedMap->readOnlyAttributes() as $attribute) {
@@ -339,17 +340,18 @@ final class Compiler
 
         $body[] = $this->conflict($resolvedMap);
         $body[] = $this->updateTable($resolvedMap, (string) $resolvedMap->primaryCurrentModel->alias, $primaryKey, true);
-        $body[] = $this->updateTable($resolvedMap, (string) $previous->alias, 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn), false);
+        $body[] = $this->updateTable($resolvedMap, (string) $previous->alias, $oldKey, false, 'stored_previous_key');
 
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
             $body[] = $this->updateDependent($resolvedMap, $dependent, $primaryKey);
         }
 
         $revisions = array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $this->ownsRevision($resolvedMap, $attribute)));
-        $body[] = $revisions === [] ? '' : $this->reload($resolvedMap, $revisions, $this->storedPreviousKey($resolvedMap));
+        $body[] = $revisions === [] ? '' : $this->reload($resolvedMap, $revisions, 'stored_previous_key');
         $body[] = '  RETURN NEW;';
+        $variables = $this->variables($resolvedMap).'  stored_previous_key '.SqlFragments::identifier((string) $previous->table).'.'.SqlFragments::identifier((string) $previous->keyColumn).'%TYPE := '.$oldKey.";\n";
 
-        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $this->variables($resolvedMap), array_values(array_filter($body, fn (string $line) => $line !== '')), true);
+        return $this->function($resolvedMap, $resolvedMap->functionName(TriggerFunction::Update), $previous->view, $variables, array_values(array_filter($body, fn (string $line) => $line !== '')), true);
     }
 
     /**
@@ -500,7 +502,7 @@ final class Compiler
         return $triggers;
     }
 
-    private function updateTable(ResolvedMap $resolvedMap, string $alias, string $key, bool $mustExist): string
+    private function updateTable(ResolvedMap $resolvedMap, string $alias, string $key, bool $mustExist, null|string $storedKey = null): string
     {
         $assignments = $this->updateAssignmentsTo($resolvedMap, $alias);
 
@@ -509,7 +511,7 @@ final class Compiler
         }
 
         $statement = '  IF '.SqlFragments::changed($this->attributeColumns($assignments), $this->comparedAsText($resolvedMap, $assignments))." THEN\n    "
-            .$this->update($resolvedMap, $alias, $assignments, $key);
+            .$this->update($resolvedMap, $alias, $assignments, $key, $storedKey);
 
         if ($mustExist) {
             $statement .= "\n    GET DIAGNOSTICS affected_rows = ROW_COUNT;\n    IF affected_rows <> 1 THEN\n      "
@@ -545,7 +547,7 @@ final class Compiler
         }
 
         $cases['('.$this->createdWhen($dependent, $assignments).')'] = $this->insert($table, $this->dependentValues($resolvedMap, $dependent, $assignments, $primaryKey), $resolvedMap->keyColumn($alias), 'key_'.$alias)
-            .$this->designate($resolvedMap, $dependent, $this->storedPreviousKey($resolvedMap), "\n        ");
+            .$this->designate($resolvedMap, $dependent, 'stored_previous_key', "\n        ");
         $branches = '';
 
         foreach ($cases as $condition => $statement) {
@@ -581,7 +583,7 @@ final class Compiler
     /**
      * @param  list<Assignment>  $assignments
      */
-    private function update(ResolvedMap $resolvedMap, string $alias, array $assignments, string $key): string
+    private function update(ResolvedMap $resolvedMap, string $alias, array $assignments, string $key, null|string $storedKey = null): string
     {
         $values = [];
 
@@ -600,7 +602,8 @@ final class Compiler
                 .' FROM (SELECT '.implode(', ', array_map(fn (string $column, string $value) => $value.' AS '.SqlFragments::identifier($column), $columns, $values)).') AS '.$converted.')';
 
         return 'UPDATE '.SqlFragments::identifier($table).' AS '.$alias.' SET '.$sets
-            .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key.';';
+            .' WHERE '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' = '.$key
+            .($storedKey === null ? '' : ' RETURNING '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' INTO '.$storedKey).';';
     }
 
     private function assigned(ResolvedMap $resolvedMap, string $alias, Assignment $assignment, string $unchanged): string
@@ -609,21 +612,6 @@ final class Compiler
             .' IS DISTINCT FROM '.$this->compared($resolvedMap, $assignment->attribute, 'OLD.'.SqlFragments::identifier($assignment->attribute->column))
             .' THEN '.$this->value($resolvedMap, $alias, $assignment->targetColumn)
             .' ELSE '.$unchanged.' END';
-    }
-
-    private function storedPreviousKey(ResolvedMap $resolvedMap): string
-    {
-        $previous = $resolvedMap->previousModel;
-        $alias = (string) $previous->alias;
-        $oldKey = 'OLD.'.SqlFragments::identifier((string) $previous->keyColumn);
-
-        foreach ($this->updateAssignmentsTo($resolvedMap, $alias) as $assignment) {
-            if ($assignment->targetColumn->column === $previous->keyColumn) {
-                return $this->assigned($resolvedMap, $alias, $assignment, $oldKey);
-            }
-        }
-
-        return $oldKey;
     }
 
     /**

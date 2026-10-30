@@ -1088,6 +1088,29 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_reloads_and_designates_by_the_key_it_stored_when_an_update_changes_a_retained_key_mapped_through_a_volatile_expression(): void
+    {
+        DB::statement('create sequence widget_keys start 1000');
+        $this->beforeApplicationDestroyed(function (): void {
+            DB::statement('drop sequence if exists widget_keys cascade');
+        });
+        $this->refuseUnraisedRevisions('retained_widgets');
+        resolve(Installer::class)->install($this->compatibilityMap([
+            'dependentCurrentModels' => $this->dependents(place: fn (DependentCurrentModel $place) => $place->designatedBy('place_id')),
+            'attributes' => [
+                ...(new WidgetCompatibilityMap(['id' => Attribute::mapped('id')->asType('bigint')->readAs('widget', 'widget.id')->writesTo('widget', 'id', "nextval('widget_keys')")]))->attributes(),
+                Attribute::retained('concurrency_revision'),
+            ],
+        ]));
+        $id = DB::table('widgets')->insertGetId(['id' => 0, 'title' => 'Blue gadget', 'price' => '12.50', 'latitude' => 47.5]);
+
+        $returned = DB::selectOne("update widgets set id = 0, sku = 'Changed', street = '1 Main St' where id = ? returning concurrency_revision", [$id]);
+        $retained = DB::table('retained_widgets')->sole();
+
+        $this->assertSame([3, DB::scalar('select last_value from widget_keys'), 3, DB::table('gadget_places')->value('id')], [$returned?->concurrency_revision, $retained->id, $retained->concurrency_revision, $retained->place_id]);
+    }
+
+    #[Test]
     public function it_lets_an_insert_omit_and_an_update_null_a_not_null_concurrency_revision_the_map_exposes(): void
     {
         foreach (['retained_widgets', 'gadgets'] as $table) {
