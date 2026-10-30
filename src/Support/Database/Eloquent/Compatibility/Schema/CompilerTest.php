@@ -1058,6 +1058,22 @@ final class CompilerTest extends TestCase
     }
 
     #[Test]
+    public function it_returns_the_stored_concurrency_revision_from_an_update_that_changes_a_writable_retained_key(): void
+    {
+        $this->refuseUnraisedRevisions('retained_widgets');
+        resolve(Installer::class)->install($this->compatibilityMap(['attributes' => [
+            ...(new WidgetCompatibilityMap(['id' => Attribute::retained('id')]))->attributes(),
+            Attribute::retained('concurrency_revision'),
+        ]]));
+        $id = $this->widget();
+
+        $returned = DB::selectOne("update widgets set id = ?, sku = 'Changed' where id = ? returning id, concurrency_revision", [$id + 100, $id]);
+
+        $this->assertSame([$id + 100, 2], [$returned?->id, $returned?->concurrency_revision]);
+        $this->assertSame([$id + 100, 2], [DB::table('retained_widgets')->value('id'), DB::table('retained_widgets')->value('concurrency_revision')]);
+    }
+
+    #[Test]
     public function it_lets_an_insert_omit_and_an_update_null_a_not_null_concurrency_revision_the_map_exposes(): void
     {
         foreach (['retained_widgets', 'gadgets'] as $table) {
