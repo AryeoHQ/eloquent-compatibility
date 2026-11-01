@@ -2,11 +2,11 @@
 
 ## Context
 
-`SqlState` and `DriftCheck` back their cases with values the outside world sees: the SQLSTATE a caller checks, and the labels `compatibility:check` prints. A test that compares a case with itself passes whatever the backing value is.
+Some enum cases carry values the outside world sees, such as an SQLSTATE a caller checks or a label a command prints. A test that compares a case with itself passes whatever the backing value is.
 
 ## Decision
 
-Tests compare those values as literal strings: CM001 in `EventBridgeOutsideTransactionTest`, and each drift label in `CheckDriftTest`.
+Tests compare those values as literal strings, never as enum cases.
 
 ## Consequences
 

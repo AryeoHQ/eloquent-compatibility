@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Support\Database\Eloquent\Compatibility\Mapping;
+namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;

@@ -6,10 +6,10 @@ Maintainers read the compiled SQL to review a map and to debug a refusal. Short 
 
 ## Decision
 
-Every name the compiler adds is a full word, such as `previous_row` and `key_<alias>`. The workbench maps use full-word aliases. `ResolvedMap::of()` refuses an alias that is `new`, `old` or one of `ReservedWords::POSTGRESQL`.
+Every name the compiler adds is a full word, such as `previous_row` and `key_<alias>`. The test fixtures use full-word aliases. The package refuses an alias that is one of `ReservedWords::POSTGRESQL` when the map is declared.
 
 ## Consequences
 
 - A reserved word fails at registration, not as a syntax error during the install.
-- A short identifier in a workbench map fails a test.
+- A short identifier in a test fixture fails a test.
 - An application still chooses its own aliases. The package checks only that they are valid.

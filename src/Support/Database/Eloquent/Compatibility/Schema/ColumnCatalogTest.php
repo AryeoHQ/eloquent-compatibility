@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\Query\Expression;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
-use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\TestCase;
 
 #[CoversClass(ColumnCatalog::class)]
@@ -18,7 +20,23 @@ final class ColumnCatalogTest extends TestCase
     {
         parent::setUp();
 
-        Tables::create();
+        Schema::create('gadgets', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('name');
+            $table->integer('price_cents')->nullable();
+            $table->timestampTz('delivered_at')->nullable();
+            $table->boolean('archived')->default(false);
+            $table->timestampsTz();
+            $table->softDeletesTz();
+        });
+
+        Schema::create('gadget_sites', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->foreignUuid('gadget_id')->unique()->constrained('gadgets');
+            $table->decimal('latitude', 24, 12);
+            $table->decimal('longitude', 24, 12)->default(0);
+            $table->timestampsTz();
+        });
     }
 
     #[Test]

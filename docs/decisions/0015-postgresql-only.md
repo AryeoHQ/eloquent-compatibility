@@ -2,7 +2,7 @@
 
 ## Context
 
-The package compiles PL/pgSQL trigger functions and reads PostgreSQL's catalogs. The Testbench command line otherwise passes its skeleton's SQLite default to the tests.
+The package compiles PostgreSQL SQL and reads PostgreSQL's catalogs. The Testbench command line otherwise passes its skeleton's SQLite default to the tests.
 
 ## Decision
 
