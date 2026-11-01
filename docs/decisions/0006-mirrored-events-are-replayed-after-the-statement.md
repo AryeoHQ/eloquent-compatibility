@@ -2,15 +2,17 @@
 
 ## Context
 
-A write through one side changes rows the other side's models read. Those models never ran, so their listeners would miss the change. The triggers already route the data; the events are what is missing.
+A write of a current model changes rows the previous model reads. The previous model never ran, so its listeners would miss the change. Since [0024](0024-writes-are-split-in-php-without-triggers.md), a write through the previous model saves the current models through Eloquent, so their own events fire natively. Only this direction, from a current model to the previous model, still needs replayed events.
 
 ## Decision
 
-After the statement succeeds, the bridge reads each affected record again and `EventReplayer::replay()` raises its events on a fresh instance. For an update, the instance carries the row from before as its original and the row from after as its attributes. The `-ing` events can stop the write, but a listener cannot change the record.
+`CurrentWriter` locks and reads each affected previous record through the view before the write, and reads it again after. `EventReplayer::replay()` then raises the previous model's events on a fresh instance. For an update, the instance carries the row from before as its original and the row from after as its attributes. The `-ing` events can stop the write, but a listener cannot change the record.
+
+The replay runs only for a model's own write, as Eloquent raises no events for a query builder write, and never for the map whose previous model is writing the row itself.
 
 ## Consequences
 
-- Listeners on the other side see the state the database stored, including values the triggers computed.
-- A mirrored listener's change has nowhere to go, so `CompatibilityWriteRefused::byMirroredChange()` refuses it. See [INV-15](../invariants.md).
-- The mirrored instance is not the caller's instance, and the replayer never begins a pending mirrored write for it.
+- Listeners on the previous model see the state the database stored, including values the view computes.
+- A mirrored listener's change has nowhere to go, so `CompatibilityWriteRefused::byMirroredChange()` refuses it. See [INV-15](../invariants.md#inv-15-a-mirrored-listener-may-refuse-a-write-never-change-it).
+- The replay runs inside the router's transaction, so a refusal rolls the current write back.
 - Writes that fire no model events are stored correctly, and mirror nothing.

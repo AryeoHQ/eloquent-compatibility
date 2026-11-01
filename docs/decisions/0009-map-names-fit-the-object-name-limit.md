@@ -2,14 +2,13 @@
 
 ## Context
 
-PostgreSQL truncates identifiers longer than 63 characters. Every trigger and function name is `compatibility__`, the map name, `__` and a suffix. The Installer finds a map's objects by that prefix alone.
+Versions before [0024](0024-writes-are-split-in-php-without-triggers.md) named every trigger and function `compatibility__`, the map name, `__` and a suffix, and PostgreSQL truncates identifiers longer than 63 characters. The package installs no such object now, but `Installer::recompile()` still finds the objects an earlier version installed by that prefix, `ResolvedMap::legacyObjectPrefix()`. The map name also keys the advisory lock of each refused state.
 
 ## Decision
 
-A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore. `ResolvedMap::of()` refuses any other. `ResolvedMap::object()` refuses an object name over 63 characters when the map compiles.
+A map name has at most 24 lowercase letters, digits and single underscores, and does not end in an underscore. `ResolvedMap::of()` refuses any other.
 
 ## Consequences
 
-- The prefix takes at most 41 characters, which leaves 22 for a suffix.
-- No map's prefix begins another's, so uninstalling one map never drops another's objects.
-- A long unrepresentable state or alias name can still exceed the limit. The compile fails, and names the object.
+- No map's legacy prefix begins another's, so recompiling one map never drops another's leftover objects.
+- A map installed by an earlier version keeps its name, so a recompile finds its triggers.

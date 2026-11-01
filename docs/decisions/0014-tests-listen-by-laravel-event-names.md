@@ -10,5 +10,5 @@ Tests that register a listener directly use Laravel's string names, as an applic
 
 ## Consequences
 
-- A test proves the bridge raises the events an application listens for, not the names the package builds.
+- A test proves the write router raises the events an application listens for, not the names the package builds.
 - Do not convert those strings to `ModelEvent::for()`.

@@ -5,12 +5,13 @@ This namespace holds the declaration of a compatibility map and its resolved for
 Entry points:
 
 - `PreviousModel::servedAsView()`, `PrimaryCurrentModel::for()` and `DependentCurrentModel::for()` declare the models.
-- `Attribute::retained()`, `Attribute::mapped()` and the `UnrepresentableState` constructors declare the attributes and states.
+- `Attribute::retained()` and `Attribute::mapped()` declare the attributes. Reads are SQL; writes are PHP closures, held by `TargetColumn`.
+- The `UnrepresentableState` constructors declare the states one side holds and the other cannot.
 - `ExcludedListener::of()` and `ModelEvent` serve an event mirror.
-- `ResolvedMap::of()` validates a map. `ResolvedMap::locate()` builds the subquery that picks a dependent row.
+- `ResolvedMap::of()` validates a map. `ResolvedMap::locate()` builds the view's subquery that picks a dependent row, and `ResolvedMap::insertAssignmentsTo()` lists what an insert writes.
 
 Every builder is immutable, and `ResolvedMap::of()` needs no database.
 
-Flows: [declaring and registering a map](../../../../../../docs/flows/declaring-and-registering-a-map.md), and the `ResolvedMap` calls in [compiling and installing the schema](../../../../../../docs/flows/compiling-and-installing-the-schema.md).
+Flows: [declaring and registering a map](../../../../../../docs/flows/declaring-and-registering-a-map.md).
 
-[Invariants](../../../../../../docs/invariants.md) held here: INV-2, INV-8, INV-9, INV-10, INV-12 and INV-22.
+[Invariants](../../../../../../docs/invariants.md) held here: INV-2, INV-8 and INV-12.

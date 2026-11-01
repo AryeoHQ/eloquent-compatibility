@@ -2,13 +2,13 @@
 
 ## Context
 
-`SqlState` and `DriftCheck` back their cases with values the outside world sees: the SQLSTATE a caller checks, and the labels `compatibility:check` prints. A test that compares a case with itself passes whatever the backing value is.
+`DriftCheck` backs its cases with values the outside world sees: the labels `compatibility:check` prints. `CompatibilityWriteRefused` builds messages callers may match. A test that compares a case or a message with itself passes whatever the value is.
 
 ## Decision
 
-Tests compare those values as literal strings: CM001 in `EventBridgeOutsideTransactionTest`, and each drift label in `CheckDriftTest`.
+Tests compare those values as literal strings: each drift label in `CheckDriftTest`, and each refusal message in `CompatibilityWriteRefusedTest` and `WriteRouterTest`.
 
 ## Consequences
 
-- Changing a backing value fails a test, so the change is deliberate.
-- Do not replace those literals with enum cases.
+- Changing a printed value fails a test, so the change is deliberate.
+- Do not replace those literals with enum cases or calls to the factories.

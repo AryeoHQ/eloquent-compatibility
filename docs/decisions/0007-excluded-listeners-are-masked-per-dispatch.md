@@ -2,7 +2,7 @@
 
 ## Context
 
-Some listeners must not run for writes through the other side, such as a journal of native writes only. The bridge dispatches mirrored events through the application's dispatcher, which runs every listener of an event. A native write inside a mirrored listener raises the same event names.
+Some listeners must not run for writes through the other side, such as a journal of native writes only. The write router dispatches mirrored events through the application's dispatcher, which runs every listener of an event. A native write inside a mirrored listener raises the same event names.
 
 ## Decision
 

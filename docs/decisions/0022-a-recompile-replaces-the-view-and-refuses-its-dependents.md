@@ -15,5 +15,5 @@ Dropping the view has its own cost. `DROP VIEW` without `CASCADE` fails while an
 - A recompile takes any change to the map's attributes, and keeps every grant on the view. A column grant follows only when the new view still has that column.
 - A view with no explicit grants saves its owner's default privileges. The recompiling role owns the new view, so a previous owner keeps its access as an explicit grant.
 - A migration that recompiles drops each dependent object first and creates it again after. [Adopting a map](../adopting-a-map.md) describes the order.
-- A comment on the view, and its ownership, do not survive a recompile. The view's triggers and functions are created again anyway.
-- [INV-41](../invariants.md) records the rule.
+- A comment on the view, and its ownership, do not survive a recompile. A recompile also drops the triggers and functions an earlier version installed.
+- [INV-24](../invariants.md#inv-24-a-recompile-replaces-the-view-keeps-its-grants-and-drops-legacy-triggers) records the rule.
