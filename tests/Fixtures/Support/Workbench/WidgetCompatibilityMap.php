@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Workbench;
 
+use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Attribute;
 use Support\Database\Eloquent\Compatibility\Mapping\DependentCurrentModel;
@@ -30,14 +31,14 @@ final class WidgetCompatibilityMap implements CompatibilityMap
             ->forModel(Widget::class)
             ->aliasedAs('widget')
             ->primaryForeignKey('gadget_id')
-            ->fillWhenCreatedFromCurrent(['status' => "CASE WHEN NEW.archived THEN 'Archived' ELSE 'Draft' END"]);
+            ->fillWhenCreatedFromCurrent(['status' => fn (Model $gadget) => $gadget->getAttribute('archived') ? 'Archived' : 'Draft']);
     }
 
     public function primaryCurrentModel(): PrimaryCurrentModel
     {
         return PrimaryCurrentModel::for(Gadget::class)
             ->aliasedAs('gadget')
-            ->fillWhenCreatedFromPrevious(['id' => 'COALESCE(NEW.gadget_id, gen_random_uuid())']);
+            ->fillWhenCreatedFromPrevious(['id' => fn (array $widget) => $widget['gadget_id'] ?? null]);
     }
 
     public function dependentCurrentModels(): array
@@ -63,7 +64,7 @@ final class WidgetCompatibilityMap implements CompatibilityMap
             Attribute::mapped('title')->asType('character varying(255)')->storedAs('gadget', 'name'),
             Attribute::mapped('price')->asType('character varying(255)')
                 ->readAs('gadget', "to_char(gadget.price_cents / 100.0, 'FM999999990.00')")
-                ->writesTo('gadget', 'price_cents', 'round(NEW.price::numeric * 100)'),
+                ->writesTo('gadget', 'price_cents', fn (array $widget) => $widget['price'] === null ? null : (int) round((float) $widget['price'] * 100)),
             Attribute::mapped('delivered_at')->asType('timestamp(0) without time zone')->storedAs('gadget', 'delivered_at'),
             Attribute::mapped('is_archived')->asType('boolean')->storedAs('gadget', 'archived'),
             Attribute::mapped('street')->asType('character varying(255)')->storedAs('place', 'street'),
@@ -89,7 +90,7 @@ final class WidgetCompatibilityMap implements CompatibilityMap
                 'a status change on an archived gadget',
                 'An archived gadget has no status the widget can change.',
                 'Unarchive the gadget first.',
-            )->checkedOnPreviousUpdate('NEW.status IS DISTINCT FROM OLD.status AND OLD.is_archived'),
+            )->checkedOnPreviousUpdate(fn (array $new, array $old) => $new['status'] !== $old['status'] && $old['is_archived'] === true),
             UnrepresentableState::degrade(
                 'child_place',
                 'a place under another place',

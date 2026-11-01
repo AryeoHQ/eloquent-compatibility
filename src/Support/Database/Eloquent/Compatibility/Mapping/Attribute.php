@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Closure;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class Attribute
@@ -19,25 +20,27 @@ final readonly class Attribute
         public null|string $readAs,
         public array $writesTo,
         public null|string $readOnlyBecause,
-        public null|string $defaultsTo,
         public null|string $storedAs = null,
     ) {}
 
     public static function retained(string $column): self
     {
-        return new self($column, true, null, null, null, [], null, null);
+        return new self($column, true, null, null, null, [], null);
     }
 
     public static function mapped(string $column): self
     {
-        return new self($column, false, null, null, null, [], null, null);
+        return new self($column, false, null, null, null, [], null);
     }
 
     public function asType(string $type): self
     {
-        return new self($this->column, $this->retained, $type, $this->alias, $this->readAs, $this->writesTo, $this->readOnlyBecause, $this->defaultsTo, $this->storedAs);
+        return new self($this->column, $this->retained, $type, $this->alias, $this->readAs, $this->writesTo, $this->readOnlyBecause, $this->storedAs);
     }
 
+    /**
+     * Reads the attribute from one column of a current model, and writes it back there unchanged.
+     */
     public function storedAs(string $alias, string $column): self
     {
         return new self(
@@ -46,19 +49,26 @@ final readonly class Attribute
             $this->type,
             $alias,
             $alias.'.'.SqlFragments::identifier($column),
-            [new TargetColumn($alias, $column, 'NEW.'.SqlFragments::identifier($this->column))],
+            [TargetColumn::copy($alias, $column, $this->column)],
             $this->readOnlyBecause,
-            $this->defaultsTo,
             $column,
         );
     }
 
+    /**
+     * Reads the attribute through a SQL expression over one current model's row. The compatibility view runs it.
+     */
     public function readAs(string $alias, string $expression): self
     {
-        return new self($this->column, $this->retained, $this->type, $alias, $expression, [], $this->readOnlyBecause, $this->defaultsTo);
+        return new self($this->column, $this->retained, $this->type, $alias, $expression, [], $this->readOnlyBecause);
     }
 
-    public function writesTo(string $alias, string $column, string $expression): self
+    /**
+     * Writes a column of a current model from the previous model's attributes. The write router calls $value in PHP.
+     *
+     * @param  Closure(array<string, mixed>): mixed  $value  receives the previous model's raw attributes after the write
+     */
+    public function writesTo(string $alias, string $column, Closure $value): self
     {
         return new self(
             $this->column,
@@ -66,21 +76,15 @@ final readonly class Attribute
             $this->type,
             $this->alias,
             $this->readAs,
-            [...$this->writesTo, new TargetColumn($alias, $column, $expression)],
+            [...$this->writesTo, new TargetColumn($alias, $column, $value)],
             $this->readOnlyBecause,
-            $this->defaultsTo,
             $this->storedAs,
         );
     }
 
     public function readOnlyBecause(string $reason): self
     {
-        return new self($this->column, $this->retained, $this->type, $this->alias, $this->readAs, [], $reason, $this->defaultsTo, $this->storedAs);
-    }
-
-    public function defaultsTo(string $expression): self
-    {
-        return new self($this->column, $this->retained, $this->type, $this->alias, $this->readAs, $this->writesTo, $this->readOnlyBecause, $expression, $this->storedAs);
+        return new self($this->column, $this->retained, $this->type, $this->alias, $this->readAs, [], $reason, $this->storedAs);
     }
 
     public function resolve(string $previousAlias): self
@@ -95,9 +99,8 @@ final readonly class Attribute
             null,
             $previousAlias,
             $previousAlias.'.'.SqlFragments::identifier($this->column),
-            $this->readOnlyBecause === null ? [new TargetColumn($previousAlias, $this->column, 'NEW.'.SqlFragments::identifier($this->column))] : [],
+            $this->readOnlyBecause === null ? [TargetColumn::copy($previousAlias, $this->column, $this->column)] : [],
             $this->readOnlyBecause,
-            $this->defaultsTo,
             $this->column,
         );
     }

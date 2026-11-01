@@ -5,12 +5,10 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
-use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
-use Support\Database\Eloquent\Compatibility\Bridge\KeyTranslator;
-use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Console\DriftCheck;
 use Support\Database\Eloquent\Compatibility\Console\DriftFinding;
 use Support\Database\Eloquent\Compatibility\Console\DriftQueries;
@@ -19,7 +17,11 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Compiler;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Testing\InteractsWithCompatibilityMaps;
+use Support\Database\Eloquent\Compatibility\Write\PreviousWriter;
+use Support\Database\Eloquent\Compatibility\Write\Records;
+use Support\Database\Eloquent\Compatibility\Write\WriteRouter;
 use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
+use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\Widget;
@@ -28,7 +30,8 @@ use Tests\TestCase;
 
 #[CoversClass(DependentCurrentModel::class)]
 #[CoversClass(Compiler::class)]
-#[CoversClass(KeyTranslator::class)]
+#[CoversClass(PreviousWriter::class)]
+#[CoversClass(Records::class)]
 #[CoversClass(DriftQueries::class)]
 final class DependentCurrentModelTest extends TestCase
 {
@@ -44,6 +47,7 @@ final class DependentCurrentModelTest extends TestCase
 
         Tables::create();
         resolve(Installer::class)->install($this->designated());
+        resolve(WriteRouter::class)->register(new CompatibilityMapEventMirror($this->designated()));
     }
 
     #[Test]
@@ -55,7 +59,7 @@ final class DependentCurrentModelTest extends TestCase
     #[Test]
     public function a_create_through_the_previous_model_designates_the_dependent_row_it_inserts(): void
     {
-        $id = DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'street' => '1 Main St']);
+        $id = Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St'])->id;
 
         $this->assertSame(DB::table('gadget_places')->sole()->id, DB::table('retained_widgets')->where('id', $id)->value('place_id'));
         $this->assertSame('1 Main St', DB::table('widgets')->where('id', $id)->value('street'));
@@ -83,8 +87,8 @@ final class DependentCurrentModelTest extends TestCase
         $place = $this->place($gadget, '1 Child St', parent: $this->place($this->gadget(), 'Elsewhere'));
         $this->assertNull($this->designation($gadget));
 
-        DB::table('gadget_places')->where('id', $place)->update(['parent_id' => null]);
-        DB::table('widgets')->where('gadget_id', $gadget)->update(['street' => '2 Readable St']);
+        GadgetPlace::query()->findOrFail($place)->update(['parent_id' => null]);
+        Widget::query()->where('gadget_id', $gadget)->update(['street' => '2 Readable St']);
 
         $this->assertSame($place, $this->designation($gadget));
         $this->assertSame(['2 Readable St'], DB::table('gadget_places')->where('gadget_id', $gadget)->pluck('street')->all());
@@ -114,7 +118,7 @@ final class DependentCurrentModelTest extends TestCase
         $retained = DB::table('retained_widgets')->where('gadget_id', $gadget)->value('id');
 
         $refusal = $this->assertWriteRefused(
-            fn () => DB::table('widgets')->where('gadget_id', $gadget)->update(['street' => '3 New St']),
+            fn () => Widget::query()->where('gadget_id', $gadget)->update(['street' => '3 New St']),
             "refused a change to street on widgets record {$retained}: its designated gadget_places row is not one the previous model reads",
         );
 
@@ -129,30 +133,30 @@ final class DependentCurrentModelTest extends TestCase
         $gadget = $this->gadget();
         DB::table('retained_widgets')->where('gadget_id', $gadget)->update(['place_id' => Str::uuid()->toString()]);
 
-        DB::table('widgets')->where('gadget_id', $gadget)->update(['street' => '4 Return St']);
+        Widget::query()->where('gadget_id', $gadget)->update(['street' => '4 Return St']);
 
         $this->assertSame(DB::table('gadget_places')->where('gadget_id', $gadget)->sole()->id, $this->designation($gadget));
         $this->assertSame('4 Return St', $this->widget($gadget)->street);
     }
 
     #[Test]
-    public function a_previous_model_write_mirrors_only_the_designated_dependent_row(): void
+    public function a_previous_model_write_saves_only_the_designated_dependent_row(): void
     {
-        resolve(EventBridge::class)->mirror(new CompatibilityMapEventMirror($this->designated()));
-        [$gadget, $first, $lower] = $this->gadgetWithTwoRoots();
-        $this->recordMirroredEvents();
+        [$gadget, $first] = $this->gadgetWithTwoRoots();
+        $updated = [];
+        Event::listen('eloquent.updated: '.GadgetPlace::class, function (GadgetPlace $place) use (&$updated): void {
+            $updated[] = $place->id;
+        });
 
         Widget::query()->where('gadget_id', $gadget)->sole()->update(['street' => '5 Mirror St']);
 
-        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (GadgetPlace $place) => $place->id === $first);
-        $this->assertMirrored(GadgetPlace::class, ModelEvent::Updated, fn (GadgetPlace $place) => $place->id === $lower, 0);
+        $this->assertSame([$first], $updated);
         $this->assertSame('5 Mirror St', DB::table('gadget_places')->where('id', $first)->value('street'));
     }
 
     #[Test]
     public function the_check_names_a_designation_of_a_missing_row_or_of_a_row_of_another_record(): void
     {
-        resolve(CompatibilityMaps::class)->register($this->designated());
         [, $first] = $this->gadgetWithTwoRoots();
         $this->artisan('compatibility:check', ['--map' => ['widgets']])->assertSuccessful();
         $stray = $this->gadget();
@@ -204,18 +208,18 @@ final class DependentCurrentModelTest extends TestCase
 
     private function gadget(): string
     {
-        return (string) DB::table('gadgets')->insertGetId(['name' => 'Gadget']);
+        return (string) Gadget::query()->create(['name' => 'Gadget'])->getKey();
     }
 
     private function place(string $gadget, string $street, null|string $parent = null, null|string $id = null, null|string $createdAt = null): string
     {
-        return (string) DB::table('gadget_places')->insertGetId([
+        return (string) GadgetPlace::query()->create([
             'id' => $id ?? Str::uuid()->toString(),
             'gadget_id' => $gadget,
             'parent_id' => $parent,
             'street' => $street,
             'created_at' => $createdAt ?? now(),
-        ]);
+        ])->getKey();
     }
 
     private function designation(string $gadget): null|string

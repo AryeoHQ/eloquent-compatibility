@@ -49,12 +49,13 @@ final class UnrepresentableStateTest extends TestCase
     #[Test]
     public function it_checks_a_copy_on_an_alias_and_keeps_the_rest(): void
     {
-        $original = $this->refused()->checkedOnPreviousUpdate('NEW.status IS DISTINCT FROM OLD.status');
+        $statusChanged = fn (array $new, array $old) => $new['status'] !== $old['status'];
+        $original = $this->refused()->checkedOnPreviousUpdate($statusChanged);
 
         $checked = $original->checkedOn('place', 'place.parent_id IS NULL');
 
-        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($checked));
-        $this->assertSame(array_replace(self::REFUSED, ['previousUpdateCondition' => 'NEW.status IS DISTINCT FROM OLD.status']), get_object_vars($original));
+        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => $statusChanged]), get_object_vars($checked));
+        $this->assertSame(array_replace(self::REFUSED, ['previousUpdateCondition' => $statusChanged]), get_object_vars($original));
     }
 
     #[Test]
@@ -70,9 +71,10 @@ final class UnrepresentableStateTest extends TestCase
     {
         $original = $this->refused()->checkedOn('place', 'place.parent_id IS NULL');
 
-        $checked = $original->checkedOnPreviousUpdate('OLD.is_archived');
+        $archived = fn (array $new, array $old) => $old['is_archived'] === true;
+        $checked = $original->checkedOnPreviousUpdate($archived);
 
-        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => 'OLD.is_archived']), get_object_vars($checked));
+        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'checkCondition' => 'place.parent_id IS NULL', 'previousUpdateCondition' => $archived]), get_object_vars($checked));
         $this->assertNull($original->previousUpdateCondition);
     }
 

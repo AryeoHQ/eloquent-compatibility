@@ -15,7 +15,7 @@ final class AssignmentTest extends TestCase
     public function it_carries_the_attribute_and_target_column_it_was_given(): void
     {
         $attribute = Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name');
-        $targetColumn = new TargetColumn('gadget', 'name', 'NEW."title"');
+        $targetColumn = TargetColumn::copy('gadget', 'name', 'title');
 
         $assignment = new Assignment($attribute, $targetColumn);
 

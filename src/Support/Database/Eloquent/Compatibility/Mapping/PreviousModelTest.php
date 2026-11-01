@@ -21,7 +21,7 @@ final class PreviousModelTest extends TestCase
         'keyColumn' => 'id',
         'alias' => 'widget',
         'primaryForeignKey' => 'gadget_id',
-        'fillWhenCreatedFromCurrent' => ['status' => "'Draft'"],
+        'fillWhenCreatedFromCurrent' => [],
     ];
 
     #[Test]
@@ -60,9 +60,14 @@ final class PreviousModelTest extends TestCase
     {
         $original = $this->widgets();
 
-        $filled = $original->fillWhenCreatedFromCurrent(['status' => "CASE WHEN NEW.archived THEN 'Archived' ELSE 'Draft' END", 'sku' => "''"]);
+        $status = fn (Gadget $gadget) => $gadget->getAttribute('archived') ? 'Archived' : 'Draft';
+        $sku = fn () => '';
 
-        $this->assertSame(array_replace(self::WIDGETS, ['fillWhenCreatedFromCurrent' => ['status' => "CASE WHEN NEW.archived THEN 'Archived' ELSE 'Draft' END", 'sku' => "''"]]), get_object_vars($filled));
+        $filled = $original->fillWhenCreatedFromCurrent(['status' => $status, 'sku' => $sku]);
+        $refilled = $filled->fillWhenCreatedFromCurrent(['sku' => $sku]);
+
+        $this->assertSame(array_replace(self::WIDGETS, ['fillWhenCreatedFromCurrent' => ['status' => $status, 'sku' => $sku]]), get_object_vars($filled));
+        $this->assertSame(['sku' => $sku], $refilled->fillWhenCreatedFromCurrent);
         $this->assertSame(self::WIDGETS, get_object_vars($original));
     }
 
@@ -73,7 +78,6 @@ final class PreviousModelTest extends TestCase
             ->forModel(Widget::class)
             ->keyedBy('id')
             ->aliasedAs('widget')
-            ->primaryForeignKey('gadget_id')
-            ->fillWhenCreatedFromCurrent(['status' => "'Draft'"]);
+            ->primaryForeignKey('gadget_id');
     }
 }

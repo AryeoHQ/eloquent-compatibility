@@ -8,8 +8,8 @@ use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
-use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Write\WriteRouter;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
@@ -38,10 +38,10 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_shares_one_set_of_compatibility_maps_and_one_event_bridge_across_the_application(): void
+    public function it_shares_one_set_of_compatibility_maps_and_one_write_router_across_the_application(): void
     {
         $this->assertSame(resolve(CompatibilityMaps::class), resolve(CompatibilityMaps::class));
-        $this->assertSame(resolve(EventBridge::class), resolve(EventBridge::class));
+        $this->assertSame(resolve(WriteRouter::class), resolve(WriteRouter::class));
     }
 
     #[Test]

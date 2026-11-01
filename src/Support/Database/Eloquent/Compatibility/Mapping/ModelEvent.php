@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
 use Illuminate\Database\Eloquent\Model;
-use Support\Database\Eloquent\Compatibility\Bridge\Operation;
 
 enum ModelEvent: string
 {
@@ -23,33 +22,11 @@ enum ModelEvent: string
     case ForceDeleting = 'forceDeleting';
     case ForceDeleted = 'forceDeleted';
 
-    /** @return list<self> */
-    public static function beginning(): array
-    {
-        return [self::Creating, self::Updating, self::Deleting];
-    }
-
-    /** @return list<self> */
-    public static function finishing(): array
-    {
-        return [self::Saved, self::Updated, self::Deleted];
-    }
-
     /**
      * @param  class-string<Model>  $model
      */
     public function for(string $model): string
     {
         return "eloquent.{$this->value}: {$model}";
-    }
-
-    public function operation(): null|Operation
-    {
-        return match ($this) {
-            self::Creating => Operation::Insert,
-            self::Updating => Operation::Update,
-            self::Deleting => Operation::Delete,
-            default => null,
-        };
     }
 }

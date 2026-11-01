@@ -4,31 +4,20 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility;
 
-use Illuminate\Contracts\Events\Dispatcher;
-use Illuminate\Queue\Events\Looping;
 use Illuminate\Support\ServiceProvider;
-use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
 use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
+use Support\Database\Eloquent\Compatibility\Write\WriteRouter;
 
 class Provider extends ServiceProvider
 {
     public function register(): void
     {
         $this->app->singleton(CompatibilityMaps::class);
-        $this->app->singleton(EventBridge::class);
+        $this->app->singleton(WriteRouter::class);
     }
 
-    public function boot(Dispatcher $events): void
+    public function boot(): void
     {
-        $release = function (): void {
-            if ($this->app->resolved(EventBridge::class)) {
-                $this->app->make(EventBridge::class)->releaseFailed();
-            }
-        };
-
-        $events->listen(Looping::class, $release);
-        $this->app->terminating($release);
-
         $this->commands([CheckDrift::class]);
     }
 }

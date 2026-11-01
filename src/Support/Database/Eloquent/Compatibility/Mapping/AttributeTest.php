@@ -19,7 +19,6 @@ final class AttributeTest extends TestCase
         'readAs' => null,
         'writesTo' => [],
         'readOnlyBecause' => null,
-        'defaultsTo' => null,
         'storedAs' => null,
     ];
 
@@ -38,7 +37,7 @@ final class AttributeTest extends TestCase
     #[Test]
     public function it_sets_the_type_on_a_copy_and_keeps_the_rest(): void
     {
-        $original = Attribute::mapped('title')->storedAs('gadget', 'name')->defaultsTo("'Untitled'");
+        $original = Attribute::mapped('title')->storedAs('gadget', 'name');
 
         $typed = $original->asType('text');
 
@@ -49,7 +48,7 @@ final class AttributeTest extends TestCase
     #[Test]
     public function it_stores_the_attribute_in_one_column_and_replaces_earlier_writes(): void
     {
-        $original = Attribute::mapped('title')->asType('text')->writesTo('gadget', 'label', 'NEW."title"');
+        $original = Attribute::mapped('title')->asType('text')->writesTo('gadget', 'label', fn (array $widget) => $widget['title']);
 
         $stored = $original->storedAs('gadget', 'name');
 
@@ -57,44 +56,45 @@ final class AttributeTest extends TestCase
             'type' => 'text',
             'alias' => 'gadget',
             'readAs' => 'gadget."name"',
-            'writesTo' => [['alias' => 'gadget', 'column' => 'name', 'expression' => 'NEW."title"']],
+            'writesTo' => [['alias' => 'gadget', 'column' => 'name', 'copiedFrom' => 'title']],
             'storedAs' => 'name',
         ] + self::MAPPED_TITLE, $stored);
-        $this->assertState(['type' => 'text', 'writesTo' => [['alias' => 'gadget', 'column' => 'label', 'expression' => 'NEW."title"']]] + self::MAPPED_TITLE, $original);
+        $this->assertState(['type' => 'text', 'writesTo' => [['alias' => 'gadget', 'column' => 'label', 'copiedFrom' => null]]] + self::MAPPED_TITLE, $original);
     }
 
     #[Test]
-    public function it_quotes_identifiers_that_contain_a_double_quote(): void
+    public function it_copies_the_attribute_value_unchanged_into_its_stored_column(): void
     {
         $stored = Attribute::mapped('ti"tle')->storedAs('gadget', 'na"me');
 
         $this->assertSame('gadget."na""me"', $stored->readAs);
-        $this->assertSame('NEW."ti""tle"', $stored->writesTo[0]->expression);
+        $this->assertSame('Blue', $stored->writesTo[0]->value(['ti"tle' => 'Blue', 'other' => 'Red']));
+        $this->assertNull($stored->writesTo[0]->value([]));
     }
 
     #[Test]
     public function it_reads_the_attribute_through_an_expression_and_drops_its_writes_and_stored_column(): void
     {
-        $original = Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->defaultsTo("'Untitled'");
+        $original = Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name');
 
         $read = $original->readAs('gadget', 'upper(gadget.name)');
 
-        $this->assertState(['type' => 'text', 'alias' => 'gadget', 'readAs' => 'upper(gadget.name)', 'defaultsTo' => "'Untitled'"] + self::MAPPED_TITLE, $read);
+        $this->assertState(['type' => 'text', 'alias' => 'gadget', 'readAs' => 'upper(gadget.name)'] + self::MAPPED_TITLE, $read);
         $this->assertSame('gadget."name"', $original->readAs);
     }
 
     #[Test]
-    public function it_appends_a_write_and_keeps_the_rest(): void
+    public function it_appends_a_write_computed_in_php_and_keeps_the_rest(): void
     {
-        $original = Attribute::mapped('price')->readAs('gadget', 'gadget.price_cents / 100.0')->writesTo('gadget', 'price_cents', 'round(NEW.price::numeric * 100)');
+        $original = Attribute::mapped('price')->readAs('gadget', 'gadget.price_cents / 100.0')->writesTo('gadget', 'price_cents', fn (array $widget) => (int) round((float) $widget['price'] * 100));
 
-        $written = $original->writesTo('gadget', 'currency', "'USD'");
+        $written = $original->writesTo('gadget', 'currency', fn () => 'USD');
 
         $this->assertSame([
-            ['alias' => 'gadget', 'column' => 'price_cents', 'expression' => 'round(NEW.price::numeric * 100)'],
-            ['alias' => 'gadget', 'column' => 'currency', 'expression' => "'USD'"],
+            ['alias' => 'gadget', 'column' => 'price_cents', 'copiedFrom' => null],
+            ['alias' => 'gadget', 'column' => 'currency', 'copiedFrom' => null],
         ], $this->state($written)['writesTo']);
-        $this->assertSame(['writesTo' => []] + $this->state($written), ['writesTo' => []] + $this->state($original));
+        $this->assertSame([1250, 'USD'], [$written->writesTo[0]->value(['price' => '12.50']), $written->writesTo[1]->value([])]);
         $this->assertCount(1, $original->writesTo);
     }
 
@@ -111,17 +111,6 @@ final class AttributeTest extends TestCase
     }
 
     #[Test]
-    public function it_sets_the_default_on_a_copy_and_keeps_the_rest(): void
-    {
-        $original = Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name');
-
-        $defaulted = $original->defaultsTo("'Untitled'");
-
-        $this->assertState(['defaultsTo' => "'Untitled'"] + $this->state($original), $defaulted);
-        $this->assertNull($original->defaultsTo);
-    }
-
-    #[Test]
     public function it_resolves_a_mapped_attribute_to_itself(): void
     {
         $mapped = Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name');
@@ -132,7 +121,7 @@ final class AttributeTest extends TestCase
     #[Test]
     public function it_resolves_a_writable_retained_attribute_to_its_column_on_the_previous_alias(): void
     {
-        $original = Attribute::retained('sku')->asType('text')->defaultsTo("'none'");
+        $original = Attribute::retained('sku')->asType('text');
 
         $resolved = $original->resolve('widget');
 
@@ -142,12 +131,11 @@ final class AttributeTest extends TestCase
             'type' => null,
             'alias' => 'widget',
             'readAs' => 'widget."sku"',
-            'writesTo' => [['alias' => 'widget', 'column' => 'sku', 'expression' => 'NEW."sku"']],
+            'writesTo' => [['alias' => 'widget', 'column' => 'sku', 'copiedFrom' => 'sku']],
             'readOnlyBecause' => null,
-            'defaultsTo' => "'none'",
             'storedAs' => 'sku',
         ], $resolved);
-        $this->assertState(['column' => 'sku', 'retained' => true, 'type' => 'text', 'defaultsTo' => "'none'"] + self::MAPPED_TITLE, $original);
+        $this->assertState(['column' => 'sku', 'retained' => true, 'type' => 'text'] + self::MAPPED_TITLE, $original);
     }
 
     #[Test]
@@ -174,7 +162,10 @@ final class AttributeTest extends TestCase
      */
     private function state(Attribute $attribute): array
     {
-        $state = ['writesTo' => array_map(get_object_vars(...), $attribute->writesTo)] + get_object_vars($attribute);
+        $state = ['writesTo' => array_map(
+            fn (TargetColumn $targetColumn) => ['alias' => $targetColumn->alias, 'column' => $targetColumn->column, 'copiedFrom' => $targetColumn->copiedFrom],
+            $attribute->writesTo,
+        )] + get_object_vars($attribute);
         ksort($state);
 
         return $state;

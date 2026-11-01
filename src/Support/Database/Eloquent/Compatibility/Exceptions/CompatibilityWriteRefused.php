@@ -5,12 +5,13 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\QueryException;
-use PDOException;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
-use Support\Database\Eloquent\Compatibility\Schema\SqlState;
 use Throwable;
 
+/**
+ * A write the write router refused before or during its transaction. The transaction rolls back, so nothing of the
+ * write is stored.
+ */
 final class CompatibilityWriteRefused extends CompatibilityException
 {
     public function __construct(
@@ -22,28 +23,107 @@ final class CompatibilityWriteRefused extends CompatibilityException
         parent::__construct("{$refused}. Why: {$because} Instead: {$instead}", 0, $previous);
     }
 
-    public static function isRefusal(Throwable $e): bool
+    public static function readOnly(string $map, string $view, string $column, int|string $key, string $because): self
     {
-        return $e instanceof self
-            || ($e instanceof QueryException && (string) $e->getCode() === SqlState::Refused->value);
+        return new self(
+            "Compatibility map '{$map}' refused a change to {$view}.{$column} on record {$key}",
+            $because,
+            "Leave {$column} unchanged in writes through the previous model.",
+        );
     }
 
-    public static function fromQueryException(QueryException $e): null|self
+    public static function nullValue(string $map, string $view, string $column, null|int|string $key, string $retainedTable): self
     {
-        if ((string) $e->getCode() !== SqlState::Refused->value) {
-            return null;
-        }
+        return new self(
+            "Compatibility map '{$map}' refused a null {$view}.{$column} on ".($key === null ? 'a new record' : "record {$key}"),
+            "{$retainedTable}.{$column} is NOT NULL, so the previous model never stores null.",
+            "Write a value to {$column}, or omit it from an insert to take its default.",
+        );
+    }
 
-        $previous = $e->getPrevious();
-        $text = $previous instanceof PDOException && is_array($previous->errorInfo)
-            ? (string) ($previous->errorInfo[2] ?? $e->getMessage())
-            : $e->getMessage();
+    /**
+     * @param  list<string>  $columns
+     */
+    public static function unknownAttributes(string $map, string $view, array $columns): self
+    {
+        $names = implode(', ', $columns);
 
         return new self(
-            self::line($text, 'ERROR'),
-            self::line($text, 'DETAIL'),
-            self::line($text, 'HINT'),
-            $e,
+            "Compatibility map '{$map}' refused a write of {$names} through {$view}",
+            'The compatibility map declares no attribute of that name, so the write has nowhere to store it.',
+            'Declare the attribute in the compatibility map, or leave it out of the write.',
+        );
+    }
+
+    public static function missingRow(string $map, string $view, int|string $key, string $table): self
+    {
+        return new self(
+            "Compatibility map '{$map}' refused a write to {$view} record {$key}: its {$table} row is missing",
+            'The record has nowhere to store the change, so the previous and current models have diverged.',
+            "Run php artisan compatibility:check --map={$map} and repair the record it names.",
+        );
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    public static function noDependentRow(string $map, string $view, int|string $key, array $columns, string $table): self
+    {
+        return new self(
+            "Compatibility map '{$map}' refused a change to ".implode(', ', $columns)." on {$view} record {$key}",
+            "The record has no {$table} row, and the compatibility map does not create one for this write.",
+            "Create the {$table} row through its own model first, or declare createdWhen() for this dependent current model.",
+        );
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    public static function designationMismatch(string $map, string $view, int|string $key, array $columns, string $table, string $designation, string $readableWhen): self
+    {
+        return new self(
+            "Compatibility map '{$map}' refused a change to ".implode(', ', $columns)." on {$view} record {$key}: its designated {$table} row is not one the previous model reads",
+            "The record reads only the {$table} row that {$designation} names, and that row no longer matches ({$readableWhen}) or belongs to another record.",
+            "Make that {$table} row match again through its own model, or repair {$designation} by hand.",
+        );
+    }
+
+    public static function refusedState(string $map, string $description, string $table, int|string $key, string $because, string $instead): self
+    {
+        return new self("Compatibility map '{$map}' refused {$description} in {$table} record {$key}", $because, $instead);
+    }
+
+    public static function refusedPreviousUpdate(string $map, string $description, string $view, int|string $key, string $because, string $instead): self
+    {
+        return new self("Compatibility map '{$map}' refused {$description} on {$view} record {$key}", $because, $instead);
+    }
+
+    public static function rawExpression(string $map, string $view, string $column): self
+    {
+        return new self(
+            "Compatibility map '{$map}' refused a raw SQL value for {$view}.{$column}",
+            'The write router computes each current column from the attribute values in PHP, so it cannot split a SQL expression across the current models.',
+            "Read the record and write the computed value, or write the current model's column through its own model.",
+        );
+    }
+
+    public static function unsupported(string $map, string $relation, string $method): self
+    {
+        return new self(
+            "Compatibility map '{$map}' refused {$method}() on {$relation}",
+            "{$method}() writes rows the write router cannot see one by one, so it cannot keep the previous and current models in step.",
+            'Write each record through the model, or through insert(), update() or delete() on its query builder.',
+        );
+    }
+
+    public static function byCurrentListener(string $map, Model $current): self
+    {
+        $record = class_basename($current).' '.self::key($current);
+
+        return new self(
+            "Compatibility map '{$map}' refused this write, because a listener of {$record} vetoed its save",
+            "The write through the previous model stores its values in {$record}, and that model's own listeners refused them.",
+            'Make the write satisfy the rules of '.class_basename($current).'.',
         );
     }
 
@@ -77,10 +157,5 @@ final class CompatibilityWriteRefused extends CompatibilityException
         $key = $model->getKey();
 
         return is_scalar($key) ? '#'.$key : '(new)';
-    }
-
-    private static function line(string $text, string $label): string
-    {
-        return preg_match('/'.$label.':\s+(.*?)\s*(?:\n|$)/', $text, $matches) === 1 ? $matches[1] : '';
     }
 }

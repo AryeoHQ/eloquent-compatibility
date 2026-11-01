@@ -6,14 +6,13 @@ namespace Support\Database\Eloquent\Compatibility\Testing;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Assert;
-use Support\Database\Eloquent\Compatibility\Bridge\EventBridge;
-use Support\Database\Eloquent\Compatibility\Bridge\Events\RecordMirrored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
+use Support\Database\Eloquent\Compatibility\Write\Events\RecordMirrored;
+use Support\Database\Eloquent\Compatibility\Write\WriteRouter;
 use Throwable;
 
 trait InteractsWithCompatibilityMaps
@@ -62,13 +61,13 @@ trait InteractsWithCompatibilityMaps
         Assert::assertCount(
             $times,
             $matches,
-            "Expected the event bridge to raise '{$event->value}' on {$model} {$times} time(s). It raised: ".$this->describeMirroredEvents(),
+            "Expected the write router to raise '{$event->value}' on {$model} {$times} time(s). It raised: ".$this->describeMirroredEvents(),
         );
     }
 
     protected function assertNothingMirrored(): void
     {
-        Assert::assertSame([], $this->mirroredEvents, 'Expected no mirrored events. The event bridge raised: '.$this->describeMirroredEvents());
+        Assert::assertSame([], $this->mirroredEvents, 'Expected no mirrored events. The write router raised: '.$this->describeMirroredEvents());
     }
 
     /**
@@ -79,15 +78,11 @@ trait InteractsWithCompatibilityMaps
         try {
             DB::transaction(fn () => $write());
         } catch (Throwable $e) {
-            $refusal = match (true) {
-                $e instanceof CompatibilityWriteRefused => $e,
-                $e instanceof QueryException => CompatibilityWriteRefused::fromQueryException($e),
-                default => null,
-            };
-
-            if ($refusal === null) {
+            if (! $e instanceof CompatibilityWriteRefused) {
                 throw $e;
             }
+
+            $refusal = $e;
 
             if ($contains !== null) {
                 Assert::assertStringContainsString($contains, $refusal->getMessage());
@@ -107,7 +102,7 @@ trait InteractsWithCompatibilityMaps
      */
     protected function withoutEventMirroring(callable $callback): mixed
     {
-        return resolve(EventBridge::class)->withoutMirroring($callback);
+        return resolve(WriteRouter::class)->withoutMirroring($callback);
     }
 
     private function describeMirroredEvents(): string

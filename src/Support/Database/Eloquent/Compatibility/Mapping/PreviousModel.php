@@ -4,13 +4,14 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Mapping;
 
+use Closure;
 use Illuminate\Database\Eloquent\Model;
 
 final readonly class PreviousModel
 {
     /**
      * @param  null|class-string<Model>  $model
-     * @param  array<string, string>  $fillWhenCreatedFromCurrent
+     * @param  array<string, Closure(Model): mixed>  $fillWhenCreatedFromCurrent
      */
     private function __construct(
         public string $view,
@@ -56,7 +57,9 @@ final readonly class PreviousModel
     }
 
     /**
-     * @param  array<string, string>  $values
+     * Fills retained columns when a primary current model is created through its own model. Each closure receives that model.
+     *
+     * @param  array<string, Closure(Model): mixed>  $values
      */
     public function fillWhenCreatedFromCurrent(array $values): self
     {

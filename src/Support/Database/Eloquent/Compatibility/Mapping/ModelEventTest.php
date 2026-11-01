@@ -8,7 +8,6 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
-use Support\Database\Eloquent\Compatibility\Bridge\Operation;
 use Tests\Fixtures\Support\Workbench\Gadget;
 use Tests\Fixtures\Support\Workbench\Tables;
 use Tests\TestCase;
@@ -37,18 +36,6 @@ final class ModelEventTest extends TestCase
     }
 
     #[Test]
-    public function it_lists_the_events_that_begin_a_write(): void
-    {
-        $this->assertSame([ModelEvent::Creating, ModelEvent::Updating, ModelEvent::Deleting], ModelEvent::beginning());
-    }
-
-    #[Test]
-    public function it_lists_the_events_that_finish_a_write(): void
-    {
-        $this->assertSame([ModelEvent::Saved, ModelEvent::Updated, ModelEvent::Deleted], ModelEvent::finishing());
-    }
-
-    #[Test]
     public function it_names_the_event_string_eloquent_dispatches_for_a_model(): void
     {
         $this->assertSame('eloquent.updated: '.Gadget::class, ModelEvent::Updated->for(Gadget::class));
@@ -74,14 +61,5 @@ final class ModelEventTest extends TestCase
             array_map(fn (ModelEvent $event) => $event->for(Gadget::class), ModelEvent::cases()),
             array_filter($dispatched, fn (string $event) => Str::endsWith($event, ': '.Gadget::class)),
         )));
-    }
-
-    #[Test]
-    public function it_maps_each_beginning_event_to_its_operation_and_every_other_case_to_none(): void
-    {
-        $this->assertSame(
-            ['Creating' => Operation::Insert, 'Updating' => Operation::Update, 'Deleting' => Operation::Delete],
-            array_filter(array_combine(array_column(ModelEvent::cases(), 'name'), array_map(fn (ModelEvent $event) => $event->operation(), ModelEvent::cases()))),
-        );
     }
 }

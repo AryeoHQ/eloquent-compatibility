@@ -31,7 +31,7 @@ final class ResolvedMapTest extends TestCase
         $sku = array_values(array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->column === 'sku'))[0];
 
         $this->assertSame(['widget', 'widget."sku"', 'sku'], [$sku->alias, $sku->readAs, $sku->storedAs]);
-        $this->assertSame([['widget', 'sku', 'NEW."sku"']], array_map(fn (TargetColumn $targetColumn) => [$targetColumn->alias, $targetColumn->column, $targetColumn->expression], $sku->writesTo));
+        $this->assertSame([['widget', 'sku', 'sku']], array_map(fn (TargetColumn $targetColumn) => [$targetColumn->alias, $targetColumn->column, $targetColumn->copiedFrom], $sku->writesTo));
         $this->assertSame('gadgets', $resolvedMap->table('gadget'));
     }
 
@@ -85,14 +85,14 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['previous_row'])]
-    #[TestWith(['affected_rows'])]
-    #[TestWith(['created_key'])]
-    #[TestWith(['key_gadget'])]
-    #[TestWith(['key_anything'])]
-    public function it_refuses_an_alias_that_names_a_variable_the_compiled_triggers_declare(string $alias): void
+    public function it_refuses_a_column_set_both_by_an_attribute_and_by_a_fill(): void
     {
-        $this->expectInvalidMap("alias '{$alias}' names a variable the compiled triggers declare", ['dependentCurrentModels' => [DependentCurrentModel::for(GadgetPlace::class)->aliasedAs($alias)->primaryForeignKey('gadget_id')]]);
+        $widgets = new WidgetCompatibilityMap;
+        [$place, $site] = $widgets->dependentCurrentModels();
+
+        $this->expectInvalidMap("place.street is set both by attribute 'street' and by fillWhenCreatedFromPrevious()", [
+            'dependentCurrentModels' => [$place->fillWhenCreatedFromPrevious(['street' => fn () => 'Unknown']), $site],
+        ]);
     }
 
     #[Test]
@@ -208,11 +208,11 @@ final class ResolvedMapTest extends TestCase
         $overrides = [
             'dependent_attribute' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->storedAs('place', 'gadget_id')]],
             'read_only_dependent_attribute' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->storedAs('place', 'gadget_id')->readOnlyBecause('A place keeps its gadget.')]],
-            'dependent_write' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->readAs('place', 'place.gadget_id')->writesTo('place', 'gadget_id', 'NEW.place_owner_id')]],
-            'dependent_fill' => ['dependentCurrentModels' => [$place->fillWhenCreatedFromPrevious(['gadget_id' => 'NEW.gadget_id']), $site]],
-            'retained_fill' => ['previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['gadget_id' => 'NULL'])],
+            'dependent_write' => ['attributes' => [...$widgets->attributes(), Attribute::mapped('place_owner_id')->asType('uuid')->readAs('place', 'place.gadget_id')->writesTo('place', 'gadget_id', fn (array $widget) => $widget['place_owner_id'])]],
+            'dependent_fill' => ['dependentCurrentModels' => [$place->fillWhenCreatedFromPrevious(['gadget_id' => fn (array $widget) => $widget['gadget_id']]), $site]],
+            'retained_fill' => ['previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['gadget_id' => fn () => null])],
             'designation_fill' => [
-                'previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['place_id' => 'NULL']),
+                'previousModel' => $widgets->previousModel()->fillWhenCreatedFromCurrent(['place_id' => fn () => null]),
                 'dependentCurrentModels' => [$place->designatedBy('place_id'), $site],
             ],
         ][$case];
@@ -227,7 +227,7 @@ final class ResolvedMapTest extends TestCase
     #[Test]
     public function it_refuses_a_write_to_an_unknown_alias(): void
     {
-        $this->expectInvalidMap("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', 'NEW.title')]]);
+        $this->expectInvalidMap("attribute 'title' writes unknown alias 'unknown'", ['attributes' => [Attribute::retained('id'), Attribute::mapped('title')->asType('text')->storedAs('gadget', 'name')->writesTo('unknown', 'name', fn (array $widget) => $widget['title'])]]);
     }
 
     #[Test]

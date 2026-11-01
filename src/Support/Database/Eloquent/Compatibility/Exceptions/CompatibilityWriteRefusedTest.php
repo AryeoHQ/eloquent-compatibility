@@ -4,32 +4,16 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
-use Closure;
-use Illuminate\Database\QueryException;
-use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Mapping\ModelEvent;
-use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Tests\Fixtures\Support\Workbench\Gadget;
-use Tests\Fixtures\Support\Workbench\Tables;
-use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
 #[CoversClass(CompatibilityWriteRefused::class)]
 final class CompatibilityWriteRefusedTest extends TestCase
 {
-    private const string SECOND = '00000000-0000-4000-8000-000000000002';
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-
-        Tables::create();
-        resolve(Installer::class)->install(new WidgetCompatibilityMap);
-    }
-
     #[Test]
     public function it_states_what_it_refused_why_and_what_to_do_instead(): void
     {
@@ -45,55 +29,57 @@ final class CompatibilityWriteRefusedTest extends TestCase
     }
 
     #[Test]
-    public function it_counts_itself_and_a_query_refused_by_the_database_as_a_refusal_and_nothing_else(): void
+    public function it_names_the_read_only_attribute_and_the_record(): void
     {
-        $this->assertTrue(CompatibilityWriteRefused::isRefusal(new CompatibilityWriteRefused('Refused', 'Because.', 'Instead.')));
-        $this->assertTrue(CompatibilityWriteRefused::isRefusal($this->secondRootPlace()));
-        $this->assertFalse(CompatibilityWriteRefused::isRefusal($this->duplicateUuid()));
-        $this->assertFalse(CompatibilityWriteRefused::isRefusal(InvalidCompatibilityMap::because('widgets', 'its event mirror is registered twice')));
-        $this->assertFalse(CompatibilityWriteRefused::isRefusal(new RuntimeException('Refused', 0)));
+        $refusal = CompatibilityWriteRefused::readOnly('widgets', 'widgets', 'uuid', 7, 'A widget keeps its public id.');
+
+        $this->assertSame(["Compatibility map 'widgets' refused a change to widgets.uuid on record 7", 'A widget keeps its public id.', 'Leave uuid unchanged in writes through the previous model.'], [$refusal->refused, $refusal->because, $refusal->instead]);
     }
 
     #[Test]
-    public function it_splits_a_refusal_the_database_raised_into_its_message_detail_and_hint(): void
+    public function it_names_a_null_on_a_new_record_or_an_existing_one(): void
     {
-        $exception = $this->secondRootPlace();
-
-        $refusal = CompatibilityWriteRefused::fromQueryException($exception);
-
-        $this->assertNotNull($refusal);
-        $this->assertSame("Compatibility map 'widgets' refused a second root place for one gadget in gadget_places record ".self::SECOND, $refusal->refused);
-        $this->assertSame('A widget has one street, so a gadget may have only one place without a parent.', $refusal->because);
-        $this->assertSame('Give the new place a parent_id, or soft-delete the current root place first.', $refusal->instead);
-        $this->assertSame($exception, $refusal->getPrevious());
+        $this->assertSame("Compatibility map 'widgets' refused a null widgets.title on a new record", CompatibilityWriteRefused::nullValue('widgets', 'widgets', 'title', null, 'retained_widgets')->refused);
+        $this->assertSame("Compatibility map 'widgets' refused a null widgets.title on record 7", CompatibilityWriteRefused::nullValue('widgets', 'widgets', 'title', 7, 'retained_widgets')->refused);
     }
 
     #[Test]
-    public function it_leaves_a_part_the_database_did_not_raise_empty(): void
+    public function it_names_each_write_the_router_cannot_split(): void
     {
-        $refusal = CompatibilityWriteRefused::fromQueryException($this->failure(
-            fn () => DB::unprepared("DO \$refuse\$ BEGIN RAISE EXCEPTION USING ERRCODE = 'CM001', MESSAGE = 'refused with no hint', DETAIL = 'Only a detail.'; END \$refuse\$"),
-        ));
-
-        $this->assertNotNull($refusal);
-        $this->assertSame(['refused with no hint', 'Only a detail.', ''], [$refusal->refused, $refusal->because, $refusal->instead]);
+        $this->assertSame("Compatibility map 'widgets' refused a write of colour, size through widgets", CompatibilityWriteRefused::unknownAttributes('widgets', 'widgets', ['colour', 'size'])->refused);
+        $this->assertSame("Compatibility map 'widgets' refused a raw SQL value for widgets.title", CompatibilityWriteRefused::rawExpression('widgets', 'widgets', 'title')->refused);
+        $this->assertSame("Compatibility map 'widgets' refused upsert() on widgets", CompatibilityWriteRefused::unsupported('widgets', 'widgets', 'upsert')->refused);
     }
 
     #[Test]
-    public function it_makes_no_refusal_of_a_query_that_failed_for_another_reason(): void
+    public function it_names_the_missing_row_and_the_check_that_finds_it(): void
     {
-        $this->assertNull(CompatibilityWriteRefused::fromQueryException($this->duplicateUuid()));
+        $refusal = CompatibilityWriteRefused::missingRow('widgets', 'widgets', 7, 'gadgets');
+
+        $this->assertSame("Compatibility map 'widgets' refused a write to widgets record 7: its gadgets row is missing", $refusal->refused);
+        $this->assertSame('Run php artisan compatibility:check --map=widgets and repair the record it names.', $refusal->instead);
+    }
+
+    #[Test]
+    public function it_blames_the_current_model_listener_that_vetoed_its_save(): void
+    {
+        $gadget = new Gadget(['id' => '00000000-0000-4000-8000-000000000001']);
+
+        $refusal = CompatibilityWriteRefused::byCurrentListener('widgets', $gadget);
+
+        $this->assertSame("Compatibility map 'widgets' refused this write, because a listener of Gadget #00000000-0000-4000-8000-000000000001 vetoed its save", $refusal->refused);
+        $this->assertSame('Make the write satisfy the rules of Gadget.', $refusal->instead);
     }
 
     #[Test]
     public function it_blames_the_mirrored_listener_that_returned_false(): void
     {
-        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
+        $gadget = new Gadget(['id' => '00000000-0000-4000-8000-000000000001']);
 
         $refusal = CompatibilityWriteRefused::byMirroredListener('widgets', $gadget, ModelEvent::Updating);
 
-        $this->assertSame("Compatibility map 'widgets' refused this write, because a 'updating' listener of Gadget #{$gadget->id} returned false", $refusal->refused);
-        $this->assertSame("The write changed Gadget #{$gadget->id} through the other side, and every listener of that side runs for it, so that side's rules refused the change.", $refusal->because);
+        $this->assertSame("Compatibility map 'widgets' refused this write, because a 'updating' listener of Gadget #00000000-0000-4000-8000-000000000001 returned false", $refusal->refused);
+        $this->assertSame("The write changed Gadget #00000000-0000-4000-8000-000000000001 through the other side, and every listener of that side runs for it, so that side's rules refused the change.", $refusal->because);
         $this->assertSame("Make the write satisfy the rules of Gadget, or exclude the listener in the map's event mirror if it must not run for writes through the other side.", $refusal->instead);
         $this->assertNull($refusal->getPrevious());
         $this->assertStringContainsString("a 'creating' listener of Gadget (new) returned false", CompatibilityWriteRefused::byMirroredListener('widgets', new Gadget, ModelEvent::Creating)->getMessage());
@@ -102,43 +88,12 @@ final class CompatibilityWriteRefusedTest extends TestCase
     #[Test]
     public function it_names_the_columns_a_mirrored_listener_changed(): void
     {
-        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
+        $gadget = new Gadget(['id' => '00000000-0000-4000-8000-000000000001']);
 
         $refusal = CompatibilityWriteRefused::byMirroredChange('widgets', $gadget, ModelEvent::Updated, ['name', 'price_cents']);
 
-        $this->assertSame("Compatibility map 'widgets' refused this write, because a 'updated' listener of Gadget #{$gadget->id} changed name, price_cents", $refusal->refused);
+        $this->assertSame("Compatibility map 'widgets' refused this write, because a 'updated' listener of Gadget #00000000-0000-4000-8000-000000000001 changed name, price_cents", $refusal->refused);
         $this->assertSame('Mirrored events fire after the write through the other side has reached the database, so a change a listener makes to the mirrored record cannot be stored.', $refusal->because);
-        $this->assertSame("Make the change through Gadget itself, or exclude the listener in the map's event mirror.", $refusal->instead);
         $this->assertStringContainsString("a 'created' listener of Gadget (new) changed name.", CompatibilityWriteRefused::byMirroredChange('widgets', new Gadget, ModelEvent::Created, ['name'])->getMessage());
-    }
-
-    private function secondRootPlace(): QueryException
-    {
-        $gadget = Gadget::query()->create(['name' => 'Blue gadget']);
-        DB::table('gadget_places')->insert(['gadget_id' => $gadget->id, 'street' => '1 Main St']);
-
-        return $this->failure(fn () => DB::table('gadget_places')->insert(['id' => self::SECOND, 'gadget_id' => $gadget->id, 'street' => '2 Second St']));
-    }
-
-    private function duplicateUuid(): QueryException
-    {
-        $uuid = DB::table('retained_widgets')->insertGetId(['status' => 'Draft']);
-        $taken = DB::table('retained_widgets')->where('id', $uuid)->value('uuid');
-
-        return $this->failure(fn () => DB::table('retained_widgets')->insert(['uuid' => $taken]));
-    }
-
-    /**
-     * @param  Closure(): mixed  $statement
-     */
-    private function failure(Closure $statement): QueryException
-    {
-        try {
-            DB::transaction($statement);
-        } catch (QueryException $e) {
-            return $e;
-        }
-
-        $this->fail('Expected the statement to fail.');
     }
 }

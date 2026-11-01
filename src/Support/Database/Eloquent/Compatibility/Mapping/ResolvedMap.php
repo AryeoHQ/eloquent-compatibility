@@ -8,13 +8,10 @@ use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
-use Support\Database\Eloquent\Compatibility\Schema\TriggerFunction;
 
 final readonly class ResolvedMap
 {
     private const string IDENTIFIER = '/^[a-z_][a-z0-9_]*$/';
-
-    private const array VARIABLES = ['previous_row', 'affected_rows', 'created_key'];
 
     /**
      * @param  list<DependentCurrentModel>  $dependentCurrentModels
@@ -79,10 +76,6 @@ final readonly class ResolvedMap
 
             if (in_array($alias, ReservedWords::POSTGRESQL, true)) {
                 throw InvalidCompatibilityMap::because($name, "alias '{$alias}' is a reserved PostgreSQL word");
-            }
-
-            if (in_array($alias, self::VARIABLES, true) || str_starts_with($alias, 'key_')) {
-                throw InvalidCompatibilityMap::because($name, "alias '{$alias}' names a variable the compiled triggers declare; choose another alias");
             }
         }
 
@@ -163,6 +156,26 @@ final readonly class ResolvedMap
         return $assignments;
     }
 
+    /**
+     * Every column an insert through the previous model writes in one alias's table: each writable attribute's
+     * writes, and the stored column of each read-only attribute no other attribute writes.
+     *
+     * @return list<Assignment>
+     */
+    public function insertAssignmentsTo(string $alias): array
+    {
+        $assignments = $this->assignmentsTo($alias);
+
+        foreach ($this->readOnlyAttributes() as $attribute) {
+            if ($attribute->alias === $alias && $attribute->storedAs !== null && ! $this->writes($alias, $attribute->storedAs)
+                && ! ($attribute->retained && $attribute->column === $this->previousModel->primaryForeignKey)) {
+                $assignments[] = new Assignment($attribute, TargetColumn::copy($alias, $attribute->storedAs, $attribute->column));
+            }
+        }
+
+        return $assignments;
+    }
+
     public function writes(string $alias, string $column): bool
     {
         return array_any($this->assignmentsTo($alias), fn (Assignment $assignment) => $assignment->targetColumn->column === $column);
@@ -194,35 +207,34 @@ final readonly class ResolvedMap
         return $models;
     }
 
-    public function functionName(TriggerFunction $function): string
+    public function previousAlias(): string
     {
-        return $this->object($function->value);
+        return (string) $this->previousModel->alias;
     }
 
-    public function refuseFunctionName(UnrepresentableState $state): string
+    public function primaryAlias(): string
     {
-        return $this->object('refuse_'.$state->name);
+        return (string) $this->primaryCurrentModel->alias;
     }
 
-    public function designateFunctionName(DependentCurrentModel $dependent): string
+    public function attribute(string $column): null|Attribute
     {
-        return $this->object('designate_'.$dependent->alias);
-    }
-
-    public function objectPrefix(): string
-    {
-        return 'compatibility__'.$this->name.'__';
-    }
-
-    private function object(string $suffix): string
-    {
-        $object = $this->objectPrefix().$suffix;
-
-        if (strlen($object) > 63) {
-            throw InvalidCompatibilityMap::because($this->name, "the database object name {$object} exceeds 63 characters; shorten the compatibility map or unrepresentable state name");
+        foreach ($this->attributes as $attribute) {
+            if ($attribute->column === $column) {
+                return $attribute;
+            }
         }
 
-        return $object;
+        return null;
+    }
+
+    /**
+     * The prefix of the trigger functions and triggers that versions before the write router installed. The installer
+     * drops every object with it.
+     */
+    public function legacyObjectPrefix(): string
+    {
+        return 'compatibility__'.$this->name.'__';
     }
 
     private function validateAttributes(): void
@@ -310,6 +322,14 @@ final readonly class ResolvedMap
 
             if (array_key_exists((string) $dependent->primaryForeignKey, $dependent->fillWhenCreatedFromPrevious)) {
                 throw InvalidCompatibilityMap::because($this->name, "dependent current model '{$dependent->alias}' fills its primary foreign key {$dependent->primaryForeignKey} with fillWhenCreatedFromPrevious(); the compatibility map maintains it");
+            }
+        }
+
+        foreach ([$this->primaryCurrentModel, ...$this->dependentCurrentModels] as $current) {
+            foreach ($this->insertAssignmentsTo((string) $current->alias) as $assignment) {
+                if (array_key_exists($assignment->targetColumn->column, $current->fillWhenCreatedFromPrevious)) {
+                    throw InvalidCompatibilityMap::because($this->name, "{$current->alias}.{$assignment->targetColumn->column} is set both by attribute '{$assignment->attribute->column}' and by fillWhenCreatedFromPrevious()");
+                }
             }
         }
 

@@ -78,22 +78,22 @@ class HasCompatibilityMustNotRedeclareWriteHooksTest extends RuleTestCase
     }
 
     #[Test]
-    public function it_fails_when_has_compatibility_redeclares_its_event_hook(): void
+    public function it_fails_when_has_compatibility_redeclares_its_builder_hook(): void
     {
-        $this->analyse([$this->getFixturePath('Compatibility/RedeclaresEventHook.php')], [
+        $this->analyse([$this->getFixturePath('Compatibility/RedeclaresBuilderHook.php')], [
             [
-                'HasCompatibility must not redeclare fireModelEvent().',
+                'HasCompatibility must not redeclare newEloquentBuilder().',
                 11,
             ],
         ]);
     }
 
     #[Test]
-    public function it_fails_when_a_subclass_of_has_compatibility_imports_its_event_hook_through_another_trait(): void
+    public function it_fails_when_a_subclass_of_has_compatibility_imports_its_builder_hook_through_another_trait(): void
     {
-        $this->analyse([$this->getFixturePath('Compatibility/SubclassImportsEventHook.php')], [
+        $this->analyse([$this->getFixturePath('Compatibility/SubclassImportsBuilderHook.php')], [
             [
-                'HasCompatibility must not redeclare fireModelEvent().',
+                'HasCompatibility must not redeclare newEloquentBuilder().',
                 7,
             ],
         ]);

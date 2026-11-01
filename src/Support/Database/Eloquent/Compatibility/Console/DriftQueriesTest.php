@@ -13,7 +13,12 @@ use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\PreviousModel;
 use Support\Database\Eloquent\Compatibility\Mapping\PrimaryCurrentModel;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Write\WriteRouter;
+use Tests\Fixtures\Support\Workbench\CompatibilityMapEventMirror;
+use Tests\Fixtures\Support\Workbench\Gadget;
+use Tests\Fixtures\Support\Workbench\GadgetPlace;
 use Tests\Fixtures\Support\Workbench\Tables;
+use Tests\Fixtures\Support\Workbench\Widget;
 use Tests\Fixtures\Support\Workbench\WidgetCompatibilityMap;
 use Tests\TestCase;
 
@@ -105,9 +110,7 @@ final class DriftQueriesTest extends TestCase
         $this->install();
         $gadget = $this->gadget();
         $first = $this->place($gadget);
-        DB::unprepared('ALTER TABLE gadget_places DISABLE TRIGGER USER');
-        $second = $this->place($gadget);
-        DB::unprepared('ALTER TABLE gadget_places ENABLE TRIGGER USER');
+        $second = (string) DB::table('gadget_places')->insertGetId(['gadget_id' => $gadget, 'street' => 'Main St']);
         $this->place($gadget, parent: $first);
 
         $this->assertFindings(array_map(
@@ -193,22 +196,22 @@ final class DriftQueriesTest extends TestCase
     private function install(CompatibilityMap $map = new WidgetCompatibilityMap): void
     {
         resolve(Installer::class)->install($map);
-        resolve(CompatibilityMaps::class)->register($map);
+        resolve(WriteRouter::class)->register(new CompatibilityMapEventMirror($map));
     }
 
     private function widget(): int
     {
-        return DB::table('widgets')->insertGetId(['title' => 'Blue gadget', 'street' => '1 Main St']);
+        return Widget::query()->create(['title' => 'Blue gadget', 'street' => '1 Main St'])->id;
     }
 
     private function gadget(): string
     {
-        return (string) DB::table('gadgets')->insertGetId(['name' => 'Gadget']);
+        return (string) Gadget::query()->create(['name' => 'Gadget'])->getKey();
     }
 
     private function place(string $gadget, null|string $parent = null): string
     {
-        return (string) DB::table('gadget_places')->insertGetId(['gadget_id' => $gadget, 'parent_id' => $parent, 'street' => 'Main St']);
+        return (string) GadgetPlace::query()->create(['gadget_id' => $gadget, 'parent_id' => $parent, 'street' => 'Main St'])->getKey();
     }
 
     private function retainedKey(string $gadget): int

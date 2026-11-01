@@ -95,7 +95,7 @@ final class Tables
         }
 
         foreach ([new WidgetCompatibilityMap, new AccountCompatibilityMap, new ProfileCompatibilityMap] as $map) {
-            $prefix = SqlFragments::like(ResolvedMap::of($map)->objectPrefix());
+            $prefix = SqlFragments::like(ResolvedMap::of($map)->legacyObjectPrefix());
 
             Schema::getConnection()->unprepared(
                 "DO \$drop\$ DECLARE trigger_function regprocedure; BEGIN
