@@ -20,6 +20,8 @@ final class UnrepresentableStateTest extends TestCase
         'checkedOn' => null,
         'checkCondition' => null,
         'previousUpdateCondition' => null,
+        'predicate' => null,
+        'candidates' => null,
     ];
 
     #[Test]
@@ -32,7 +34,7 @@ final class UnrepresentableStateTest extends TestCase
     public function it_declares_a_degraded_state_with_its_rule_and_no_alternative(): void
     {
         $this->assertSame(
-            ['kind' => UnrepresentableStateKind::Degrade, 'name' => 'child_place', 'description' => 'a place under another place', 'because' => 'The widget shows only the root place.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => null, 'previousUpdateCondition' => null],
+            ['kind' => UnrepresentableStateKind::Degrade, 'name' => 'child_place', 'description' => 'a place under another place', 'because' => 'The widget shows only the root place.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => null, 'previousUpdateCondition' => null, 'predicate' => null, 'candidates' => null],
             get_object_vars(UnrepresentableState::degrade('child_place', 'a place under another place', 'The widget shows only the root place.')),
         );
     }
@@ -41,7 +43,7 @@ final class UnrepresentableStateTest extends TestCase
     public function it_declares_a_hidden_state_with_its_condition_and_no_alternative(): void
     {
         $this->assertSame(
-            ['kind' => UnrepresentableStateKind::Hide, 'name' => 'retired', 'description' => 'a retired widget', 'because' => 'Retired widgets predate gadgets.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => "widget.status = 'Retired'", 'previousUpdateCondition' => null],
+            ['kind' => UnrepresentableStateKind::Hide, 'name' => 'retired', 'description' => 'a retired widget', 'because' => 'Retired widgets predate gadgets.', 'instead' => '', 'checkedOn' => null, 'checkCondition' => "widget.status = 'Retired'", 'previousUpdateCondition' => null, 'predicate' => null, 'candidates' => null],
             get_object_vars(UnrepresentableState::hide('retired', 'a retired widget', 'Retired widgets predate gadgets.', "widget.status = 'Retired'")),
         );
     }
@@ -81,5 +83,17 @@ final class UnrepresentableStateTest extends TestCase
     private function refused(): UnrepresentableState
     {
         return UnrepresentableState::refuse('second_root_place', 'a second root place for one gadget', 'A widget has one street.', 'Give the new place a parent_id.');
+    }
+
+    #[Test]
+    public function it_checks_a_predicate_with_its_candidates_on_a_copy_and_keeps_the_rest(): void
+    {
+        $predicate = fn () => true;
+        $candidates = fn ($query) => $query;
+
+        $checked = $this->refused()->checkedBy('place', $predicate, $candidates);
+
+        $this->assertSame(array_replace(self::REFUSED, ['checkedOn' => 'place', 'predicate' => $predicate, 'candidates' => $candidates]), get_object_vars($checked));
+        $this->assertSame(self::REFUSED, get_object_vars($this->refused()));
     }
 }

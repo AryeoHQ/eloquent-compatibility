@@ -12,6 +12,7 @@ final readonly class DependentCurrentModel
     /**
      * @param  class-string<Model>  $model
      * @param  array<string, Closure(array<string, mixed>): mixed>  $fillWhenCreatedFromPrevious
+     * @param  list<Closure(Model, array<string, mixed>): void>  $creating
      */
     private function __construct(
         public string $model,
@@ -21,6 +22,8 @@ final readonly class DependentCurrentModel
         public array $fillWhenCreatedFromPrevious,
         public null|Closure $createdWhen,
         public null|string $designationColumn,
+        public null|string $orderedBy = null,
+        public array $creating = [],
     ) {}
 
     /**
@@ -33,17 +36,17 @@ final readonly class DependentCurrentModel
 
     public function aliasedAs(string $alias): self
     {
-        return new self($this->model, $alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
+        return $this->with(alias: $alias);
     }
 
     public function primaryForeignKey(string $column): self
     {
-        return new self($this->model, $this->alias, $column, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
+        return $this->with(primaryForeignKey: $column);
     }
 
     public function readableWhen(string $condition): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $condition, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $this->designationColumn);
+        return $this->with(readableWhen: $condition);
     }
 
     /**
@@ -54,7 +57,7 @@ final readonly class DependentCurrentModel
      */
     public function fillWhenCreatedFromPrevious(array $values): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $values, $this->createdWhen, $this->designationColumn);
+        return $this->with(fillWhenCreatedFromPrevious: $values);
     }
 
     /**
@@ -65,11 +68,57 @@ final readonly class DependentCurrentModel
      */
     public function createdWhen(Closure $condition): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $condition, $this->designationColumn);
+        return $this->with(createdWhen: $condition);
     }
 
     public function designatedBy(string $column): self
     {
-        return new self($this->model, $this->alias, $this->primaryForeignKey, $this->readableWhen, $this->fillWhenCreatedFromPrevious, $this->createdWhen, $column);
+        return $this->with(designationColumn: $column);
+    }
+
+    /**
+     * Orders the readable rows, as SQL over this alias, so the previous model reads the first. Without it, the key orders them.
+     */
+    public function orderedBy(string $order): self
+    {
+        return $this->with(orderedBy: $order);
+    }
+
+    /**
+     * Runs before a write through the previous model saves a new row of this model. The hook receives the unsaved
+     * model and the previous model's raw attributes, and may set more attributes on the model.
+     *
+     * @param  Closure(Model, array<string, mixed>): void  $hook
+     */
+    public function onCreate(Closure $hook): self
+    {
+        return $this->with(creating: [...$this->creating, $hook]);
+    }
+
+    /**
+     * @param  null|array<string, Closure(array<string, mixed>): mixed>  $fillWhenCreatedFromPrevious
+     * @param  null|list<Closure(Model, array<string, mixed>): void>  $creating
+     */
+    private function with(
+        null|string $alias = null,
+        null|string $primaryForeignKey = null,
+        null|string $readableWhen = null,
+        null|array $fillWhenCreatedFromPrevious = null,
+        null|Closure $createdWhen = null,
+        null|string $designationColumn = null,
+        null|string $orderedBy = null,
+        null|array $creating = null,
+    ): self {
+        return new self(
+            $this->model,
+            $alias ?? $this->alias,
+            $primaryForeignKey ?? $this->primaryForeignKey,
+            $readableWhen ?? $this->readableWhen,
+            $fillWhenCreatedFromPrevious ?? $this->fillWhenCreatedFromPrevious,
+            $createdWhen ?? $this->createdWhen,
+            $designationColumn ?? $this->designationColumn,
+            $orderedBy ?? $this->orderedBy,
+            $creating ?? $this->creating,
+        );
     }
 }

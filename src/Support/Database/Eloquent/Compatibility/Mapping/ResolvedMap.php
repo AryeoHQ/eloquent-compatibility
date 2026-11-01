@@ -129,7 +129,7 @@ final readonly class ResolvedMap
             .' WHERE '.$alias.'.'.SqlFragments::identifier($this->primaryForeignKey($dependent)).' = '.$primaryKey
             .($dependent->designationColumn === null ? '' : ' AND '.$key.' = '.$previous.'.'.SqlFragments::identifier($dependent->designationColumn))
             .' AND ('.$dependent->readableWhen.')'
-            .' ORDER BY '.$key.' LIMIT 1';
+            .' ORDER BY '.($dependent->orderedBy === null ? '' : $dependent->orderedBy.', ').$key.' LIMIT 1';
     }
 
     /** @return list<DependentCurrentModel> */
@@ -217,6 +217,22 @@ final readonly class ResolvedMap
         return (string) $this->primaryCurrentModel->alias;
     }
 
+    /**
+     * The model class over an alias's table: a current model, or the retained model the previous model names.
+     *
+     * @return null|class-string<Model>
+     */
+    public function modelOf(string $alias): null|string
+    {
+        if ($alias === $this->previousAlias()) {
+            return $this->previousModel->retainedModel;
+        }
+
+        $model = array_search($alias, $this->currentModels(), true);
+
+        return is_string($model) ? $model : null;
+    }
+
     public function attribute(string $column): null|Attribute
     {
         foreach ($this->attributes as $attribute) {
@@ -253,8 +269,8 @@ final readonly class ResolvedMap
 
             $columns[$attribute->column] = true;
 
-            if (! $attribute->retained && $attribute->type === null) {
-                throw InvalidCompatibilityMap::because($this->name, "mapped attribute '{$attribute->column}' says no asType()");
+            if (! $attribute->retained && $attribute->type === null && $attribute->storedAs === null) {
+                throw InvalidCompatibilityMap::because($this->name, "mapped attribute '{$attribute->column}' reads through readAs() and says no asType()");
             }
 
             if ($attribute->alias === null || $attribute->readAs === null) {
@@ -357,8 +373,12 @@ final readonly class ResolvedMap
 
             $names[$state->name] = true;
 
-            if ($state->kind === UnrepresentableStateKind::Refuse && $state->checkCondition === null && $state->previousUpdateCondition === null) {
-                throw InvalidCompatibilityMap::because($this->name, "refused state '{$state->name}' says neither checkedOn() nor checkedOnPreviousUpdate()");
+            if ($state->kind === UnrepresentableStateKind::Refuse && $state->checkCondition === null && $state->previousUpdateCondition === null && $state->predicate === null) {
+                throw InvalidCompatibilityMap::because($this->name, "refused state '{$state->name}' says neither checkedOn(), checkedBy() nor checkedOnPreviousUpdate()");
+            }
+
+            if ($state->predicate !== null && $state->checkedOn === $this->previousAlias() && $this->previousModel->retainedModel === null) {
+                throw InvalidCompatibilityMap::because($this->name, "refused state '{$state->name}' checks the retained table by a predicate, and the previous model names no retainedAs() model to load its rows through");
             }
 
             if ($state->checkedOn !== null && ! array_key_exists($state->checkedOn, $this->tables)) {

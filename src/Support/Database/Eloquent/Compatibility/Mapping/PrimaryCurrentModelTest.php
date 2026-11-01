@@ -12,7 +12,7 @@ use Tests\TestCase;
 #[CoversClass(PrimaryCurrentModel::class)]
 final class PrimaryCurrentModelTest extends TestCase
 {
-    private const array GADGET = ['model' => Gadget::class, 'alias' => null, 'fillWhenCreatedFromPrevious' => []];
+    private const array GADGET = ['model' => Gadget::class, 'alias' => null, 'fillWhenCreatedFromPrevious' => [], 'creating' => []];
 
     #[Test]
     public function it_declares_the_model_with_no_alias_and_nothing_to_fill(): void
@@ -34,7 +34,7 @@ final class PrimaryCurrentModelTest extends TestCase
 
         $aliased = $original->aliasedAs('gadget');
 
-        $this->assertSame(['model' => Gadget::class, 'alias' => 'gadget', 'fillWhenCreatedFromPrevious' => ['id' => $fill]], get_object_vars($aliased));
+        $this->assertSame(['model' => Gadget::class, 'alias' => 'gadget', 'fillWhenCreatedFromPrevious' => ['id' => $fill], 'creating' => []], get_object_vars($aliased));
         $this->assertNull($original->alias);
     }
 
@@ -47,7 +47,20 @@ final class PrimaryCurrentModelTest extends TestCase
 
         $filled = $original->fillWhenCreatedFromPrevious(['id' => $gadgetId]);
 
-        $this->assertSame(['model' => Gadget::class, 'alias' => 'gadget', 'fillWhenCreatedFromPrevious' => ['id' => $gadgetId]], get_object_vars($filled));
+        $this->assertSame(['model' => Gadget::class, 'alias' => 'gadget', 'fillWhenCreatedFromPrevious' => ['id' => $gadgetId], 'creating' => []], get_object_vars($filled));
         $this->assertSame(['name' => $untitled], $original->fillWhenCreatedFromPrevious);
+    }
+
+    #[Test]
+    public function it_appends_a_creation_hook_on_a_copy_and_keeps_the_rest(): void
+    {
+        $original = PrimaryCurrentModel::for(Gadget::class)->aliasedAs('gadget');
+        $first = fn (Gadget $gadget) => $gadget->setAttribute('name', 'First');
+        $second = fn (Gadget $gadget) => $gadget->setAttribute('name', 'Second');
+
+        $hooked = $original->onCreate($first)->onCreate($second);
+
+        $this->assertSame([$first, $second], $hooked->creating);
+        $this->assertSame([], $original->creating);
     }
 }

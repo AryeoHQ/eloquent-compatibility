@@ -22,13 +22,15 @@ final class PreviousModelTest extends TestCase
         'alias' => 'widget',
         'primaryForeignKey' => 'gadget_id',
         'fillWhenCreatedFromCurrent' => [],
+        'fillingWhenCreatedFromCurrent' => null,
+        'retainedModel' => null,
     ];
 
     #[Test]
     public function it_declares_only_the_view(): void
     {
         $this->assertSame(
-            ['view' => 'widgets', 'table' => null, 'model' => null, 'keyColumn' => null, 'alias' => null, 'primaryForeignKey' => null, 'fillWhenCreatedFromCurrent' => []],
+            ['view' => 'widgets', 'table' => null, 'model' => null, 'keyColumn' => null, 'alias' => null, 'primaryForeignKey' => null, 'fillWhenCreatedFromCurrent' => [], 'fillingWhenCreatedFromCurrent' => null, 'retainedModel' => null],
             get_object_vars(PreviousModel::servedAsView('widgets')),
         );
     }
@@ -39,6 +41,7 @@ final class PreviousModelTest extends TestCase
     #[TestWith(['keyColumn', 'keyedBy', 'uuid'])]
     #[TestWith(['alias', 'aliasedAs', 'legacy'])]
     #[TestWith(['primaryForeignKey', 'primaryForeignKey', 'owner_id'])]
+    #[TestWith(['retainedModel', 'retainedAs', Gadget::class])]
     public function it_sets_one_property_on_a_copy_and_keeps_the_rest(string $property, string $method, string $value): void
     {
         $original = $this->widgets();
@@ -79,5 +82,13 @@ final class PreviousModelTest extends TestCase
             ->keyedBy('id')
             ->aliasedAs('widget')
             ->primaryForeignKey('gadget_id');
+    }
+
+    #[Test]
+    public function it_fills_through_one_closure_on_a_copy_and_keeps_the_rest(): void
+    {
+        $fill = fn (Gadget $gadget) => ['status' => 'Draft'];
+
+        $this->assertSame(array_replace(self::WIDGETS, ['fillingWhenCreatedFromCurrent' => $fill]), get_object_vars($this->widgets()->fillWhenCreatedFromCurrentUsing($fill)));
     }
 }

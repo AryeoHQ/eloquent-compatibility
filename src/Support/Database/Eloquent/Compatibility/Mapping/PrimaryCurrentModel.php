@@ -12,11 +12,13 @@ final readonly class PrimaryCurrentModel
     /**
      * @param  class-string<Model>  $model
      * @param  array<string, Closure(array<string, mixed>): mixed>  $fillWhenCreatedFromPrevious
+     * @param  list<Closure(Model, array<string, mixed>): void>  $creating
      */
     private function __construct(
         public string $model,
         public null|string $alias,
         public array $fillWhenCreatedFromPrevious,
+        public array $creating = [],
     ) {}
 
     /**
@@ -29,7 +31,7 @@ final readonly class PrimaryCurrentModel
 
     public function aliasedAs(string $alias): self
     {
-        return new self($this->model, $alias, $this->fillWhenCreatedFromPrevious);
+        return new self($this->model, $alias, $this->fillWhenCreatedFromPrevious, $this->creating);
     }
 
     /**
@@ -40,6 +42,17 @@ final readonly class PrimaryCurrentModel
      */
     public function fillWhenCreatedFromPrevious(array $values): self
     {
-        return new self($this->model, $this->alias, $values);
+        return new self($this->model, $this->alias, $values, $this->creating);
+    }
+
+    /**
+     * Runs before a write through the previous model saves a new row of this model. The hook receives the unsaved
+     * model and the previous model's raw attributes, and may set more attributes on the model.
+     *
+     * @param  Closure(Model, array<string, mixed>): void  $hook
+     */
+    public function onCreate(Closure $hook): self
+    {
+        return new self($this->model, $this->alias, $this->fillWhenCreatedFromPrevious, [...$this->creating, $hook]);
     }
 }

@@ -206,6 +206,14 @@ final readonly class CurrentWriter
                 }
             }
 
+            if ($previous->fillingWhenCreatedFromCurrent !== null) {
+                foreach (($previous->fillingWhenCreatedFromCurrent)($stored) as $column => $value) {
+                    if ($value !== null && $column !== $previous->primaryForeignKey) {
+                        $values[$column] = $value;
+                    }
+                }
+            }
+
             foreach ($this->records->refusedStatesOn($resolvedMap, $resolvedMap->previousAlias()) as $state) {
                 $this->records->serialize($resolvedMap, $state, $key);
             }

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
@@ -13,9 +15,12 @@ final readonly class Installer
 {
     public function __construct(private ConnectionInterface $connection) {}
 
-    public function install(CompatibilityMap $map): void
+    /**
+     * @param  CompatibilityMap|class-string<Model>  $map  a map, or a previous model that defines one
+     */
+    public function install(CompatibilityMap|string $map): void
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $resolvedMap = ResolvedMap::of(Compatibility::map($map));
 
         if ($this->relation($resolvedMap->previousModel->view) !== null) {
             throw InvalidCompatibilityMap::because($resolvedMap->name, "a relation named {$resolvedMap->previousModel->view} already exists; use recompile() to recompile the compatibility map");
@@ -41,9 +46,12 @@ final readonly class Installer
         });
     }
 
-    public function recompile(CompatibilityMap $map): void
+    /**
+     * @param  CompatibilityMap|class-string<Model>  $map  a map, or a previous model that defines one
+     */
+    public function recompile(CompatibilityMap|string $map): void
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $resolvedMap = ResolvedMap::of(Compatibility::map($map));
 
         $this->connection->transaction(function () use ($resolvedMap): void {
             $grants = $this->viewGrants($resolvedMap);
@@ -61,9 +69,12 @@ final readonly class Installer
         });
     }
 
-    public function uninstall(CompatibilityMap $map): void
+    /**
+     * @param  CompatibilityMap|class-string<Model>  $map  a map, or a previous model that defines one
+     */
+    public function uninstall(CompatibilityMap|string $map): void
     {
-        $resolvedMap = ResolvedMap::of($map);
+        $resolvedMap = ResolvedMap::of(Compatibility::map($map));
 
         $this->connection->transaction(function () use ($resolvedMap): void {
             $this->dropLegacyObjects($resolvedMap);

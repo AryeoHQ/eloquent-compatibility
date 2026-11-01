@@ -120,7 +120,7 @@ final readonly class Records
             $bindings[] = $designation;
         }
 
-        $sql .= ' and ('.$dependent->readableWhen.') order by '.$key.' limit 1'.($lock ? ' for update of '.$alias : '');
+        $sql .= ' and ('.$dependent->readableWhen.') order by '.($dependent->orderedBy === null ? '' : $dependent->orderedBy.', ').$key.' limit 1'.($lock ? ' for update of '.$alias : '');
         $row = $this->connection->selectOne($sql, $bindings);
         $located = $row === null ? null : $row->key;
 
@@ -217,6 +217,12 @@ final readonly class Records
         $key = $alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias));
 
         foreach ($this->refusedStatesOn($resolvedMap, $alias) as $state) {
+            if ($state->predicate !== null) {
+                $this->refusePredicate($resolvedMap, $state, $alias, $keys);
+
+                continue;
+            }
+
             $row = $this->connection->selectOne(
                 'select '.$key.' as key from '.SqlFragments::identifier($table).' '.$alias
                 .' where '.$key.' in ('.implode(', ', array_fill(0, count($keys), '?')).') and coalesce(('.$state->checkCondition.'), false) order by 1 limit 1',
@@ -225,6 +231,24 @@ final readonly class Records
 
             if ($row !== null) {
                 throw CompatibilityWriteRefused::refusedState($resolvedMap->name, $state->description, $table, $row->key, $state->because, $state->instead);
+            }
+        }
+    }
+
+    /**
+     * Loads each written row through its model, and refuses when the state's predicate holds for one.
+     *
+     * @param  list<int|string>  $keys
+     */
+    private function refusePredicate(ResolvedMap $resolvedMap, UnrepresentableState $state, string $alias, array $keys): void
+    {
+        $class = (string) $resolvedMap->modelOf($alias);
+        $model = new $class;
+        $model->setConnection($this->connection->getName());
+
+        foreach ($model->newQueryWithoutScopes()->whereKey($keys)->orderBy($model->getKeyName())->get() as $row) {
+            if (($state->predicate)($row) === true) {
+                throw CompatibilityWriteRefused::refusedState($resolvedMap->name, $state->description, $resolvedMap->table($alias), $row->getKey(), $state->because, $state->instead);
             }
         }
     }

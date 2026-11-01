@@ -20,6 +20,7 @@ final class DriftCheckTest extends TestCase
             'MoreThanOnePrimary' => 'more than one primary',
             'RefusedState' => 'refused state',
             'Designation' => 'designation',
+            'ViewDefinition' => 'view definition',
         ], array_column(array_map(fn (DriftCheck $check) => [$check->name, $check->value], DriftCheck::cases()), 1, 0));
     }
 

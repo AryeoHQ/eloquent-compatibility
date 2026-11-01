@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\CompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Mapping\Assignment;
@@ -28,16 +30,32 @@ final class Compiler
         $this->columnCatalog = new ColumnCatalog($connection);
     }
 
-    public function compile(CompatibilityMap|ResolvedMap $map): CompiledSql
+    /**
+     * @param  CompatibilityMap|ResolvedMap|class-string<Model>  $map  a map, its resolved form, or a previous model that defines one
+     */
+    public function compile(CompatibilityMap|ResolvedMap|string $map): CompiledSql
     {
-        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of($map);
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of(Compatibility::map($map));
         $this->validateColumns($resolvedMap);
         $this->validateFills($resolvedMap);
 
-        return new CompiledSql([$this->view($resolvedMap)]);
+        return new CompiledSql(['CREATE VIEW '.SqlFragments::identifier($resolvedMap->previousModel->view).' AS '.$this->select($resolvedMap)]);
     }
 
-    private function view(ResolvedMap $resolvedMap): string
+    /**
+     * The query the compatibility view runs, after the same checks as compile().
+     *
+     * @param  CompatibilityMap|ResolvedMap|class-string<Model>  $map
+     */
+    public function viewQuery(CompatibilityMap|ResolvedMap|string $map): string
+    {
+        $resolvedMap = $map instanceof ResolvedMap ? $map : ResolvedMap::of(Compatibility::map($map));
+        $this->validateColumns($resolvedMap);
+
+        return $this->select($resolvedMap);
+    }
+
+    private function select(ResolvedMap $resolvedMap): string
     {
         $previous = $resolvedMap->previousModel;
         $primary = $resolvedMap->primaryAlias();
@@ -50,7 +68,7 @@ final class Compiler
             $resolvedMap->unrepresentableStates(UnrepresentableStateKind::Hide),
         );
 
-        return 'CREATE VIEW '.SqlFragments::identifier($previous->view)." AS SELECT\n  ".implode(",\n  ", $columns)
+        return "SELECT\n  ".implode(",\n  ", $columns)
             ."\nFROM ".SqlFragments::identifier($resolvedMap->table($primary)).' '.$primary
             ."\nJOIN ".SqlFragments::identifier((string) $previous->table).' '.$previous->alias
             .' ON '.$previous->alias.'.'.SqlFragments::identifier((string) $previous->primaryForeignKey).' = '.$primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary))
@@ -69,7 +87,7 @@ final class Compiler
             ? '('.$attribute->readAs.')'
             : '(SELECT '.$attribute->readAs.' '.$resolvedMap->locate($dependent, $primary.'.'.SqlFragments::identifier($resolvedMap->keyColumn($primary)), $resolvedMap->previousAlias()).')';
 
-        return 'CAST('.$expression.' AS '.$attribute->type.')';
+        return $attribute->type === null ? $expression : 'CAST('.$expression.' AS '.$attribute->type.')';
     }
 
     private function validateColumns(ResolvedMap $resolvedMap): void
@@ -156,14 +174,19 @@ final class Compiler
         $targets = fn (string $alias) => array_map(fn (Assignment $assignment) => $assignment->targetColumn->column, $resolvedMap->insertAssignmentsTo($alias));
         $retained = array_map(fn (Attribute $attribute) => $attribute->column, array_filter($resolvedMap->attributes, fn (Attribute $attribute) => $attribute->retained));
 
-        $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...array_keys($previous->fillWhenCreatedFromCurrent)], "a {$primaryTable} row created through its own model leaves it empty; fill it with fillWhenCreatedFromCurrent()");
+        if ($previous->fillingWhenCreatedFromCurrent === null) {
+            $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...array_keys($previous->fillWhenCreatedFromCurrent)], "a {$primaryTable} row created through its own model leaves it empty; fill it with fillWhenCreatedFromCurrent()");
+        }
         $this->refuseEmpty($resolvedMap, (string) $previous->table, [(string) $previous->primaryForeignKey, ...$retained, ...$targets($previousAlias)], $throughPrevious.'declare it as a retained attribute');
-        $this->refuseEmpty($resolvedMap, $primaryTable, [...$targets((string) $primary->alias), ...array_keys($primary->fillWhenCreatedFromPrevious)], $throughPrevious.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
+        // A creation hook sets attributes only when it runs, so a table with one is left to the database's own check.
+        if ($primary->creating === []) {
+            $this->refuseEmpty($resolvedMap, $primaryTable, [...$targets((string) $primary->alias), ...array_keys($primary->fillWhenCreatedFromPrevious)], $throughPrevious.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
+        }
 
         foreach ($resolvedMap->dependentCurrentModels as $dependent) {
             $alias = (string) $dependent->alias;
 
-            if ($resolvedMap->insertAssignmentsTo($alias) !== [] || $dependent->fillWhenCreatedFromPrevious !== []) {
+            if ($dependent->creating === [] && ($resolvedMap->insertAssignmentsTo($alias) !== [] || $dependent->fillWhenCreatedFromPrevious !== [])) {
                 $this->refuseEmpty($resolvedMap, $resolvedMap->table($alias), [$resolvedMap->primaryForeignKey($dependent), ...$targets($alias), ...array_keys($dependent->fillWhenCreatedFromPrevious)], $throughPrevious.'map an attribute to it or fill it with fillWhenCreatedFromPrevious()');
             }
         }

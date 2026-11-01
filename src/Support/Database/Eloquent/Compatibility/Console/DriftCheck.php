@@ -11,4 +11,5 @@ enum DriftCheck: string
     case MoreThanOnePrimary = 'more than one primary';
     case RefusedState = 'refused state';
     case Designation = 'designation';
+    case ViewDefinition = 'view definition';
 }

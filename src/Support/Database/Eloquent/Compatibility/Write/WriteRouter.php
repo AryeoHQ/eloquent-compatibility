@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\Concerns\AsPivot;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Events\NullDispatcher;
 use ReflectionMethod;
+use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\CompatibilityMaps;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\EventMirror;
@@ -64,9 +65,12 @@ final class WriteRouter
 
     /**
      * Registers a compatibility map, so writes of its models route through it. Registration reads no database.
+     *
+     * @param  EventMirror|class-string<Model>  $mirror  an event mirror, or a previous model that defines its map
      */
-    public function register(EventMirror $mirror): void
+    public function register(EventMirror|string $mirror): void
     {
+        $mirror = Compatibility::mirror($mirror);
         $map = $mirror->compatibilityMap();
         $resolvedMap = ResolvedMap::of($map);
 

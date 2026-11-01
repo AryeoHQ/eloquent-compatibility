@@ -47,7 +47,7 @@ final readonly class PreviousWriter
         $primary = $this->create($primaryAlias, [
             ...$this->insertValues($primaryAlias, $row),
             ...$this->fills($this->map->primaryCurrentModel->fillWhenCreatedFromPrevious, $row),
-        ]);
+        ], $row);
         $primaryKey = $this->key($primary);
 
         $retained = $this->insertValues($this->map->previousAlias(), $row);
@@ -319,11 +319,18 @@ final readonly class PreviousWriter
 
     /**
      * @param  array<string, mixed>  $values
+     * @param  array<string, mixed>  $attributes  the previous model's raw attributes, for the model's onCreate() hooks
      */
-    private function create(string $alias, array $values): Model
+    private function create(string $alias, array $values, array $attributes): Model
     {
         $model = $this->newModel($alias);
         $model->setRawAttributes($values);
+        $current = $alias === $this->map->primaryAlias() ? $this->map->primaryCurrentModel : $this->map->dependent($alias);
+
+        foreach ($current->creating ?? [] as $hook) {
+            $hook($model, $attributes);
+        }
+
         $this->save($model);
 
         return $model;
@@ -339,7 +346,7 @@ final readonly class PreviousWriter
             ...$this->insertValues($alias, $attributes),
             ...$this->fills($dependent->fillWhenCreatedFromPrevious, $attributes),
             $this->map->primaryForeignKey($dependent) => $primaryKey,
-        ]);
+        ], $attributes);
 
         if ($dependent->designationColumn !== null) {
             $previous = $this->map->previousModel;

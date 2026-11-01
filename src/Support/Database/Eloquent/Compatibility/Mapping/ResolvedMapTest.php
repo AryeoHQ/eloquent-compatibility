@@ -122,17 +122,28 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mapped_attribute_without_a_type_when_the_map_is_registered(): void
+    public function it_refuses_a_mapped_attribute_read_through_sql_without_a_type_when_the_map_is_registered(): void
     {
         $this->assertThrows(
             fn () => resolve(CompatibilityMaps::class)->register($this->compatibilityMap(['attributes' => [
                 Attribute::retained('id'),
                 Attribute::retained('gadget_id')->readOnlyBecause('Linked.'),
-                Attribute::mapped('title')->storedAs('gadget', 'name'),
+                Attribute::mapped('title')->readAs('gadget', 'upper(gadget.name)')->readOnlyBecause('Derived.'),
             ]])),
             InvalidCompatibilityMap::class,
-            "Compatibility map 'widgets' is declared wrongly: mapped attribute 'title' says no asType().",
+            "Compatibility map 'widgets' is declared wrongly: mapped attribute 'title' reads through readAs() and says no asType().",
         );
+    }
+
+    #[Test]
+    public function it_lets_a_stored_attribute_take_the_type_of_its_column(): void
+    {
+        $resolvedMap = resolve(CompatibilityMaps::class)->register($this->compatibilityMap(['attributes' => [
+            ...array_filter((new WidgetCompatibilityMap)->attributes(), fn (Attribute $attribute) => $attribute->column !== 'title'),
+            Attribute::mapped('title')->storedAs('gadget', 'name'),
+        ]]));
+
+        $this->assertNull($resolvedMap->attribute('title')?->type);
     }
 
     #[Test]
@@ -245,7 +256,7 @@ final class ResolvedMapTest extends TestCase
     #[Test]
     public function it_refuses_a_refused_state_that_names_no_state_to_check(): void
     {
-        $this->expectInvalidMap("refused state 'never' says neither checkedOn() nor checkedOnPreviousUpdate()", ['unrepresentableStates' => [UnrepresentableState::refuse('never', 'a state', 'because', 'instead')]]);
+        $this->expectInvalidMap("refused state 'never' says neither checkedOn(), checkedBy() nor checkedOnPreviousUpdate()", ['unrepresentableStates' => [UnrepresentableState::refuse('never', 'a state', 'because', 'instead')]]);
     }
 
     /**

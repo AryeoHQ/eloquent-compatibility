@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Mapping\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableState;
 use Support\Database\Eloquent\Compatibility\Mapping\UnrepresentableStateKind;
+use Support\Database\Eloquent\Compatibility\Schema\Compiler;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Throwable;
 
 final readonly class DriftQueries
 {
@@ -20,12 +23,49 @@ final readonly class DriftQueries
     public function find(ResolvedMap $resolvedMap, int $limit): array
     {
         return [
+            ...$this->viewDefinition($resolvedMap),
             ...$this->previousWithoutCurrent($resolvedMap, $limit),
             ...$this->orphanCurrents($resolvedMap, $limit),
             ...$this->sharedPrimaries($resolvedMap, $limit),
             ...$this->refusedStates($resolvedMap, $limit),
             ...$this->brokenDesignations($resolvedMap, $limit),
         ];
+    }
+
+    /**
+     * Compares the installed compatibility view with the view the map compiles to now. A change to a relation, a
+     * scope or an attribute changes the compiled view, and only Installer::recompile() changes the installed one.
+     * The compiled view is created as a temporary view and dropped again, so PostgreSQL normalizes both alike.
+     *
+     * @return list<DriftFinding>
+     */
+    private function viewDefinition(ResolvedMap $resolvedMap): array
+    {
+        $view = $resolvedMap->previousModel->view;
+        $finding = fn (string $detail) => [new DriftFinding($resolvedMap->name, DriftCheck::ViewDefinition, $view, $view, $detail)];
+        $installed = $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?)::text", [SqlFragments::identifier($view)]);
+
+        if (! is_string($installed)) {
+            return $finding('the compatibility view is not installed; run Installer::install()');
+        }
+
+        $this->connection->beginTransaction();
+
+        try {
+            $this->connection->statement('create temporary view compatibility_expected_view as '.(new Compiler($this->connection))->viewQuery($resolvedMap));
+            $definitions = $this->connection->selectOne(
+                "select pg_get_viewdef(?::regclass, true) as installed, pg_get_viewdef('compatibility_expected_view'::regclass, true) as expected",
+                [$installed],
+            );
+        } catch (Throwable $e) {
+            return $finding('the map no longer compiles against the database: '.strtok($e->getMessage(), "\n"));
+        } finally {
+            $this->connection->rollBack();
+        }
+
+        return trim((string) $definitions?->installed) === trim((string) $definitions?->expected)
+            ? []
+            : $finding('the installed view differs from the view the map compiles to now; run Installer::recompile()');
     }
 
     /**
@@ -179,8 +219,9 @@ final readonly class DriftQueries
 
             $alias = $state->checkedOn;
             $table = $resolvedMap->table($alias);
+            $rows = $state->predicate === null ? null : $this->predicateRows($resolvedMap, $state, $alias, $limit);
 
-            $rows = $this->connection->select(
+            $rows ??= $this->connection->select(
                 'select '.$alias.'.'.SqlFragments::identifier($resolvedMap->keyColumn($alias)).' as key from '.SqlFragments::identifier($table).' '.$alias
                 .' where COALESCE(('.$state->checkCondition.'), false) order by 1 limit ?',
                 [$limit],
@@ -198,5 +239,40 @@ final readonly class DriftQueries
         }
 
         return $findings;
+    }
+
+    /**
+     * Walks the rows the state's candidates select, by key, through their model, and keeps each one its predicate holds for.
+     *
+     * @return list<object{key: int|string}>
+     */
+    private function predicateRows(ResolvedMap $resolvedMap, UnrepresentableState $state, string $alias, int $limit): array
+    {
+        $class = (string) $resolvedMap->modelOf($alias);
+        $model = new $class;
+
+        if ($this->connection instanceof Connection) {
+            $model->setConnection($this->connection->getName());
+        }
+
+        $query = $model->newQueryWithoutScopes();
+
+        if ($state->candidates !== null) {
+            ($state->candidates)($query);
+        }
+
+        $rows = [];
+
+        foreach ($query->lazyById(500, $model->getKeyName()) as $row) {
+            if (($state->predicate)($row) === true) {
+                $rows[] = (object) ['key' => $row->getKey()];
+
+                if (count($rows) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        return $rows;
     }
 }
