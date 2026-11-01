@@ -1,0 +1,137 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility;
+
+use Closure;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\JobSite;
+use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\TestCase;
+
+#[CoversClass(Compatibility::class)]
+final class CompatibilityTest extends TestCase
+{
+    #[Test]
+    public function it_resolves_the_listing_map_without_a_database_connection(): void
+    {
+        foreach (array_keys(DB::getConnections()) as $connection) {
+            DB::purge($connection);
+        }
+
+        $map = Compatibility::of(Listing::class)->resolve();
+
+        $this->assertSame([], DB::getConnections());
+        $this->assertSame(['title', 'company_id', 'price', 'status', 'street', 'city', 'latitude', 'created_at', 'updated_at', 'deleted_at'], array_keys($map->attributes));
+    }
+
+    #[Test]
+    public function it_resolves_a_map_built_directly_for_a_model(): void
+    {
+        $map = (new Compatibility(Listing::class))
+            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')))
+            ->resolve();
+
+        $this->assertSame([Listing::class, 'listings', ['id'], ['title'], [], [], []], [$map->model, $map->table, array_keys($map->identifiers), array_keys($map->attributes), $map->hides, $map->guards, $map->withoutForwarding]);
+    }
+
+    #[Test]
+    public function it_leaves_every_successor_model_free_of_the_package(): void
+    {
+        $package = fn (string $name) => str_starts_with($name, 'Support\\Database\\Eloquent\\Compatibility\\');
+
+        foreach ([Job::class, Place::class, JobSite::class] as $successor) {
+            $this->assertSame([], array_values(array_filter([...class_implements($successor), ...class_uses_recursive($successor)], $package)), $successor);
+        }
+    }
+
+    #[Test]
+    public function it_refuses_a_model_that_declares_no_map(): void
+    {
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('jobs', 'Job does not implement '.Contracts\Compatible::class.', so it declares no map'));
+
+        Compatibility::of(Job::class);
+    }
+
+    #[Test]
+    public function it_refuses_a_class_that_is_no_model(): void
+    {
+        $this->expectExceptionObject(InvalidCompatibilityMap::because(SyncListingToMls::class, 'it names no Eloquent model'));
+
+        new Compatibility(SyncListingToMls::class);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Compatibility): mixed, string}>
+     */
+    public static function invalidDeclarations(): iterable
+    {
+        $identifier = fn (Identifier $identifier) => $identifier->integer()->from('legacy_id');
+        $successor = fn (Successor $job) => $job;
+
+        yield 'an identifier twice' => [fn (Compatibility $listing) => $listing->identifiedBy('id', $identifier)->identifiedBy('id', $identifier), "identifier 'id' is declared twice"];
+        yield 'a retained table twice' => [fn (Compatibility $listing) => $listing->retainedIn('listings_retained')->retainedIn('listings_kept'), 'retainedIn() is declared twice'];
+        yield 'an empty retained key' => [fn (Compatibility $listing) => $listing->retainedIn('listings_retained', key: ''), 'retainedIn() names an empty table or key'];
+        yield 'a successor twice' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(Job::class, $successor), 'servedFrom() is declared twice'];
+        yield 'a successor that is no model' => [fn (Compatibility $listing) => $listing->servedFrom(SyncListingToMls::class, $successor), 'servedFrom() names '.SyncListingToMls::class.', which is not an Eloquent model'];
+        yield 'a hide rule without a reason' => [fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs, because: ''), 'hide() gives no reason; it takes the reason the legacy model never shows these records'];
+        yield 'a guard without a remedy' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, because: 'Frozen.', instead: ' '), "guard 'frozen' needs a name, a reason and what to do instead"];
+        yield 'a guard twice' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, 'Frozen.', 'Wait.')->guard('frozen', fn (Model $after, Model $before) => true, 'Frozen.', 'Wait.'), "guard 'frozen' is declared twice"];
+        yield 'an unknown listener' => [fn (Compatibility $listing) => $listing->withoutForwardingTo('App\\Listeners\\Missing', because: 'Gone.'), 'withoutForwardingTo() names App\\Listeners\\Missing, which is not a class'];
+        yield 'a listener without a reason' => [fn (Compatibility $listing) => $listing->withoutForwardingTo(SyncListingToMls::class, because: ''), 'withoutForwardingTo('.SyncListingToMls::class.') gives no reason'];
+        yield 'a listener twice' => [fn (Compatibility $listing) => $listing->withoutForwardingTo(SyncListingToMls::class, 'Own edits.')->withoutForwardingTo(SyncListingToMls::class, 'Own edits.'), 'withoutForwardingTo('.SyncListingToMls::class.') is declared twice'];
+    }
+
+    /**
+     * @param  Closure(Compatibility): mixed  $declare
+     */
+    #[DataProvider('invalidDeclarations')]
+    #[Test]
+    public function it_refuses_an_invalid_declaration_and_names_the_map(Closure $declare, string $problem): void
+    {
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', $problem));
+
+        $declare(new Compatibility(Listing::class));
+    }
+
+    #[Test]
+    public function it_refuses_each_closure_that_captures_a_variable(): void
+    {
+        $merged = 'merged_into_job_id';
+        $refusals = [];
+
+        foreach ([
+            fn (Compatibility $listing) => $listing->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from($merged)),
+            fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute($merged, fn (Attribute $attribute) => $attribute)),
+            fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs->whereNotNull($merged), because: 'Merged.'),
+            fn (Compatibility $listing) => $listing->guard('merged', fn (Model $after, Model $before) => $after->getAttribute($merged) !== null, because: 'Merged.', instead: 'Unmerge.'),
+        ] as $declare) {
+            try {
+                $declare(new Compatibility(Listing::class));
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame([
+            "Compatibility map 'listings' is declared wrongly: the closure of identifier 'id' captures \$merged, and a map reads nothing but its own arguments.",
+            "Compatibility map 'listings' is declared wrongly: the servedFrom() closure captures \$merged, and a map reads nothing but its own arguments.",
+            "Compatibility map 'listings' is declared wrongly: a hide() scope captures \$merged, and a map reads nothing but its own arguments.",
+            "Compatibility map 'listings' is declared wrongly: guard 'merged' captures \$merged, and a map reads nothing but its own arguments.",
+        ], $refusals);
+    }
+}
