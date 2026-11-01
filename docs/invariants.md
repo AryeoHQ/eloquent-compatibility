@@ -211,3 +211,40 @@ Each invariant is a rule every change must keep. It names why the rule holds, an
 **Rule.** The compiler and the installer look every mapped table up in `current_schema()`. A table found only further down the search path is refused as missing.
 
 **Code that must agree.** `ColumnCatalog`, `Compiler` and `Installer`.
+
+## INV-31: A definition compiles without a database
+
+**Rule.** `Compatibility::toMap()` reads only the declaration, the model classes and their relations. It writes each binding of a compiled relation or scope as a literal itself, and never opens a connection.
+
+**Why.** An application registers its maps while it boots, as [decision 0011](decisions/0011-registration-needs-no-database.md) records. Laravel's `toRawSql()` would connect to escape a string.
+
+**Code that must agree.** `RelationCompiler` and `SqlFragments::inline()`. `CompatibilityTest` counts the queries a registration sends.
+
+## INV-32: A relation decides the row a dependent attribute reads
+
+**Rule.** A definition's dependent reads the first row of its `HasOne` relation: the relation's constraints and its `SoftDeletes` scope are the readable condition, and its order comes before the key. A created row takes the relation's `withAttributes()`. Each alias is its table's name, so Eloquent's qualified columns resolve in the view and in the writers' queries.
+
+**Code that must agree.** `RelationCompiler::hasOne()`, `ResolvedMap::locate()` and `Records::locate()`, which both read `DependentCurrentModel::orderedBy()`.
+
+## INV-33: No global scope but SoftDeletes reaches the view
+
+**Rule.** `RelationCompiler` refuses a relation whose related model has a global scope other than `SoftDeletingScope`.
+
+**Why.** The view is compiled once, at install time. A scope that reads the application's state, such as the current tenant, would freeze that state for every reader.
+
+**Code that must agree.** `RelationCompiler`.
+
+## INV-34: A query on a converted attribute reaches SQL in the stored form, or refuses
+
+**Rule.** On an attribute whose cast implements `QueryableCast`, the builder converts each filter value, increment amount and aggregate result through the cast. It refuses a range, order or `min()` and `max()` the cast does not preserve, and a `sum()`, `avg()` or increment it is not proportional for. On an attribute with a filter translation, it applies the translation to `where()` and `whereIn()`, and refuses ordering, ranges and arithmetic. Raw SQL is not translated.
+
+**Code that must agree.** `RoutesCompatibleWrites`, `QueryableCast` and `CompatibilityQueryRefused`.
+
+## INV-35: The drift check compares the installed view with the code
+
+**Rule.** `compatibility:check` reports an installed view whose normalized definition differs from the view the map compiles to now.
+
+**Why.** Relations are part of the schema after [decision 0025](decisions/0025-a-map-is-declared-through-the-models-relations.md), and a code change does not recompile the view.
+
+**Code that must agree.** `DriftQueries::find()` and `Compiler::viewQuery()`.
+

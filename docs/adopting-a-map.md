@@ -25,19 +25,30 @@ The trait overrides three methods of `Model`, and each override calls its parent
 
 A model with a custom builder names it through Laravel's `Illuminate\Database\Eloquent\Attributes\UseEloquentBuilder` attribute or its `$builder` property, and the builder uses `RoutesCompatibleWrites`, or extends `CompatibleBuilder`. A model that declares `newEloquentBuilder()`, `setKeysForSaveQuery()` or `getAttributesForInsert()` itself, takes one from another trait, or extends a class that does, cannot be mapped. `WriteRouter::register()` refuses it, and the `HasCompatibilityMustNotRedeclareWriteHooks` PHPStan rule reports it earlier. [INV-21](invariants.md#inv-21-every-mapped-model-routes-its-writes) records the rule.
 
+## Declare the map on the previous model
+
+The previous model implements `DefinesCompatibility` and returns a `Compatibility` from its static `compatibility()` method, as the [README](../README.md#declare-the-map-on-the-previous-model) shows. Before writing it:
+
+- **Give the retained table a model.** The map's key is that model's key. It needs no contract of its own.
+- **Name each hop as a relation.** The retained model reaches the primary current model through a `BelongsTo`, and the primary reaches each dependent through a `HasOne`. Put the dependent's rules on the relation itself: its `where` constraints decide which row the previous model reads, its `orderBy()` which comes first, and its `withAttributes()` what a created row needs. Most applications already have these relations.
+- **Keep global scopes off the mapped models.** Only `SoftDeletes` may take part, because the view would freeze any other scope's state at install time.
+- **Move conversions into casts on the previous model.** The view stores the current models' values, so a column that converts, such as cents shown as dollars, gets a cast. Give it `QueryableCast` when legacy code filters or sorts on it, or a builder `filterTranslations()` entry when no cast can translate it.
+
 ## Register each map
 
-A service provider registers each map with the write router, through an event mirror:
+A service provider registers each map with the write router:
 
 ```php
-resolve(WriteRouter::class)->register(new WidgetEventMirror);
+resolve(WriteRouter::class)->register(Listing::class);
 ```
+
+A hand-written `CompatibilityMap` registers through an event mirror instead: `resolve(WriteRouter::class)->register(new WidgetEventMirror)`.
 
 The registration reads no database, so it is safe in `boot()`. Until a map is registered, its previous model cannot write, because its writes reach the read-only view. Register every map in every process that writes: web, queue workers, console commands and tests.
 
 ## Move write expressions from SQL to PHP
 
-A map's writes are PHP closures. Each receives the previous model's raw attributes after the write, as the database stores them, not cast:
+A `Compatibility` declaration hands its closures models. A hand-written map's write closures receive the previous model's raw attributes after the write, as the database stores them, not cast:
 
 | Declaration | Receives | Returns |
 | :-- | :-- | :-- |
@@ -107,6 +118,12 @@ The previous model's events still fire natively for its own writes. For a write 
 - A large mass write costs a few queries per record. Chunk it where that matters.
 
 `insertOrIgnore()` and `saveOrIgnore()` skip a conflicting row, as they did on the old table.
+
+## Raw SQL reads compare stored values
+
+The compatibility view stores what the current models store, such as cents. The previous model's builder translates queries on a converted attribute, but raw SQL bypasses it and compares the stored value without an error: `whereRaw('price > 400000')`, `orderByRaw()`, `havingRaw()`, `selectRaw()` and DB::table('listings'), and every report or service that reads the view. Find each one, and rewrite it through the builder, or onto the stored value.
+
+A query the builder cannot translate, such as `orderBy()` on an attribute with only a filter translation, refuses with `CompatibilityQueryRefused` instead.
 
 ## Tests that fake every event
 

@@ -21,25 +21,27 @@ A write that bypasses Eloquent is not split. Through the view it fails; on a cur
 
 | Component | Namespace | Entry points | Job |
 | :-- | :-- | :-- | :-- |
-| compatibility map | Contracts, Mapping | `CompatibilityMap` and the Mapping builders | the application's declaration: reads in SQL, writes in PHP closures |
+| definition | root, Definition | `Compatibility`, `DefinesCompatibility`, `RelationCompiler` | the application's declaration on the previous model, through its relations, compiled into a map without a database |
+| compatibility map | Contracts, Mapping | `CompatibilityMap` and the Mapping builders | the lower-level declaration every part reads: reads in SQL, writes in PHP closures |
 | resolved map | Mapping | `ResolvedMap::of()` | validates a map and answers every question about it |
 | registry | root | `CompatibilityMaps::register()`, `CompatibilityMaps::get()` | holds the application's maps by name |
 | schema | Schema | `Installer::install()`, `Installer::recompile()`, `Installer::uninstall()` | reads the catalog, compiles the read-only view and installs it in one transaction |
 | model contract | Contracts, Provides | `Compatible`, `HasCompatibility` | gives each mapped model a routing builder, and marks the model's own writes |
-| routing builder | Write | `RoutesCompatibleWrites`, `CompatibleBuilder` | hands every write method of the Eloquent builder to the router |
+| routing builder | Write | `RoutesCompatibleWrites`, `CompatibleBuilder` | hands every write method of the Eloquent builder to the router, and translates queries on converted attributes through `QueryableCast` and filter translations |
 | write router | Write | `WriteRouter::register()`, `WriteRouter::withoutMirroring()` | registers maps, opens each write's transaction, and picks its writer |
 | previous writer | Write | `PreviousWriter::insert()`, `PreviousWriter::update()`, `PreviousWriter::delete()` | splits one previous record's write into current-model saves |
 | current writer | Write | `CurrentWriter::insert()`, `CurrentWriter::update()`, `CurrentWriter::delete()` | keeps retained rows, designations and refused states in step, and replays the previous model's events |
 | records | Write | `Records` | the writers' SQL: locks, reads through the view, designations, refused-state checks |
 | event replayer | Write | `EventReplayer::replay()` | raises a previous record's events on a fresh instance, and masks excluded listeners |
 | PHPStan rules | Tooling\Database\Eloquent\Compatibility\PhpStan | `CompatibleMustUseHasCompatibility`, `HasCompatibilityMustImplementCompatible`, `HasCompatibilityMustOnlyBeOnModel`, `HasCompatibilityMustNotRedeclareWriteHooks` | report a model that breaks the model contract at analysis time |
-| drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree |
-| exceptions | Exceptions | `CompatibilityWriteRefused`, `InvalidCompatibilityMap` | every error the package raises |
+| drift check | Console | `compatibility:check`, run by `CheckDrift` | names the records where the two sides disagree, and an installed view the code no longer compiles to |
+| exceptions | Exceptions | `CompatibilityWriteRefused`, `CompatibilityQueryRefused`, `InvalidCompatibilityMap` | every error the package raises |
 | testing trait | Testing | `InteractsWithCompatibilityMaps` | records mirrored events and asserts refusals in application tests |
 | provider | root | `Provider` | binds the singletons and registers the command |
 
 ```mermaid
 flowchart LR
+  Definition["Listing::compatibility()"] -->|"Compatibility::toMap()"| Map
   Map["CompatibilityMap"] --> Resolved["ResolvedMap"]
   Resolved --> Installer
   Installer --> Compiler
@@ -55,7 +57,7 @@ flowchart LR
   Registry --> Check["CheckDrift"]
 ```
 
-`Installer` resolves each map itself and never reads the registry. `WriteRouter::register()` registers the map it routes, so `CheckDrift` sees every routed map. Three namespaces carry a README of their own: [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Write](../src/Support/Database/Eloquent/Compatibility/Write/README.md).
+`Installer` resolves each map itself and never reads the registry. `WriteRouter::register()` registers the map it routes, so `CheckDrift` sees every routed map. Four namespaces carry a README of their own: [Definition](../src/Support/Database/Eloquent/Compatibility/Definition/README.md), [Mapping](../src/Support/Database/Eloquent/Compatibility/Mapping/README.md), [Schema](../src/Support/Database/Eloquent/Compatibility/Schema/README.md) and [Write](../src/Support/Database/Eloquent/Compatibility/Write/README.md).
 
 ## The life of a write
 
@@ -85,17 +87,18 @@ The flows below take each step in depth:
 Read the code in this order. Each step answers one question.
 
 1. [README.md](../README.md): what does a map look like, and how does an application install and register it?
-2. [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php) and [Tables](../tests/Fixtures/Support/Workbench/Tables.php): which builders does a real map use, over which tables?
-3. `CompatibilityMap`, `Attribute`, `TargetColumn`, `DependentCurrentModel` and `UnrepresentableState`: what does each builder store?
-4. `ResolvedMap`: what does registration refuse, and how does a map locate a dependent row?
-5. `Compiler` and `Installer`: what view does a map compile to, and how is it installed?
-6. `HasCompatibility` and `RoutesCompatibleWrites`: how does a write reach the router, and how does the router know it is a model's own?
-7. `WriteRouter`: which writer takes a write, in which transaction?
-8. `PreviousWriter`: how does one record's write become current-model saves, and what does it refuse?
-9. `CurrentWriter` and `Records`: what does a current write keep in step, and in what order does it lock?
-10. `EventReplayer`: how does the router reproduce native model events, and how does it exclude listeners?
-11. `DriftQueries`: which five kinds of drift does the check find?
-12. The colocated tests, starting with `WriteRouterTest` and `InstallerTest`: what does each write do, end to end?
+2. [Listing](../tests/Fixtures/Support/Listings/Listing.php) and [ListingTables](../tests/Fixtures/Support/Listings/ListingTables.php): how does a previous model declare its map through relations?
+3. `Compatibility` and `RelationCompiler`: how does that declaration compile into a map, without a database?
+4. [WidgetCompatibilityMap](../tests/Fixtures/Support/Workbench/WidgetCompatibilityMap.php), `CompatibilityMap`, `Attribute`, `TargetColumn`, `DependentCurrentModel` and `UnrepresentableState`: what does the lower-level form store?
+5. `ResolvedMap`: what does registration refuse, and how does a map locate a dependent row?
+6. `Compiler` and `Installer`: what view does a map compile to, and how is it installed?
+7. `HasCompatibility` and `RoutesCompatibleWrites`: how does a write reach the router, how does the router know it is a model's own, and how does a filter on a converted attribute translate?
+8. `WriteRouter`: which writer takes a write, in which transaction?
+9. `PreviousWriter`: how does one record's write become current-model saves, and what does it refuse?
+10. `CurrentWriter` and `Records`: what does a current write keep in step, and in what order does it lock?
+11. `EventReplayer`: how does the router reproduce native model events, and how does it exclude listeners?
+12. `DriftQueries`: which kinds of drift does the check find?
+13. The colocated tests, starting with `CompatibilityTest`, `QueryTranslationTest` and `WriteRouterTest`: what does each write and query do, end to end?
 
 Then read the [invariants](invariants.md), the rules every change must keep, and the [decisions](decisions/), the choices a change should not undo by accident. The [glossary](glossary.md) defines each term once. [Adopting a map](adopting-a-map.md) lists what changes for an application's code and tests once a model is mapped.
 

@@ -11,7 +11,9 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **compatibility view**: the read-only PostgreSQL view, named after the previous model's old table, that serves the previous model's reads.
 - **compiled SQL**: the view statement a map compiles to; `CompiledSql`.
 - **current model**: a model that now stores some of the previous model's attributes: the primary current model or a dependent current model. A map names each current model class once.
+- **candidates**: the Eloquent scope that narrows the rows the drift check walks for a predicate refused state; see `UnrepresentableState::checkedBy()`.
 - **current writer**: the part of the router that keeps the previous models in step with a write of a current model's table; `CurrentWriter`.
+- **definition**: a previous model's own declaration of its map, a `Compatibility` returned from `DefinesCompatibility::compatibility()`, which compiles into a `DefinedMap`.
 - **degrade**: an unrepresentable state the map documents and lets through; no code reads it.
 - **dependent current model**: a current model whose rows link the primary current model's row by a primary foreign key; `DependentCurrentModel`.
 - **designation**: a retained column that names the one dependent row the previous model reads; see `DependentCurrentModel::designatedBy()`.
@@ -21,6 +23,7 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **event replayer**: the part of the router that raises one previous record's events on a fresh instance; `EventReplayer`.
 - **excluded listener**: a listener the router skips for mirrored events; `ExcludedListener`.
 - **exclusion**: the excluded listeners in force for one mirrored dispatch; an `Exclusion`.
+- **filter translation**: a builder's rule, in `filterTranslations()`, that turns a filter on an attribute no cast can translate into conditions on the stored columns.
 - **hide**: an unrepresentable state the view and the drift check leave out.
 - **legacy prefix**: `compatibility__<name>__`, which started the name of every trigger and function an earlier version installed; see `ResolvedMap::legacyObjectPrefix()`.
 - **map member**: a map name and an alias, under which a model class or a table belongs to a map; a `MapMember`.
@@ -31,16 +34,20 @@ Each term has one meaning across the code and these docs. Where the context leav
 - **model contract**: what every model of a registered map carries, the interface `Compatible` and the trait `HasCompatibility`.
 - **own write**: a write a model's own method sends, such as `save()` or `delete()`, as opposed to a query builder write. `HasCompatibility` marks it; it fires model events, and a query builder write fires none.
 - **previous model**: the model the application replaced, served from the compatibility view; declared with `PreviousModel`.
+- **predicate state**: a refused state written as a PHP closure over the written row's model; see `UnrepresentableState::checkedBy()`.
 - **previous record**: one record of a previous model, read through the view; a `PreviousRecord`.
 - **previous writer**: the part of the router that splits a write through the previous model into current-model saves; `PreviousWriter`.
 - **primary current model**: the current model whose row each retained row links, and which the view joins; declared with `PrimaryCurrentModel`.
 - **primary foreign key**: the column that links a retained row, or a dependent row, to its primary current model's row.
+- **queryable cast**: a cast that implements `QueryableCast`, whose stored value the builder can filter, sort and aggregate on.
 - **readable condition**: the SQL condition a dependent row meets for the previous model to read it; see `DependentCurrentModel::readableWhen()`.
+- **relation path**: an attribute's place in a definition, written as `column`, `relation.column` or `relation.relation.column` from the retained model.
 - **refusal**: a write the package rejects, thrown as `CompatibilityWriteRefused` inside the write's transaction.
 - **refuse**: an unrepresentable state that refuses every write through a model reaching it; see `UnrepresentableState::refuse()`.
 - **refused-state lock**: the transaction-scoped advisory lock a write of a dependent's table or the retained table takes before it writes. Its key is the map, the state and the row's primary foreign key; see `Records::serialize()`.
 - **resolved map**: the checked, immutable form of a compatibility map that every part reads; `ResolvedMap`.
 - **retained attribute**: a previous model's attribute that stays in the retained table; see `Attribute::retained()`.
+- **retained model**: the model over the retained table that a definition names with `Compatibility::identifiedBy()`; `PreviousModel::$retainedModel`.
 - **retained table**: the previous model's table after its rename, which keeps the retained attributes.
 - **routing builder**: an Eloquent builder that uses `RoutesCompatibleWrites`; `CompatibleBuilder` is the default.
 - **target column**: a column an attribute writes, with the PHP closure that computes its value; a `TargetColumn`.

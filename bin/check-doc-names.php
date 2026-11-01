@@ -7,13 +7,19 @@ require __DIR__.'/../vendor/autoload.php';
 $root = dirname(__DIR__);
 $package = 'Support\\Database\\Eloquent\\Compatibility\\';
 $external = [
+    'BelongsTo' => Illuminate\Database\Eloquent\Relations\BelongsTo::class,
     'Connection' => Illuminate\Database\Connection::class,
     'Event' => Illuminate\Support\Facades\Event::class,
     'EventFake' => Illuminate\Support\Testing\Fakes\EventFake::class,
+    'HasMany' => Illuminate\Database\Eloquent\Relations\HasMany::class,
+    'HasOne' => Illuminate\Database\Eloquent\Relations\HasOne::class,
     'Looping' => Illuminate\Queue\Events\Looping::class,
     'Model' => Illuminate\Database\Eloquent\Model::class,
     'QueryException' => Illuminate\Database\QueryException::class,
     'QueryExecuted' => Illuminate\Database\Events\QueryExecuted::class,
+    'Relation' => Illuminate\Database\Eloquent\Relations\Relation::class,
+    'SoftDeletes' => Illuminate\Database\Eloquent\SoftDeletes::class,
+    'SoftDeletingScope' => Illuminate\Database\Eloquent\SoftDeletingScope::class,
 ];
 
 $exists = fn (string $class): bool => class_exists($class) || interface_exists($class) || trait_exists($class);

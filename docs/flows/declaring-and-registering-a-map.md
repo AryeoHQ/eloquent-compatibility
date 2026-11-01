@@ -11,9 +11,26 @@ flowchart LR
   Router -->|"add()"| Index["MirrorIndex"]
 ```
 
+## Declaring through the models
+
+A previous model that implements `DefinesCompatibility` declares its map with a `Compatibility` builder. `Compatibility::of()` calls the model's `compatibility()` method, and `Compatibility::toMap()` compiles the declaration into a `DefinedMap`, a `CompatibilityMap` that is also its own event mirror. `Compatibility::map()` and `Compatibility::mirror()` accept either a map or a model class, so `Installer`, `CompatibilityMaps::register()`, `WriteRouter::register()` and `Compiler::compile()` all take `Listing::class`.
+
+The compile reads the declaration and the model classes, never the database:
+
+1. `Compatibility::identifiedBy()` names the retained model. Its table is the retained table and the previous alias, and its key is the previous model's key.
+2. Each path in `Compatibility::attributes()` has one, two or three segments. Every path with a relation starts with the same one, the primary relation. `RelationCompiler::belongsTo()` reads it as a `BelongsTo` from the retained model, and takes its foreign key as the previous model's primary foreign key.
+3. Each second relation is a dependent. `RelationCompiler::hasOne()` reads it as a `HasOne` of the primary current model, built under `Relation::noConstraints()` so it carries no parent key. Its `where` constraints, the `SoftDeletes` scope included, become the readable condition. Its order becomes `DependentCurrentModel::orderedBy()`, and its `withAttributes()` become the fills of a created row. `SqlFragments::inline()` writes the bindings as literals, so no connection is opened.
+4. Each alias is its table's name, because Eloquent qualifies columns with the table, and two paths to one table refuse. A related model with a global scope other than `SoftDeletingScope` refuses, because the view would freeze its state.
+5. A one-segment path is a retained attribute, and a renamed one is stored on the previous alias. Every other path is a mapped attribute stored in its column, with no type, so the view reads the column's own. The key and the primary foreign key are added when missing, and made read-only with `Compatibility::readOnly()`'s reasons.
+6. `Compatibility::timestampsOn()` maps the previous model's timestamp columns to the primary current model's.
+7. The closures are wrapped to hand models to the declaration's closures. `Compatibility::creating()` becomes `PrimaryCurrentModel::onCreate()` or `DependentCurrentModel::onCreate()`. `Compatibility::createWhen()` becomes `DependentCurrentModel::createdWhen()`, and `Compatibility::oneForEach()` becomes `PreviousModel::fillWhenCreatedFromCurrentUsing()`. `Compatibility::guard()` becomes `UnrepresentableState::checkedOnPreviousUpdate()`, and `Compatibility::refuse()` becomes `UnrepresentableState::checkedBy()`.
+8. `Compatibility::hide()` compiles its scope into `<retained>.<key> IN (<the scope's keys>)`, through `RelationCompiler::scope()`, so its columns resolve inside their own subquery.
+
+The `DefinedMap` then resolves as any other map, through the steps below.
+
 ## The declaration
 
-A map implements `CompatibilityMap`, whose six methods return builders. Every builder is a `final readonly` class: each call returns a new instance, and nothing mutates.
+A hand-written map implements `CompatibilityMap`, whose six methods return builders. Every builder is a `final readonly` class: each call returns a new instance, and nothing mutates.
 
 - `PreviousModel::servedAsView()` names the compatibility view. `PreviousModel::retainedInTable()`, `PreviousModel::forModel()`, `PreviousModel::aliasedAs()` and `PreviousModel::primaryForeignKey()` are required. `PreviousModel::keyedBy()` is optional, and the key defaults to the model's own key name.
 - `PrimaryCurrentModel::for()` and `DependentCurrentModel::for()` take the model class. Each needs an alias, and a dependent needs `DependentCurrentModel::primaryForeignKey()`.
