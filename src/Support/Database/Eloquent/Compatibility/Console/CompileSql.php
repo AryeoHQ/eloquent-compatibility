@@ -52,6 +52,12 @@ final class CompileSql extends Command
             return $this->refuse($exception->getMessage());
         }
 
+        if ($statements->steps !== []) {
+            $externals = $map->externals();
+
+            return $this->refuse("Compatibility::{$for}() reads the external() ".(count($externals) === 1 ? 'attribute ' : 'attributes ').implode(', ', $externals)." of {$map->table} through PHP between its statements, and no printed SQL runs that step. Run Compatibility::{$for}() instead.");
+        }
+
         $server = (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version");
         $header = array_map(fn (string $line) => str_replace(["\r", "\n"], ['\\r', '\\n'], $line), [
             "-- compatibility:sql {$model} --for={$for}: the statements Compatibility::{$for}() runs for {$map->table}",

@@ -119,35 +119,7 @@ final class ExternalAttributesTest extends TestCase
     #[Test]
     public function it_serves_the_value_an_earlier_branch_fixes_and_refuses_a_filter_its_later_branch_keeps_externally(): void
     {
-        $embeds = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            protected $table = 'videos';
-
-            public function getMorphClass()
-            {
-                return 'video';
-            }
-
-            public static function compatibility(Compatibility $video): Compatibility
-            {
-                return $video
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('videos_retained')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed('text/html'))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)));
-            }
-        };
+        $embeds = $this->embeds();
 
         $this->assertSame(['video/mp4', 'text/html', 'video/quicktime'], $embeds::query()->orderBy('id')->get()->map(fn (Model $video) => $video->getAttribute('mime_type'))->all());
         $this->assertCount(1, FakeMediaLibrary::bound()->calls);
@@ -155,6 +127,41 @@ final class ExternalAttributesTest extends TestCase
         $this->expectException(CompatibilityQueryRefused::class);
 
         $embeds::query()->where('mime_type', 'text/html')->get();
+    }
+
+    #[Test]
+    public function it_serves_the_value_the_holding_branch_fixes_whatever_columns_the_record_loaded_or_changed(): void
+    {
+        $embeds = $this->embeds();
+        $partial = $embeds::query()->orderBy('id')->get(['id'])->map(fn (Model $video) => $video->getAttribute('mime_type'))->all();
+        $changed = $embeds::query()->findOrFail(2);
+        $changed->setAttribute('youtube_embed_url', null);
+
+        $this->assertSame([['video/mp4', 'text/html', 'video/quicktime'], 'text/html'], [$partial, $changed->getAttribute('mime_type')]);
+    }
+
+    #[Test]
+    public function it_refuses_a_row_values_filter_that_names_the_attribute(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->whereRowValues(['id', 'mime_type'], '=', [1, 'image/jpeg'])->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereRowValues(['id', 'photos.mime_type'], '=', [1, 'image/jpeg'])->get(),
+        ] as $query) {
+            try {
+                $query();
+                $refusals[] = 'ran';
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = Photo::class.'::$mime_type cannot take where. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([$refusal, $refusal], $refusals);
     }
 
     #[Test]
@@ -362,12 +369,13 @@ final class ExternalAttributesTest extends TestCase
             $loaded[1]->refresh();
             $replica = $loaded[0]->getAttribute('mime_type');
             $refreshed = $loaded[1]->getAttribute('mime_type');
+            $cursor = $replicated::query()->useWritePdo()->whereKey(3)->cursor()->first()?->getAttribute('mime_type'); // @phpstan-ignore staticMethod.dynamicCall
         } finally {
             DB::purge('compatibility_replicated');
             DB::statement('drop schema compatibility_replica cascade');
         }
 
-        $this->assertSame(['image/jpeg', 'image/png', null], [$written, $refreshed, $replica]);
+        $this->assertSame(['image/jpeg', 'image/png', 'image/png', null], [$written, $refreshed, $cursor, $replica]);
     }
 
     #[Test]
@@ -413,6 +421,39 @@ final class ExternalAttributesTest extends TestCase
         $photos[0]->save();
 
         $this->assertSame('{"a":1,"b":2}', DB::table('photos')->where('id', 1)->value('caption'));
+    }
+
+    private function embeds(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed('text/html'))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)));
+            }
+        };
     }
 
     private function successorQueries(Closure $read, string $table = 'files'): int

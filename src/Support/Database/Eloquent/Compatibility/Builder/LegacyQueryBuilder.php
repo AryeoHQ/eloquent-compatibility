@@ -373,6 +373,10 @@ final class LegacyQueryBuilder extends QueryBuilder
             foreach (['column', 'first', 'second'] as $key) {
                 $columns[] = $where[$key] ?? null;
             }
+
+            if (is_array($where['columns'] ?? null)) {
+                $columns = [...$columns, ...array_values($where['columns'])];
+            }
         }
 
         return $columns;

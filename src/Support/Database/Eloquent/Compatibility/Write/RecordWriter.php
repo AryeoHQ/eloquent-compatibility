@@ -193,6 +193,7 @@ final readonly class RecordWriter
         $moved = $this->rekey($legacy, $key, $values);
         (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
+        $this->readBackExternal($legacy, $moved, $values);
 
         return 1;
     }
@@ -576,6 +577,24 @@ final readonly class RecordWriter
 
         if ($row !== []) {
             $legacy->setRawAttributes(array_replace($legacy->getAttributes(), $row));
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    private function readBackExternal(Model $legacy, int|string $key, array $values): void
+    {
+        $read = [];
+
+        foreach ($this->map->externals() as $name) {
+            if (array_key_exists($name, $legacy->getAttributes()) && ! array_key_exists($name, $values)) {
+                $read[$name] = ExternalAttributes::values($this->map, $name, [$key], $this->connection->getName(), true)[$key] ?? null;
+            }
+        }
+
+        if ($read !== []) {
+            $legacy->setRawAttributes(array_replace($legacy->getAttributes(), $read));
         }
     }
 
