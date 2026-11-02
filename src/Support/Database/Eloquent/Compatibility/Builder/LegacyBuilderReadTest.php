@@ -390,6 +390,42 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
+    public function it_filters_a_mapping_on_the_served_value_when_the_served_collation_is_not_deterministic(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+        DB::statement('create domain compatibility_case_insensitive_text as varchar(255) collate compatibility_case_insensitive');
+
+        try {
+            DB::statement('alter table listings alter column status type compatibility_case_insensitive_text');
+            $model = new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return LegacyBuilderReadTest::identified($listing)
+                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'ACTIVE', 'closed' => 'Sold'])));
+                }
+            };
+            $this->installMap($model::class);
+
+            $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+                'a value another value equals' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
+                'not a value in another case' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', 'sold'),
+                'not values in another case' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('status', ['sold']),
+            ]);
+            $this->assertSame([1, 2, 4, 5], array_map(intval(...), DB::table('listings')->where('status', 'active')->orderBy('id')->pluck('id')->all()));
+        } finally {
+            ListingTables::drop();
+            DB::statement('drop domain if exists compatibility_case_insensitive_text');
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    #[Test]
     public function it_filters_an_or_default_attribute_by_a_value_normalised_to_the_default_type(): void
     {
         DB::statement('alter table jobs add column is_featured boolean');

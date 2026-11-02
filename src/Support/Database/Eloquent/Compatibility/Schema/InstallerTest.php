@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\DB;
 use LogicException;
 use Pdo\Pgsql;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -549,6 +550,53 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame(['55P03', false, false], [$concurrent, ...array_map(fn (string $relation) => DB::scalar('select count(*) > 0 from pg_attribute where attrelid = cast(? as regclass) and attname = ?', [$relation, 'notes']), ['listings', 'listings_retained'])]);
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function concurrentChanges(): array
+    {
+        return [
+            'a column' => ['alter table listings add column notes text', "select count(*) from pg_attribute where attname = 'notes' and attrelid in (to_regclass('listings'), to_regclass('listings_retained'))"],
+            'an index' => ['create index listings_city_index on listings (city)', "select count(*) from pg_class where relname = 'listings_city_index'"],
+            'a foreign key to the legacy table' => ['create table listing_notes (listing_id bigint references listings (id))', "select count(*) from pg_class where relname = 'listing_notes'"],
+        ];
+    }
+
+    #[DataProvider('concurrentChanges')]
+    #[Test]
+    public function it_holds_back_a_concurrent_change_to_a_table_it_read_until_install_commits(string $change, string $exists): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent, $change): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, "privilege_type || ' ('")) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function () use ($change): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement($change);
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+            $outcome = [$concurrent, (int) DB::scalar($exists), DB::scalar("select relkind::text from pg_class where oid = to_regclass('listings')")];
+        } finally {
+            DB::purge('compatibility_concurrent');
+            DB::statement('drop table if exists listing_notes');
+        }
+
+        $this->assertSame(['55P03', 0, 'v'], $outcome);
     }
 
     #[Test]
