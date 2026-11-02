@@ -64,7 +64,7 @@ final class MappingTest extends TestCase
     #[TestWith(['=', 'Active', ['=', 'live']])]
     #[TestWith(['!=', 'Sold', ['in', ['drafting', 'live']]])]
     #[TestWith(['<>', 'Draft', ['in', ['live', 'closed']]])]
-    #[TestWith(['!=', 'Withdrawn', ['in', ['drafting', 'live', 'closed']]])]
+    #[TestWith(['!=', 'Withdrawn', null])]
     #[TestWith(['<', 'Sold', null])]
     #[TestWith(['=', 'Withdrawn', null])]
     #[TestWith(['=', null, null])]
