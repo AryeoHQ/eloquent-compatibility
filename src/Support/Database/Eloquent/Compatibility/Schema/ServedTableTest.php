@@ -89,7 +89,7 @@ final class ServedTableTest extends TestCase
         });
         $second = DB::transaction(fn () => [ServedTable::serves($listing), ServedTable::reading($listing, ['jobs']), $asked()]);
 
-        $relation = ['schema' => 'public', 'view' => true, 'readable' => true];
+        $relation = ['path' => (string) DB::scalar("select array_to_string(current_schemas(true), ',')"), 'view' => true, 'readable' => true];
         $this->assertSame([[true, true, $relation, [true, $relation]], 2], $first);
         $this->assertSame([true, $relation, 4], $second);
     }

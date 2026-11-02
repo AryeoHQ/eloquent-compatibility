@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -401,6 +402,51 @@ final class BackfillerTest extends TestCase
         $this->assertStringStartsWith("Compatibility map 'listings' cannot backfill: pg_stat_activity hides from {$role} whether ", $failure);
         $this->assertStringEndsWith("Grant pg_read_all_stats to {$role}, then backfill again.", $failure);
         $this->assertSame(0, DB::scalar('select count(*) from jobs'));
+    }
+
+    #[Test]
+    public function it_refuses_a_legacy_value_a_fixed_attribute_of_the_chosen_successor_cannot_store_and_writes_nothing_of_that_chunk(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        Compatibility::prepare(Video::class);
+        DB::update("update videos set original_file_name = 'oak.mp4' where id = 2");
+
+        try {
+            $this->backfiller(Video::class)->run();
+            $this->fail('The backfill did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'videos' cannot backfill: videos row id 2 holds a original_file_name that attribute 'original_file_name' cannot store: The attribute always reads NULL, so it cannot store 'oak.mp4'..", $exception->getMessage());
+        }
+
+        $this->assertSame([0, 0], [DB::scalar("select count(*) from files where legacy_type = 'video'"), DB::scalar("select count(*) from links where legacy_type = 'video'")]);
+    }
+
+    #[Test]
+    public function it_refuses_the_watermark_uninstall_remembers_while_pg_stat_activity_hides_the_transactions_of_other_sessions(): void
+    {
+        $role = 'compatibility_hidden_'.DB::connection()->getDatabaseName();
+        DB::statement('create role '.$role);
+        DB::statement('create table compatibility_remembered (id integer)');
+        DB::statement('alter table compatibility_remembered owner to '.$role);
+        config(['database.connections.hidden' => config('database.connections.'.DB::getDefaultConnection())]);
+        $hidden = DB::connection('hidden');
+        $failure = null;
+
+        try {
+            $hidden->statement('set role '.$role);
+            $hidden->unprepared(Backfiller::rememberNow('"compatibility_remembered"', null, 3));
+        } catch (QueryException $exception) {
+            $failure = $exception->getMessage();
+        } finally {
+            DB::disconnect('hidden');
+            DB::statement('drop table compatibility_remembered');
+            DB::statement('drop role '.$role);
+        }
+
+        $this->assertIsString($failure);
+        $this->assertStringContainsString("pg_stat_activity hides from {$role} whether ", $failure);
+        $this->assertStringContainsString("Grant pg_read_all_stats to {$role}, then uninstall again.", $failure);
     }
 
     private function seattleListing(bool $withAttributes): Model

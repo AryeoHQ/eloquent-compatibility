@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
@@ -229,6 +230,28 @@ final class CompileSqlTest extends TestCase
             ->expectsOutputToContain('Compatibility::uninstall() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::uninstall() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
+    }
+
+    #[Test]
+    public function it_refuses_to_print_an_install_that_catches_up_a_backfill_and_deletes_the_successor_rows_of_hard_deleted_legacy_rows(): void
+    {
+        $refusal = "Compatibility map 'listings' cannot install: the last compatibility:backfill of listings left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead.";
+        (new Backfiller(Compatibility::of(Listing::class)->resolve(), DB::connection()))->run();
+        DB::delete('delete from listings where id = 3');
+
+        $this->artisan('compatibility:sql', ['model' => Listing::class])
+            ->expectsOutputToContain($refusal)
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
+
+        Compatibility::install(Listing::class);
+        Compatibility::uninstall(Listing::class);
+
+        $this->artisan('compatibility:sql', ['model' => Listing::class])
+            ->expectsOutputToContain($refusal)
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
+        $this->assertSame([1, 2], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
     }
 
     #[Test]

@@ -1512,6 +1512,79 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_catches_up_on_a_reinstall_a_legacy_edit_that_a_transaction_open_since_before_the_uninstall_commits_after_it(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        Compatibility::install(Listing::class);
+        $writer = $this->writer();
+        $writer->beginTransaction();
+
+        try {
+            $writer->select('select 1');
+            usleep(1200000);
+            Compatibility::uninstall(Listing::class);
+            $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp where id = 1");
+            $writer->commit();
+        } finally {
+            if ($writer->transactionLevel() > 0) {
+                $writer->rollBack();
+            }
+        }
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+    }
+
+    #[Test]
+    public function it_deletes_at_install_the_job_of_a_listing_hard_deleted_between_the_two_deletes_of_an_off_lock_catch_up_pass(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $deleted = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$deleted): void {
+            if (! $deleted && $query->connectionName === DB::getDefaultConnection() && str_contains($query->sql, 'DELETE FROM "jobs"')) {
+                $deleted = true;
+                $writer->delete('delete from listings where id = 3');
+            }
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertTrue($deleted);
+        $this->assertSame([1, 2], array_column($this->listings(), 'id'));
+        $this->assertSame([1, 2], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+    }
+
+    #[Test]
+    public function it_catches_up_off_the_lock_the_legacy_writes_that_land_while_it_fills_the_retained_key(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $churned = false;
+        $locked = false;
+        $walked = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$churned, &$locked, &$walked): void {
+            if ($query->connectionName !== DB::getDefaultConnection()) {
+                return;
+            }
+
+            if (! $churned && str_starts_with($query->sql, 'CREATE UNIQUE INDEX CONCURRENTLY')) {
+                $churned = true;
+                $writer->insert("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0) - interval '1 hour', localtimestamp(0) - interval '1 hour' from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+            }
+
+            $locked = $locked || $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE';
+            $walked += $locked && str_starts_with($query->sql, 'select * from "listings"') ? 1 : 0;
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([true, true, 1], [$churned, $locked, $walked]);
+        $this->assertSame(['v', 1100], [$this->kind('listings'), DB::table('listings')->where('title', 'like', 'Bulk %')->count()]);
+    }
+
+    #[Test]
     public function it_refuses_to_install_from_a_watermark_while_the_legacy_table_has_no_updated_at_its_model_writes(): void
     {
         $listing = new class extends Model implements Compatible

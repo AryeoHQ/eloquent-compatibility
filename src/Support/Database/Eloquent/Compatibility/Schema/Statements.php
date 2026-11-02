@@ -88,8 +88,12 @@ final readonly class Statements
             ."  END IF;\nEND\n\$compatibility\$";
     }
 
-    public static function install(ResolvedMap $map, ConnectionInterface $connection): self
+    public static function install(ResolvedMap $map, ConnectionInterface $connection, bool $catchingUp = false): self
     {
+        if (! $catchingUp && (new Backfiller($map, $connection))->remembered() !== null) {
+            throw InvalidCompatibilityMap::cannot($map->table, 'install', "the last compatibility:backfill of {$map->table} left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead");
+        }
+
         $branched = $map->branches !== [];
         $served = $branched ? array_values($map->branches) : [$map];
         $retainedKeyOf = $branched ? 'absent' : self::retainedKeyOf($connection, $map);

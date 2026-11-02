@@ -172,7 +172,7 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function incrementEach(array $columns, array $extra = []): int
     {
-        return $this->route(fn (): int => parent::incrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1), $this->alias($legacy)));
+        return $this->route(fn (): int => $this->natively(fn (): int => parent::incrementEach($columns, $extra)), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1), $this->alias($legacy)));
     }
 
     /**
@@ -181,7 +181,7 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function decrementEach(array $columns, array $extra = []): int
     {
-        return $this->route(fn (): int => parent::decrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1), $this->alias($legacy)));
+        return $this->route(fn (): int => $this->natively(fn (): int => parent::decrementEach($columns, $extra)), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1), $this->alias($legacy)));
     }
 
     /**

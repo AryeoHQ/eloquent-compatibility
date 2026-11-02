@@ -147,12 +147,17 @@ final readonly class Backfiller
 
     public static function rememberNow(string $table, null|string $comment, null|int|string $key): string
     {
-        return "DO \$compatibility\$\nBEGIN\n"
+        return "DO \$compatibility\$\nDECLARE\n  watermark text;\n  hidden bigint;\nBEGIN\n"
+            ."  SELECT to_char(least(now(), min(xact_start) FILTER (WHERE backend_type = 'client backend')) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), count(*) FILTER (WHERE state IS NULL AND backend_type IS NULL)\n"
+            ."    INTO watermark, hidden FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid();\n"
+            ."  IF hidden > 0 THEN\n"
+            ."    RAISE EXCEPTION 'pg_stat_activity hides from % whether % other sessions of this database hold a transaction open, so no watermark can start before a write they have not committed yet. Grant pg_read_all_stats to %, then uninstall again.', current_user, hidden, current_user;\n"
+            ."  END IF;\n"
             ."  EXECUTE format('COMMENT ON TABLE %s IS %L', ".SqlFragments::literal($table).', CAST(json_build_object('
             .SqlFragments::literal('backfilled').', '.SqlFragments::literal(self::MARKER).', '
             .SqlFragments::literal('comment').', CAST('.($comment === null ? 'NULL' : SqlFragments::literal($comment)).' AS text), '
             .SqlFragments::literal('key').', CAST('.SqlFragments::literal(json_encode($key, JSON_THROW_ON_ERROR)).' AS json), '
-            .SqlFragments::literal('updatedAt').", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) AS text));\n"
+            .SqlFragments::literal('updatedAt').", watermark) AS text));\n"
             ."END\n\$compatibility\$";
     }
 
@@ -360,14 +365,18 @@ final readonly class Backfiller
             $column = $attribute->column();
             $conversion = $attribute->conversions()[0] ?? null;
 
-            if ($column === null || ($conversion instanceof ReadAs && $conversion->inverse === null)) {
+            if ($conversion instanceof ReadAs && $conversion->inverse === null) {
                 continue;
             }
 
             try {
-                $stored[$branch->owners[$name]->table][$column] = $attribute->write($row[$name] ?? null);
+                $value = $attribute->write($row[$name] ?? null);
             } catch (LogicException $exception) {
                 throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} row {$this->key} {$key} holds a {$name} that attribute '{$name}' cannot store: {$exception->getMessage()}");
+            }
+
+            if ($column !== null) {
+                $stored[$branch->owners[$name]->table][$column] = $value;
             }
         }
 
@@ -585,23 +594,26 @@ final readonly class Backfiller
         $legacy = SqlFragments::identifier($this->map->table);
         $backfilled = SqlFragments::identifier(self::backfilledTable($this->map->table));
         $key = SqlFragments::identifier($this->key);
-        $gone = "NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$key} = backfilled.{$key})";
-        $deleted = 0;
+        $deletes = [];
 
-        foreach ($this->map->branches === [] ? [$this->map] : $this->map->branches as $branch) {
+        foreach (array_values($this->map->branches === [] ? [$this->map] : $this->map->branches) as $index => $branch) {
             $primary = SqlFragments::identifier($branch->primary->table);
-
-            $deleted += $this->connection->affectingStatement(
-                "DELETE FROM {$primary} USING {$backfilled} AS backfilled WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = backfilled.{$key}"
-                    .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table))
-                    .implode('', array_map(fn (string $condition) => ' AND NOT COALESCE(('.$condition.'), false)', ViewCompiler::hidden($branch)))
-                    .' AND '.$gone,
-            );
+            $deletes[] = "compatibility_deleted_{$index} AS (DELETE FROM {$primary} USING compatibility_gone WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = compatibility_gone.{$key}"
+                .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table))
+                .implode('', array_map(fn (string $condition) => ' AND NOT COALESCE(('.$condition.'), false)', ViewCompiler::hidden($branch)))
+                .' RETURNING 1)';
         }
 
-        $this->connection->delete("DELETE FROM {$backfilled} AS backfilled WHERE {$gone}");
+        $deleted = $this->connection->scalar(
+            "WITH compatibility_gone AS (SELECT backfilled.{$key} FROM {$backfilled} AS backfilled WHERE NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$key} = backfilled.{$key})),\n"
+                .implode(",\n", $deletes).",\n"
+                ."compatibility_forgotten AS (DELETE FROM {$backfilled} AS backfilled USING compatibility_gone WHERE backfilled.{$key} = compatibility_gone.{$key})\n"
+                .'SELECT '.implode(' + ', array_map(fn (int $index) => "(SELECT count(*) FROM compatibility_deleted_{$index})", array_keys($deletes))),
+            [],
+            false,
+        );
 
-        return $deleted;
+        return is_int($deleted) ? $deleted : 0;
     }
 
     private function track(): void

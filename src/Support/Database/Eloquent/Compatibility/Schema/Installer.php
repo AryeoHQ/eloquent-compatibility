@@ -74,6 +74,7 @@ final readonly class Installer
                 if ($map->branches === []) {
                     $retaining = true;
                     $this->retain(Statements::retain($map, $this->connection));
+                    $watermark = $this->converge($map, $backfiller, $watermark);
                 }
             }
 

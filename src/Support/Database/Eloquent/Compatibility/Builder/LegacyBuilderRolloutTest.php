@@ -5,12 +5,18 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -62,6 +68,8 @@ final class LegacyBuilderRolloutTest extends TestCase
         yield 'a mass update' => [fn () => Listing::query()->whereKey(1)->update(['title' => 'Oak Manor']), 'update listings', $title(1), 'Oak Manor'];
         yield 'a query builder insert' => [fn () => Listing::query()->toBase()->insert(['title' => 'Oak Manor', 'company_id' => ListingTables::COMPANY]), 'insert listings', $title(4), 'Oak Manor'];
         yield 'a query builder delete' => [fn () => Listing::query()->toBase()->where('id', 3)->delete(), 'delete listings', fn () => DB::table('listings')->where('id', 3)->count(), 0];
+        yield 'a query builder increment' => [fn () => Listing::query()->toBase()->where('id', 1)->increment('price'), 'update listings', fn () => DB::table('jobs')->where('legacy_id', 1)->value('price_cents'), 125150];
+        yield 'a query builder decrement' => [fn () => Listing::query()->toBase()->where('id', 1)->decrement('price'), 'update listings', fn () => DB::table('jobs')->where('legacy_id', 1)->value('price_cents'), 124950];
     }
 
     /**
@@ -243,6 +251,134 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->assertSame('Oak Manor', $this->job(1)->name);
         $this->assertStringContainsString('"jobs"."price_cents" > ?', $filtered[0]);
         $this->assertSame([1], $filtered[1]);
+    }
+
+    #[Test]
+    public function it_filters_a_narrowed_attribute_on_the_expression_the_view_serves_when_the_search_path_reaches_the_view_through_a_later_schema(): void
+    {
+        DB::statement('alter table jobs add column price_mills integer');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_mills')->dividedBy(1000)));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update('update jobs set price_mills = 1005 where legacy_id = 1');
+        DB::update('update jobs set price_mills = 1010 where legacy_id = 3');
+        Compatibility::install($model::class);
+        DB::statement('create schema compatibility_empty');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        $read = fn () => array_map(intval(...), $model->newQuery()->where('price', 1.01)->orderBy('id')->pluck('id')->all());
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_empty, '.$searchPath]);
+            $later = $read();
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_empty');
+        }
+
+        $this->assertSame([[1, 3], [1, 3]], [$later, $read()]);
+    }
+
+    #[Test]
+    public function it_filters_the_native_table_once_the_search_path_leaves_the_installed_view_within_one_transaction(): void
+    {
+        DB::statement('create schema compatibility_tenant');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant']);
+            ListingTables::create();
+            ListingTables::seed();
+            DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            $this->install();
+            $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+            $answers = DB::transaction(function () use ($read): array {
+                $installed = $read();
+                DB::statement('set local search_path to compatibility_tenant');
+
+                return [$installed, $read()];
+            });
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([[1], [1, 3]], $answers);
+    }
+
+    #[Test]
+    public function it_filters_the_native_table_once_a_savepoint_that_left_the_installed_view_rolls_back(): void
+    {
+        DB::statement('create schema compatibility_tenant');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant']);
+            ListingTables::create();
+            ListingTables::seed();
+            DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            $this->install();
+            $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+            $answers = DB::transaction(function () use ($read): array {
+                DB::statement('set local search_path to compatibility_tenant');
+                $tenant = [];
+
+                try {
+                    DB::transaction(function () use ($read, &$tenant): never {
+                        DB::statement('set local search_path to public');
+                        $tenant = $read();
+
+                        throw new RuntimeException('roll back the savepoint');
+                    });
+                } catch (RuntimeException) {
+                }
+
+                return [$tenant, $read()];
+            });
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([[1], [1, 3]], $answers);
+    }
+
+    #[Test]
+    public function it_filters_on_the_view_once_the_transaction_switches_to_a_role_that_cannot_read_the_successors(): void
+    {
+        $this->install();
+        $role = 'compatibility_rollout_role_'.getmypid();
+        DB::statement("create role {$role}");
+        $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+
+        try {
+            DB::statement("grant select on listings to {$role}");
+            $answers = DB::transaction(function () use ($read, $role): array {
+                $owner = $read();
+                DB::statement("set local role {$role}");
+
+                return [$owner, $read()];
+            });
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame([[1], [1]], $answers);
     }
 
     /**

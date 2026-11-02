@@ -88,7 +88,7 @@ final class Compatibility
         $connection = self::connection($map);
 
         try {
-            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection));
+            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection, catchingUp: true));
         } finally {
             LegacyBuilder::forgetViews();
         }

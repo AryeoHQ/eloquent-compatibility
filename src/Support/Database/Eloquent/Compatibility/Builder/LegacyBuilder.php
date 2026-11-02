@@ -761,7 +761,7 @@ final class LegacyBuilder extends Builder
     private function served(string $attribute, string $owner): array
     {
         $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
+        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['path']] ??= new ColumnCatalog($connection, throughSearchPath: true);
         $definition = $this->definition($attribute);
         $column = $definition->column();
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
@@ -782,11 +782,11 @@ final class LegacyBuilder extends Builder
     {
         $connection = $this->model->getConnection();
 
-        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
-            "select attribute.attname as name
+        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['path'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
+            'select attribute.attname as name
              from pg_attribute attribute
              join pg_collation column_collation on column_collation.oid = attribute.attcollation
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic",
+             where attribute.attrelid = to_regclass(?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic',
             [SqlFragments::identifier($table)],
         )));
     }
@@ -877,7 +877,7 @@ final class LegacyBuilder extends Builder
     }
 
     /**
-     * @return array{schema: string, view: bool, readable: bool}
+     * @return array{path: string, view: bool, readable: bool}
      */
     private function relation(): array
     {
