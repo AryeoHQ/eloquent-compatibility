@@ -177,6 +177,22 @@ final class BranchMoveTest extends TestCase
     }
 
     #[Test]
+    public function it_gives_the_legacy_record_every_value_the_new_successor_serves_after_a_move_before_its_own_events_run(): void
+    {
+        $seen = [];
+        Event::listen('eloquent.updated: '.Video::class, function (Video $video) use (&$seen): void {
+            $seen[] = [$video->original_file_name, $video->mime_type, $video->size_kb];
+        });
+        $video = Video::query()->findOrFail(1);
+
+        $video->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+        $served = Video::query()->findOrFail(1);
+
+        $this->assertSame([[[null, null, null]], [null, null, null]], [$seen, [$video->original_file_name, $video->mime_type, $video->size_kb]]);
+        $this->assertSame([null, null, null], [$served->original_file_name, $served->mime_type, $served->size_kb]);
+    }
+
+    #[Test]
     public function it_moves_inside_the_callers_transaction_and_rolls_back_with_it(): void
     {
         DB::beginTransaction();

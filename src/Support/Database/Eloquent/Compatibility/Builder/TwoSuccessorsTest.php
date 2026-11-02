@@ -4,15 +4,24 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Link;
@@ -243,6 +252,113 @@ final class TwoSuccessorsTest extends TestCase
         $this->assertSame([0, 1], $ignored);
         $this->assertSame([1, 2, 3, 40], Video::query()->orderBy('id')->pluck('id')->all());
         $this->assertSame([['files', 1], ['links', 2], ['files', 3], ['links', 40]], $this->holders([1, 2, 3, 40]));
+    }
+
+    #[Test]
+    public function it_refuses_an_allocated_identifier_an_explicit_insert_already_gave_a_record_of_the_other_successor(): void
+    {
+        $next = (int) DB::scalar('select case when is_called then last_value + 1 else last_value end from compatibility_legacy_id_seq');
+        Video::query()->create(['id' => $next, 'youtube_embed_url' => 'https://youtu.be/ahead', 'title' => 'Ahead']);
+
+        try {
+            Video::query()->create(['original_file_name' => 'next.mp4', 'mime_type' => 'video/mp4']);
+            $code = 'stored';
+        } catch (UniqueConstraintViolationException $exception) {
+            $code = $exception->getCode();
+        }
+
+        $retried = Video::query()->create(['original_file_name' => 'next.mp4', 'mime_type' => 'video/mp4']);
+
+        $this->assertSame('23505', $code);
+        $this->assertSame([['links', $next], ['files', $next + 1]], $this->holders([$next, $next + 1]));
+        $this->assertSame([$next + 1, 'next.mp4'], [$retried->id, Video::query()->findOrFail($next + 1)->original_file_name]);
+    }
+
+    #[Test]
+    public function it_refuses_an_increment_of_an_identifier_through_a_record_or_a_mass_write(): void
+    {
+        $messages = [];
+
+        foreach ([
+            fn () => Video::query()->findOrFail(1)->increment('id'),
+            fn () => Video::query()->whereKey(1)->increment('id'),
+        ] as $write) {
+            try {
+                $write();
+                $messages[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $messages[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame(array_fill(0, 2, Video::class.' cannot run an increment of its identifier id through its compatibility map'), $messages);
+        $this->assertSame([['files', 1], ['links', 2], ['files', 3]], $this->holders([1, 2, 3]));
+        $this->assertSame([1, 2, 3], DB::table('videos_retained')->orderBy('id')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_from_the_value_a_retained_expression_gives(): void
+    {
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('title') !== 'Upload only' ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+        $incremented = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine tour'])->id;
+        $mass = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/elm', 'title' => 'Elm tour'])->id;
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(2)->update(['title' => DB::raw("'Upload only'"), 'original_file_name' => 'oak.mp4', 'mime_type' => 'video/mp4']),
+            fn () => $video->newQuery()->findOrFail($incremented)->increment('views', 1, ['title' => DB::raw("'Upload only'")]),
+            fn () => $video->newQuery()->whereKey($mass)->update(['title' => DB::raw("'Upload only'")]),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame([
+            'stored',
+            $video::class.' cannot run an increment that moves record '.$incremented.' to File through its compatibility map',
+            $video::class.' cannot run a mass write that changes what servedFrom() chooses through its compatibility map',
+        ], $outcomes);
+        $this->assertSame([['files', 2], ['links', $incremented], ['links', $mass]], $this->holders([2, $incremented, $mass]));
+        $this->assertSame([['Upload only', 2], ['Pine tour', 0], ['Elm tour', 0]], Video::query()->whereIn('id', [2, $incremented, $mass])->orderBy('id')->get()->map(fn (Video $video) => [$video->title, $video->views])->all());
     }
 
     #[Test]

@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -37,8 +38,10 @@ final readonly class RecordWriter
             return $writer->transaction(function () use ($writer, $legacy, $values): int|string {
                 $branch = $this->map->branchFor(self::probe($legacy, $values));
                 $writer->claim($values, $branch);
+                $key = $this->through($branch)->insert($legacy, $values);
+                $writer->claim(array_diff_key($this->allocated($legacy, $branch, $key), array_filter($values, fn (mixed $value) => $value !== null)), $branch);
 
-                return $this->through($branch)->insert($legacy, $values);
+                return $key;
             });
         }
 
@@ -170,6 +173,7 @@ final readonly class RecordWriter
             return 0;
         }
 
+        $values = $this->evaluateRetained($legacy, $key, $values);
         $before = $this->before($legacy, $key);
         $target = $this->map->branchFor(self::probe($legacy, array_replace($before, $values)));
 
@@ -188,7 +192,7 @@ final readonly class RecordWriter
         $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
         $moved = $this->rekey($legacy, $key, $values);
         (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
-        $this->readBack($legacy, $moved, array_keys($values));
+        $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
 
         return 1;
     }
@@ -212,6 +216,17 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  array<string, mixed>  $values
+     * @return array<string, mixed>
+     */
+    private function evaluateRetained(Model $legacy, int|string $key, array $values): array
+    {
+        $retained = array_diff_key($values, $this->map->identifiers, $this->map->attributes);
+
+        return array_replace($values, $this->evaluate($legacy, $key, array_filter($retained, fn (mixed $value) => $value instanceof Expression)));
+    }
+
+    /**
      * @param  array<array-key, mixed>  $values
      */
     private function refuseRaw(array $values): void
@@ -232,6 +247,7 @@ final readonly class RecordWriter
     private function incrementBranch(Model $legacy, array $amounts, array $extra): int
     {
         $this->refuseRaw($extra);
+        MassWriter::refuseIdentifierAmounts($this->map, $amounts);
         $key = self::keyOf($legacy);
         [$current] = $this->holding($legacy, $key);
 
@@ -239,6 +255,7 @@ final readonly class RecordWriter
             return 0;
         }
 
+        $extra = $this->evaluateRetained($legacy, $key, $extra);
         $after = array_replace($this->before($legacy, $key), $extra);
 
         foreach ($amounts as $name => $amount) {
@@ -306,6 +323,21 @@ final readonly class RecordWriter
         $row = $this->connection->table($this->map->table)->where($legacy->getKeyName(), $key)->first();
 
         return $row === null ? throw new LogicException("{$this->map->table} serves no row {$key} for the successor row the write locked.") : (array) $row;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function allocated(Model $legacy, ResolvedMap $branch, int|string $key): array
+    {
+        $table = $branch->primary->table;
+        $columns = array_map(fn (Identifier $identifier) => (string) $identifier->column(), $branch->identifiers);
+        $row = (array) $this->connection->table($table)
+            ->where($table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
+            ->where($table.'.'.$columns[$legacy->getKeyName()], $key)
+            ->first(array_values($columns));
+
+        return array_map(fn (string $column) => $row[$column] ?? null, $columns);
     }
 
     private function through(ResolvedMap $branch): self
@@ -422,6 +454,10 @@ final readonly class RecordWriter
 
         foreach ($states as $table => $columns) {
             $model = $models[$table] ?? $this->successor($this->ownerOf($table));
+
+            if ($key !== null && $model->exists && $model->usesTimestamps()) {
+                $this->assign($model, array_intersect_key($stored[$table] ?? [], [(string) $model->getUpdatedAtColumn() => true]));
+            }
 
             foreach ($columns as $column => [$name, $value]) {
                 if ($key !== null && $model->exists) {

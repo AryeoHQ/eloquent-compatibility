@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -19,6 +20,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -45,6 +47,29 @@ final class PreparerTest extends TestCase
         FileTables::drop();
 
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_prints_a_prepare_script_for_a_map_over_two_successors_that_prepares_each_successor_as_compatibility_prepare_does(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        Compatibility::prepare(Video::class);
+        $prepared = $this->preparedShape();
+        FileTables::create();
+        FileTables::seedMedia();
+
+        Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'prepare']);
+        $script = preg_replace('/^--.*$/m', '', Artisan::output()) ?? '';
+
+        foreach (explode("\n;\n", $script) as $statement) {
+            if (trim($statement) !== '') {
+                DB::unprepared(trim($statement));
+            }
+        }
+
+        $this->assertSame($prepared, $this->preparedShape());
+        $this->assertSame(['legacy_id', 'legacy_type', 'legacy_uuid'], array_keys($prepared['links']['columns']));
     }
 
     #[Test]
@@ -310,6 +335,35 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_advances_the_shared_sequence_only_once_no_open_transaction_still_draws_from_it(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        Compatibility::prepare(Photo::class);
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $allocator = proc_open([PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->query("select nextval(\'compatibility_legacy_id_seq\')"); echo $pdo->query("select pg_backend_pid()")->fetchColumn(), "\n"; fflush(STDOUT); sleep(2); $pdo->commit(); $pdo = null;'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($allocator === false) {
+            $this->fail('The allocating transaction did not start.');
+        }
+
+        try {
+            $pid = (int) fgets($pipes[1]);
+            Compatibility::prepare(FloorPlan::class);
+            $state = DB::scalar('select state from pg_stat_activity where pid = ?', [$pid]);
+        } finally {
+            $failure = (string) stream_get_contents($pipes[2]);
+            proc_close($allocator);
+        }
+
+        $this->assertNotSame(0, $pid);
+        $this->assertNotSame('idle in transaction', $state);
+        $this->assertSame('', $failure);
+    }
+
+    #[Test]
     public function it_refuses_identifiers_of_two_types_that_share_one_successor_column(): void
     {
         FileTables::create();
@@ -400,5 +454,29 @@ final class PreparerTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::because('listings_of_the_vendor_storefront_before_the_redesign', 'the compiled name places_listings_of_the_vendor_storefront_before_the_redesign_at_most_one has 72 characters, and PostgreSQL keeps 63'));
 
         Statements::prepare($map, DB::connection());
+    }
+
+    /**
+     * @return array<string, array{columns: array<string, list<null|string>>, constraints: array<string, string>, indexes: array<string, string>}>
+     */
+    private function preparedShape(): array
+    {
+        $shape = [];
+
+        foreach (['files', 'links'] as $table) {
+            $shape[$table] = [
+                'columns' => collect(DB::select("select column_name, column_default, is_nullable from information_schema.columns where table_schema = current_schema() and table_name = ? and column_name like 'legacy\\_%' order by column_name", [$table]))
+                    ->mapWithKeys(fn (object $column) => [(string) $column->column_name => [$column->column_default === null ? null : (string) $column->column_default, (string) $column->is_nullable]])
+                    ->all(),
+                'constraints' => collect(DB::select('select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = ?::regclass order by conname', [$table]))
+                    ->mapWithKeys(fn (object $constraint) => [(string) $constraint->conname => (string) $constraint->definition])
+                    ->all(),
+                'indexes' => collect(DB::select('select indexname, indexdef from pg_indexes where schemaname = current_schema() and tablename = ? order by indexname', [$table]))
+                    ->mapWithKeys(fn (object $index) => [(string) $index->indexname => (string) $index->indexdef])
+                    ->all(),
+            ];
+        }
+
+        return $shape;
     }
 }

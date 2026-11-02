@@ -149,6 +149,17 @@ final class BranchConcurrencyTest extends TestCase
         $this->assertSame(['Tour', 99, null], [Video::query()->findOrFail(1)->title, Video::query()->findOrFail(1)->views, Video::query()->findOrFail(1)->youtube_embed_url]);
     }
 
+    #[Test]
+    public function it_leaves_a_record_a_concurrent_retained_write_takes_out_of_a_mass_update_filter_before_the_update_commits(): void
+    {
+        $locked = $this->lockConcurrently("update videos_retained set title = 'Retitled' where id = 1");
+
+        $updated = Video::query()->where('title', 'Tour')->update(['original_file_name' => 'other.mp4']);
+
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
+        $this->assertSame([0, 'Retitled', 'tour.mp4'], [$updated, Video::query()->findOrFail(1)->title, Video::query()->findOrFail(1)->original_file_name]);
+    }
+
     private function writeConcurrently(string $write): string
     {
         $concurrent = 'require '.var_export(dirname(__DIR__, 6).'/vendor/autoload.php', true).';'
@@ -170,7 +181,7 @@ final class BranchConcurrencyTest extends TestCase
 
     private function start(string $concurrent): string
     {
-        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['DB_DATABASE' => DB::connection()->getDatabaseName()] + getenv());
 
         if ($process === false) {
             $this->fail('The concurrent writer did not start.');
