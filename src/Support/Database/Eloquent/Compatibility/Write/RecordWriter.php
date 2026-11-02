@@ -31,6 +31,11 @@ final readonly class RecordWriter
             [$stored, $retained, $states] = $this->split($legacy, $values, null);
             $primary = $this->successor($this->map->primary->model);
             $table = $this->map->primary->table;
+
+            if ($this->map->membership !== null) {
+                $stored[$table][$this->map->membership->column] = $this->map->membership->alias;
+            }
+
             $stored = $this->transition($legacy, null, [$table => $primary], array_intersect_key($states, [$table => true]), $stored);
             $this->assign($primary, $stored[$table] ?? []);
             $this->save($legacy, $primary, fn () => $primary->save());
@@ -331,6 +336,10 @@ final readonly class RecordWriter
     private function lock(Model $legacy, int|string $key): null|Model
     {
         $query = $this->successor($this->map->primary->model)->newModelQuery()->where((string) $this->map->identifiers[$legacy->getKeyName()]->column(), $key);
+
+        if ($this->map->membership !== null) {
+            $query->where($this->map->membership->column, $this->map->membership->alias);
+        }
 
         foreach (ViewCompiler::hidden($this->map) as $condition) {
             $query->whereRaw('NOT COALESCE(('.$condition.'), false)');

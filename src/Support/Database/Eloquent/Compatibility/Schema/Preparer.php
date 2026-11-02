@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -41,7 +42,10 @@ final readonly class Preparer
         $primary = SqlFragments::identifier($map->primary->table);
         $key = SqlFragments::identifier($map->primary->key);
         $keyType = $this->columnCatalog->type($map->primary->table, $map->primary->key) ?? throw InvalidCompatibilityMap::because($map->table, "the successor table {$map->primary->table} has no column {$map->primary->key}");
-        $columns = [];
+        $membership = $map->membership;
+        $discriminator = $membership === null ? null : SqlFragments::identifier($membership->column);
+        $columns = $discriminator === null ? [] : ['ADD COLUMN IF NOT EXISTS '.$discriminator.' text'];
+        $shared = [];
         $defaults = [];
         $fills = [];
         $missing = [];
@@ -55,10 +59,21 @@ final readonly class Preparer
 
         foreach ($map->identifiers as $name => $identifier) {
             $column = $legacy[$name] ?? throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so identifier '{$name}' has no type to take");
-            $default = $identifier->isUuid() ? 'gen_random_uuid()' : $this->sequenceDefault($map, $name, $column);
+            $sharesSequence = $membership !== null && $identifier->isInteger();
+            $default = match (true) {
+                $identifier->isUuid() => 'gen_random_uuid()',
+                $sharesSequence => $this->sharedDefault($map, $name, $column),
+                default => $this->sequenceDefault($map, $name, $column),
+            };
+            $existing = $this->columnCatalog->type($map->primary->table, (string) $identifier->column());
+
+            if ($existing !== null && $existing !== $column->type) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->primary->table}.{$identifier->column()} is {$existing}, and {$map->table}.{$name} is {$column->type}; identifiers that share a successor column take one type");
+            }
+
             $successorColumn = SqlFragments::identifier((string) $identifier->column());
             $filled = SqlFragments::identifier(SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_filled'));
-            $unique = SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_unique');
+            $unique = SqlFragments::objectName($map->table, $map->primary->table.'_'.($sharesSequence ? $membership->column.'_' : '').$identifier->column().'_unique');
             $columns[] = 'ADD COLUMN IF NOT EXISTS '.$successorColumn.' '.$column->type;
             $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
             $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
@@ -66,13 +81,22 @@ final readonly class Preparer
             $missing[] = $successorColumn.' IS NULL';
             $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
             $notNull[] = ['ALTER COLUMN '.$successorColumn.' SET NOT NULL', 'DROP CONSTRAINT '.$filled];
-            $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, $unique, '('.$successorColumn.')', true)];
+            $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, $unique, '('.($sharesSequence ? $discriminator.', ' : '').$successorColumn.')', true)];
+
+            if ($sharesSequence) {
+                $shared[] = 'ALTER TABLE '.SqlFragments::identifier($map->table).' ALTER COLUMN '.SqlFragments::identifier($name).' SET DEFAULT '.$default;
+                $shared[] = self::advance($map->table, $name);
+            }
         }
 
         $table = "ALTER TABLE {$primary}\n  ";
 
         return [
-            [$table.implode(",\n  ", $columns), $table.implode(",\n  ", $defaults)],
+            [
+                ...($shared === [] ? [] : ['CREATE SEQUENCE IF NOT EXISTS '.SqlFragments::identifier(Identifier::SHARED_SEQUENCE), ...$shared]),
+                $table.implode(",\n  ", $columns),
+                $table.implode(",\n  ", $defaults),
+            ],
             [
                 "DO \$compatibility\$\nDECLARE\n  filled_through {$keyType};\n  fill_upto {$keyType};\nBEGIN\n"
                     ."  LOOP\n"
@@ -91,6 +115,33 @@ final readonly class Preparer
                 ...$indexes,
             ],
         ];
+    }
+
+    public static function advance(string $table, string $column): string
+    {
+        $next = 'CASE WHEN is_called THEN last_value + 1 ELSE last_value END';
+        $shared = SqlFragments::identifier(Identifier::SHARED_SEQUENCE);
+
+        return "DO \$compatibility\$\nDECLARE\n  legacy_sequence text := pg_get_serial_sequence(".SqlFragments::literal(SqlFragments::identifier($table)).', '.SqlFragments::literal($column).");\n  legacy_next bigint := 1;\n  shared_next bigint;\nBEGIN\n"
+            ."  IF legacy_sequence IS NOT NULL THEN\n"
+            ."    EXECUTE format('SELECT {$next} FROM %s', legacy_sequence) INTO legacy_next;\n"
+            ."  END IF;\n"
+            ."  SELECT {$next} INTO shared_next FROM {$shared};\n"
+            .'  PERFORM setval('.SqlFragments::literal($shared).', greatest(shared_next, legacy_next, (SELECT coalesce(max('.SqlFragments::identifier($column).'), 0) + 1 FROM '.SqlFragments::identifier($table).")), false);\n"
+            ."END\n\$compatibility\$";
+    }
+
+    private function sharedDefault(ResolvedMap $map, string $name, Column $column): string
+    {
+        if ($column->generated) {
+            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is an identity column, and integer() on a discriminated successor moves it onto the sequence ".Identifier::SHARED_SEQUENCE);
+        }
+
+        if ($column->default === null || preg_match('/^(pg_catalog\.)?nextval\(/', $column->default) !== 1) {
+            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} draws from no sequence, and integer() on a discriminated successor moves it onto the sequence ".Identifier::SHARED_SEQUENCE);
+        }
+
+        return Identifier::sharedDefault();
     }
 
     private function sequenceDefault(ResolvedMap $map, string $name, Column $column): string

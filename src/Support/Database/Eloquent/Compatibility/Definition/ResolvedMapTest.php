@@ -11,6 +11,8 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -75,6 +77,17 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_a_discriminated_map_into_its_membership_and_lets_a_read_only_attribute_serve_the_discriminator(): void
+    {
+        $map = self::identified(new Compatibility(Photo::class))
+            ->discriminatedBy('legacy_type')
+            ->servedFrom(File::class, fn (Successor $file) => $file->attribute('kind', fn (Attribute $attribute) => $attribute->from('legacy_type')->readOnly(because: 'A legacy write never moves a record to another legacy model.')))
+            ->resolve();
+
+        $this->assertSame(['files', 'legacy_type', 'photo', ['kind']], [$map->membership?->table, $map->membership?->column, $map->membership?->alias, array_keys($map->attributes)]);
+    }
+
+    #[Test]
     public function it_keys_the_retained_table_by_the_successor_foreign_key_unless_told_otherwise(): void
     {
         $retained = self::identified(new Compatibility(Listing::class))->retainedIn('listings_retained')->servedFrom(Job::class, self::titled(...))->resolve();
@@ -115,6 +128,7 @@ final class ResolvedMapTest extends TestCase
         yield 'an attribute in two successors' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => self::titled($job)->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place->attribute('title', fn (Attribute $attribute) => $attribute->from('street')))), "attribute 'title' is declared twice"];
         yield 'a timestamp declared as an attribute' => [fn (Compatibility $listing) => self::identified($listing)->timestamps()->servedFrom(Job::class, fn (Successor $job) => $job->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at'))), "attribute 'created_at' is declared twice"];
         yield 'two writers of one column' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => self::titled($job)->attribute('headline', fn (Attribute $attribute) => $attribute->from('name'))), "attribute 'headline' writes jobs.name, which attribute 'title' already owns; make one of them readOnly()"];
+        yield 'a writer of the discriminator' => [fn (Compatibility $listing) => self::identified($listing)->discriminatedBy('legacy_type')->servedFrom(Job::class, fn (Successor $job) => $job->attribute('kind', fn (Attribute $attribute) => $attribute->from('legacy_type'))), "attribute 'kind' writes jobs.legacy_type, which discriminatedBy() already owns; make one of them readOnly()"];
         yield 'a writer of an identifier column' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => $job->attribute('legacy_number', fn (Attribute $attribute) => $attribute->from('legacy_id'))), "attribute 'legacy_number' writes jobs.legacy_id, which identifier 'id' already owns; make one of them readOnly()"];
         yield 'raw sql that cannot be written' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->readAs('upper(name)'))), "attribute 'title' reads as raw SQL with readAs(), and says neither writeTo() nor readOnly()"];
         yield 'an attribute without a column' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute)), "attribute 'title' names no column; give it from(), fixed(), readAs() or external()"];

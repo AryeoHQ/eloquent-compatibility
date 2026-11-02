@@ -34,6 +34,8 @@ final class Compatibility
 
     private bool $timestamps = false;
 
+    private null|string $discriminator = null;
+
     private null|Successor $primary = null;
 
     /** @var list<Hide> */
@@ -127,6 +129,21 @@ final class Compatibility
         return $this;
     }
 
+    public function discriminatedBy(string $column): self
+    {
+        if ($this->discriminator !== null) {
+            throw $this->invalid('discriminatedBy() is declared twice');
+        }
+
+        if ($column === '' || str_contains($column, '.')) {
+            throw $this->invalid("discriminatedBy() names '{$column}', which names no column of the primary successor's own table");
+        }
+
+        $this->discriminator = $column;
+
+        return $this;
+    }
+
     /**
      * @param  Closure(Successor): mixed  $definition
      */
@@ -210,6 +227,7 @@ final class Compatibility
             $this->hides,
             $this->guards,
             $this->withoutForwarding,
+            $this->discriminator,
         );
     }
 

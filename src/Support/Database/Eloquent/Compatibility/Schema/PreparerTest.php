@@ -15,6 +15,9 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -38,6 +41,7 @@ final class PreparerTest extends TestCase
     protected function tearDown(): void
     {
         ListingTables::drop();
+        FileTables::drop();
 
         parent::tearDown();
     }
@@ -207,6 +211,69 @@ final class PreparerTest extends TestCase
         $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 13 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
 
         DB::transaction(fn () => Compatibility::prepare(Listing::class));
+    }
+
+    #[Test]
+    public function it_adds_the_discriminator_one_shared_sequence_and_the_unique_indexes_for_a_discriminated_successor(): void
+    {
+        FileTables::create();
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::prepare(FloorPlan::class);
+        Compatibility::prepare(Photo::class);
+
+        $this->assertEquals(
+            ['legacy_type' => new Column('text', null, false), 'legacy_id' => new Column('integer', "nextval('compatibility_legacy_id_seq'::regclass)", true), 'legacy_uuid' => new Column('uuid', 'gen_random_uuid()', true)],
+            array_intersect_key((new ColumnCatalog(DB::connection()))->of('files'), ['legacy_type' => true, 'legacy_id' => true, 'legacy_uuid' => true]),
+        );
+        $this->assertSame(
+            ['files_legacy_type_legacy_id_unique' => 'UNIQUE (legacy_type, legacy_id)', 'files_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'],
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'files'::regclass and contype = 'u' order by conname"), 'definition', 'conname'),
+        );
+        $this->assertSame(
+            ["nextval('compatibility_legacy_id_seq'::regclass)", "nextval('compatibility_legacy_id_seq'::regclass)"],
+            [(new ColumnCatalog(DB::connection()))->of('photos')['id']->default, (new ColumnCatalog(DB::connection()))->of('floorplans')['id']->default],
+        );
+    }
+
+    #[Test]
+    public function it_draws_every_legacy_id_written_after_prepare_from_one_sequence_above_every_existing_legacy_id(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        DB::table('files')->insert(['filename' => 'orphan.bin', 'mime_type' => 'application/octet-stream']);
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::prepare(FloorPlan::class);
+        $photo = DB::table('photos')->insertGetId(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+        $floorPlan = DB::table('floorplans')->insertGetId(['file_name' => 'birch-plan.pdf', 'mime_type' => 'application/pdf']);
+        DB::table('files')->insert(['filename' => 'birch-extra.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => 'photo']);
+
+        $this->assertEquals((object) ['legacy_type' => null, 'legacy_id' => 4], DB::selectOne("select legacy_type, legacy_id from files where filename = 'orphan.bin'"));
+        $this->assertSame([5, 6, 7], [$photo, $floorPlan, DB::scalar("select legacy_id from files where filename = 'birch-extra.jpg'")]);
+    }
+
+    #[Test]
+    public function it_refuses_identifiers_of_two_types_that_share_one_successor_column(): void
+    {
+        FileTables::create();
+        Compatibility::prepare(Photo::class);
+        DB::statement('alter table floorplans alter column id type bigint');
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('floorplans', 'files.legacy_id is integer, and floorplans.id is bigint; identifiers that share a successor column take one type'));
+
+        Compatibility::prepare(FloorPlan::class);
+    }
+
+    #[Test]
+    public function it_refuses_a_discriminated_integer_identifier_whose_legacy_column_draws_from_no_sequence(): void
+    {
+        FileTables::create();
+        DB::statement('alter table photos alter column id drop default');
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('photos', 'photos.id draws from no sequence, and integer() on a discriminated successor moves it onto the sequence compatibility_legacy_id_seq'));
+
+        Compatibility::prepare(Photo::class);
     }
 
     #[Test]

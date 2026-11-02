@@ -574,6 +574,10 @@ final class LegacyBuilder extends Builder
             $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
         }
 
+        if ($map->membership !== null) {
+            $successors->whereRaw($map->membership->of($map->primary->table));
+        }
+
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
         $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
 

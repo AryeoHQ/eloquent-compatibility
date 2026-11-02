@@ -25,6 +25,8 @@ final readonly class ResolvedMap
     /** @var array<string, Successor> */
     public array $owners;
 
+    public null|Membership $membership;
+
     /**
      * @param  class-string<Model>  $model
      * @param  array<string, Identifier>  $identifiers
@@ -43,6 +45,7 @@ final readonly class ResolvedMap
         public array $hides,
         public array $guards,
         public array $withoutForwarding,
+        null|string $discriminator = null,
     ) {
         if ($primary === null) {
             throw $this->invalid('it says no servedFrom(), so it names no successor');
@@ -60,12 +63,13 @@ final readonly class ResolvedMap
         }
 
         foreach ($identifiers as $identifier) {
-            $identifier->resolve($primary);
+            $identifier->resolve($primary, $discriminator);
         }
 
         [$related, $successors] = $this->walk($primary);
         [$attributes, $owners] = $this->collect($successors, $timestamps ? $this->timestamps($legacy, $primary) : []);
-        $this->refuseSharedColumns($primary, $attributes, $owners);
+        $this->refuseSharedColumns($primary, $attributes, $owners, $discriminator);
+        $this->membership = $this->resolveMembership($legacy, $primary, $discriminator);
 
         if ($retainedTable !== null && ($retainedTable === $table || in_array($retainedTable, array_map(fn (Successor $successor) => $successor->table, $successors), true))) {
             throw $this->invalid("retainedIn() names the table {$retainedTable}, which the map already reads as another table");
@@ -114,6 +118,10 @@ final readonly class ResolvedMap
 
             if (array_key_exists($successor->table, $tables)) {
                 throw $this->invalid("{$name} reaches the table {$successor->table}, which {$tables[$successor->table]} already reaches; map each table through one relation");
+            }
+
+            if ($successor !== $primary && $successor->membershipScope() !== null) {
+                throw $this->invalid("when() on {$name} decides membership, and only the servedFrom() successor carries the discriminator");
             }
 
             $tables[$successor->table] = $name;
@@ -207,9 +215,9 @@ final readonly class ResolvedMap
      * @param  array<string, Attribute>  $attributes
      * @param  array<string, Successor>  $owners
      */
-    private function refuseSharedColumns(Successor $primary, array $attributes, array $owners): void
+    private function refuseSharedColumns(Successor $primary, array $attributes, array $owners, null|string $discriminator): void
     {
-        $columns = [];
+        $columns = $discriminator === null ? [] : [$primary->table.'.'.$discriminator => 'discriminatedBy()'];
 
         foreach ($this->identifiers as $name => $identifier) {
             $column = $primary->table.'.'.$identifier->column();
@@ -234,6 +242,21 @@ final readonly class ResolvedMap
 
             $columns[$column] = "attribute '{$name}'";
         }
+    }
+
+    private function resolveMembership(Model $legacy, Successor $primary, null|string $discriminator): null|Membership
+    {
+        if ($discriminator === null) {
+            return $primary->membershipScope() === null ? null : throw $this->invalid('when() on '.class_basename($primary->model).' states which rows may carry the morph alias, and the map declares no discriminatedBy()');
+        }
+
+        $alias = $legacy->getMorphClass();
+
+        if ($alias === $legacy::class) {
+            throw $this->invalid('discriminatedBy() stores the morph alias of '.class_basename($legacy).', which has none; register one with Relation::morphMap(), because a class name changes when the class moves');
+        }
+
+        return new Membership($this->table, $primary->model, $primary->table, $discriminator, $alias, $primary->membershipScope());
     }
 
     private function invalid(string $problem): InvalidCompatibilityMap

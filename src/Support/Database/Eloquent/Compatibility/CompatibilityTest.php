@@ -15,6 +15,10 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\LegacyFile;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -39,6 +43,19 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_each_map_over_a_shared_successor_without_a_database_connection(): void
+    {
+        foreach (array_keys(DB::getConnections()) as $connection) {
+            DB::purge($connection);
+        }
+
+        $aliases = array_map(fn (string $model) => Compatibility::of($model)->resolve()->membership?->alias, [Photo::class, FloorPlan::class, LegacyFile::class]);
+
+        $this->assertSame([], DB::getConnections());
+        $this->assertSame(['photo', 'floorplan', 'legacy_file'], $aliases);
+    }
+
+    #[Test]
     public function it_resolves_a_map_built_directly_for_a_model(): void
     {
         $map = (new Compatibility(Listing::class))
@@ -54,7 +71,7 @@ final class CompatibilityTest extends TestCase
     {
         $package = fn (string $name) => str_starts_with($name, 'Support\\Database\\Eloquent\\Compatibility\\');
 
-        foreach ([Job::class, Place::class, JobSite::class] as $successor) {
+        foreach ([Job::class, Place::class, JobSite::class, File::class] as $successor) {
             $this->assertSame([], array_values(array_filter([...class_implements($successor), ...class_uses_recursive($successor)], $package)), $successor);
         }
     }
@@ -107,6 +124,8 @@ final class CompatibilityTest extends TestCase
         yield 'an identifier twice' => [fn (Compatibility $listing) => $listing->identifiedBy('id', $identifier)->identifiedBy('id', $identifier), "identifier 'id' is declared twice"];
         yield 'a retained table twice' => [fn (Compatibility $listing) => $listing->retainedIn('listings_retained')->retainedIn('listings_kept'), 'retainedIn() is declared twice'];
         yield 'an empty retained key' => [fn (Compatibility $listing) => $listing->retainedIn('listings_retained', key: ''), 'retainedIn() names an empty table or key'];
+        yield 'a discriminator twice' => [fn (Compatibility $listing) => $listing->discriminatedBy('legacy_type')->discriminatedBy('kind'), 'discriminatedBy() is declared twice'];
+        yield 'a discriminator in another table' => [fn (Compatibility $listing) => $listing->discriminatedBy('jobs.legacy_type'), "discriminatedBy() names 'jobs.legacy_type', which names no column of the primary successor's own table"];
         yield 'a successor twice' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(Job::class, $successor), 'servedFrom() is declared twice'];
         yield 'a successor that is no model' => [fn (Compatibility $listing) => $listing->servedFrom(SyncListingToMls::class, $successor), 'servedFrom() names '.SyncListingToMls::class.', which is not an Eloquent model'];
         yield 'a hide rule without a reason' => [fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs, because: ''), 'hide() gives no reason; it takes the reason the legacy model never shows these records'];

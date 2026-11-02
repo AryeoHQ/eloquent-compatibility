@@ -79,7 +79,10 @@ final readonly class MassWriter
     {
         $primary = $this->map->primary;
 
-        return (int) $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$this->legacyColumn(), $keys)->delete();
+        $query = $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$this->legacyColumn(), $keys);
+        $this->members($query->getQuery());
+
+        return (int) $query->delete();
     }
 
     /**
@@ -194,11 +197,18 @@ final readonly class MassWriter
         $grammar = $this->connection->getQueryGrammar();
 
         $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::PINNED).' ON COMMIT DROP AS SELECT '.$grammar->wrap($key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
-        $locked = $this->connection->table(self::PINNED)->insertUsing(['key'], $this->connection->table($primary->table)->select($key)->whereIn($legacy, $keys)->orderBy($key)->lockForUpdate());
+        $locked = $this->connection->table(self::PINNED)->insertUsing(['key'], $this->members($this->connection->table($primary->table))->select($key)->whereIn($legacy, $keys)->orderBy($key)->lockForUpdate());
         $filter = $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']);
-        $moved = $this->connection->table(self::PINNED.' as pinned')->whereNotExists(fn (QueryBuilder $matching) => $matching->from($primary->table)->whereColumn($key, 'pinned.key')->whereIn($legacy, $filter))->delete();
+        $moved = $this->connection->table(self::PINNED.' as pinned')->whereNotExists(fn (QueryBuilder $matching) => $this->members($matching->from($primary->table))->whereColumn($key, 'pinned.key')->whereIn($legacy, $filter))->delete();
 
         return $locked - $moved;
+    }
+
+    private function members(QueryBuilder $query): QueryBuilder
+    {
+        $membership = $this->map->membership;
+
+        return $membership === null ? $query : $query->where($membership->table.'.'.$membership->column, $membership->alias);
     }
 
     private function pinned(): QueryBuilder

@@ -90,9 +90,12 @@ final readonly class ViewCompiler
     public static function primary(ResolvedMap $map): string
     {
         $table = SqlFragments::identifier($map->primary->table);
-        $hidden = array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map));
+        $conditions = [
+            ...($map->membership === null ? [] : [$map->membership->of($map->primary->table)]),
+            ...array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map)),
+        ];
 
-        return $hidden === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $hidden).') AS '.$table;
+        return $conditions === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $conditions).') AS '.$table;
     }
 
     /**
@@ -244,7 +247,7 @@ final readonly class ViewCompiler
             throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
         }
 
-        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
+        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...($map->membership === null ? [] : [$map->membership->column]), ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
 
         foreach ($map->related as $related) {
             $this->columnsOf($map, $related->parentTable, [$related->parentKey], 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');
