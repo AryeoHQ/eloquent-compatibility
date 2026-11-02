@@ -48,6 +48,9 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $deletes = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $restores = null;
+
     /** @var array<string, true> */
     private static array $tables = [];
 
@@ -99,6 +102,17 @@ final class LegacyBuilder extends Builder
         } finally {
             $deletes->offsetUnset($model);
         }
+    }
+
+    public static function restoreOf(Model $model): void
+    {
+        $restores = self::$restores ??= new WeakMap;
+        $restores[$model] = true;
+    }
+
+    public static function forgetRestoreOf(Model $model): void
+    {
+        self::$restores?->offsetUnset($model);
     }
 
     public static function serves(Model $model): bool
@@ -200,7 +214,14 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::update($values) : $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false);
+        if ($model === null) {
+            return parent::update($values);
+        }
+
+        $restoring = self::$restores?->offsetExists($model) ?? false;
+        self::forgetRestoreOf($model);
+
+        return $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false, $restoring);
     }
 
     public function delete(): mixed

@@ -352,6 +352,59 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_runs_the_successor_restore_and_its_veto_when_a_stale_legacy_record_restores_a_successor_another_writer_restored(): void
+    {
+        $listing = Listing::withTrashed()->findOrFail(2);
+        DB::table('jobs')->where('legacy_id', 2)->update(['deleted_at' => null]);
+        $before = $this->snapshot();
+        /** @var Collection<int, string> $fired */
+        $fired = new Collection;
+        Event::listen('eloquent.*: '.Job::class, function (string $name) use ($fired): void {
+            $fired->push(Str::before(Str::after($name, 'eloquent.'), ':'));
+        });
+        Event::listen('eloquent.restoring: '.Job::class, function () use ($fired): bool {
+            $fired->push('vetoed');
+
+            return false;
+        });
+        $listing->title = 'Pine Lodge';
+
+        $refusal = $this->refusal(fn () => $listing->restore()); // @phpstan-ignore staticMethod.dynamicCall
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame(['retrieved', 'vetoed'], $fired->all());
+        $this->assertSame($before, $this->snapshot());
+
+        Event::forget('eloquent.restoring: '.Job::class);
+
+        $this->assertTrue($listing->restore()); // @phpstan-ignore staticMethod.dynamicCall
+        $this->assertSame(['retrieved', 'restoring', 'saving', 'updating', 'updated', 'saved', 'restored'], $fired->slice(2)->values()->all());
+        $this->assertSame(['Pine Lodge', null], [Job::query()->where('legacy_id', 2)->value('name'), Job::query()->where('legacy_id', 2)->value('deleted_at')]);
+    }
+
+    #[Test]
+    public function it_saves_the_successor_without_its_restore_events_when_a_legacy_listener_refused_the_restore_before_the_save(): void
+    {
+        $listing = Listing::withTrashed()->findOrFail(2);
+        DB::table('jobs')->where('legacy_id', 2)->update(['deleted_at' => null]);
+        /** @var Collection<int, string> $fired */
+        $fired = new Collection;
+        Event::listen('eloquent.*: '.Job::class, function (string $name) use ($fired): void {
+            $fired->push(Str::before(Str::after($name, 'eloquent.'), ':'));
+        });
+        Event::listen('eloquent.saving: '.Listing::class, fn (): bool => false);
+
+        $restored = $listing->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        Event::forget('eloquent.saving: '.Listing::class);
+        $listing->title = 'Pine Lodge';
+        $saved = $listing->save();
+
+        $this->assertSame([false, true], [$restored, $saved]);
+        $this->assertSame(['retrieved', 'saving', 'updating', 'updated', 'saved'], $fired->all());
+        $this->assertSame('Pine Lodge', Job::query()->where('legacy_id', 2)->value('name'));
+    }
+
+    #[Test]
     public function it_keeps_the_timestamps_a_legacy_write_sets_when_it_soft_deletes(): void
     {
         $this->freezeSecond();
