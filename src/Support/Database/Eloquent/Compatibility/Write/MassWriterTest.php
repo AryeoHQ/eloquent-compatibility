@@ -21,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
 
@@ -172,6 +173,15 @@ final class MassWriterTest extends TestCase
         $this->assertSame(Listing::class.' cannot run a raw expression for $price through its compatibility map. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write each record through Listing, or write the successor models directly.', $raw->getMessage());
         $this->assertSame(Listing::class.' records cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
         $this->assertSame([125050, 9999], DB::table('jobs')->whereNotNull('price_cents')->orderBy('legacy_id')->pluck('price_cents')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_mass_write_of_an_attribute_that_runs_transitions(): void
+    {
+        $refused = $this->refusal(fn () => Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]));
+
+        $this->assertSame(Listing::class.'::$status cannot take a mass write. Why: It is declared transitions(), so each record\'s change runs its successor\'s state-machine trigger, and a set-based statement cannot run a trigger per row. Instead: Write the records one at a time through Listing.', $refused->getMessage());
+        $this->assertSame([['Oak House', 'live'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->orderBy('legacy_id')->get(['name', 'lifecycle_status'])->map(fn (object $job) => array_values((array) $job))->all());
     }
 
     #[Test]

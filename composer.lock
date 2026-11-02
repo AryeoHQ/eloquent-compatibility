@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "91750a1e063a226b0a6e733a3f5cefc3",
+    "content-hash": "8a34d67ff317c5406a5c6a2b4b91ff14",
     "packages": [
         {
             "name": "brick/math",
@@ -3145,16 +3145,16 @@
         },
         {
             "name": "symfony/console",
-            "version": "v8.1.9",
+            "version": "v8.1.10",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/console.git",
-                "reference": "630e74196a2635ec0f06c12bd3fb47cfedf85157"
+                "reference": "5b6d9b127ec27bc6db59bf65e2e37b6fe5b00083"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/console/zipball/630e74196a2635ec0f06c12bd3fb47cfedf85157",
-                "reference": "630e74196a2635ec0f06c12bd3fb47cfedf85157",
+                "url": "https://api.github.com/repos/symfony/console/zipball/5b6d9b127ec27bc6db59bf65e2e37b6fe5b00083",
+                "reference": "5b6d9b127ec27bc6db59bf65e2e37b6fe5b00083",
                 "shasum": ""
             },
             "require": {
@@ -3221,7 +3221,7 @@
                 "terminal"
             ],
             "support": {
-                "source": "https://github.com/symfony/console/tree/v8.1.9"
+                "source": "https://github.com/symfony/console/tree/v8.1.10"
             },
             "funding": [
                 {
@@ -3241,7 +3241,7 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2026-10-12T19:11:16+00:00"
+            "time": "2026-10-28T11:16:19+00:00"
         },
         {
             "name": "symfony/css-selector",
@@ -3632,16 +3632,16 @@
         },
         {
             "name": "symfony/finder",
-            "version": "v8.1.8",
+            "version": "v8.1.10",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/finder.git",
-                "reference": "bd4fed193a3132c91c5c93595cbfc78988915822"
+                "reference": "2f4c0f26106520d82e1b71759d2fb8d32d8b7a43"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/finder/zipball/bd4fed193a3132c91c5c93595cbfc78988915822",
-                "reference": "bd4fed193a3132c91c5c93595cbfc78988915822",
+                "url": "https://api.github.com/repos/symfony/finder/zipball/2f4c0f26106520d82e1b71759d2fb8d32d8b7a43",
+                "reference": "2f4c0f26106520d82e1b71759d2fb8d32d8b7a43",
                 "shasum": ""
             },
             "require": {
@@ -3676,7 +3676,7 @@
             "description": "Finds files and directories via an intuitive fluent interface",
             "homepage": "https://symfony.com",
             "support": {
-                "source": "https://github.com/symfony/finder/tree/v8.1.8"
+                "source": "https://github.com/symfony/finder/tree/v8.1.10"
             },
             "funding": [
                 {
@@ -3696,7 +3696,7 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2026-09-26T06:33:49+00:00"
+            "time": "2026-10-19T17:00:07+00:00"
         },
         {
             "name": "symfony/http-foundation",
@@ -4140,16 +4140,16 @@
         },
         {
             "name": "symfony/polyfill-intl-grapheme",
-            "version": "v1.43.0",
+            "version": "v1.43.3",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/polyfill-intl-grapheme.git",
-                "reference": "5cac8f4db97208823aa353f59a01faad2da52c75"
+                "reference": "5a8f33c87aeecffce24e721b5064fab05f4becf8"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/polyfill-intl-grapheme/zipball/5cac8f4db97208823aa353f59a01faad2da52c75",
-                "reference": "5cac8f4db97208823aa353f59a01faad2da52c75",
+                "url": "https://api.github.com/repos/symfony/polyfill-intl-grapheme/zipball/5a8f33c87aeecffce24e721b5064fab05f4becf8",
+                "reference": "5a8f33c87aeecffce24e721b5064fab05f4becf8",
                 "shasum": ""
             },
             "require": {
@@ -4198,7 +4198,7 @@
                 "shim"
             ],
             "support": {
-                "source": "https://github.com/symfony/polyfill-intl-grapheme/tree/v1.43.0"
+                "source": "https://github.com/symfony/polyfill-intl-grapheme/tree/v1.43.3"
             },
             "funding": [
                 {
@@ -4218,7 +4218,7 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2026-09-25T15:46:47+00:00"
+            "time": "2026-10-15T09:18:53+00:00"
         },
         {
             "name": "symfony/polyfill-intl-idn",
@@ -4394,16 +4394,16 @@
         },
         {
             "name": "symfony/polyfill-mbstring",
-            "version": "v1.43.0",
+            "version": "v1.43.3",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/polyfill-mbstring.git",
-                "reference": "4d5d331bf731e0aedbc6b2f5e61135b7b7996a72"
+                "reference": "122889ed24dc000165bcbfd77ec412f15cbdfc6a"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/4d5d331bf731e0aedbc6b2f5e61135b7b7996a72",
-                "reference": "4d5d331bf731e0aedbc6b2f5e61135b7b7996a72",
+                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/122889ed24dc000165bcbfd77ec412f15cbdfc6a",
+                "reference": "122889ed24dc000165bcbfd77ec412f15cbdfc6a",
                 "shasum": ""
             },
             "require": {
@@ -4455,7 +4455,7 @@
                 "shim"
             ],
             "support": {
-                "source": "https://github.com/symfony/polyfill-mbstring/tree/v1.43.0"
+                "source": "https://github.com/symfony/polyfill-mbstring/tree/v1.43.3"
             },
             "funding": [
                 {
@@ -4475,7 +4475,7 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2026-09-24T15:19:04+00:00"
+            "time": "2026-10-28T09:35:49+00:00"
         },
         {
             "name": "symfony/polyfill-php80",
@@ -5281,16 +5281,16 @@
         },
         {
             "name": "symfony/string",
-            "version": "v8.1.9",
+            "version": "v8.1.10",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/string.git",
-                "reference": "07fb208558f941eab50ec49c89c2a6a93fb11f01"
+                "reference": "6c6110979c0150393bbb336170e286d51ab4d76c"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/string/zipball/07fb208558f941eab50ec49c89c2a6a93fb11f01",
-                "reference": "07fb208558f941eab50ec49c89c2a6a93fb11f01",
+                "url": "https://api.github.com/repos/symfony/string/zipball/6c6110979c0150393bbb336170e286d51ab4d76c",
+                "reference": "6c6110979c0150393bbb336170e286d51ab4d76c",
                 "shasum": ""
             },
             "require": {
@@ -5347,7 +5347,7 @@
                 "utf8"
             ],
             "support": {
-                "source": "https://github.com/symfony/string/tree/v8.1.9"
+                "source": "https://github.com/symfony/string/tree/v8.1.10"
             },
             "funding": [
                 {
@@ -5367,7 +5367,7 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2026-10-03T15:16:03+00:00"
+            "time": "2026-10-23T17:06:53+00:00"
         },
         {
             "name": "symfony/translation",
@@ -5925,6 +5925,204 @@
     ],
     "packages-dev": [
         {
+            "name": "aryeo/actions",
+            "version": "0.0.23",
+            "dist": {
+                "type": "zip",
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/actions/actions-0.0.23.zip",
+                "reference": "c1178d594ac14dc261f6c64bb5722da8d2a8162d"
+            },
+            "require": {
+                "aryeo/tooling-laravel": "0.0.41",
+                "laravel/framework": "^12.0 || ^13",
+                "laravel/prompts": "^0.3",
+                "mockery/mockery": "^1.6",
+                "nikic/php-parser": "^5.6",
+                "php": "^8.4",
+                "phpstan/phpstan": "^2.1",
+                "symfony/console": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "brianium/paratest": "^7.15",
+                "orchestra/testbench": "^10.0.0||^9.0.0||^11",
+                "orchestra/testbench-core": "^10.0.0||^9.0.0||^11",
+                "phpunit/phpunit": "^12||^11||^13"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "Support\\Actions\\Providers\\Provider"
+                    ]
+                },
+                "tooling": {
+                    "phpstan": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/phpstan/rules.neon"
+                    },
+                    "rector": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/rector/rules.php"
+                    },
+                    "pint": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests"
+                            ]
+                        }
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Support\\": "src/Support/",
+                    "Tooling\\": "src/Tooling/"
+                },
+                "exclude-from-classmap": [
+                    "*Test.php",
+                    "*TestCases.php",
+                    "/tests/"
+                ]
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "Workbench\\App\\": "workbench/app/",
+                    "Tests\\": "tests/"
+                }
+            },
+            "scripts": {
+                "test": [
+                    "vendor/bin/phpunit"
+                ],
+                "test-coverage": [
+                    "vendor/bin/phpunit --coverage-html coverage"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Rob Fonseca",
+                    "email": "robfo@zillowgroup.com"
+                }
+            ],
+            "description": "An actions package.",
+            "homepage": "https://github.com/aryeohq/actions",
+            "keywords": [
+                "Aryeo",
+                "actions",
+                "laravel"
+            ]
+        },
+        {
+            "name": "aryeo/eloquent-state-machines",
+            "version": "0.0.34",
+            "dist": {
+                "type": "zip",
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/eloquent-state-machines/eloquent-state-machines-0.0.34.zip",
+                "reference": "3904e81487653e0a7ca589d94a4548a0920b5229"
+            },
+            "require": {
+                "aryeo/actions": "0.0.23",
+                "laravel/framework": "12.x || ^13",
+                "laravel/prompts": "^0.3.7",
+                "nikic/php-parser": "^5.7",
+                "php": "^8.4",
+                "phpstan/phpdoc-parser": "^2.3",
+                "phpstan/phpstan": "^2.1",
+                "rector/rector": "^2.3",
+                "symfony/console": "^7.3 || ^8.0",
+                "symfony/finder": "^7.3 || ^8.0"
+            },
+            "require-dev": {
+                "aryeo/tooling-laravel": "0.0.41",
+                "nesbot/carbon": "^3.10",
+                "orchestra/testbench": "^10.6 || ^11",
+                "orchestra/testbench-core": "^10.7 || ^11",
+                "pestphp/pest": "^4.1",
+                "phpunit/phpunit": "^12.4.1 || ^13",
+                "symplify/rule-doc-generator-contracts": "^11.2"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "Support\\Database\\Eloquent\\StateMachines\\Provider"
+                    ]
+                },
+                "tooling": {
+                    "rector": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/rector/rules.php",
+                        "configured_rules": "tooling/rector/configured-rules.php",
+                        "skip": "tooling/rector/skip.php"
+                    },
+                    "phpstan": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests/Fixtures/Support"
+                            ]
+                        },
+                        "rules": "tooling/phpstan/phpstan.neon"
+                    },
+                    "pint": {
+                        "config": {
+                            "paths": [
+                                "src",
+                                "tests",
+                                "tooling"
+                            ]
+                        }
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Support\\": "src/Support/",
+                    "Tooling\\": "src/Tooling/"
+                },
+                "exclude-from-classmap": [
+                    "*Test.php",
+                    "*TestCases.php",
+                    "/tests/"
+                ]
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "Workbench\\App\\": "workbench/app/",
+                    "Tests\\": "tests/"
+                }
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Justin Seliga",
+                    "email": "justinsel@zillowgroup.com"
+                }
+            ],
+            "description": "A state machine package for Eloquent."
+        },
+        {
             "name": "aryeo/tooling-laravel",
             "version": "0.0.41",
             "dist": {
@@ -6015,6 +6213,9 @@
                     "php ./vendor/bin/testbench tooling:discover"
                 ]
             },
+            "license": [
+                "MIT"
+            ],
             "authors": [
                 {
                     "name": "Justin Seliga",
@@ -8488,6 +8689,53 @@
                 "source": "https://github.com/phar-io/version/tree/3.2.1"
             },
             "time": "2022-02-21T01:04:05+00:00"
+        },
+        {
+            "name": "phpstan/phpdoc-parser",
+            "version": "2.4.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpstan/phpdoc-parser.git",
+                "reference": "af8e840551031d254cfdb3a18a62c3470a309c10"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpstan/phpdoc-parser/zipball/af8e840551031d254cfdb3a18a62c3470a309c10",
+                "reference": "af8e840551031d254cfdb3a18a62c3470a309c10",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.4 || ^8.0"
+            },
+            "require-dev": {
+                "doctrine/annotations": "^2.0",
+                "nikic/php-parser": "^5.3.0",
+                "php-parallel-lint/php-parallel-lint": "^1.2",
+                "phpstan/extension-installer": "^1.0",
+                "phpstan/phpstan": "^2.0",
+                "phpstan/phpstan-phpunit": "^2.0",
+                "phpstan/phpstan-strict-rules": "^2.0",
+                "phpunit/phpunit": "^9.6",
+                "symfony/process": "^5.2"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "PHPStan\\PhpDocParser\\": [
+                        "src/"
+                    ]
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "PHPDoc parser with support for nullable, intersection and generic types",
+            "support": {
+                "issues": "https://github.com/phpstan/phpdoc-parser/issues",
+                "source": "https://github.com/phpstan/phpdoc-parser/tree/2.4.1"
+            },
+            "time": "2026-10-30T19:36:28+00:00"
         },
         {
             "name": "phpstan/phpstan",

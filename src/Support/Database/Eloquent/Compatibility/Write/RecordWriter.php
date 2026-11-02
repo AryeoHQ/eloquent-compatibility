@@ -26,12 +26,16 @@ final readonly class RecordWriter
     public function insert(Model $legacy, array $values): int|string
     {
         return $this->connection->transaction(function () use ($legacy, $values): int|string {
-            [$stored, $retained] = $this->split($legacy, $values, null);
+            [$stored, $retained, $states] = $this->split($legacy, $values, null);
             $primary = $this->successor($this->map->primary->model);
-            $this->assign($primary, $stored[$this->map->primary->table] ?? []);
+            $table = $this->map->primary->table;
+            $stored = $this->transition($legacy, null, [$table => $primary], array_intersect_key($states, [$table => true]), $stored);
+            $this->assign($primary, $stored[$table] ?? []);
             $this->save($legacy, $primary, fn () => $primary->save());
             $key = $this->identify($legacy, $primary);
-            [$models, $existing, $missing] = $this->locate($primary, $stored);
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
+            $stored = $this->transition($legacy, $key, $models, array_diff_key($states, [$table => true]), $stored);
+            $this->assignEach($models, $stored);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $models, $missing, $stored);
             (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
@@ -53,9 +57,11 @@ final readonly class RecordWriter
                 return 0;
             }
 
-            [$stored, $retained] = $this->split($legacy, $values, $key);
+            [$stored, $retained, $states] = $this->split($legacy, $values, $key);
             $this->guard($legacy, $key);
-            [$models, $existing, $missing] = $this->locate($primary, $stored);
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
+            $stored = $this->transition($legacy, $key, $models, $states, $stored);
+            $this->assignEach($models, $stored);
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], array_keys($values));
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $models, $missing, $stored);
@@ -79,10 +85,12 @@ final readonly class RecordWriter
                 return 0;
             }
 
-            [$stored, $retained] = $this->split($legacy, $extra, $key);
+            [$stored, $retained, $states] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
             $this->guard($legacy, $key);
-            [$models, $existing, $missing] = $this->locate($primary, $stored + array_fill_keys(array_keys($added), []));
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states + array_fill_keys(array_keys($added), []));
+            $stored = $this->transition($legacy, $key, $models, $states, $stored);
+            $this->assignEach($models, $stored);
 
             foreach ($added as $table => $columns) {
                 foreach ($columns as $column => $amount) {
@@ -121,12 +129,13 @@ final readonly class RecordWriter
 
     /**
      * @param  array<string, mixed>  $values
-     * @return array{array<string, array<string, mixed>>, array<string, mixed>}
+     * @return array{array<string, array<string, mixed>>, array<string, mixed>, array<string, array<string, array{string, mixed}>>}
      */
     private function split(Model $legacy, array $values, null|int|string $key): array
     {
         $stored = [];
         $retained = [];
+        $states = [];
 
         foreach ($values as $name => $value) {
             $name = (string) $name;
@@ -147,7 +156,6 @@ final readonly class RecordWriter
             $readOnly = $attribute->readOnlyBecause();
             $refusal = match (true) {
                 $attribute->isExternal() => CompatibilityWriteRefused::external($legacy::class, $name),
-                $attribute->runsTransitions() => CompatibilityWriteRefused::transitions($legacy::class, $name),
                 $key !== null && $readOnly !== null => CompatibilityWriteRefused::readOnly($legacy::class, $name, $key, $readOnly),
                 default => null,
             };
@@ -164,12 +172,69 @@ final readonly class RecordWriter
 
             $column = $attribute->column();
 
-            if ($column !== null) {
+            if ($column !== null && $attribute->runsTransitions()) {
+                $states[$this->map->owners[$name]->table][$column] = [$name, $value];
+            } elseif ($column !== null) {
                 $stored[$this->map->owners[$name]->table][$column] = $value;
             }
         }
 
-        return [$stored, $retained];
+        return [$stored, $retained, $states];
+    }
+
+    /**
+     * @param  array<string, Model>  $models
+     * @param  array<string, array<string, array{string, mixed}>>  $states
+     * @param  array<string, array<string, mixed>>  $stored
+     * @return array<string, array<string, mixed>>
+     */
+    private function transition(Model $legacy, null|int|string $key, array $models, array $states, array $stored): array
+    {
+        $transitions = new Transitions($this->connection);
+
+        foreach ($states as $table => $columns) {
+            $model = $models[$table] ?? $this->successor($this->ownerOf($table));
+
+            foreach ($columns as $column => [$name, $value]) {
+                if ($key !== null && $model->exists) {
+                    $transitions->run($legacy, $key, $name, $model, $column, $value);
+
+                    continue;
+                }
+
+                $transitions->initial($legacy, $name, $model, $column, $value);
+                $stored[$table][$column] = $value;
+            }
+        }
+
+        return $stored;
+    }
+
+    /**
+     * @return class-string<Model>
+     */
+    private function ownerOf(string $table): string
+    {
+        foreach ($this->map->related as $related) {
+            if ($related->table === $table) {
+                return $related->model;
+            }
+        }
+
+        return $this->map->primary->model;
+    }
+
+    /**
+     * @param  array<string, Model>  $models
+     * @param  array<string, array<string, mixed>>  $stored
+     */
+    private function assignEach(array $models, array $stored): void
+    {
+        foreach ($models as $table => $model) {
+            if ($table !== $this->map->primary->table) {
+                $this->assign($model, $stored[$table] ?? []);
+            }
+        }
     }
 
     private function guard(Model $legacy, int|string $key): void
@@ -253,7 +318,6 @@ final readonly class RecordWriter
                 continue;
             }
 
-            $this->assign($model, $stored[$related->table] ?? []);
             $models[$related->table] = $model;
             $existing[] = $model;
         }

@@ -34,11 +34,15 @@
         "laravel/framework": "12.x || ^13"
     },
     "require-dev": {
+        "aryeo/eloquent-state-machines": "0.0.34",
         "aryeo/tooling-laravel": "0.0.41",
         "brianium/paratest": "^7.14",
         "orchestra/testbench": "^10.6 || ^11",
         "orchestra/testbench-core": "^10.7 || ^11",
         "phpunit/phpunit": "^12.4.1 || ^13"
+    },
+    "suggest": {
+        "aryeo/eloquent-state-machines": "Runs a successor's state-machine trigger for a legacy write of a transitions() attribute. Version 0.0.34 supports PHP 8.4; later versions need PHP 8.5."
     },
     "config": {
         "allow-plugins": {

@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Carbon;
+use Support\Database\Eloquent\StateMachines\StateMachine;
 
 /**
  * @property string $id
@@ -18,7 +19,7 @@ use Illuminate\Support\Carbon;
  * @property string $name
  * @property string $company_id
  * @property null|int $price_cents
- * @property LifecycleStatus $lifecycle_status
+ * @property StateMachine<LifecycleStatus> $lifecycle_status
  * @property null|string $merged_into_job_id
  * @property null|Carbon $created_at
  * @property null|Carbon $updated_at

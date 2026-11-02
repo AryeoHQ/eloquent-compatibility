@@ -131,18 +131,20 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_write_of_an_attribute_that_runs_transitions(): void
+    public function it_runs_the_transition_of_a_state_write_before_the_other_successor_saves(): void
     {
-        $before = $this->snapshot();
+        $saves = [];
+        Event::listen('eloquent.updated: *', function (string $event, array $models) use (&$saves): void {
+            foreach ($models as $model) {
+                $saves[] = [class_basename($model), array_keys(array_diff_key($model->getChanges(), ['updated_at' => true]))];
+            }
+        });
         $listing = Listing::query()->findOrFail(1);
-        $listing->fill(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]);
 
-        $update = $this->refusal(fn () => $listing->save());
-        $insert = $this->refusal(fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Active]));
+        $listing->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold, 'street' => '2 Oak St']);
 
-        $this->assertSame('Tests\Fixtures\Support\Listings\Listing::$status cannot take a write. Why: It is declared transitions(), so a write must run the successor\'s state transition, and this release runs no transition yet. Instead: Change the state through the successor model\'s own transition.', $update->getMessage());
-        $this->assertSame($update->getMessage(), $insert->getMessage());
-        $this->assertSame($before, $this->snapshot());
+        $this->assertSame([['Job', ['lifecycle_status']], ['Job', ['name']], ['Place', ['street']], ['Listing', ['title', 'status', 'street']]], $saves);
+        $this->assertSame([ListingStatus::Sold, 'Oak Manor', '2 Oak St'], [Listing::query()->findOrFail(1)->status, Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->street]);
     }
 
     #[Test]
