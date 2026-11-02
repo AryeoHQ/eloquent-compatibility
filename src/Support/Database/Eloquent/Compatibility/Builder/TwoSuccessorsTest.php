@@ -787,6 +787,173 @@ final class TwoSuccessorsTest extends TestCase
         $this->assertSame([[10, 'Tour', 5], [20, 'Oak walkthrough', 3], [30, null, 0]], Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->title, $video->views])->all());
     }
 
+    #[Test]
+    public function it_reads_a_retained_expression_of_a_branched_mass_write_by_the_alias_the_write_reads_the_legacy_table_by(): void
+    {
+        $updated = Video::query()->toBase()->from('videos as legacy')->where('legacy.id', 2)->update(['title' => DB::raw("legacy.title || '!'")]);
+        $aliased = Video::query();
+        $aliased->getQuery()->from('videos AS legacy');
+        $eloquent = $aliased->where('legacy.id', 1)->update(['title' => DB::raw("legacy.title || '-' || legacy.views")]);
+        $incremented = Video::query()->getQuery()->from('videos as legacy')->where('legacy.id', 3)->incrementEach(['views' => 2], ['title' => DB::raw("coalesce(legacy.title, 'Drone') || '-' || legacy.views")]);
+
+        $this->assertSame([1, 1, 1], [$updated, $eloquent, $incremented]);
+        $this->assertSame([['Tour-5', 5], ['Oak walkthrough!', 2], ['Drone-0', 2]], Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->title, $video->views])->all());
+        $this->assertSame([['files', 1], ['links', 2], ['files', 3]], $this->holders([1, 2, 3]));
+    }
+
+    #[Test]
+    public function it_stores_the_value_a_retained_expression_takes_in_its_column_through_every_branched_write(): void
+    {
+        $inserted = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine', 'views' => DB::raw('1.5')])->id;
+        $outcomes = [];
+
+        foreach ([
+            fn () => Video::query()->findOrFail(1)->update(['views' => DB::raw('1.5')]),
+            fn () => Video::query()->findOrFail(2)->increment('views', 1, ['views' => DB::raw('1.5')]),
+            fn () => Video::query()->whereKey(3)->update(['views' => DB::raw('1.5')]),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (QueryException $exception) {
+                $outcomes[] = strstr($exception->getMessage(), '(Connection', true);
+            }
+        }
+
+        $this->assertSame(['stored', 'stored', 'stored'], $outcomes);
+        $this->assertSame([2, 2, 2, 2], Video::query()->whereIn('id', [1, 2, 3, $inserted])->orderBy('id')->pluck('views')->all());
+        $this->assertSame([['files', 1], ['links', 2], ['files', 3], ['links', $inserted]], $this->holders([1, 2, 3, $inserted]));
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_of_a_write_from_the_value_a_retained_literal_takes_in_its_column(): void
+    {
+        $video = $this->unviewedVideo();
+        $link = $video->newQuery()->create(['youtube_embed_url' => 'https://youtu.be/elm', 'title' => 'Elm'])->getKey();
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine', 'views' => '0'])->getKey(),
+            fn () => $video->newQuery()->toBase()->insertGetId(['youtube_embed_url' => 'https://youtu.be/fir', 'title' => 'Fir', 'views' => '0']),
+            fn () => $video->newQuery()->whereKey($link)->update(['views' => '0', 'title' => 'Elm walk']),
+            fn () => $video->newQuery()->findOrFail($link)->increment('views', 0, ['views' => '0', 'title' => 'Elm tour']),
+        ] as $write) {
+            try {
+                $outcomes[] = $write();
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertIsInt($outcomes[0]);
+        $this->assertIsInt($outcomes[1]);
+        $this->assertSame([1, 1], [$outcomes[2], $outcomes[3]]);
+        $this->assertSame([['links', $link], ['links', $outcomes[0]], ['links', $outcomes[1]]], $this->holders([$link, $outcomes[0], $outcomes[1]]));
+        $this->assertSame([[0, 'Elm tour'], [0, 'Pine'], [0, 'Fir']], Video::query()->whereIn('id', [$link, $outcomes[0], $outcomes[1]])->orderBy('id')->get()->map(fn (Video $video) => [$video->views, $video->title])->all());
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_of_an_increment_from_the_value_its_column_stores_after_the_amount(): void
+    {
+        $video = $this->viewedVideo();
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(2)->decrement('views', 0.6),
+            fn () => $video->newQuery()->findOrFail(2)->increment('views', -0.6, ['title' => 'Oak']),
+            fn () => $video->newQuery()->whereKey(2)->decrement('views', 0.6),
+            fn () => $video->newQuery()->whereKey(2)->toBase()->decrementEach(['views' => 0.6], ['title' => 'Oak']),
+        ] as $write) {
+            DB::table('videos_retained')->where('id', 2)->update(['views' => 2, 'title' => 'Oak walkthrough']);
+
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame([
+            $video::class.' cannot run an increment that moves record 2 to File through its compatibility map',
+            $video::class.' cannot run an increment that moves record 2 to File through its compatibility map',
+            $video::class.' cannot run a mass write that changes what servedFrom() chooses through its compatibility map',
+            $video::class.' cannot run a mass write that changes what servedFrom() chooses through its compatibility map',
+        ], $outcomes);
+        $this->assertSame([['links', 2]], $this->holders([2]));
+        $this->assertSame([2, 'Oak walkthrough'], [Video::query()->findOrFail(2)->views, Video::query()->findOrFail(2)->title]);
+        $video->newQuery()->findOrFail(2)->increment('views', 0.6);
+        $this->assertSame([[3, 'links']], [[Video::query()->findOrFail(2)->views, $this->holders([2])[0][0]]]);
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_of_an_increment_that_adds_to_a_successor_attribute_from_the_record_the_write_stores(): void
+    {
+        $video = $this->countedVideo();
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(1)->incrementEach(['size_kb' => 1, 'views' => -0.6]),
+            fn () => $video->newQuery()->whereKey(1)->incrementEach(['size_kb' => 1, 'views' => -0.6]),
+        ] as $write) {
+            DB::table('videos_retained')->where('id', 1)->update(['views' => 5]);
+
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame([
+            $video::class.' cannot run an increment that moves record 1 to Link through its compatibility map',
+            $video::class.' cannot run a mass write that changes what servedFrom() chooses through its compatibility map',
+        ], $outcomes);
+        $this->assertSame([['files', 1]], $this->holders([1]));
+        $this->assertSame([5, '2048.000'], [Video::query()->findOrFail(1)->views, Video::query()->findOrFail(1)->size_kb]);
+        $video->newQuery()->findOrFail(1)->incrementEach(['size_kb' => 1, 'views' => -0.4]);
+        $this->assertSame([[5, '2049.000', 'files']], [[Video::query()->findOrFail(1)->views, Video::query()->findOrFail(1)->size_kb, $this->holders([1])[0][0]]]);
+    }
+
+    private function countedVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('views') > 4 ? File::class : Link::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+    }
+
     private function unviewedVideo(): Model
     {
         return new class extends Model implements Compatible

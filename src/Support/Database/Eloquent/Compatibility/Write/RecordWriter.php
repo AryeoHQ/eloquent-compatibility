@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final readonly class RecordWriter
@@ -221,9 +222,7 @@ final readonly class RecordWriter
      */
     private function evaluateRetained(Model $legacy, null|int|string $key, array $values): array
     {
-        $retained = array_diff_key($values, $this->map->identifiers, $this->map->attributes);
-
-        return array_replace($values, $this->evaluate($legacy, $key, array_filter($retained, fn (mixed $value) => $value instanceof Expression)));
+        return array_replace($values, (new MassWriter($this->map, $this->connection))->typed(array_diff_key($values, $this->map->identifiers, $this->map->attributes), $key));
     }
 
     /**
@@ -277,23 +276,41 @@ final readonly class RecordWriter
         }
 
         $extra = $this->evaluateRetained($legacy, $key, $extra);
-        $after = array_replace($this->before($legacy, $key), $extra);
+        $added = array_diff_key($amounts, $extra);
+        $sums = [];
 
-        foreach (array_diff_key($amounts, $extra) as $name => $amount) {
-            $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
+        foreach (array_diff_key($added, $this->map->attributes) as $name => $amount) {
+            $sums[$name] = new RawExpression(SqlFragments::identifier($this->map->table).'.'.SqlFragments::identifier($name).' + '.($amount + 0));
         }
 
+        $exact = count($sums) === count($added);
+
+        if ($exact) {
+            $this->refuseIncrementMove($legacy, $key, $current, array_replace($this->before($legacy, $key), $extra, (new MassWriter($this->map, $this->connection))->typed($sums, $key)));
+        }
+
+        (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
+        $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
+        $moved = $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
+        $after = $exact ? null : $this->connection->table($this->map->table)->where($legacy->getKeyName(), $moved)->first();
+
+        if ($after !== null) {
+            $this->refuseIncrementMove($legacy, $key, $current, (array) $after);
+        }
+
+        return $incremented;
+    }
+
+    /**
+     * @param  array<string, mixed>  $after
+     */
+    private function refuseIncrementMove(Model $legacy, int|string $key, ResolvedMap $current, array $after): void
+    {
         $target = $this->map->branchFor(self::probe($legacy, $after));
 
         if ($target !== $current) {
             throw CompatibilityWriteRefused::unsupported($legacy::class, 'an increment that moves record '.$key.' to '.class_basename($target->primary->model), 'An increment adds to the values its record stores, and a move recreates the record through another successor model.');
         }
-
-        (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
-        $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
-        $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
-
-        return $incremented;
     }
 
     private function deleteBranch(Model $legacy): int
@@ -348,7 +365,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $values
      * @param  list<int|string>  $names
      */
-    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): void
+    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): int|string
     {
         $this->confirm($legacy, $branch, $key, $values, $this->identifiersWhere($branch, $branch->primary->key, self::keyOf($primary)));
         $moved = $this->rekey($legacy, null, $key, $values);
@@ -356,6 +373,8 @@ final readonly class RecordWriter
         if ($moved !== $key) {
             $this->readBack($legacy, $moved, $names);
         }
+
+        return $moved;
     }
 
     /**
