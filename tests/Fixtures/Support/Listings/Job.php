@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Carbon;
 
 /**
  * @property string $id
@@ -19,6 +20,9 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  * @property null|int $price_cents
  * @property LifecycleStatus $lifecycle_status
  * @property null|string $merged_into_job_id
+ * @property null|Carbon $created_at
+ * @property null|Carbon $updated_at
+ * @property null|Carbon $deleted_at
  */
 final class Job extends Model
 {

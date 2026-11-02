@@ -20,6 +20,8 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
+use WeakMap;
 
 /**
  * @template TModel of Model
@@ -39,12 +41,79 @@ final class LegacyBuilder extends Builder
     /** @var array<string, ColumnCatalog> */
     private static array $catalogs = [];
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $inserts = null;
+
     private int $negations = 0;
+
+    private null|Model $writeOf = null;
 
     public static function forgetViews(): void
     {
         self::$views = [];
         self::$catalogs = [];
+    }
+
+    public static function insertOf(Model $model): void
+    {
+        $inserts = self::$inserts ??= new WeakMap;
+        $inserts[$model] = true;
+    }
+
+    public function writeOf(Model $model): void
+    {
+        $this->writeOf = $model;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     */
+    public function insert(array $values): bool
+    {
+        $model = $this->ownInsert();
+
+        if ($model === null) {
+            return $this->toBase()->insert($values);
+        }
+
+        $this->writer()->insert($model, $values);
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  null|string  $sequence
+     */
+    public function insertGetId(array $values, $sequence = null): int|string
+    {
+        $model = $this->ownInsert();
+
+        return $model === null ? $this->toBase()->insertGetId($values, $sequence) : $this->writer()->insert($model, $values);
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    public function update(array $values): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::update($values) : $this->writer()->update($model, $values);
+    }
+
+    public function delete(): mixed
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::delete() : $this->writer()->delete($model);
+    }
+
+    public function forceDelete(): mixed
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::forceDelete() : $this->writer()->delete($model);
     }
 
     /**
@@ -551,6 +620,25 @@ final class LegacyBuilder extends Builder
     private function definition(string $attribute): Attribute
     {
         return $this->map()->attributes[$attribute];
+    }
+
+    private function ownInsert(): null|Model
+    {
+        $inserts = self::$inserts ??= new WeakMap;
+        $inserting = $inserts->offsetExists($this->model);
+        $inserts->offsetUnset($this->model);
+
+        return $inserting && $this->servesTheView() ? $this->model : null;
+    }
+
+    private function ownWrite(): null|Model
+    {
+        return $this->writeOf !== null && $this->servesTheView() ? $this->writeOf : null;
+    }
+
+    private function writer(): RecordWriter
+    {
+        return new RecordWriter($this->map(), $this->model->getConnection());
     }
 
     private function servesTheView(): bool

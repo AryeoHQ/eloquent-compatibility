@@ -1,0 +1,303 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Write;
+
+use Closure;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Date;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingStatus;
+use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\Place;
+use Tests\TestCase;
+
+#[CoversClass(RecordWriter::class)]
+final class RecordWriterTest extends TestCase
+{
+    /** @var list<string> */
+    protected $connectionsToTransact = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        ListingTables::create();
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(Listing::class);
+    }
+
+    protected function tearDown(): void
+    {
+        ListingTables::drop();
+
+        parent::tearDown();
+    }
+
+    #[Test]
+    public function it_rolls_back_every_table_when_a_successor_listener_vetoes_its_save(): void
+    {
+        $before = $this->snapshot();
+        Event::listen('eloquent.saving: '.Place::class, fn () => false);
+        $listing = Listing::query()->findOrFail(1);
+        $listing->fill(['title' => 'Oak Manor', 'street' => '2 Oak St', 'mls_number' => 'MLS-1B']);
+
+        $update = $this->refusal(fn () => $listing->save());
+        $insert = $this->refusal(fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'mls_number' => 'MLS-9']));
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Place refused its save. Why: The write stores its values through Place, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Place.', $update->getMessage());
+        $this->assertSame($update->getMessage(), $insert->getMessage());
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_keeps_a_legacy_only_fact_through_a_successor_write_and_a_successor_only_fact_through_a_legacy_write(): void
+    {
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $root = Place::query()->where('job_id', $job->id)->firstOrFail();
+        DB::table('places')->where('id', $root->id)->update(['created_at' => '2026-01-01 00:00:00+00']);
+        $wing = Place::query()->create(['job_id' => $job->id, 'parent_id' => $root->id, 'street' => '1 Oak St, wing']);
+        $wingBefore = DB::table('places')->where('id', $wing->id)->first();
+
+        $job->update(['name' => 'Oak Lodge']);
+        $listing = Listing::query()->findOrFail(1);
+        $listing->update(['street' => '2 Oak St']);
+
+        $this->assertSame(['Oak Lodge', 'MLS-1', true], [$listing->title, $listing->mls_number, $listing->featured]);
+        $this->assertSame(['MLS-1', true], [Listing::query()->findOrFail(1)->mls_number, Listing::query()->findOrFail(1)->featured]);
+        $this->assertSame(['2 Oak St', '2026-01-01 00:00:00'], [$root->refresh()->street, $root->created_at?->toDateTimeString()]);
+        $this->assertEquals($wingBefore, DB::table('places')->where('id', $wing->id)->first());
+    }
+
+    #[Test]
+    public function it_stores_the_value_a_successor_listener_sets(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+        $listing = Listing::query()->findOrFail(1);
+
+        $listing->update(['title' => 'Oak Manor']);
+
+        $this->assertSame('OAK MANOR', Job::query()->where('legacy_id', 1)->value('name'));
+        $this->assertSame('OAK MANOR', Listing::query()->findOrFail(1)->title);
+    }
+
+    #[Test]
+    public function it_gives_the_legacy_record_the_timestamps_its_primary_stored_on_a_soft_delete(): void
+    {
+        $this->freezeSecond();
+        $deleting = Date::now()->toDateTimeString();
+        Event::listen('eloquent.deleting: '.Job::class, function (): void {
+            $this->travel(1)->minutes();
+        });
+        $listing = Listing::query()->findOrFail(1);
+
+        $listing->delete();
+        $stored = Listing::withTrashed()->findOrFail(1);
+
+        $this->assertNotSame($deleting, $stored->deleted_at?->toDateTimeString());
+        $this->assertSame([$stored->deleted_at?->toDateTimeString(), $stored->updated_at?->toDateTimeString()], [$listing->deleted_at?->toDateTimeString(), $listing->updated_at?->toDateTimeString()]);
+        $this->assertFalse($listing->isDirty());
+    }
+
+    #[Test]
+    public function it_refuses_a_change_to_a_read_only_attribute(): void
+    {
+        $before = $this->snapshot();
+        $listing = Listing::query()->findOrFail(1);
+        $listing->fill(['title' => 'Oak Manor', 'company_id' => 'a7c3e5f1-2b4d-4e6f-8a0b-1c2d3e4f5a6b']);
+
+        $refusal = $this->refusal(fn () => $listing->save());
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 1 cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $refusal->getMessage());
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_refuses_a_write_of_an_attribute_that_runs_transitions(): void
+    {
+        $before = $this->snapshot();
+        $listing = Listing::query()->findOrFail(1);
+        $listing->fill(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]);
+
+        $update = $this->refusal(fn () => $listing->save());
+        $insert = $this->refusal(fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Active]));
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing::$status cannot take a write. Why: It is declared transitions(), so a write must run the successor\'s state transition, and this release runs no transition yet. Instead: Change the state through the successor model\'s own transition.', $update->getMessage());
+        $this->assertSame($update->getMessage(), $insert->getMessage());
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_refuses_a_write_its_guard_forbids(): void
+    {
+        $before = $this->snapshot();
+        $sold = Listing::query()->findOrFail(3);
+        $active = Listing::query()->findOrFail(1);
+
+        $refusal = $this->refusal(fn () => $sold->update(['price' => '120.00']));
+        $active->update(['price' => '1300.00']);
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 3 cannot take this write, because guard \'sold price frozen\' refuses it. Why: A sold listing keeps the price it sold for. Instead: Change the price before the sale.', $refusal->getMessage());
+        $this->assertSame($before['jobs'][2], $this->snapshot()['jobs'][2]);
+        $this->assertSame(130000, Job::query()->where('legacy_id', 1)->value('price_cents'));
+    }
+
+    #[Test]
+    public function it_refuses_a_write_of_an_external_attribute_and_a_value_its_conversions_cannot_store(): void
+    {
+        $before = $this->snapshot();
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: fn (Job $job, mixed $value) => $value))
+                        ->attribute('featured', fn (Attribute $attribute) => $attribute->fixed(false)));
+            }
+        };
+        $external = $listing->newQuery()->findOrFail(3);
+        $fixed = $listing->newQuery()->findOrFail(3);
+
+        $externalRefusal = $this->refusal(fn () => $external->update(['title' => 'Elm House', 'mls_number' => 'MLS-3B']));
+        $fixedRefusal = $this->refusal(fn () => $fixed->update(['title' => 'Elm House', 'featured' => true]));
+
+        $this->assertStringEndsWith('::$mls_number cannot take a write. Why: It is declared external(), so its value lives outside the database, and this release writes no external value yet. Instead: Write the value through the successor model.', $externalRefusal->getMessage());
+        $this->assertStringEndsWith('::$featured cannot take a write. Why: The attribute always reads false, so it cannot store true. Instead: Write a value its conversions can store, or write the stored column through the successor model.', $fixedRefusal->getMessage());
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_creates_a_dependent_only_when_one_of_its_values_is_set(): void
+    {
+        $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => null, 'city' => null, 'latitude' => null]);
+        $createdJob = Job::query()->where('legacy_id', $created->id)->firstOrFail();
+        $listing = Listing::withTrashed()->findOrFail(2);
+        $job = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $listing->update(['street' => '2 Pine St']);
+
+        $this->assertSame([0, 0], [DB::table('places')->where('job_id', $createdJob->id)->count(), DB::table('job_sites')->where('job_id', $createdJob->id)->count()]);
+        $this->assertSame([['2 Pine St', null, null]], DB::table('places')->where('job_id', $job->id)->get(['street', 'city', 'parent_id'])->map(fn (object $place) => array_values((array) $place))->all());
+        $this->assertSame(0, DB::table('job_sites')->where('job_id', $job->id)->count());
+        $this->assertSame('2 Pine St', Listing::withTrashed()->findOrFail(2)->street);
+    }
+
+    #[Test]
+    public function it_writes_to_a_dependent_a_successor_listener_created_rather_than_create_a_second(): void
+    {
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            $job->rootPlace()->create(['street' => 'To be confirmed']);
+        });
+
+        $listing = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'city' => 'Tacoma']);
+        $job = Job::query()->where('legacy_id', $listing->id)->firstOrFail();
+
+        $this->assertSame([['9 Birch St', 'Tacoma']], DB::table('places')->where('job_id', $job->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
+    }
+
+    #[Test]
+    public function it_saves_the_other_changes_of_a_write_that_soft_deletes_before_the_primary_deletes(): void
+    {
+        $saved = [];
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job) use (&$saved): void {
+            $saved[] = [$job->name, $job->deleted_at === null];
+        });
+        $listing = Listing::query()->findOrFail(1);
+
+        $listing->update(['title' => 'Oak Manor', 'deleted_at' => Date::now()]);
+        $job = Job::withTrashed()->where('legacy_id', 1)->firstOrFail();
+
+        $this->assertSame([['Oak Manor', true]], $saved);
+        $this->assertSame(['Oak Manor', true], [$job->name, $job->trashed()]);
+        $this->assertNull(Listing::query()->find(1));
+    }
+
+    #[Test]
+    public function it_writes_nothing_for_a_record_its_primary_no_longer_serves(): void
+    {
+        $listing = Listing::query()->findOrFail(1);
+        $merged = Job::query()->where('legacy_id', 3)->firstOrFail();
+        Job::query()->where('legacy_id', 1)->update(['merged_into_job_id' => $merged->id]);
+        $before = $this->snapshot();
+
+        $saved = $listing->update(['title' => 'Oak Manor', 'mls_number' => 'MLS-1B']);
+
+        $this->assertTrue($saved);
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_holds_each_successor_save_of_a_legacy_write_while_it_runs(): void
+    {
+        $held = [];
+        Event::listen('eloquent.saving: *', function (string $event, array $models) use (&$held): void {
+            foreach ($models as $model) {
+                $held[] = [class_basename($model), $model instanceof Model && Applying::holds($model)];
+            }
+        });
+        $listing = Listing::query()->findOrFail(1);
+
+        $listing->update(['title' => 'Oak Manor', 'street' => '2 Oak St']);
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Job', false]], $held);
+    }
+
+    /**
+     * @param  Closure(): mixed  $write
+     */
+    private function refusal(Closure $write): CompatibilityWriteRefused
+    {
+        try {
+            $write();
+        } catch (CompatibilityWriteRefused $refusal) {
+            return $refusal;
+        }
+
+        $this->fail('The write was not refused.');
+    }
+
+    /**
+     * @return array<string, list<array<string, mixed>>>
+     */
+    private function snapshot(): array
+    {
+        $tables = [];
+
+        foreach (['jobs' => 'legacy_id', 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'job_id'] as $table => $order) {
+            $tables[$table] = DB::table($table)->orderBy($order)->get()->map(fn (object $row) => (array) $row)->all();
+        }
+
+        return $tables;
+    }
+}

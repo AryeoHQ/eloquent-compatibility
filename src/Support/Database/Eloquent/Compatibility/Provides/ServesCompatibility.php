@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Provides;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
@@ -26,5 +27,30 @@ trait ServesCompatibility
         $builder = new LegacyBuilder($query);
 
         return $builder;
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     * @return Builder<static>
+     */
+    protected function setKeysForSaveQuery($query)
+    {
+        parent::setKeysForSaveQuery($query);
+
+        if ($query instanceof LegacyBuilder) {
+            $query->writeOf($this);
+        }
+
+        return $query;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function getAttributesForInsert()
+    {
+        LegacyBuilder::insertOf($this);
+
+        return parent::getAttributesForInsert();
     }
 }
