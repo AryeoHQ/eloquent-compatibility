@@ -36,7 +36,7 @@ final readonly class RecordWriter
                 $branch = $this->map->branchFor(self::probe($legacy, $values));
                 $writer->claim($values, $branch);
                 $key = $this->through($branch)->insert($legacy, $values);
-                $writer->claim(array_diff_key($this->allocated($legacy, $branch, $key), array_filter($values, fn (mixed $value) => $value !== null)), $branch);
+                $writer->claim($this->allocated($legacy, $branch, $key), $branch);
 
                 return $key;
             });
@@ -182,9 +182,11 @@ final readonly class RecordWriter
             return $updated;
         }
 
+        $this->through($target)->split($legacy, $values, $key);
         $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
         $moved = $this->rekey($legacy, $key, $values);
-        (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
+        $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
+        (new MassWriter($this->map, $this->connection))->claim($this->allocated($legacy, $target, $stored), $target);
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
 
         return 1;

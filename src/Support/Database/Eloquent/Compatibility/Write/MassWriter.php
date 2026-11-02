@@ -32,6 +32,8 @@ final readonly class MassWriter
 
     private const string REACHED = 'pg_temp.compatibility_reached';
 
+    private const string EVALUATED = 'pg_temp.compatibility_evaluated';
+
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     public static function refuseRaw(ResolvedMap $map, string $name, mixed $value): void
@@ -333,6 +335,9 @@ final readonly class MassWriter
         self::refuseIdentifierAmounts($this->map, $mappedAmounts);
 
         return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $amounts, $mapped, $retained, $mappedAmounts, $retainedAmounts): int {
+            $evaluated = $this->evaluateOnce($selected, $retained);
+            $values = array_replace($values, $evaluated);
+            $retained = array_replace($retained, $evaluated);
             $this->refuseMoves($selected, $values, $amounts);
             $identities = array_intersect_key(self::named($mapped), $this->map->identifiers);
 
@@ -353,8 +358,49 @@ final readonly class MassWriter
                 $this->connection->table($this->map->retainedTable)->whereIn((string) $this->map->retainedKey, $selected)->update([(string) $this->map->retainedKey => $identities[$key]]);
             }
 
+            if ($evaluated !== []) {
+                $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::EVALUATED));
+            }
+
             return $updated;
         });
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $retained
+     * @return array<array-key, Expression>
+     */
+    private function evaluateOnce(QueryBuilder $selected, array $retained): array
+    {
+        $expressions = array_filter($retained, fn (mixed $value) => $value instanceof Expression);
+
+        if ($expressions === []) {
+            return [];
+        }
+
+        $grammar = $this->connection->getQueryGrammar();
+        $evaluated = $grammar->wrapTable(self::EVALUATED);
+        $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($this->map));
+        $legacy = SqlFragments::identifier($this->map->table);
+        $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
+        $shape = [$retainedTable.'.'.SqlFragments::identifier((string) $this->map->retainedKey).' AS '.$grammar->wrap('key')];
+        $columns = [$grammar->wrap('key')];
+        $selects = [$legacyKey];
+        $reads = [];
+
+        foreach (array_keys($expressions) as $index => $name) {
+            $value = $expressions[$name];
+            $column = $grammar->wrap('value_'.$index);
+            $shape[] = $retainedTable.'.'.SqlFragments::identifier(Str::afterLast((string) $name, '.')).' AS '.$column;
+            $columns[] = $column;
+            $selects[] = '('.($value instanceof Expression ? (string) $value->getValue($grammar) : '').')';
+            $reads[$name] = new RawExpression('(SELECT evaluated.'.$column.' FROM '.$evaluated.' AS evaluated WHERE evaluated.'.$grammar->wrap('key').' = '.$legacyKey.')');
+        }
+
+        $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.' WITH NO DATA');
+        $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
+
+        return $reads;
     }
 
     /**
@@ -386,7 +432,7 @@ final readonly class MassWriter
             $selected = $this->connection->table(self::SELECTED)->select('key');
             $holding = [];
 
-            $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
+            $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT DISTINCT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
             $this->connection->table(self::SELECTED)
                 ->selectRaw('pg_advisory_xact_lock(hashtextextended(CAST(? AS text) || CAST(CAST('.$grammar->wrap('key').' AS '.$this->identityType($key).') AS text), 0))', [$this->identityLock($key)])
                 ->orderBy('key')
