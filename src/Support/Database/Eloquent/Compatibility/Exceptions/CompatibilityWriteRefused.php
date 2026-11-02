@@ -171,6 +171,17 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
+    public static function byForwardedMutation(string $model, string $attribute, Model $successor, string $because): self
+    {
+        $name = class_basename($successor);
+
+        return new self(
+            "A listener of a {$model} event that {$name} forwarded cannot change \${$attribute}",
+            $because,
+            "Write {$attribute} through ".class_basename($model).", or change {$name} or the model that stores {$attribute} directly.",
+        );
+    }
+
     /**
      * @param  list<string>  $attributes
      */

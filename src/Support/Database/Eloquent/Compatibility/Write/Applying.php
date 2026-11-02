@@ -40,4 +40,20 @@ final class Applying
     {
         return self::$writes !== null && self::$writes->offsetExists($successor);
     }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function writes(string $model, int|string $key): bool
+    {
+        foreach (self::$writes ?? [] as $legacy) {
+            $written = $legacy->getRawOriginal($legacy->getKeyName()) ?? $legacy->getKey();
+
+            if ($legacy::class === $model && (is_int($written) || is_string($written)) && (string) $written === (string) $key) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

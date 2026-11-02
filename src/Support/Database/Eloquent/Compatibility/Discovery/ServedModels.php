@@ -31,6 +31,11 @@ final class ServedModels
         return $this->models ??= $this->scans ? $this->scan() : $this->cached();
     }
 
+    public function available(): bool
+    {
+        return $this->scans || $this->files->isFile($this->cache);
+    }
+
     public function contains(string $model): bool
     {
         return in_array($model, $this->all(), true);
