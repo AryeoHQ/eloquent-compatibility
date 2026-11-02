@@ -14,6 +14,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -33,8 +34,8 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\TestCase;
 
 #[CoversClass(ExternalAttributes::class)]
-#[CoversClass(ServesCompatibility::class)]
 #[CoversClass(LegacyBuilder::class)]
+#[CoversTrait(ServesCompatibility::class)]
 final class ExternalAttributesTest extends TestCase
 {
     /** @var list<string> */
