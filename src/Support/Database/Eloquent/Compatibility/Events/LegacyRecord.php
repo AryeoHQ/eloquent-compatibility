@@ -18,6 +18,8 @@ use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
 final class LegacyRecord
 {
+    private const string WRITTEN = 'compatibility:written';
+
     /** @var array<array-key, Model> */
     private array $records = [];
 
@@ -27,6 +29,18 @@ final class LegacyRecord
     private null|string $computed = null;
 
     private bool $stored = false;
+
+    /** @var null|array<string, mixed> */
+    private null|array $storedFrom = null;
+
+    /** @var null|list<string> */
+    private null|array $reached = null;
+
+    /** @var array<string, mixed> */
+    private array $destinations = [];
+
+    /** @var array<array-key, bool> */
+    private array $serves = [];
 
     private bool $expressed = false;
 
@@ -79,24 +93,7 @@ final class LegacyRecord
             return $record;
         }
 
-        foreach ($record->stored($successor, false) as $key => $row) {
-            if (Applying::writes($map->model, $key, $successor->getConnection()->getName(), fn (Model $held) => self::identity($map, $held))) {
-                if ($dependent === null) {
-                    return null;
-                }
-
-                continue;
-            }
-
-            $legacy = (new $map->model)->setConnection($successor->getConnectionName())->newInstance([], true);
-            $legacy->setRawAttributes($row, true);
-            $record->records[$key] = $legacy;
-            $record->before[$key] = $row;
-        }
-
-        ExternalAttributes::gather(array_values($record->records), true);
-
-        return $record;
+        return $record->admit($successor) ? $record : null;
     }
 
     /**
@@ -107,7 +104,7 @@ final class LegacyRecord
         return $this->records;
     }
 
-    public function after(Model $successor): void
+    public function after(Model $successor, bool $written = false): void
     {
         $this->expressed = $this->dependent !== null && $this->expresses($successor);
         $values = $this->values($successor);
@@ -136,8 +133,16 @@ final class LegacyRecord
             return;
         }
 
+        if (! $written) {
+            $this->admit($successor);
+        }
+
         foreach (array_keys($this->records) as $key) {
-            $this->apply($key, $rows[$key] ?? array_fill_keys(array_keys($this->columns), null));
+            if (array_key_exists($key, $rows)) {
+                $this->apply($key, $rows[$key]);
+            } else {
+                unset($this->records[$key], $this->before[$key]);
+            }
         }
     }
 
@@ -167,11 +172,12 @@ final class LegacyRecord
 
     public function store(Model $successor): void
     {
-        if ($this->stored) {
+        if ($this->stored && $this->storedFrom === $successor->getAttributes()) {
             return;
         }
 
         $this->stored = true;
+        $this->storedFrom = $successor->getAttributes();
 
         if ($this->dependent === null && ! $successor->exists) {
             foreach ($this->records as $legacy) {
@@ -193,6 +199,8 @@ final class LegacyRecord
             $row = $this->dependent === null ? reset($rows) : $rows[$key] ?? false;
 
             if ($row === false) {
+                unset($this->records[$key], $this->before[$key]);
+
                 continue;
             }
 
@@ -206,15 +214,59 @@ final class LegacyRecord
 
             $this->reload($legacy);
 
-            if (! $legacy->wasRecentlyCreated) {
+            if ($this->dependent === null && $this->removes && method_exists($legacy, 'getDeletedAtColumn')) {
+                $legacy->syncOriginalAttributes(array_values(array_filter([(string) $legacy->getDeletedAtColumn(), $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null], is_string(...))));
+            } elseif (! $legacy->wasRecentlyCreated) {
                 $legacy->syncChanges();
             }
         }
     }
 
+    public function serves(int|string $key): bool
+    {
+        return $this->serves[$key] ?? false;
+    }
+
     public function reread(): void
     {
         $this->stored = false;
+    }
+
+    private function admit(Model $successor): bool
+    {
+        $filter = $this->filter($successor, false);
+        $reaches = array_map(fn (mixed $value) => (string) $value, $filter[1] ?? []);
+
+        if ($this->reached !== null && array_diff($reaches, $this->reached) === []) {
+            return true;
+        }
+
+        $this->reached = array_values(array_unique([...$this->reached ?? [], ...$reaches]));
+        $admitted = [];
+
+        foreach ($this->stored($successor, false) as $key => $row) {
+            if (array_key_exists($key, $this->before)) {
+                continue;
+            }
+
+            if (Applying::writes($this->map->model, $key, $successor->getConnection()->getName(), fn (Model $held) => self::identity($this->map, $held))) {
+                if ($this->dependent === null) {
+                    return false;
+                }
+
+                continue;
+            }
+
+            $legacy = (new $this->map->model)->setConnection($successor->getConnectionName())->newInstance([], true);
+            $legacy->setRawAttributes($row, true);
+            $this->records[$key] = $legacy;
+            $this->before[$key] = $row;
+            $admitted[] = $legacy;
+        }
+
+        ExternalAttributes::gather($admitted, true);
+
+        return true;
     }
 
     private static function identity(ResolvedMap $map, Model $held): null|int|string
@@ -293,9 +345,10 @@ final class LegacyRecord
         $key = SqlFragments::identifier($successor->getKeyName());
         $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
         $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
+        $written = $this->dependent === null ? '' : ', true AS '.SqlFragments::identifier(self::WRITTEN);
         [$row, $bindings] = $stored === null
-            ? ['SELECT (jsonb_populate_record(NULL::'.$table.', CAST(? AS jsonb))).*', [$json]]
-            : ['SELECT (jsonb_populate_record(stored, CAST(? AS jsonb))).* FROM '.$table.' AS stored WHERE stored.'.$key.' = ?', [$json, $stored]];
+            ? ['SELECT (jsonb_populate_record(NULL::'.$table.', CAST(? AS jsonb))).*'.$written, [$json]]
+            : ['SELECT (jsonb_populate_record(stored, CAST(? AS jsonb))).*'.$written.' FROM '.$table.' AS stored WHERE stored.'.$key.' = ?', [$json, $stored]];
         $filter = null;
 
         if ($this->dependent !== null) {
@@ -306,12 +359,12 @@ final class LegacyRecord
             }
 
             $hard = $this->removes && ! self::softDeletes($successor);
-            $others = 'SELECT * FROM '.$table.($stored === null ? '' : ' WHERE '.$table.'.'.$key.' <> ?');
+            $others = 'SELECT '.$table.'.*, false AS '.SqlFragments::identifier(self::WRITTEN).' FROM '.$table.($stored === null ? '' : ' WHERE '.$table.'.'.$key.' <> ?');
             $row = $hard ? $others : $others.' UNION ALL '.$row;
             $bindings = [...($stored === null ? [] : [$stored]), ...($hard ? [] : $bindings), ...$filter[1]];
         }
 
-        $select = [];
+        $select = $this->dependent === null ? [] : [SqlFragments::identifier($this->dependent->table).'.'.SqlFragments::identifier(self::WRITTEN).' AS '.SqlFragments::identifier(self::WRITTEN)];
 
         foreach ($this->columns as $name => $sql) {
             $select[] = $sql.' AS '.SqlFragments::identifier($name);
@@ -325,7 +378,18 @@ final class LegacyRecord
             false,
         );
 
-        return $this->dependent === null ? array_map(fn (object $row) => (array) $row, $rows) : $this->keyed($rows);
+        if ($this->dependent === null) {
+            return array_map(fn (object $row) => (array) $row, $rows);
+        }
+
+        $keyed = $this->keyed($rows);
+
+        foreach ($keyed as $legacyKey => $computed) {
+            $this->serves[$legacyKey] = ($computed[self::WRITTEN] ?? null) === true;
+            unset($keyed[$legacyKey][self::WRITTEN]);
+        }
+
+        return $keyed;
     }
 
     private function expresses(Model $successor): bool
@@ -380,6 +444,7 @@ final class LegacyRecord
         $old = $this->relationshipKey($successor, $related->relatedKey);
         $attributes = $successor->getAttributes();
         $new = array_key_exists($related->relatedKey, $attributes) ? $attributes[$related->relatedKey] : $old;
+        $new = $new instanceof Expression ? $this->destination($successor, $new) : $new;
         $values = array_values(array_unique(array_filter([$old, $new], fn (mixed $value) => $value !== null), SORT_REGULAR));
 
         if ($values === []) {
@@ -397,11 +462,27 @@ final class LegacyRecord
         return [$condition, $values];
     }
 
+    private function destination(Model $successor, Expression $expression): mixed
+    {
+        $connection = $successor->getConnection();
+        $sql = (string) $expression->getValue($connection->getQueryGrammar());
+
+        if (! array_key_exists($sql, $this->destinations)) {
+            $table = SqlFragments::identifier($successor->getTable());
+            $row = $successor->exists
+                ? $connection->selectOne('SELECT ('.$sql.') AS destination FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
+                : $connection->selectOne('SELECT ('.$sql.') AS destination', [], false);
+            $this->destinations[$sql] = is_object($row) ? $row->destination ?? null : null;
+        }
+
+        return $this->destinations[$sql];
+    }
+
     private function relationshipKey(Model $successor, string $column): mixed
     {
         $original = $successor->getRawOriginal();
 
-        if (array_key_exists($column, $original)) {
+        if (array_key_exists($column, $original) && ! $original[$column] instanceof Expression) {
             return $original[$column];
         }
 

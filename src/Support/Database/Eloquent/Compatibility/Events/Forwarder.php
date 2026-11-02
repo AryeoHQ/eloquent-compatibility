@@ -349,18 +349,18 @@ final class Forwarder
             return null;
         }
 
-        if ($ahead && ($this->dependent !== null || ! $record->removes)) {
-            $record->after($successor);
+        if ($this->dependent === null ? $ahead && ! $record->removes : $ahead || ! $record->removes) {
+            $record->after($successor, ! $ahead);
         }
 
         $events = ($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [];
         $batches = null;
 
         if ($this->dependent !== null) {
-            $joining = $ahead ? array_diff_key($record->changed(), $sequence->forwarding) : [];
+            $joining = array_diff_key($record->changed(), $sequence->forwarding);
             $batches = array_filter([
                 [$events, array_intersect_key($record->records(), $sequence->forwarding)],
-                [$event === $sequence->start ? $events : ['saving', ...$events], $joining],
+                [! $ahead || $event === $sequence->start ? $events : ['saving', ...$events], $joining],
             ], fn (array $batch) => $batch[1] !== []);
             $sequence->forwarding += array_fill_keys(array_keys($joining), true);
 
@@ -374,12 +374,14 @@ final class Forwarder
         }
 
         foreach ($batches ?? [[$events, $record->records()]] as [$legacyEvents, $legacies]) {
+            $legacies = array_intersect_key($legacies, $record->records());
+
             foreach ($legacyEvents as $legacyEvent) {
                 if (! $this->listens($legacyEvent)) {
                     continue;
                 }
 
-                foreach ($legacies as $legacy) {
+                foreach ($legacies as $key => $legacy) {
                     if ($this->dependent === null) {
                         self::forceDeleting($legacy, $successor);
                     }
@@ -392,7 +394,7 @@ final class Forwarder
                     }
 
                     if ($ahead) {
-                        $this->mapBack($legacy, $before, $successor, $event, $record->removes);
+                        $this->mapBack($legacy, $before, $successor, $event, $record->removes, $this->dependent === null || $record->serves($key));
                     }
                 }
             }
@@ -445,7 +447,7 @@ final class Forwarder
             return $record;
         }
 
-        if ($removes) {
+        if ($removes || $successor->exists) {
             foreach ($record->records() as $legacy) {
                 ExternalAttributes::resolveAll($legacy);
             }
@@ -462,15 +464,21 @@ final class Forwarder
             return true;
         }
 
-        return $successor->getAttributes()[$membership->column] === $membership->alias
-            && (! $successor->exists || $successor->getRawOriginal($membership->column) === $membership->alias);
+        $original = $successor->getRawOriginal();
+        $stored = array_key_exists($membership->column, $original) || ! $successor->exists
+            ? $original[$membership->column] ?? null
+            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($membership->column);
+
+        return $successor->getAttributes()[$membership->column] === $membership->alias && (! $successor->exists || $stored === $membership->alias);
     }
 
     /**
      * @param  array<string, mixed>  $before
      */
-    private function mapBack(Model $legacy, array $before, Model $successor, string $event, bool $removes): void
+    private function mapBack(Model $legacy, array $before, Model $successor, string $event, bool $removes, bool $serves): void
     {
+        $inserts = $this->dependent === null && ! $successor->exists;
+
         $baseline = $before + $legacy->getRawOriginal();
         $compared = $legacy->newInstance([], true);
         $compared->setRawAttributes($baseline, true);
@@ -487,9 +495,10 @@ final class Forwarder
                 array_key_exists($name, $this->served->identifiers) => 'It identifies the record, and a forwarded event cannot move it.',
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
+                ! $serves => 'The written '.class_basename($successor).' no longer serves this '.class_basename($legacy).', so the forwarded write cannot store it there.',
                 $attribute->runsTransitions() => 'It is declared transitions(), so only a write through '.class_basename($legacy).' can run the trigger that changes it.',
                 $attribute->isExternal() => $attribute->declinedBecause() ?? (in_array($event, self::STORED_BEFORE, true) ? null : 'It is declared external(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so the write closure reaches no save."),
-                ! $attribute->isWritable() => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
+                ! $attribute->isWritable() && ! ($inserts && $attribute->readOnlyBecause() !== null && $attribute->column() !== null) => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
 
@@ -586,28 +595,44 @@ final class Forwarder
             return $halt ? $dispatcher->until($event, $payload) : $dispatcher->dispatch($event, $payload);
         }
 
-        $raw = $this->raw($dispatcher, $name);
-        $responses = [];
+        $filtered = $this->filtered($dispatcher, $name);
 
-        foreach ($dispatcher->getListeners($name) as $index => $listener) {
-            if ($this->excluded($raw[$index] ?? null)) {
-                continue;
+        return $halt ? $filtered->until($event, $payload) : $filtered->dispatch($event, $payload);
+    }
+
+    private function filtered(Dispatcher $dispatcher, string $name): Dispatcher
+    {
+        $filtered = new class extends Dispatcher
+        {
+            /** @var null|Closure(string): array<int, mixed> */
+            public null|Closure $resolves = null;
+
+            /**
+             * @param  string  $eventName
+             * @return array<int, mixed>
+             */
+            public function getListeners($eventName)
+            {
+                return $this->resolves === null ? [] : ($this->resolves)($eventName);
+            }
+        };
+        $filtered->resolves = function (string $eventName) use ($dispatcher, $name): array {
+            $listeners = $dispatcher->getListeners($eventName);
+
+            if ($eventName !== $name) {
+                return $listeners;
             }
 
-            $response = $listener($name, is_object($event) ? [$event] : [$payload]);
+            $raw = $this->raw($dispatcher, $name);
 
-            if ($halt && $response !== null) {
-                return $response;
-            }
+            return array_values(array_filter($listeners, fn (int $index) => ! $this->excluded($raw[$index] ?? null), ARRAY_FILTER_USE_KEY));
+        };
+        Closure::bind(function () use ($dispatcher): void {
+            $this->container = $dispatcher->container;
+            $this->transactionManagerResolver = $dispatcher->transactionManagerResolver;
+        }, $filtered, Dispatcher::class)();
 
-            if ($response === false) {
-                break;
-            }
-
-            $responses[] = $response;
-        }
-
-        return $halt ? null : $responses;
+        return $filtered;
     }
 
     private function listens(string $event): bool

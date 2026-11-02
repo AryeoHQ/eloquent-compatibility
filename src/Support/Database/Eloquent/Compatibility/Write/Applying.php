@@ -74,10 +74,12 @@ final class Applying
                 continue;
             }
 
-            $written = $legacy->getRawOriginal($legacy->getKeyName()) ?? $legacy->getKey() ?? self::identity($legacy, $successor, $identify);
+            $written = array_filter([$legacy->getRawOriginal($legacy->getKeyName()), $legacy->getKey()], fn (mixed $written) => is_int($written) || is_string($written));
 
-            if ((is_int($written) || is_string($written)) && (string) $written === (string) $key) {
-                return true;
+            foreach ($written === [] ? [self::identity($legacy, $successor, $identify)] : $written as $held) {
+                if ($held !== null && (string) $held === (string) $key) {
+                    return true;
+                }
             }
         }
 
