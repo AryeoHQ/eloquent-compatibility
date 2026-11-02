@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyQueryBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 
 /**
@@ -27,6 +28,13 @@ trait ServesCompatibility
         $builder = new LegacyBuilder($query);
 
         return $builder;
+    }
+
+    protected function newBaseQueryBuilder(): LegacyQueryBuilder
+    {
+        $connection = $this->getConnection();
+
+        return new LegacyQueryBuilder($connection, $connection->getQueryGrammar(), $connection->getPostProcessor(), $this);
     }
 
     /**

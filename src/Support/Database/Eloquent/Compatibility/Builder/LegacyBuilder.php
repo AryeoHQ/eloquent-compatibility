@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -58,6 +59,31 @@ final class LegacyBuilder extends Builder
     {
         $inserts = self::$inserts ??= new WeakMap;
         $inserts[$model] = true;
+    }
+
+    public static function takeInsertOf(Model $model): bool
+    {
+        $inserts = self::$inserts ??= new WeakMap;
+        $inserting = $inserts->offsetExists($model);
+        $inserts->offsetUnset($model);
+
+        return $inserting;
+    }
+
+    public static function serves(Model $model): bool
+    {
+        $connection = $model->getConnection();
+        $relation = $connection->getName().'.'.$model->getTable();
+
+        return self::$views[$relation] ??= $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())]) === 'v';
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function mapOf(string $model): ResolvedMap
+    {
+        return self::$maps[$model] ??= Compatibility::of($model)->resolve();
     }
 
     public function writeOf(Model $model): void
@@ -114,6 +140,52 @@ final class LegacyBuilder extends Builder
         $model = $this->ownWrite();
 
         return $model === null ? parent::forceDelete() : $this->writer()->delete($model);
+    }
+
+    /**
+     * @param  Expression|string  $column
+     * @param  float|int  $amount
+     * @param  array<string, mixed>  $extra
+     */
+    public function increment($column, $amount = 1, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null || ! is_string($column) ? parent::increment($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount], $extra);
+    }
+
+    /**
+     * @param  Expression|string  $column
+     * @param  float|int  $amount
+     * @param  array<string, mixed>  $extra
+     */
+    public function decrement($column, $amount = 1, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null || ! is_string($column) ? parent::decrement($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount * -1], $extra);
+    }
+
+    /**
+     * @param  array<string, float|int|numeric-string>  $columns
+     * @param  array<string, mixed>  $extra
+     */
+    public function incrementEach(array $columns, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::incrementEach($columns, $extra) : $this->incrementOwn($model, $columns, $extra);
+    }
+
+    /**
+     * @param  array<string, float|int|numeric-string>  $columns
+     * @param  array<string, mixed>  $extra
+     */
+    public function decrementEach(array $columns, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::decrementEach($columns, $extra) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
     }
 
     /**
@@ -624,11 +696,22 @@ final class LegacyBuilder extends Builder
 
     private function ownInsert(): null|Model
     {
-        $inserts = self::$inserts ??= new WeakMap;
-        $inserting = $inserts->offsetExists($this->model);
-        $inserts->offsetUnset($this->model);
+        return self::takeInsertOf($this->model) && $this->servesTheView() ? $this->model : null;
+    }
 
-        return $inserting && $this->servesTheView() ? $this->model : null;
+    /**
+     * @param  array<string, float|int|numeric-string>  $amounts
+     * @param  array<string, mixed>  $extra
+     */
+    private function incrementOwn(Model $model, array $amounts, array $extra): int
+    {
+        $values = [];
+
+        foreach ($this->addUpdatedAtColumn($extra) as $name => $value) {
+            $values[Str::afterLast((string) $name, '.')] = $value;
+        }
+
+        return $this->writer()->increment($model, $amounts, $values);
     }
 
     private function ownWrite(): null|Model
@@ -643,15 +726,12 @@ final class LegacyBuilder extends Builder
 
     private function servesTheView(): bool
     {
-        $connection = $this->model->getConnection();
-        $relation = $connection->getName().'.'.$this->model->getTable();
-
-        return self::$views[$relation] ??= $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($this->model->getTable())]) === 'v';
+        return self::serves($this->model);
     }
 
     private function map(): ResolvedMap
     {
-        return self::$maps[$this->model::class] ??= Compatibility::of($this->model::class)->resolve();
+        return self::mapOf($this->model::class);
     }
 
     private function refuse(string $attribute, string $operation, string $because): CompatibilityQueryRefused

@@ -14,10 +14,10 @@ final class CompatibilityWriteRefused extends CompatibilityException
         parent::__construct("{$refused}. Why: {$because} Instead: {$instead}");
     }
 
-    public static function readOnly(string $model, string $attribute, int|string $key, string $because): self
+    public static function readOnly(string $model, string $attribute, null|int|string $key, string $because): self
     {
         return new self(
-            "{$model} record {$key} cannot change \${$attribute}",
+            ($key === null ? "{$model} records" : "{$model} record {$key}")." cannot change \${$attribute}",
             $because,
             "Leave {$attribute} unchanged in writes through ".class_basename($model).'.',
         );
@@ -47,6 +47,15 @@ final class CompatibilityWriteRefused extends CompatibilityException
             "{$model}::\${$attribute} cannot take a write",
             $because,
             'Write a value its conversions can store, or write the stored column through the successor model.',
+        );
+    }
+
+    public static function unsupported(string $model, string $operation, string $because): self
+    {
+        return new self(
+            "{$model} cannot run {$operation} through its compatibility map",
+            $because,
+            'Write each record through '.class_basename($model).', or write the successor models directly.',
         );
     }
 

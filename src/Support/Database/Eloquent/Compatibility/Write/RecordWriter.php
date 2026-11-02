@@ -65,6 +65,45 @@ final readonly class RecordWriter
         });
     }
 
+    /**
+     * @param  array<string, float|int|numeric-string>  $amounts
+     * @param  array<string, mixed>  $extra
+     */
+    public function increment(Model $legacy, array $amounts, array $extra): int
+    {
+        return $this->connection->transaction(function () use ($legacy, $amounts, $extra): int {
+            $key = self::keyOf($legacy);
+            $primary = $this->lock($legacy, $key);
+
+            if ($primary === null) {
+                return 0;
+            }
+
+            [$stored, $retained] = $this->split($legacy, $extra, $key);
+            [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
+            $this->guard($legacy, $key);
+            [$models, $existing, $missing] = $this->locate($primary, $stored + array_fill_keys(array_keys($added), []));
+
+            foreach ($added as $table => $columns) {
+                foreach ($columns as $column => $amount) {
+                    $current = ($models[$table] ?? null)?->getAttributes()[$column] ?? null;
+
+                    if (is_numeric($current) && ! array_key_exists($column, $stored[$table] ?? [])) {
+                        $this->assign($models[$table], [$column => $current + $amount]);
+                    }
+                }
+            }
+
+            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], array_keys($extra));
+            $this->saveEach($legacy, $existing);
+            $this->create($legacy, $models, $missing, $stored);
+            (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
+            (new RetainedRows($this->map, $this->connection))->upsertAll([self::keyOf($primary)], [], array_diff_key($retainedAmounts, $retained));
+
+            return 1;
+        });
+    }
+
     public function delete(Model $legacy): int
     {
         return $this->connection->transaction(function () use ($legacy): int {
