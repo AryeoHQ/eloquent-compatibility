@@ -28,9 +28,15 @@ final class LegacyRecord
 
     private bool $stored = false;
 
+    private bool $expressed = false;
+
+    /** @var array<string, mixed> */
+    private array $keys = [];
+
     /**
      * @param  array<string, string>  $columns
      * @param  list<string>  $json
+     * @param  list<string>  $reads
      */
     private function __construct(
         private readonly ResolvedMap $map,
@@ -38,11 +44,12 @@ final class LegacyRecord
         private readonly null|Related $dependent,
         private readonly array $columns,
         private readonly array $json,
+        private readonly array $reads,
         public readonly bool $removes,
     ) {}
 
     /**
-     * @return array{array<string, string>, list<string>}
+     * @return array{array<string, string>, list<string>, list<string>}
      */
     public static function compile(ResolvedMap $map, ResolvedMap $served, Model $successor): array
     {
@@ -50,17 +57,23 @@ final class LegacyRecord
         $catalog = new ColumnCatalog($connection);
         $columns = (new ViewCompiler($catalog, $connection))->served($served, $catalog->of($map->table), $map->externals());
         $json = array_filter($catalog->of($successor->getTable()), fn (Column $column) => in_array($column->baseType ?? $column->type, ['json', 'jsonb'], true));
+        $reads = $connection->select(
+            "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(quote_ident(current_schema()) || '.' || ?) and depend.refobjid = to_regclass(quote_ident(current_schema()) || '.' || ?)",
+            [SqlFragments::identifier($map->table), SqlFragments::identifier($successor->getTable())],
+            false,
+        );
 
-        return [$columns, array_map(strval(...), array_keys($json))];
+        return [$columns, array_map(strval(...), array_keys($json)), array_map(fn (object $read) => (string) $read->name, $reads)];
     }
 
     /**
      * @param  array<string, string>  $columns
      * @param  list<string>  $json
+     * @param  list<string>  $reads
      */
-    public static function read(ResolvedMap $map, ResolvedMap $served, null|Related $dependent, array $columns, array $json, Model $successor, bool $removes): null|self
+    public static function read(ResolvedMap $map, ResolvedMap $served, null|Related $dependent, array $columns, array $json, array $reads, Model $successor, bool $removes): null|self
     {
-        $record = new self($map, $served, $dependent, $columns, $json, $removes);
+        $record = new self($map, $served, $dependent, $columns, $json, $reads, $removes);
 
         if ($dependent === null && ! $successor->exists) {
             return $record;
@@ -96,6 +109,7 @@ final class LegacyRecord
 
     public function after(Model $successor): void
     {
+        $this->expressed = $this->dependent !== null && $this->expresses($successor);
         $values = $this->values($successor);
         $computed = serialize(array_diff_key($values, [$successor->getKeyName() => true]));
 
@@ -132,6 +146,10 @@ final class LegacyRecord
      */
     public function changed(): array
     {
+        if ($this->expressed) {
+            return $this->records;
+        }
+
         $changed = [];
 
         foreach ($this->records as $key => $legacy) {
@@ -184,8 +202,6 @@ final class LegacyRecord
                 $legacy->exists = true;
                 $legacy->wasRecentlyCreated = true;
                 ExternalAttributes::gather([$legacy], true);
-
-                continue;
             }
 
             $this->reload($legacy);
@@ -240,7 +256,8 @@ final class LegacyRecord
      */
     private function apply(int|string $key, array $row): void
     {
-        $this->records[$key]->setRawAttributes(array_replace($this->before[$key] ?? [], $row));
+        $legacy = $this->records[$key];
+        $legacy->setRawAttributes(array_replace($this->before[$key] ?? [], array_intersect_key($legacy->getAttributes(), array_flip($this->map->externals())), $row));
     }
 
     /**
@@ -275,7 +292,7 @@ final class LegacyRecord
         $table = SqlFragments::identifier($successor->getTable());
         $key = SqlFragments::identifier($successor->getKeyName());
         $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
-        $json = json_encode((object) $values, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+        $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
         [$row, $bindings] = $stored === null
             ? ['SELECT (jsonb_populate_record(NULL::'.$table.', CAST(? AS jsonb))).*', [$json]]
             : ['SELECT (jsonb_populate_record(stored, CAST(? AS jsonb))).* FROM '.$table.' AS stored WHERE stored.'.$key.' = ?', [$json, $stored]];
@@ -311,8 +328,19 @@ final class LegacyRecord
         return $this->dependent === null ? array_map(fn (object $row) => (array) $row, $rows) : $this->keyed($rows);
     }
 
+    private function expresses(Model $successor): bool
+    {
+        foreach ($successor->exists ? $successor->getDirty() : $successor->getAttributes() as $column => $value) {
+            if ($value instanceof Expression && in_array($column, $this->reads, true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
-     * @return array<string, mixed>
+     * @return array<string, string>
      */
     private function values(Model $successor): array
     {
@@ -329,7 +357,7 @@ final class LegacyRecord
                 continue;
             }
 
-            $prepared[$column] = is_string($value) && in_array($column, $this->json, true) && json_validate($value) ? json_decode($value) : $value;
+            $prepared[(string) $column] = is_string($value) && in_array($column, $this->json, true) && json_validate($value) ? $value : json_encode($value, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
         }
 
         return $prepared;
@@ -349,7 +377,10 @@ final class LegacyRecord
         }
 
         $related = $this->dependent;
-        $values = array_values(array_unique(array_filter([$successor->getRawOriginal($related->relatedKey), $successor->getAttributes()[$related->relatedKey] ?? null], fn (mixed $value) => $value !== null), SORT_REGULAR));
+        $old = $this->relationshipKey($successor, $related->relatedKey);
+        $attributes = $successor->getAttributes();
+        $new = array_key_exists($related->relatedKey, $attributes) ? $attributes[$related->relatedKey] : $old;
+        $values = array_values(array_unique(array_filter([$old, $new], fn (mixed $value) => $value !== null), SORT_REGULAR));
 
         if ($values === []) {
             return null;
@@ -364,6 +395,21 @@ final class LegacyRecord
         }
 
         return [$condition, $values];
+    }
+
+    private function relationshipKey(Model $successor, string $column): mixed
+    {
+        $original = $successor->getRawOriginal();
+
+        if (array_key_exists($column, $original)) {
+            return $original[$column];
+        }
+
+        if (! array_key_exists($column, $this->keys)) {
+            $this->keys[$column] = $successor->exists ? $successor->newModelQuery()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column) : null;
+        }
+
+        return $this->keys[$column];
     }
 
     private function relatedTo(string $table): Related

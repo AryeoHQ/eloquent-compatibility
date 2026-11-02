@@ -80,10 +80,10 @@ final class Forwarder
     /** @var WeakMap<Model, list<Sequence>> */
     private WeakMap $sequences;
 
-    /** @var WeakMap<Model, string> */
+    /** @var WeakMap<Model, array<int, string>> */
     private WeakMap $fired;
 
-    /** @var array<int, array{array<string, string>, list<string>}> */
+    /** @var array<int, array{array<string, string>, list<string>, list<string>}> */
     private array $compiled = [];
 
     /** @var null|array<string, class-string> */
@@ -172,11 +172,7 @@ final class Forwarder
 
     public function forward(string $event, Model $successor, bool $object = false): null|false
     {
-        if ($object) {
-            $this->fired[$successor] = $event;
-        } elseif (($this->fired[$successor] ?? null) === $event) {
-            $this->fired->offsetUnset($successor);
-
+        if ($this->forwarded($event, $successor, $object)) {
             return null;
         }
 
@@ -222,6 +218,55 @@ final class Forwarder
         }
 
         return $result;
+    }
+
+    private function forwarded(string $event, Model $successor, bool $object): bool
+    {
+        $marks = $this->fired[$successor] ?? [];
+
+        if (! $object && $marks === []) {
+            return false;
+        }
+
+        $frames = debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT);
+        $count = count($frames);
+        $marks = array_filter($marks, fn (string $marked, int $depth) => self::fires($frames[$count - $depth] ?? null, $successor, $marked), ARRAY_FILTER_USE_BOTH);
+        $depth = null;
+
+        foreach ($frames as $index => $frame) {
+            if (self::fires($frame, $successor)) {
+                $depth = $count - $index;
+
+                break;
+            }
+        }
+
+        $forwarded = ! $object && $depth !== null && ($marks[$depth] ?? null) === $event;
+
+        if ($forwarded) {
+            unset($marks[$depth]);
+        } elseif ($object && $depth !== null) {
+            $marks[$depth] = $event;
+        }
+
+        if ($marks !== []) {
+            $this->fired[$successor] = $marks;
+        } elseif ($this->fired->offsetExists($successor)) {
+            $this->fired->offsetUnset($successor);
+        }
+
+        return $forwarded;
+    }
+
+    /**
+     * @param  null|array{function: string, object?: object, args?: array<array-key, mixed>}  $frame
+     */
+    private static function fires(null|array $frame, Model $successor, null|string $event = null): bool
+    {
+        return $frame !== null
+            && $frame['function'] === 'fireModelEvent'
+            && ($frame['object'] ?? null) === $successor
+            && ($event === null || ($frame['args'][0] ?? null) === $event);
     }
 
     /**
@@ -387,8 +432,8 @@ final class Forwarder
             return null;
         }
 
-        [$columns, $json] = $this->compiled[$view] ??= LegacyRecord::compile($this->map, $this->served, $successor);
-        $record = LegacyRecord::read($this->map, $this->served, $this->dependent, $columns, $json, $successor, $removes);
+        [$columns, $json, $reads] = $this->compiled[$view] ??= LegacyRecord::compile($this->map, $this->served, $successor);
+        $record = LegacyRecord::read($this->map, $this->served, $this->dependent, $columns, $json, $reads, $successor, $removes);
 
         if ($record === null) {
             return null;
