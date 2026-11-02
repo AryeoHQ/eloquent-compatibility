@@ -170,7 +170,7 @@ final class BranchConcurrencyTest extends TestCase
 
     private function start(string $concurrent): string
     {
-        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['DB_DATABASE' => DB::connection()->getDatabaseName()] + getenv());
 
         if ($process === false) {
             $this->fail('The concurrent writer did not start.');
