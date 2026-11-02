@@ -17,9 +17,12 @@ final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
-    public function create(ResolvedMap $map): string
+    /**
+     * @param  list<string>  $omitted
+     */
+    public function create(ResolvedMap $map, array $omitted = []): string
     {
-        $legacy = $this->columnCatalog->of($map->table);
+        $legacy = array_diff_key($this->columnCatalog->of($map->table), array_flip($omitted));
 
         return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
     }

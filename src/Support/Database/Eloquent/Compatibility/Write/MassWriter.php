@@ -399,6 +399,8 @@ final readonly class MassWriter
 
         $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.' WITH NO DATA');
         $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
+        $this->connection->statement('ALTER TABLE '.$evaluated.' ADD PRIMARY KEY ('.$grammar->wrap('key').')');
+        $this->connection->statement('ANALYZE '.$evaluated);
 
         return $reads;
     }

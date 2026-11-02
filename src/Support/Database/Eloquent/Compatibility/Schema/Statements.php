@@ -34,7 +34,8 @@ final readonly class Statements
     {
         self::refuseBranches($map, 'install');
         $columnCatalog = new ColumnCatalog($connection);
-        $view = (new ViewCompiler($columnCatalog, $connection))->create($map);
+        $owned = self::ownedConstants($connection, $map);
+        $view = (new ViewCompiler($columnCatalog, $connection))->create($map, $owned);
 
         if (self::kind($connection, $map->table) !== 'r') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a plain table, so install() cannot serve it through a view; recompile() replaces an installed view");
@@ -49,7 +50,7 @@ final readonly class Statements
         $retainedKey = (string) $map->retainedKey;
         $primary = SqlFragments::identifier($map->primary->table);
         $primaryKey = SqlFragments::identifier($map->primary->key);
-        $legacy = $columnCatalog->of($map->table);
+        $legacy = array_diff_key($columnCatalog->of($map->table), array_flip($owned));
         $key = (new $map->model)->getKeyName();
 
         foreach ($map->attributes as $name => $attribute) {
@@ -166,6 +167,7 @@ final readonly class Statements
             self::refuseSharedAlias($connection, $map, $map->membership);
         }
 
+        self::refuseChangedMembership($connection, $map);
         $view = (new ViewCompiler(new ColumnCatalog($connection), $connection))->replace($map);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $identifiers = array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers));
@@ -222,6 +224,7 @@ final readonly class Statements
         $membership = $map->membership;
         $statements = [
             "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            ...($membership === null ? [] : [self::refuseReclassified($map, $membership, $key)]),
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
             "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE "
@@ -362,7 +365,75 @@ final readonly class Statements
 
     private static function refuseSharedAlias(ConnectionInterface $connection, ResolvedMap $map, Membership $membership): void
     {
-        $claim = ['table' => $membership->table, 'column' => $membership->column, 'alias' => $membership->alias];
+        $claim = self::claim($membership);
+
+        foreach (self::installed($connection) as $name => $captured) {
+            if ($name !== ViewCompiler::retainedTable($map) && ($captured['membership'] ?? null) === $claim) {
+                throw InvalidCompatibilityMap::because($map->table, "the installed map retained in {$name} already serves the {$membership->table} rows whose {$membership->column} is '{$membership->alias}', and two installed maps cannot share a morph alias");
+            }
+        }
+    }
+
+    private static function refuseChangedMembership(ConnectionInterface $connection, ResolvedMap $map): void
+    {
+        $retainedTable = ViewCompiler::retainedTable($map);
+        $captured = self::installed($connection)[$retainedTable] ?? null;
+        $recorded = is_array($captured['membership'] ?? null) ? $captured['membership'] : null;
+        $claim = $map->membership === null ? null : self::claim($map->membership);
+
+        if ($captured === null || $recorded === $claim) {
+            return;
+        }
+
+        $describe = fn (null|array $membership): string => $membership === null ? 'every row of its successor' : 'the '.$membership['table'].' rows whose '.$membership['column']." is '".$membership['alias']."'";
+
+        throw InvalidCompatibilityMap::because($map->table, 'install() recorded that it serves '.$describe($recorded).', and the map now serves '.$describe($claim)."; recompile() cannot move the generated columns of repointed foreign keys or the record in {$retainedTable}, so uninstall() and install() the map to change it");
+    }
+
+    private static function refuseReclassified(ResolvedMap $map, Membership $membership, string $key): string
+    {
+        $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
+        $primary = SqlFragments::identifier($map->primary->table);
+        $legacyColumn = (string) $map->identifiers[$key]->column();
+        $legacyKey = "{$primary}.".SqlFragments::identifier($legacyColumn);
+        $reclassified = "FROM {$retainedTable} JOIN {$primary} ON {$primary}.".SqlFragments::identifier($map->primary->key)." = {$retainedTable}.".SqlFragments::identifier((string) $map->retainedKey)
+            ." WHERE {$primary}.".SqlFragments::identifier($membership->column).' IS DISTINCT FROM '.SqlFragments::literal($membership->alias);
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot uninstall: ")
+            .' || reclassified || '.SqlFragments::literal(' '.ViewCompiler::retainedTable($map)." rows belong to {$map->primary->table} rows whose {$membership->column} is no longer '{$membership->alias}'; the first are {$legacyColumn} ")
+            .' || first_keys || '.SqlFragments::literal(". Restore their {$membership->column}, or delete their ".ViewCompiler::retainedTable($map).' rows, before uninstall().');
+
+        return "DO \$compatibility\$\nDECLARE\n  reclassified bigint;\n  first_keys text;\nBEGIN\n"
+            ."  SELECT count(*) INTO reclassified {$reclassified};\n"
+            ."  IF reclassified > 0 THEN\n"
+            ."    SELECT string_agg(CAST(reclassified_key AS text), ', ' ORDER BY reclassified_key) INTO first_keys FROM (SELECT {$legacyKey} {$reclassified} ORDER BY {$legacyKey} LIMIT 5) AS first_reclassified (reclassified_key);\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\nEND\n\$compatibility\$";
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function ownedConstants(ConnectionInterface $connection, ResolvedMap $map): array
+    {
+        $owned = [];
+
+        foreach (self::installed($connection) as $captured) {
+            foreach (self::pairs($captured['constants'] ?? null) as [$table, $constant]) {
+                if ($table === SqlFragments::identifier($map->table)) {
+                    $owned[] = $constant;
+                }
+            }
+        }
+
+        return array_values(array_unique($owned));
+    }
+
+    /**
+     * @return array<string, array<array-key, mixed>>
+     */
+    private static function installed(ConnectionInterface $connection): array
+    {
+        $installed = [];
 
         foreach ($connection->select(
             "select relation.relname as name, obj_description(relation.oid, 'pg_class') as comment
@@ -374,10 +445,20 @@ final readonly class Statements
         ) as $row) {
             $captured = json_decode((string) $row->comment, true);
 
-            if ((string) $row->name !== ViewCompiler::retainedTable($map) && is_array($captured) && ($captured['membership'] ?? null) === $claim) {
-                throw InvalidCompatibilityMap::because($map->table, "the installed map retained in {$row->name} already serves the {$membership->table} rows whose {$membership->column} is '{$membership->alias}', and two installed maps cannot share a morph alias");
+            if (is_array($captured)) {
+                $installed[(string) $row->name] = $captured;
             }
         }
+
+        return $installed;
+    }
+
+    /**
+     * @return array{table: string, column: string, alias: string}
+     */
+    private static function claim(Membership $membership): array
+    {
+        return ['table' => $membership->table, 'column' => $membership->column, 'alias' => $membership->alias];
     }
 
     /**
@@ -469,7 +550,7 @@ final readonly class Statements
             'moved' => $moved,
             ...($map->membership === null ? [] : [
                 'constants' => $constants,
-                'membership' => ['table' => $map->membership->table, 'column' => $map->membership->column, 'alias' => $map->membership->alias],
+                'membership' => self::claim($map->membership),
             ]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }

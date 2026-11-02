@@ -833,6 +833,106 @@ final class InstallerTest extends TestCase
         $this->assertSame('r', $this->kind('photos'));
     }
 
+    #[Test]
+    public function it_refuses_to_uninstall_while_a_retained_row_belongs_to_a_successor_row_another_morph_alias_now_claims(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        $pine = Photo::query()->create(['file_name' => 'pine.jpg', 'mime_type' => 'image/jpeg', 'caption' => 'Pine']);
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', $pine->id)->update(['legacy_type' => 'legacy_file']);
+
+        try {
+            Compatibility::uninstall(Photo::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'photos' cannot uninstall: 1 photos_retained rows belong to files rows whose legacy_type is no longer 'photo'; the first are legacy_id {$pine->id}. Restore their legacy_type, or delete their photos_retained rows, before uninstall().", $refusal);
+        $this->assertSame('v', $this->kind('photos'));
+
+        DB::table('files')->where('legacy_type', 'legacy_file')->where('legacy_id', $pine->id)->update(['legacy_type' => 'photo']);
+        Compatibility::uninstall(Photo::class);
+
+        $this->assertSame([[1, 'Front'], [2, null], [3, 'Elm'], [$pine->id, 'Pine']], array_map(fn (object $row) => [(int) $row->id, $row->caption], DB::select('select id, caption from photos order by id')));
+    }
+
+    #[Test]
+    public function it_installs_and_uninstalls_two_maps_whose_legacy_tables_reference_each_other_in_either_order(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table floorplans add column photo_id integer references photos (id)');
+        DB::statement('alter table photos add column floorplan_id integer references floorplans (id)');
+        DB::update('update floorplans set photo_id = 1 where id = 1');
+        DB::update('update photos set floorplan_id = 1 where id = 2');
+        $foreignKeys = fn () => array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where contype = 'f' and conrelid in (to_regclass('photos'), to_regclass('photos_retained'), to_regclass('floorplans'), to_regclass('floorplans_retained')) order by conname"), 'definition', 'conname');
+        $before = [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id'), $foreignKeys()];
+
+        foreach ([[Photo::class, FloorPlan::class], [FloorPlan::class, Photo::class]] as $order) {
+            foreach ($order as $model) {
+                Compatibility::install($model);
+            }
+
+            $served = [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id')];
+            $codes = [];
+
+            foreach ([
+                fn () => FloorPlan::query()->findOrFail(2)->update(['photo_id' => 999]),
+                fn () => Photo::query()->findOrFail(3)->update(['floorplan_id' => 999]),
+            ] as $write) {
+                try {
+                    $write();
+                    $codes[] = 'stored';
+                } catch (QueryException $exception) {
+                    $codes[] = $exception->getCode();
+                }
+            }
+
+            foreach (array_reverse($order) as $model) {
+                Compatibility::uninstall($model);
+            }
+
+            $this->assertEquals([$before[0], $before[1]], $served);
+            $this->assertSame(['23503', '23503'], $codes);
+            $this->assertEquals($before, [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id'), $foreignKeys()]);
+        }
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_an_installed_map_onto_a_morph_alias_install_did_not_record(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        $view = DB::scalar("select pg_get_viewdef('photos'::regclass)");
+        $renamed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'image';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return Photo::compatibility($photo);
+            }
+        };
+
+        try {
+            Compatibility::recompile($renamed::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(InvalidCompatibilityMap::because('photos', "install() recorded that it serves the files rows whose legacy_type is 'photo', and the map now serves the files rows whose legacy_type is 'image'; recompile() cannot move the generated columns of repointed foreign keys or the record in photos_retained, so uninstall() and install() the map to change it")->getMessage(), $refusal);
+        $this->assertSame($view, DB::scalar("select pg_get_viewdef('photos'::regclass)"));
+        $this->assertSame([1, 2, 3], Photo::query()->orderBy('id')->pluck('id')->all());
+    }
+
     private function prepareFiles(): void
     {
         FileTables::create();

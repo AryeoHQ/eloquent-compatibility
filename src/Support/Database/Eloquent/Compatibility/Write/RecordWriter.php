@@ -10,6 +10,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -34,7 +35,7 @@ final readonly class RecordWriter
             $writer = new MassWriter($this->map, $this->connection);
 
             return $writer->transaction(function () use ($writer, $legacy, $values): int|string {
-                $values = $this->evaluateRetained($legacy, null, $values);
+                $values = $this->evaluateRetained($legacy, null, $this->withRetainedDefaults($values));
                 $branch = $this->map->branchFor(self::probe($legacy, $values));
                 $writer->claim($values, $branch);
                 $key = $this->through($branch)->insert($legacy, $values);
@@ -226,6 +227,27 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  array<string, mixed>  $values
+     * @return array<string, mixed>
+     */
+    private function withRetainedDefaults(array $values): array
+    {
+        if ($this->map->retainedTable === null) {
+            return $values;
+        }
+
+        $defaults = [];
+
+        foreach ((new ColumnCatalog($this->connection))->of($this->map->retainedTable) as $name => $column) {
+            if ($column->default !== null && $name !== $this->map->retainedKey && ! array_key_exists($name, $values) && $this->map->legacyOnly([$name]) !== []) {
+                $defaults[$name] = new RawExpression('CAST(('.$column->default.') AS '.$column->type.')');
+            }
+        }
+
+        return $values + $defaults;
+    }
+
+    /**
      * @param  array<array-key, mixed>  $values
      */
     private function refuseRaw(array $values): void
@@ -346,11 +368,22 @@ final readonly class RecordWriter
         $written = $values[$legacy->getKeyName()] ?? $key;
         $kept = $stored[$legacy->getKeyName()] ?? null;
 
-        if ((is_int($written) || is_string($written)) && (is_int($kept) || is_string($kept)) && (string) $written === (string) $kept) {
+        if ((is_int($written) || is_string($written)) && (is_int($kept) || is_string($kept)) && $this->sameIdentity($branch, $legacy->getKeyName(), $written, $kept)) {
             return;
         }
 
         throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that changes the id of record '.$key, class_basename($branch->primary->model).' stored id '.(is_scalar($kept) ? (string) $kept : 'none').' where the write gives '.(is_scalar($written) ? (string) $written : '').', and the retained values and the instance follow the id the write gives.');
+    }
+
+    private function sameIdentity(ResolvedMap $branch, string $name, int|string $written, int|string $kept): bool
+    {
+        if ((string) $written === (string) $kept) {
+            return true;
+        }
+
+        $type = (new ColumnCatalog($this->connection))->type($branch->primary->table, (string) $branch->identifiers[$name]->column()) ?? 'text';
+
+        return $this->connection->scalar("select cast(? as {$type}) = cast(? as {$type})", [(string) $written, (string) $kept]) === true;
     }
 
     /**
