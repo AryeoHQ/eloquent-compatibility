@@ -110,7 +110,7 @@ final class ViewCompilerTest extends TestCase
         $view = $this->viewCompiler()->create($map);
 
         $this->assertStringContainsString(<<<'SQL'
-            FROM (SELECT * FROM "jobs" WHERE NOT COALESCE(("price_cents" > 1000000 or "name"::text like '%?%'), false)) AS "jobs"
+            FROM (SELECT * FROM "jobs" WHERE NOT COALESCE(("price_cents" > '1000000' or "name"::text like '%?%'), false)) AS "jobs"
             SQL, $view);
         $this->assertStringContainsString(<<<'SQL'
             LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("city" = 'Coeur d''Alene' and "street" in ('1 Oak St', '2 Oak St')) AND "places"."deleted_at" IS NULL LIMIT 1) AS "places" ON true

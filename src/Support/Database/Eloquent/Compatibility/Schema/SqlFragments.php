@@ -242,6 +242,10 @@ final class SqlFragments
 
     public static function literal(string $value): string
     {
+        if (str_contains($value, '\\')) {
+            return "E'".str_replace(['\\', "'"], ['\\\\', "''"], $value)."'";
+        }
+
         return "'".str_replace("'", "''", $value)."'";
     }
 
@@ -256,10 +260,8 @@ final class SqlFragments
 
         return match (true) {
             $value === null => 'NULL',
-            is_bool($value) => $value ? 'true' : 'false',
-            is_int($value) => (string) $value,
-            is_float($value) => var_export($value, true),
-            is_string($value) => self::literal($value),
+            is_bool($value) => self::literal($value ? '1' : '0'),
+            is_int($value), is_float($value), is_string($value) => self::literal((string) $value),
             default => throw new InvalidArgumentException(get_debug_type($value).' has no SQL literal.'),
         };
     }
