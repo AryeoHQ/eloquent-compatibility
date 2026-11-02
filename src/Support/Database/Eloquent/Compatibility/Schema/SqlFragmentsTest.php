@@ -100,6 +100,15 @@ final class SqlFragmentsTest extends TestCase
         );
     }
 
+    #[Test]
+    public function it_binds_no_placeholder_inside_a_dollar_quoted_string_an_escape_string_or_a_comment(): void
+    {
+        $bound = SqlFragments::bind("select \$\$Why?\$\$ || \$note\$ it's? \$\$ \$note\$ || E'it\\'s?' || ? -- why?\n || /* a /* b? */ c? */ ?", ['x', 'y']);
+
+        $this->assertSame("select \$\$Why?\$\$ || \$note\$ it's? \$\$ \$note\$ || E'it\\'s?' || 'x' -- why?\n || /* a /* b? */ c? */ 'y'", $bound);
+        $this->assertSame("Why? it's? \$\$ it's?xy", DB::scalar($bound));
+    }
+
     /**
      * @param  list<mixed>  $bindings
      */

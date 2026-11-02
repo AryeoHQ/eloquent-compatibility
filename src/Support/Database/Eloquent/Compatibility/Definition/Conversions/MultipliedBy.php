@@ -13,7 +13,7 @@ final readonly class MultipliedBy implements Conversion
 
     public function read(string $stored): string
     {
-        return '('.$stored.' * '.(new Fixed($this->factor))->read('').')';
+        return '('.$stored.' * '.(is_int($this->factor) ? 'CAST('.$this->factor.' AS numeric)' : (new Fixed($this->factor))->read('')).')';
     }
 
     public function write(mixed $value): mixed
@@ -53,7 +53,6 @@ final readonly class MultipliedBy implements Conversion
     {
         return match (true) {
             SqlFragments::isFloat($type) => 'double precision',
-            SqlFragments::isInteger($type) && is_int($this->factor) => in_array($type, ['bigint', 'int8'], true) ? 'bigint' : 'integer',
             SqlFragments::isInteger($type), $type !== null && preg_match('/^(numeric|decimal)\b/i', $type) === 1 => 'numeric',
             default => null,
         };
