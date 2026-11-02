@@ -59,7 +59,7 @@ final class AttributeTest extends TestCase
     {
         $attribute = (new Attribute('listings', 'status'))->from('lifecycle_status')->mapping(['live' => ListingStatus::Active])->asType('text');
 
-        $this->assertSame([['=', 'live'], null, null], [$attribute->filter('=', 'Active'), $attribute->filter('>', 'Active'), $attribute->order('asc')]);
+        $this->assertSame([null, null, null], [$attribute->filter('=', 'Active'), $attribute->filter('>', 'Active'), $attribute->order('asc')]);
     }
 
     #[Test]

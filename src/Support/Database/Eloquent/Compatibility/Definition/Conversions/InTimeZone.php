@@ -31,10 +31,10 @@ final readonly class InTimeZone implements Conversion
             default => throw new InvalidArgumentException(var_export($value, true).' is not a date and time in '.$this->zone.'.'),
         };
 
-        return (new DateTimeImmutable($wallClock, new DateTimeZone($this->zone)))->setTimezone(new DateTimeZone(date_default_timezone_get()));
+        return (new DateTimeImmutable($wallClock, new DateTimeZone($this->zone)))->setTimezone(new DateTimeZone(date_default_timezone_get()))->format('Y-m-d H:i:s.uP');
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
         return in_array($operator, ['=', '!=', '<>', '<', '>', '<=', '>='], true) ? [$operator, $this->write($value)] : null;
     }
@@ -42,5 +42,15 @@ final readonly class InTimeZone implements Conversion
     public function order(string $direction): string
     {
         return strtolower($direction);
+    }
+
+    public function type(null|string $type): string
+    {
+        return 'timestamp without time zone';
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        return SqlFragments::isZoned($type) && SqlFragments::isWallClock($served) && SqlFragments::precision($served) >= SqlFragments::precision((string) $type);
     }
 }

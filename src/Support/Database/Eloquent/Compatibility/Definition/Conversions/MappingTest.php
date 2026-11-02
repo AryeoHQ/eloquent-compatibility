@@ -20,7 +20,7 @@ final class MappingTest extends TestCase
     {
         $mapping = $this->statuses();
 
-        $this->assertSame("(CASE \"jobs\".\"lifecycle_status\" WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END)", $mapping->read('"jobs"."lifecycle_status"'));
+        $this->assertSame("(CASE CAST(\"jobs\".\"lifecycle_status\" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END)", $mapping->read('"jobs"."lifecycle_status"'));
         $this->assertSame(
             ['Draft', 'Active', 'Sold', null],
             array_map(fn (string $stored) => DB::scalar('select '.$mapping->read('CAST(? AS text)'), [$stored]), ['drafting', 'live', 'closed', 'archived']),
@@ -28,9 +28,10 @@ final class MappingTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_an_integer_stored_value_without_quotes(): void
+    public function it_compares_an_integer_stored_value_as_text(): void
     {
-        $this->assertSame("(CASE \"places\".\"kind\" WHEN 1 THEN 'Root' WHEN 2 THEN 'Unit' END)", (new Mapping([1 => 'Root', 2 => 'Unit']))->read('"places"."kind"'));
+        $this->assertSame("(CASE CAST(\"places\".\"kind\" AS text) WHEN '1' THEN 'Root' WHEN '2' THEN 'Unit' END)", (new Mapping([1 => 'Root', 2 => 'Unit']))->read('"places"."kind"'));
+        $this->assertSame([['=', 1], ['=', '1']], [(new Mapping([1 => 'Root', 2 => 'Unit']))->filter('=', 'Root', 'integer'), (new Mapping([1 => 'Root', 2 => 'Unit']))->filter('=', 'Root', 'text')]);
     }
 
     #[Test]
@@ -61,12 +62,13 @@ final class MappingTest extends TestCase
      */
     #[Test]
     #[TestWith(['=', 'Active', ['=', 'live']])]
-    #[TestWith(['!=', 'Sold', ['!=', 'closed']])]
-    #[TestWith(['<>', 'Draft', ['<>', 'drafting']])]
+    #[TestWith(['!=', 'Sold', ['in', ['drafting', 'live']]])]
+    #[TestWith(['<>', 'Draft', ['in', ['live', 'closed']]])]
+    #[TestWith(['!=', 'Withdrawn', ['in', ['drafting', 'live', 'closed']]])]
     #[TestWith(['<', 'Sold', null])]
     #[TestWith(['=', 'Withdrawn', null])]
     #[TestWith(['=', null, null])]
-    public function it_filters_equality_by_the_stored_value_and_nothing_else(string $operator, null|string $value, null|array $filter): void
+    public function it_filters_equality_by_the_stored_value_and_inequality_by_the_other_mapped_values(string $operator, null|string $value, null|array $filter): void
     {
         $this->assertSame($filter, $this->statuses()->filter($operator, $value));
     }

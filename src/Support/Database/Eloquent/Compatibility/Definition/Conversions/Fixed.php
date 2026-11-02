@@ -39,7 +39,7 @@ final readonly class Fixed implements Conversion
         return $this->value;
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
         return null;
     }
@@ -47,5 +47,15 @@ final readonly class Fixed implements Conversion
     public function order(string $direction): null|string
     {
         return null;
+    }
+
+    public function type(null|string $type): null|string
+    {
+        return null;
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        return true;
     }
 }

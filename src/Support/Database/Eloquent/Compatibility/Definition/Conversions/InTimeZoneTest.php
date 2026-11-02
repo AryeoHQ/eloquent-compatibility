@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use DateTimeImmutable;
-use DateTimeInterface;
 use DateTimeZone;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
@@ -27,14 +26,11 @@ final class InTimeZoneTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['2026-07-01 12:00:00', '2026-07-01T16:00:00+00:00'])]
-    #[TestWith(['2026-01-15 09:30:00', '2026-01-15T14:30:00+00:00'])]
-    public function it_writes_a_wall_clock_time_in_the_zone_as_the_instant_in_the_application_zone(string $legacy, string $stored): void
+    #[TestWith(['2026-07-01 12:00:00', '2026-07-01 16:00:00.000000+00:00'])]
+    #[TestWith(['2026-01-15 09:30:00', '2026-01-15 14:30:00.000000+00:00'])]
+    public function it_writes_a_wall_clock_time_in_the_zone_as_the_instant_with_an_explicit_offset(string $legacy, string $stored): void
     {
-        $written = (new InTimeZone('America/New_York'))->write($legacy);
-
-        $this->assertInstanceOf(DateTimeInterface::class, $written);
-        $this->assertSame($stored, $written->format(DATE_ATOM));
+        $this->assertSame($stored, (new InTimeZone('America/New_York'))->write($legacy));
     }
 
     #[Test]
@@ -42,8 +38,7 @@ final class InTimeZoneTest extends TestCase
     {
         $written = (new InTimeZone('America/New_York'))->write(new DateTimeImmutable('2026-01-15 09:30:00', new DateTimeZone('Asia/Tokyo')));
 
-        $this->assertInstanceOf(DateTimeInterface::class, $written);
-        $this->assertSame('2026-01-15T14:30:00+00:00', $written->format(DATE_ATOM));
+        $this->assertSame('2026-01-15 14:30:00.000000+00:00', $written);
     }
 
     #[Test]
@@ -52,8 +47,11 @@ final class InTimeZoneTest extends TestCase
         $conversion = new InTimeZone('America/New_York');
         $written = $conversion->write('2026-03-08 01:59:00');
 
-        $this->assertInstanceOf(DateTimeInterface::class, $written);
-        $this->assertSame('2026-03-08 01:59:00', DB::scalar('select '.$conversion->read('CAST(? AS timestamptz)').'::text', [$written->format('Y-m-d H:i:sP')]));
+        $this->assertSame('2026-03-08 01:59:00', DB::transaction(function () use ($conversion, $written): mixed {
+            DB::statement("set local time zone 'Asia/Tokyo'");
+
+            return DB::scalar('select '.$conversion->read('CAST(? AS timestamptz)').'::text', [$written]);
+        }));
     }
 
     #[Test]
@@ -67,17 +65,12 @@ final class InTimeZoneTest extends TestCase
     }
 
     #[Test]
-    #[TestWith(['>', '2026-07-01T16:00:00+00:00'])]
-    #[TestWith(['<=', '2026-07-01T16:00:00+00:00'])]
-    #[TestWith(['=', '2026-07-01T16:00:00+00:00'])]
-    public function it_filters_the_stored_column_by_the_instant(string $operator, string $instant): void
+    #[TestWith(['>'])]
+    #[TestWith(['<='])]
+    #[TestWith(['='])]
+    public function it_filters_the_stored_column_by_the_instant(string $operator): void
     {
-        $filter = (new InTimeZone('America/New_York'))->filter($operator, '2026-07-01 12:00:00');
-
-        $this->assertNotNull($filter);
-        $this->assertSame($operator, $filter[0]);
-        $this->assertInstanceOf(DateTimeInterface::class, $filter[1]);
-        $this->assertSame($instant, $filter[1]->format(DATE_ATOM));
+        $this->assertSame([$operator, '2026-07-01 16:00:00.000000+00:00'], (new InTimeZone('America/New_York'))->filter($operator, '2026-07-01 12:00:00'));
     }
 
     #[Test]

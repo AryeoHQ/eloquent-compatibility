@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use InvalidArgumentException;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class DividedBy implements Conversion
 {
@@ -30,7 +31,7 @@ final readonly class DividedBy implements Conversion
         return floor($stored) === $stored ? (int) $stored : $stored;
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
         $operator = match ($operator) {
             '=', '!=', '<>' => $operator,
@@ -38,7 +39,7 @@ final readonly class DividedBy implements Conversion
             default => null,
         };
 
-        return $operator === null ? null : [$operator, $this->write($value)];
+        return $operator === null ? null : SqlFragments::bound($operator, $this->write($value), $type);
     }
 
     public function order(string $direction): string
@@ -46,5 +47,39 @@ final readonly class DividedBy implements Conversion
         $direction = strtolower($direction);
 
         return $this->divisor > 0 ? $direction : ($direction === 'asc' ? 'desc' : 'asc');
+    }
+
+    public function type(null|string $type): string
+    {
+        return 'numeric';
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        $places = $this->places();
+        $scale = SqlFragments::scale($type);
+
+        return $places !== null && $scale !== null && SqlFragments::holds($served, $scale + $places);
+    }
+
+    private function places(): null|int
+    {
+        $divisor = abs($this->divisor);
+
+        if (floor($divisor) !== (float) $divisor) {
+            return floor(1 / $divisor) === 1 / $divisor ? 0 : null;
+        }
+
+        $remaining = (int) $divisor;
+        $places = [2 => 0, 5 => 0];
+
+        foreach ([2, 5] as $prime) {
+            while ($remaining % $prime === 0) {
+                $remaining = intdiv($remaining, $prime);
+                $places[$prime]++;
+            }
+        }
+
+        return $remaining === 1 ? max($places) : null;
     }
 }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use InvalidArgumentException;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class MultipliedBy implements Conversion
 {
@@ -30,7 +31,7 @@ final readonly class MultipliedBy implements Conversion
         return floor($stored) === $stored ? (int) $stored : $stored;
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
         $operator = match ($operator) {
             '=', '!=', '<>' => $operator,
@@ -38,7 +39,7 @@ final readonly class MultipliedBy implements Conversion
             default => null,
         };
 
-        return $operator === null ? null : [$operator, $this->write($value)];
+        return $operator === null ? null : SqlFragments::bound($operator, $this->write($value), $type);
     }
 
     public function order(string $direction): string
@@ -46,5 +47,53 @@ final readonly class MultipliedBy implements Conversion
         $direction = strtolower($direction);
 
         return $this->factor > 0 ? $direction : ($direction === 'asc' ? 'desc' : 'asc');
+    }
+
+    public function type(null|string $type): null|string
+    {
+        return match (true) {
+            SqlFragments::isFloat($type) => 'double precision',
+            SqlFragments::isInteger($type) && is_int($this->factor) => in_array($type, ['bigint', 'int8'], true) ? 'bigint' : 'integer',
+            SqlFragments::isInteger($type), $type !== null && preg_match('/^(numeric|decimal)\b/i', $type) === 1 => 'numeric',
+            default => null,
+        };
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        if (SqlFragments::isFloat($type)) {
+            return ($served === 'double precision' || $served === $type) && $this->doublesOrHalves();
+        }
+
+        $places = $this->places();
+        $scale = SqlFragments::scale($type);
+
+        return $places !== null && $scale !== null && SqlFragments::holds($served, $scale + $places);
+    }
+
+    private function places(): null|int
+    {
+        if (is_int($this->factor)) {
+            return 0;
+        }
+
+        $literal = var_export($this->factor, true);
+
+        return str_contains($literal, 'E') ? null : strlen(rtrim(substr($literal, strpos($literal, '.') + 1), '0'));
+    }
+
+    private function doublesOrHalves(): bool
+    {
+        $factor = abs((float) $this->factor);
+
+        while ($factor >= 2.0) {
+            $factor /= 2;
+        }
+
+        while ($factor > 0.0 && $factor < 1.0) {
+            $factor *= 2;
+        }
+
+        return $factor === 1.0;
     }
 }

@@ -25,19 +25,57 @@ final readonly class OrDefault implements Conversion
         return $value;
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
-        $value = $value instanceof BackedEnum ? $value->value : $value;
+        if ($value === null) {
+            return match ($operator) {
+                '=' => ['none', null],
+                '!=', '<>' => ['all', null],
+                default => null,
+            };
+        }
 
-        if ($operator !== '=' || ! is_scalar($value) || (string) $value === (string) $this->default) {
+        $value = $this->normalised($value);
+
+        if ($value === null) {
             return null;
         }
 
-        return ['=', $value];
+        return match ($operator) {
+            '=' => $this->isDefault($value) ? null : ['=', $value],
+            '!=', '<>' => [$this->isDefault($value) ? '!=' : 'is distinct from', $value],
+            default => null,
+        };
     }
 
     public function order(string $direction): null|string
     {
         return null;
+    }
+
+    public function type(null|string $type): null|string
+    {
+        return $type;
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        return $type !== null && $type === $served;
+    }
+
+    private function normalised(mixed $value): null|bool|int|float|string
+    {
+        $value = $value instanceof BackedEnum ? $value->value : $value;
+
+        return match (true) {
+            is_bool($this->default) => IsNotNull::boolean($value),
+            is_string($this->default) => is_string($value) || is_int($value) || is_float($value) ? (string) $value : null,
+            default => is_numeric($value) ? $value + 0 : null,
+        };
+    }
+
+    private function isDefault(bool|int|float|string $value): bool
+    {
+        return is_bool($this->default) || is_string($this->default) ? $value === $this->default : (float) $value === (float) $this->default;
     }
 }

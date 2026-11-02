@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -28,11 +29,22 @@ final class IsNotNullTest extends TestCase
     #[Test]
     #[TestWith([true, '2026-11-01 12:00:00+00'])]
     #[TestWith([1, '2026-11-01 12:00:00+00'])]
+    #[TestWith(['true', '2026-11-01 12:00:00+00'])]
     #[TestWith([false, null])]
+    #[TestWith(['false', null])]
+    #[TestWith(['0', null])]
     #[TestWith([null, null])]
-    public function it_writes_the_value_set_to_gives_for_true_and_null_for_false(null|bool|int $legacy, null|string $stored): void
+    public function it_writes_the_value_set_to_gives_for_true_and_null_for_false(null|bool|int|string $legacy, null|string $stored): void
     {
         $this->assertSame($stored, (new IsNotNull(fn () => '2026-11-01 12:00:00+00'))->write($legacy));
+    }
+
+    #[Test]
+    public function it_refuses_to_write_a_value_that_is_not_a_boolean(): void
+    {
+        $this->expectExceptionObject(new InvalidArgumentException("'maybe' is not a boolean, so isNotNull() cannot store it."));
+
+        (new IsNotNull(fn () => '2026-11-01 12:00:00+00'))->write('maybe');
     }
 
     /**
