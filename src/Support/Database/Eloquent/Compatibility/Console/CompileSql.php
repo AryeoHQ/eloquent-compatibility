@@ -45,14 +45,15 @@ final class CompileSql extends Command
 
         try {
             $map = Compatibility::of($model)->resolve();
-            $connection = (new $map->model)->getConnection();
-            $connection->useWriteConnectionWhenReading();
-            $statements = $statementsFor($map, $connection);
+            $connection = Compatibility::connection($map);
+            [$statements, $server] = $connection->transaction(fn () => [
+                $statementsFor($map, $connection),
+                (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version"),
+            ]);
         } catch (InvalidCompatibilityMap $exception) {
             return $this->refuse($exception->getMessage());
         }
 
-        $server = (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version");
         $header = array_map(fn (string $line) => str_replace(["\r", "\n"], ['\\r', '\\n'], $line), [
             "-- compatibility:sql {$model} --for={$for}: the statements Compatibility::{$for}() runs for {$map->table}",
             "-- Read from database {$server['database']}, schema {$server['schema']} (search path {$server['search_path']}), on PostgreSQL {$server['version']}",

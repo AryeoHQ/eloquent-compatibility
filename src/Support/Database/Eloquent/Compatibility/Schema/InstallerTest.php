@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
@@ -519,6 +521,69 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('v', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_reads_the_catalog_under_locks_that_keep_the_legacy_shape_until_install_commits(): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'format_type(table_column.atttypid')) {
+                return;
+            }
+
+            $concurrent = 'added';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function (): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement('alter table listings add column notes text');
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $this->assertSame(['55P03', false, false], [$concurrent, ...array_map(fn (string $relation) => DB::scalar('select count(*) > 0 from pg_attribute where attrelid = cast(? as regclass) and attname = ?', [$relation, 'notes']), ['listings', 'listings_retained'])]);
+    }
+
+    #[Test]
+    public function it_hides_the_rows_eloquent_matches_with_a_float_binding_as_pdo_sends_it(): void
+    {
+        DB::statement('alter table jobs add column score double precision');
+        DB::update('update jobs set score = 0.01 where legacy_id = 1');
+        DB::update('update jobs set score = 0.009999999999999998 where legacy_id = 3');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.')))
+                    ->hide(fn (Builder $jobs) => $jobs->where('score', 0.009999999999999998), because: 'A scored job is internal.');
+            }
+        };
+        $hidden = array_map(intval(...), Job::query()->withTrashed()->where('score', 0.009999999999999998)->pluck('legacy_id')->all());
+
+        Compatibility::install($model::class);
+
+        $this->assertSame([[1], [2, 3]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
     }
 
     #[Test]
