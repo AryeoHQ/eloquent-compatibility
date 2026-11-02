@@ -576,6 +576,37 @@ final class InstallerTest extends TestCase
         $this->assertSame('v', $this->kind('listings'));
     }
 
+    #[Test]
+    public function it_installs_when_the_legacy_and_successor_connections_reach_one_database_through_a_url_that_overrides_the_database_setting(): void
+    {
+        $pgsql = (array) config('database.connections.pgsql');
+        $url = sprintf('pgsql://%s:%s@%s:%s/%s', rawurlencode((string) $pgsql['username']), rawurlencode((string) $pgsql['password']), $pgsql['host'], $pgsql['port'], rawurlencode((string) $pgsql['database']));
+        $connection = [...$pgsql, 'url' => $url, 'database' => 'laravel'];
+        config(['database.connections.compatibility_url_legacy' => $connection, 'database.connections.compatibility_url_successor' => $connection, 'database.default' => 'compatibility_url_successor']);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_url_legacy';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+        } finally {
+            DB::purge('compatibility_url_legacy');
+            DB::purge('compatibility_url_successor');
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
+    }
+
     /**
      * @return array<string, array{string, string}>
      */
