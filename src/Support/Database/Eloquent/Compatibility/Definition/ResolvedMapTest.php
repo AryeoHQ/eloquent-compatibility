@@ -137,6 +137,7 @@ final class ResolvedMapTest extends TestCase
         yield 'timestamps from a successor without them' => [fn (Compatibility $listing) => self::identified($listing)->timestamps()->servedFrom($untimed::class, self::titled(...)), 'timestamps() reads the timestamps of '.class_basename($untimed).', which uses none'];
         yield 'retained in a successor table' => [fn (Compatibility $listing) => self::identified($listing)->retainedIn('places')->servedFrom(Job::class, fn (Successor $job) => $job->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place)), 'retainedIn() names the table places, which the map already reads as another table'];
         yield 'retained in the legacy table' => [fn (Compatibility $listing) => self::identified($listing)->retainedIn('listings')->servedFrom(Job::class, self::titled(...)), 'retainedIn() names the table listings, which the map already reads as another table'];
+        yield 'an external attribute on a related successor' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => self::titled($job)->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place->attribute('city', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $places) => $places, write: fn (mixed $place, mixed $city) => null)))), "attribute 'city' is external() on Place, which related() reaches, and an external() read and write receive the servedFrom() successor Job; declare it on Job"];
     }
 
     /**

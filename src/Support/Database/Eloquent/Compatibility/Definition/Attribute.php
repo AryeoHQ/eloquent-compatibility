@@ -252,11 +252,20 @@ final class Attribute
     {
         $read = $this->external[0] ?? throw new LogicException("Attribute '{$this->name}' is not external, so no external() read serves it.");
         $values = $read($successors);
-
-        return match (true) {
+        $values = match (true) {
             $values instanceof Values => $values->all(),
             is_array($values) => $values,
             default => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns ".get_debug_type($values).', and it returns the values keyed by successor key.'),
+        };
+        $received = array_map(fn (Model $successor) => self::keyOf($successor->getKey()), $successors->all());
+        $returned = array_map(self::keyOf(...), array_keys($values));
+        $missing = array_diff($received, $returned);
+        $unexpected = array_diff($returned, $received);
+
+        return match (true) {
+            $missing !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns no value for successor key ".reset($missing).'; it returns one value, or null, for each successor it receives.'),
+            $unexpected !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns a value for successor key ".reset($unexpected).', which it did not receive; it returns one value, or null, for each successor it receives.'),
+            default => $values,
         };
     }
 
@@ -431,6 +440,11 @@ final class Attribute
         }
 
         return ['in', $stored];
+    }
+
+    private static function keyOf(mixed $key): string
+    {
+        return is_int($key) || is_string($key) ? (string) $key : throw new LogicException('A successor handed to an external() read has no key, so the read cannot key its value.');
     }
 
     private function convert(Conversion $conversion): self

@@ -225,15 +225,17 @@ final readonly class Statements
                 ."NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
                 ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns),
-                ...array_map(fn (string $type, string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$type, $external, array_keys($external)),
+                ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'], $external, array_keys($external)),
             ]),
             "UPDATE {$legacyTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
                 ."\nWHERE {$primary}.{$primaryKey} = {$legacyTable}.{$retainedKey}",
         ];
 
-        if ($defaults !== []) {
-            $statements[] = "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (Column $column, string $name) => 'ALTER COLUMN '.SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)));
+        $restoredDefaults = [...array_map(fn (Column $column) => (string) $column->default, $defaults), ...array_filter(array_map(fn (array $column) => $column['default'], $external), is_string(...))];
+
+        if ($restoredDefaults !== []) {
+            $statements[] = "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $default, string $name) => 'ALTER COLUMN '.SqlFragments::identifier($name).' SET DEFAULT '.$default, $restoredDefaults, array_keys($restoredDefaults)));
         }
 
         if ($generated !== []) {
@@ -286,7 +288,7 @@ final readonly class Statements
             $statements[] = "ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint());
         }
 
-        return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [5 => array_map(fn (string $type, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $type), $external, array_keys($external))]);
+        return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [5 => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
     }
 
     /**
@@ -471,7 +473,7 @@ final readonly class Statements
                 'constants' => $constants,
                 'membership' => ['table' => $map->membership->table, 'column' => $map->membership->column, 'alias' => $map->membership->alias],
             ]),
-            ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => $legacy[$name]->type, $external))]),
+            ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => ['type' => $legacy[$name]->type, 'default' => $legacy[$name]->default], $external))]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
@@ -492,7 +494,7 @@ final readonly class Statements
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, string>}
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -519,6 +521,14 @@ final readonly class Statements
             }
         }
 
+        $external = [];
+
+        foreach (is_array($captured['external'] ?? null) ? $captured['external'] : [] as $name => $column) {
+            if (is_string($name) && is_array($column) && is_string($column['type'] ?? null)) {
+                $external[$name] = ['type' => $column['type'], 'default' => is_string($column['default'] ?? null) ? $column['default'] : null];
+            }
+        }
+
         return [
             'comment' => is_string($captured['comment'] ?? null) ? $captured['comment'] : null,
             'notNull' => array_values(array_filter(is_array($captured['notNull'] ?? null) ? $captured['notNull'] : [], is_string(...))),
@@ -527,12 +537,12 @@ final readonly class Statements
             'indexes' => array_values(array_filter(is_array($captured['indexes'] ?? null) ? $captured['indexes'] : [], is_string(...))),
             'moved' => self::pairs($captured['moved'] ?? null),
             'constants' => self::pairs($captured['constants'] ?? null),
-            'external' => array_filter(is_array($captured['external'] ?? null) ? $captured['external'] : [], fn (mixed $type, int|string $name) => is_string($name) && is_string($type), ARRAY_FILTER_USE_BOTH),
+            'external' => $external,
         ];
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, string>}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */

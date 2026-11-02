@@ -88,6 +88,11 @@ final class LegacyBuilder extends Builder
         return self::$maps[$model] ??= Compatibility::of($model)->resolve();
     }
 
+    public static function refuseExternal(string $model, string $attribute, string $operation): CompatibilityQueryRefused
+    {
+        return CompatibilityQueryRefused::untranslatable($model, $attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+    }
+
     public function writeOf(Model $model): void
     {
         $this->writeOf = $model;
@@ -99,9 +104,18 @@ final class LegacyBuilder extends Builder
     public function hydrate(array $items)
     {
         $models = parent::hydrate($items);
-        ExternalAttributes::gather($models->all());
+        ExternalAttributes::gather($models->all(), $this->query->useWritePdo);
 
         return $models;
+    }
+
+    /**
+     * @param  array<int, Expression|string>|Expression|string  $columns
+     * @return list<TModel>
+     */
+    public function getModels($columns = ['*'])
+    {
+        return array_values($this->hydrate($this->query->get($columns)->all())->all());
     }
 
     /**
@@ -437,7 +451,7 @@ final class LegacyBuilder extends Builder
         if ($attribute !== null && $this->map()->isExternal($attribute)) {
             $orders = $this->query->unions ? $this->query->unionOrders : $this->query->orders;
 
-            throw $this->refuse($attribute, 'orderBy '.end($orders)['direction'], 'it is stored outside the database, so no SQL reads it.');
+            throw self::refuseExternal($this->model::class, $attribute, 'orderBy '.end($orders)['direction']);
         }
 
         return $this;
@@ -525,7 +539,7 @@ final class LegacyBuilder extends Builder
         $attribute = is_string($column) ? $this->attributeOf($column) : null;
 
         if ($attribute !== null && $this->map()->isExternal($attribute) && $this->relation()['view']) {
-            throw $this->refuse($attribute, "{$function}()", 'it is stored outside the database, so no SQL reads it.');
+            throw self::refuseExternal($this->model::class, $attribute, "{$function}()");
         }
 
         return $this->toBase()->{$function}($column);
@@ -542,7 +556,7 @@ final class LegacyBuilder extends Builder
         $definition = $this->definition($attribute);
 
         if ($map->isExternal($attribute)) {
-            throw $this->refuse($attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+            throw self::refuseExternal($this->model::class, $attribute, $operation);
         }
 
         foreach ($conditions as [, $value]) {

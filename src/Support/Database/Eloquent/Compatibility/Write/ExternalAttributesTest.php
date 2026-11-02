@@ -128,6 +128,49 @@ final class ExternalAttributesTest extends TestCase
 
         $this->assertEquals($before, DB::select('select * from files order by legacy_type, legacy_id'));
         $this->assertSame([], array_filter(FakeMediaLibrary::bound()->calls, fn (array $call) => $call[0] !== 'fetch'));
+
+        $declined::query()->findOrFail(1)->update(['file_name' => 'oak-front-2.jpg', 'mime_type' => 'image/jpeg']);
+
+        $this->assertSame(['oak-front-2.jpg', 'image/jpeg'], [Photo::query()->findOrFail(1)->file_name, Photo::query()->findOrFail(1)->mime_type]);
+    }
+
+    #[Test]
+    public function it_writes_no_unchanged_value_it_never_read_and_shows_listeners_the_value_it_replaces(): void
+    {
+        $seen = [];
+        Photo::updating(function (Photo $photo) use (&$seen): void {
+            $seen[] = [$photo->getOriginal('mime_type'), $photo->isDirty('mime_type')];
+        });
+        $assets = DB::table('files')->where('legacy_type', 'photo')->orderBy('legacy_id')->pluck('zml_asset_id')->all();
+
+        Photo::query()->findOrFail(1)->update(['file_name' => 'oak-front-2.jpg', 'mime_type' => 'image/jpeg']);
+        Photo::query()->findOrFail(2)->update(['mime_type' => 'image/avif']);
+
+        $this->assertSame([['image/jpeg', false], ['image/jpeg', true]], $seen);
+        $this->assertSame([['put', [$assets[1]]]], array_values(array_filter(FakeMediaLibrary::bound()->calls, fn (array $call) => $call[0] !== 'fetch')));
+    }
+
+    #[Test]
+    public function it_copies_an_unread_value_into_a_replica_and_writes_it_through_the_new_successor(): void
+    {
+        $copy = Photo::query()->findOrFail(3)->replicate(['uuid']);
+        $copy->save();
+
+        $this->assertSame(['image/png', 'image/png'], [$copy->mime_type, Photo::query()->findOrFail($copy->id)->mime_type]);
+    }
+
+    #[Test]
+    public function it_keeps_an_unread_value_on_a_deleted_record_for_its_listeners_and_its_serialization(): void
+    {
+        $seen = [];
+        Photo::deleted(function (Photo $photo) use (&$seen): void {
+            $seen[] = $photo->mime_type;
+        });
+        $photo = Photo::query()->findOrFail(3);
+
+        $photo->delete();
+
+        $this->assertSame([['image/png'], 'image/png', false], [$seen, $photo->toArray()['mime_type'] ?? 'missing', $photo->exists]);
     }
 
     #[Test]

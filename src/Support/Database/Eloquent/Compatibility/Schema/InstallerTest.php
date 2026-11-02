@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
@@ -462,6 +463,60 @@ final class InstallerTest extends TestCase
 
         $this->assertSame('r', $this->kind('photos'));
         $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_while_a_legacy_row_holds_null_where_the_read_returns_a_value(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photos alter column mime_type drop not null');
+        DB::table('photos')->where('id', 3)->update(['mime_type' => null]);
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+    }
+
+    #[Test]
+    public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
+    {
+        $this->prepareFiles();
+        DB::statement("alter table photos alter column mime_type set default 'application/octet-stream'");
+
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'application/octet-stream'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+        $this->assertSame([true, "'application/octet-stream'::character varying"], [
+            DB::scalar("select attnotnull from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+            DB::scalar("select pg_get_expr(adbin, adrelid) from pg_attrdef join pg_attribute on attrelid = adrelid and attnum = adnum where adrelid = 'photos'::regclass and attname = 'mime_type'"),
+        ]);
+    }
+
+    #[Test]
+    public function it_pages_install_verification_and_uninstall_restore_by_an_indexed_key_without_an_offset(): void
+    {
+        $this->prepareFiles();
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+
+        $paged = array_values(array_filter($statements, fn (string $sql) => str_contains($sql, ' limit 500')));
+
+        $this->assertCount(2, $paged);
+        $this->assertMatchesRegularExpression('/^select "id", "mime_type" from "photos" (where "id" is not null )?order by "id" asc limit 500$/', $paged[0]);
+        $this->assertMatchesRegularExpression('/^select "file_id", "id" from "photos" (where "file_id" is not null )?order by "file_id" asc limit 500$/', $paged[1]);
+        $this->assertStringEndsWith(' WHERE "photos"."file_id" = CAST(restored.key AS uuid)', array_values(array_filter($statements, fn (string $sql) => str_starts_with($sql, 'UPDATE "photos" SET "mime_type"')))[0] ?? '');
     }
 
     #[Test]

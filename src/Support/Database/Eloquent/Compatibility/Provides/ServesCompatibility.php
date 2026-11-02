@@ -44,6 +44,20 @@ trait ServesCompatibility
     }
 
     /**
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return $this
+     */
+    public function setAttribute($key, $value)
+    {
+        if (is_string($key) && $this->exists && ! array_key_exists($key, $this->original)) {
+            ExternalAttributes::resolve($this, $key);
+        }
+
+        return parent::setAttribute($key, $value);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function attributesToArray(): array
@@ -53,6 +67,30 @@ trait ServesCompatibility
         }
 
         return parent::attributesToArray();
+    }
+
+    /**
+     * @param  null|array<array-key, mixed>  $except
+     * @return static
+     */
+    public function replicate(null|array $except = null)
+    {
+        if ($this->exists) {
+            ExternalAttributes::resolveAll($this);
+        }
+
+        return parent::replicate($except);
+    }
+
+    /**
+     * @return $this
+     */
+    public function refresh()
+    {
+        parent::refresh();
+        ExternalAttributes::refreshed($this);
+
+        return $this;
     }
 
     protected function newBaseQueryBuilder(): LegacyQueryBuilder

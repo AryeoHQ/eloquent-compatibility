@@ -5,14 +5,17 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use BackedEnum;
+use Closure;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use Stringable;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use WeakMap;
 use WeakReference;
@@ -33,12 +36,12 @@ final class ExternalAttributes
     /**
      * @param  list<WeakReference<Model>>  $models
      */
-    private function __construct(private readonly array $models) {}
+    private function __construct(private readonly array $models, private readonly bool $writePdo) {}
 
     /**
      * @param  array<array-key, mixed>  $models
      */
-    public static function gather(array $models): void
+    public static function gather(array $models, bool $writePdo): void
     {
         $first = reset($models);
 
@@ -53,7 +56,7 @@ final class ExternalAttributes
             return;
         }
 
-        $batch = new self(array_map(fn (Model $model) => WeakReference::create($model), $joining));
+        $batch = new self(array_map(fn (Model $model) => WeakReference::create($model), $joining), $writePdo);
 
         foreach ($joining as $model) {
             $batches[$model] = $batch;
@@ -69,10 +72,18 @@ final class ExternalAttributes
         $batches = self::$batches ??= new WeakMap;
 
         if (! $batches->offsetExists($legacy)) {
-            $batches[$legacy] = new self([WeakReference::create($legacy)]);
+            $batches[$legacy] = new self([WeakReference::create($legacy)], false);
         }
 
         $batches[$legacy]->load($legacy, $name);
+    }
+
+    public static function refreshed(Model $legacy): void
+    {
+        if (self::of($legacy::class) !== []) {
+            $batches = self::$batches ??= new WeakMap;
+            $batches[$legacy] = new self([WeakReference::create($legacy)], true);
+        }
     }
 
     public static function resolveAll(Model $legacy): void
@@ -97,7 +108,7 @@ final class ExternalAttributes
      * @param  array<array-key, null|Model>  $records
      * @return array<array-key, mixed>
      */
-    public static function values(ResolvedMap $map, string $name, array $records, null|string $connection): array
+    public static function values(ResolvedMap $map, string $name, array $records, null|string $connection, bool $writePdo): array
     {
         $legacyKey = (new $map->model)->getKeyName();
         $values = [];
@@ -109,8 +120,15 @@ final class ExternalAttributes
                 continue;
             }
 
-            $column = (string) $branch->identifiers[$legacyKey]->column();
-            $query = (new $branch->primary->model)->setConnection($connection)->newModelQuery()->whereIn($column, array_keys($records));
+            $identifier = $branch->identifiers[$legacyKey];
+            $column = (string) $identifier->column();
+            $primary = (new $branch->primary->model)->setConnection($connection);
+            $query = $primary->newModelQuery();
+            $query->whereRaw($query->getQuery()->getGrammar()->wrap($primary->qualifyColumn($column)).' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral(array_keys($records))]);
+
+            if ($writePdo) {
+                $query->useWritePdo();
+            }
 
             if ($branch->membership !== null) {
                 $query->where($branch->membership->column, $branch->membership->alias);
@@ -124,7 +142,7 @@ final class ExternalAttributes
                 $successorKey = $successor->getKey();
 
                 if ((is_int($key) || is_string($key)) && (is_int($successorKey) || is_string($successorKey))) {
-                    $values[$key] = $read[$successorKey] ?? null;
+                    $values[$key] = $read[$successorKey];
                 }
             }
         }
@@ -148,7 +166,7 @@ final class ExternalAttributes
         $refused = 0;
         $first = [];
 
-        $connection->table($map->table)->whereNotNull($name)->orderBy($key)->select([$key, $name])->chunk(self::CHUNK, function (iterable $rows) use ($map, $name, $key, &$refused, &$first): void {
+        $connection->table($map->table)->select([$key, $name])->chunkById(self::CHUNK, function (iterable $rows) use ($map, $name, $key, &$refused, &$first): void {
             $stored = [];
 
             foreach ($rows as $row) {
@@ -156,7 +174,7 @@ final class ExternalAttributes
                 $stored[self::key($row[$key] ?? null)] = $row[$name] ?? null;
             }
 
-            $values = self::values($map, $name, array_fill_keys(array_keys($stored), null), (new $map->model)->getConnectionName());
+            $values = self::values($map, $name, array_fill_keys(array_keys($stored), null), (new $map->model)->getConnectionName(), true);
 
             foreach ($stored as $legacyKey => $value) {
                 if (! self::same($value, $values[$legacyKey] ?? null)) {
@@ -167,7 +185,7 @@ final class ExternalAttributes
                     }
                 }
             }
-        });
+        }, $key);
 
         if ($refused > 0) {
             throw InvalidCompatibilityMap::cannot($map->table, 'install', "{$refused} {$map->table} rows hold a {$name} that the external() read of attribute '{$name}' does not return; the first are {$key} ".implode(', ', $first).". Write each value through the attribute's external() write before install(), because install() drops {$map->table}.{$name}");
@@ -177,20 +195,23 @@ final class ExternalAttributes
     public static function restore(ResolvedMap $map, ConnectionInterface $connection, string $name, string $type): void
     {
         $key = (new $map->model)->getKeyName();
+        $retainedKey = (string) $map->retainedKey;
         $table = SqlFragments::identifier($map->table);
+        $retainedType = (new ColumnCatalog($connection))->type($map->table, $retainedKey) ?? throw new LogicException("{$map->table} has no column {$retainedKey} to restore attribute '{$name}' by.");
 
-        $connection->table($map->table)->orderBy($key)->select($key)->chunk(self::CHUNK, function (iterable $rows) use ($map, $connection, $name, $type, $key, $table): void {
-            $keys = [];
+        $connection->table($map->table)->select([$retainedKey, $key])->chunkById(self::CHUNK, function (iterable $rows) use ($map, $connection, $name, $type, $key, $retainedKey, $retainedType, $table): void {
+            $retained = [];
 
             foreach ($rows as $row) {
-                $keys[self::key(((array) $row)[$key] ?? null)] = null;
+                $row = (array) $row;
+                $retained[self::key($row[$key] ?? null)] = self::key($row[$retainedKey] ?? null);
             }
 
             $bindings = [];
 
-            foreach (self::values($map, $name, $keys, (new $map->model)->getConnectionName()) as $legacyKey => $value) {
+            foreach (self::values($map, $name, array_fill_keys(array_keys($retained), null), (new $map->model)->getConnectionName(), true) as $legacyKey => $value) {
                 if ($value !== null) {
-                    array_push($bindings, (string) $legacyKey, self::bindable($map, $name, $value));
+                    array_push($bindings, (string) $retained[$legacyKey], self::bindable($map, $name, $value));
                 }
             }
 
@@ -201,10 +222,10 @@ final class ExternalAttributes
             $connection->update(
                 "UPDATE {$table} SET ".SqlFragments::identifier($name)." = CAST(restored.value AS {$type})"
                 .' FROM (VALUES '.implode(', ', array_fill(0, intdiv(count($bindings), 2), '(?, ?)')).') AS restored (key, value)'
-                ." WHERE CAST({$table}.".SqlFragments::identifier($key).' AS text) = restored.key',
+                ." WHERE {$table}.".SqlFragments::identifier($retainedKey)." = CAST(restored.key AS {$retainedType})",
                 $bindings,
             );
-        });
+        }, $retainedKey);
     }
 
     private function load(Model $legacy, string $name): void
@@ -214,11 +235,12 @@ final class ExternalAttributes
         }
 
         $pending = [];
+        $batches = self::$batches ??= new WeakMap;
 
         foreach ($this->models as $reference) {
             $model = $reference->get();
 
-            if ($model === null || ! $model->exists || array_key_exists($name, $model->getAttributes())) {
+            if ($model === null || ! $model->exists || array_key_exists($name, $model->getAttributes()) || ($batches[$model] ?? $this) !== $this) {
                 continue;
             }
 
@@ -236,17 +258,38 @@ final class ExternalAttributes
         $this->loading[$name] = true;
 
         try {
-            $values = self::values(LegacyBuilder::mapOf($legacy::class), $name, array_map(fn (array $models) => $models[0], $pending), $legacy->getConnectionName());
+            $values = self::values(LegacyBuilder::mapOf($legacy::class), $name, array_map(fn (array $models) => $models[0], $pending), $legacy->getConnectionName(), $this->writePdo);
         } finally {
             unset($this->loading[$name]);
         }
 
+        $serve = Closure::bind(static function (Model $model, string $name, mixed $value): void {
+            $model->attributes[$name] = $value;
+            $model->original[$name] = $value;
+        }, null, Model::class);
+
         foreach ($pending as $key => $models) {
             foreach ($models as $model) {
-                $model->setRawAttributes(array_replace($model->getAttributes(), [$name => $values[$key] ?? null]));
-                $model->syncOriginalAttribute($name);
+                $serve($model, $name, $values[$key] ?? null);
             }
         }
+    }
+
+    private static function arrayType(Identifier $identifier): string
+    {
+        return match (true) {
+            $identifier->isUuid() => 'uuid[]',
+            $identifier->isInteger() => 'bigint[]',
+            default => 'text[]',
+        };
+    }
+
+    /**
+     * @param  list<int|string>  $keys
+     */
+    private static function arrayLiteral(array $keys): string
+    {
+        return '{'.implode(',', array_map(fn (int|string $key) => '"'.addcslashes((string) $key, '"\\').'"', $keys)).'}';
     }
 
     private static function key(mixed $key): int|string

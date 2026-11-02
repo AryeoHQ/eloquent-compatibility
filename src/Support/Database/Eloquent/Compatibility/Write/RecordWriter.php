@@ -56,15 +56,14 @@ final readonly class RecordWriter
 
             $stored = $this->transition($legacy, null, [$table => $primary], array_intersect_key($states, [$table => true]), $stored);
             $this->assign($primary, $stored[$table] ?? []);
-            $this->writeExternal([$table => $primary], $external);
+            $this->writeExternal($primary, $external);
             $this->save($legacy, $primary, fn () => $primary->save());
             $key = $this->identify($legacy, $primary);
-            [$models, $existing, $missing] = $this->locate($primary, $stored + $states + $external);
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, array_diff_key($states, [$table => true]), $stored);
             $this->assignEach($models, $stored);
-            $touched = $this->writeExternal(array_diff_key($models, [$table => true]), $external);
-            $this->saveEach($legacy, $existing, $touched);
-            $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
+            $this->saveEach($legacy, $existing);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
             (new RetainedRows($this->map, $this->connection))->upsert($this->map->branch ? $key : self::keyOf($primary), $retained);
             $this->readBack($legacy, $key, array_keys($values));
 
@@ -92,13 +91,13 @@ final readonly class RecordWriter
             [$stored, $retained, $states, $external] = $this->split($legacy, $values, $key);
             $retained = $this->guard($legacy, $primary, $key, $values, [], $retained);
             $this->retain($key, $primary, $retained, []);
-            [$models, $existing, $missing] = $this->locate($primary, $stored + $states + $external);
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-            $touched = $this->writeExternal($models, $external);
+            $touched = $this->writeExternal($primary, $external);
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], $touched);
-            $this->saveEach($legacy, $existing, $touched);
-            $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
+            $this->saveEach($legacy, $existing);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, array_keys($values));
 
             return 1;
@@ -127,14 +126,14 @@ final readonly class RecordWriter
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
             $retained = $this->guard($legacy, $primary, $key, $extra, $amounts, $retained);
             $this->retain($key, $primary, $retained, array_diff_key($retainedAmounts, $retained));
-            [$models, $existing, $missing] = $this->locate($primary, $stored + $states + $external + array_fill_keys(array_keys($added), []));
+            [$models, $existing, $missing] = $this->locate($primary, $stored + $states + array_fill_keys(array_keys($added), []));
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $this->addEach($models, $added, $stored);
-            $touched = $this->writeExternal($models, $external);
+            $touched = $this->writeExternal($primary, $external);
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], $touched);
-            $this->saveEach($legacy, $existing, $touched);
-            $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
+            $this->saveEach($legacy, $existing);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
 
             return 1;
@@ -154,6 +153,7 @@ final readonly class RecordWriter
                 return 0;
             }
 
+            ExternalAttributes::resolveAll($legacy);
             $this->save($legacy, $primary, fn () => $primary->forceDelete());
 
             return 1;
@@ -357,7 +357,7 @@ final readonly class RecordWriter
 
     /**
      * @param  array<string, mixed>  $values
-     * @return array{array<string, array<string, mixed>>, array<string, mixed>, array<string, array<string, array{string, mixed}>>, array<string, array<string, mixed>>}
+     * @return array{array<string, array<string, mixed>>, array<string, mixed>, array<string, array<string, array{string, mixed}>>, array<string, mixed>}
      */
     private function split(Model $legacy, array $values, null|int|string $key): array
     {
@@ -394,7 +394,7 @@ final readonly class RecordWriter
                     throw CompatibilityWriteRefused::rawExpression($legacy::class, $name, 'It is declared external(), so its value lives outside the database, and no SQL computes it.');
                 }
 
-                $external[$this->map->owners[$name]->table][$name] = $value;
+                $external[$name] = $value;
 
                 continue;
             }
@@ -426,22 +426,15 @@ final readonly class RecordWriter
     }
 
     /**
-     * @param  array<string, Model>  $models
-     * @param  array<string, array<string, mixed>>  $external
-     * @return list<Model>
+     * @param  array<string, mixed>  $external
      */
-    private function writeExternal(array $models, array $external): array
+    private function writeExternal(Model $primary, array $external): bool
     {
-        $touched = [];
-
-        foreach ($models as $table => $model) {
-            foreach ($external[$table] ?? [] as $name => $value) {
-                $this->map->attributes[$name]->writeExternally($model, $value);
-                $touched[] = $model;
-            }
+        foreach ($external as $name => $value) {
+            $this->map->attributes[$name]->writeExternally($primary, $value);
         }
 
-        return $touched;
+        return $external !== [];
     }
 
     /**
@@ -731,9 +724,8 @@ final readonly class RecordWriter
 
     /**
      * @param  array<string, mixed>  $values
-     * @param  list<Model>  $touched
      */
-    private function savePrimary(Model $legacy, Model $primary, array $values, array $touched): void
+    private function savePrimary(Model $legacy, Model $primary, array $values, bool $touched): void
     {
         $deletedAt = method_exists($primary, 'getDeletedAtColumn') ? (string) $primary->getDeletedAtColumn() : null;
 
@@ -753,7 +745,7 @@ final readonly class RecordWriter
 
         $updatedAt = $primary->usesTimestamps() ? $primary->getUpdatedAtColumn() : null;
 
-        if (array_diff_key($values, array_flip(array_filter([$deletedAt, $updatedAt], fn (null|string $column) => $column !== null))) !== [] || in_array($primary, $touched, true)) {
+        if (array_diff_key($values, array_flip(array_filter([$deletedAt, $updatedAt], fn (null|string $column) => $column !== null))) !== [] || $touched) {
             $this->assign($primary, array_diff_key($values, [$deletedAt => true]));
             $this->saveEach($legacy, [$primary], $touched);
         }
@@ -777,14 +769,13 @@ final readonly class RecordWriter
      * @param  list<Related>  $missing
      * @param  array<string, array<string, mixed>>  $stored
      * @param  array<string, array<string, array{string, mixed}>>  $states
-     * @param  array<string, array<string, mixed>>  $external
      */
-    private function create(Model $legacy, int|string $key, array $models, array $missing, array $stored, array $states, array $external): void
+    private function create(Model $legacy, int|string $key, array $models, array $missing, array $stored, array $states): void
     {
         foreach ($missing as $related) {
             $values = $stored[$related->table] ?? [];
 
-            if (array_filter([...$values, ...$external[$related->table] ?? []], fn (mixed $value) => $value !== null) === []) {
+            if (array_filter($values, fn (mixed $value) => $value !== null) === []) {
                 continue;
             }
 
@@ -796,7 +787,7 @@ final readonly class RecordWriter
                 $transitioned = array_intersect_key($states, [$related->table => true]);
                 $this->transition($legacy, $key, [$related->table => $created], $transitioned, []);
                 $this->assign($created, array_diff_key($values, $transitioned[$related->table] ?? []));
-                $this->saveEach($legacy, [$created], $this->writeExternal([$related->table => $created], $external));
+                $this->saveEach($legacy, [$created]);
                 $models[$related->table] = $created;
 
                 continue;
@@ -808,7 +799,6 @@ final readonly class RecordWriter
 
             $model = $relation->make();
             $this->assign($model, $values);
-            $this->writeExternal([$related->table => $model], $external);
             $this->save($legacy, $model, fn () => $model->save());
             $models[$related->table] = $model;
         }
@@ -825,12 +815,11 @@ final readonly class RecordWriter
 
     /**
      * @param  list<Model>  $models
-     * @param  list<Model>  $touched
      */
-    private function saveEach(Model $legacy, array $models, array $touched = []): void
+    private function saveEach(Model $legacy, array $models, bool $touched = false): void
     {
         foreach ($models as $model) {
-            if ($model->isDirty() || in_array($model, $touched, true)) {
+            if ($model->isDirty() || $touched) {
                 $this->save($legacy, $model, fn () => $model->save());
             }
         }

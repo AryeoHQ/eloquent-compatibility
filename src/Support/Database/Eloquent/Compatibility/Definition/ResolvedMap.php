@@ -309,6 +309,10 @@ final readonly class ResolvedMap
                 throw $this->invalid("attribute '{$name}' is declared twice");
             }
 
+            if ($attribute->isExternal() && $successor !== $successors[0]) {
+                throw $this->invalid("attribute '{$name}' is external() on ".class_basename($successor->model).', which related() reaches, and an external() read and write receive the servedFrom() successor '.class_basename($successors[0]->model).'; declare it on '.class_basename($successors[0]->model));
+            }
+
             $attributes[$name] = $attribute->resolve();
             $owners[$name] = $successor;
         }

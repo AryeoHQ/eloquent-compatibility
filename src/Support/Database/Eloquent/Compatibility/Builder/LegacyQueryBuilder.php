@@ -14,6 +14,7 @@ use Illuminate\Support\Collection;
 use InvalidArgumentException;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 
@@ -22,6 +23,22 @@ final class LegacyQueryBuilder extends QueryBuilder
     public function __construct(ConnectionInterface $connection, null|Grammar $grammar = null, null|Processor $processor = null, private readonly null|Model $legacy = null)
     {
         parent::__construct($connection, $grammar, $processor);
+    }
+
+    public function toSql(): string
+    {
+        $this->applyBeforeQueryCallbacks();
+        $this->refuseExternal();
+
+        return parent::toSql();
+    }
+
+    public function exists(): bool
+    {
+        $this->applyBeforeQueryCallbacks();
+        $this->refuseExternal();
+
+        return parent::exists();
     }
 
     /**
@@ -290,6 +307,86 @@ final class LegacyQueryBuilder extends QueryBuilder
             ->cloneWithoutBindings($limited ? ['select'] : ['select', 'order']);
 
         return $keys->select($legacy->qualifyColumn($legacy->getKeyName()));
+    }
+
+    private function refuseExternal(): void
+    {
+        $legacy = $this->legacy;
+
+        if ($legacy === null || $this->from !== $legacy->getTable()) {
+            return;
+        }
+
+        $externals = ExternalAttributes::of($legacy::class);
+        $reading = $externals === [] ? null : $this->reading($legacy->getTable(), $externals);
+
+        if ($reading !== null && LegacyBuilder::serves($legacy)) {
+            throw LegacyBuilder::refuseExternal($legacy::class, ...$reading);
+        }
+    }
+
+    /**
+     * @param  list<string>  $externals
+     * @return null|array{string, string}
+     */
+    private function reading(string $table, array $externals): null|array
+    {
+        $clauses = [
+            ...($this->aggregate === null ? [] : [[$this->aggregate['function'].'()', $this->aggregate['columns'] ?? []]]),
+            ['select', $this->columns ?? []],
+            ['groupBy', $this->groups ?? []],
+            ['having', array_column($this->havings ?? [], 'column')],
+            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], $this->orders ?? []),
+            ['where', self::whereColumns($this->wheres)],
+        ];
+
+        foreach ($clauses as [$operation, $columns]) {
+            foreach ($columns as $column) {
+                $attribute = is_string($column) ? self::attributeOf($table, $column) : null;
+
+                if ($attribute !== null && in_array($attribute, $externals, true)) {
+                    return [$attribute, $operation];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     * @return list<mixed>
+     */
+    private static function whereColumns(array $wheres): array
+    {
+        $columns = [];
+
+        foreach ($wheres as $where) {
+            if (! is_array($where)) {
+                continue;
+            }
+
+            if (($where['type'] ?? null) === 'Nested' && ($where['query'] ?? null) instanceof QueryBuilder) {
+                $columns = [...$columns, ...self::whereColumns($where['query']->wheres)];
+            }
+
+            foreach (['column', 'first', 'second'] as $key) {
+                $columns[] = $where[$key] ?? null;
+            }
+        }
+
+        return $columns;
+    }
+
+    private static function attributeOf(string $table, string $column): null|string
+    {
+        $column = trim((string) preg_replace('/\s+as\s+.*$/is', '', $column));
+
+        if (! str_contains($column, '.')) {
+            return $column;
+        }
+
+        return str_starts_with($column, $table.'.') ? substr($column, strlen($table) + 1) : null;
     }
 
     private function served(): null|Model
