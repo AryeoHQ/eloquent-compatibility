@@ -308,6 +308,8 @@ final readonly class RecordWriter
             $primary = $this->through($branch)->lock($legacy, $key);
 
             if ($primary !== null) {
+                (new MassWriter($branch, $this->connection))->lockDependentsOf(self::keyOf($primary));
+
                 return [$branch, $primary];
             }
         }
