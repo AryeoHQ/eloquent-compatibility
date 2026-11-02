@@ -23,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -33,6 +34,8 @@ use Tests\TestCase;
 #[CoversClass(RetainedRows::class)]
 final class MassWriterTest extends TestCase
 {
+    private const string OTHER_COMPANY = 'b2c3d4e5-0000-4000-8000-000000000002';
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -161,14 +164,7 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_creates_one_dependent_for_each_parent_that_several_matching_records_share(): void
     {
-        Schema::create('companies', function (Blueprint $table): void {
-            $table->uuid('id')->primary();
-        });
-        Schema::create('company_profiles', function (Blueprint $table): void {
-            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
-            $table->foreignUuid('company_id')->unique()->constrained('companies')->cascadeOnDelete();
-            $table->string('tagline')->nullable();
-        });
+        $this->createCompanies();
         DB::table('companies')->insert(['id' => ListingTables::COMPANY]);
         $profiled = new class extends Model implements Compatible
         {
@@ -197,6 +193,88 @@ final class MassWriterTest extends TestCase
         $this->assertSame([[ListingTables::COMPANY, 'Homes by the water']], DB::table('company_profiles')->get(['company_id', 'tagline'])->map(fn (object $profile) => array_values((array) $profile))->all());
     }
 
+    /**
+     * @return iterable<string, array{null|string}>
+     */
+    public static function profilesBeforeACompanyChange(): iterable
+    {
+        yield 'an existing profile' => ['Old tagline'];
+        yield 'a missing profile' => [null];
+    }
+
+    #[DataProvider('profilesBeforeACompanyChange')]
+    #[Test]
+    public function it_writes_the_dependent_the_record_reached_before_the_same_write_changed_the_key_that_reaches_it(null|string $tagline): void
+    {
+        $this->createCompanies();
+        DB::table('companies')->insert([['id' => ListingTables::COMPANY], ['id' => self::OTHER_COMPANY]]);
+        DB::table('company_profiles')->insert(array_values(array_filter([
+            $tagline === null ? null : ['company_id' => ListingTables::COMPANY, 'tagline' => $tagline],
+            ['company_id' => self::OTHER_COMPANY, 'tagline' => 'Other tagline'],
+        ])));
+        $profiled = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->related(fn (Job $job) => $job->belongsTo(Company::class, 'company_id'), fn (Successor $company) => $company
+                            ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
+                                ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline')))));
+            }
+        };
+
+        $updated = $profiled->newQuery()->whereKey(1)->update(['company_id' => self::OTHER_COMPANY, 'tagline' => 'Homes by the water']);
+
+        $this->assertSame(1, $updated);
+        $this->assertSame(self::OTHER_COMPANY, Job::query()->where('legacy_id', 1)->value('company_id'));
+        $this->assertSame([[ListingTables::COMPANY, 'Homes by the water'], [self::OTHER_COMPANY, 'Other tagline']], DB::table('company_profiles')->orderBy('company_id')->get(['company_id', 'tagline'])->map(fn (object $profile) => array_values((array) $profile))->all());
+    }
+
+    #[Test]
+    public function it_creates_a_dependent_under_a_parent_the_same_write_creates(): void
+    {
+        $sited = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')))));
+            }
+        };
+        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $updated = $sited->newQuery()->whereKey([1, 2])->update(['street' => '7 Ash St', 'latitude' => 3.5]);
+
+        $this->assertSame(2, $updated);
+        $this->assertSame(['7 Ash St'], DB::table('places')->where('job_id', $pine->id)->pluck('street')->all());
+        $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
+        $this->assertSame([3.5, 3.5], DB::table('job_sites')->join('jobs', 'jobs.id', '=', 'job_sites.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('latitude')->all());
+    }
+
     #[Test]
     public function it_creates_no_related_row_for_a_null_value(): void
     {
@@ -223,6 +301,19 @@ final class MassWriterTest extends TestCase
         $this->assertSame([42, 7, 10], Listing::withTrashed()->orderBy('id')->pluck('views')->all());
         $this->assertSame(['MLS-Z', 'MLS-Z', 'MLS-Z'], Listing::withTrashed()->orderBy('id')->pluck('mls_number')->all());
         $this->assertSame([47.1062, null, -122.8321], Listing::withTrashed()->orderBy('id')->pluck('latitude')->all());
+    }
+
+    #[Test]
+    public function it_stores_the_backing_value_of_an_enum_written_to_a_legacy_only_column(): void
+    {
+        $updated = [
+            Listing::query()->whereKey(1)->update(['mls_number' => ListingStatus::Sold]),
+            Listing::query()->whereKey(3)->toBase()->update(['mls_number' => ListingStatus::Active]),
+            Listing::query()->findOrFail(1)->increment('views', 1, ['mls_number' => ListingStatus::Draft]),
+        ];
+
+        $this->assertSame([1, 1, 1], $updated);
+        $this->assertSame([['Draft', 6], ['Active', 5]], Listing::query()->whereKey([1, 3])->orderBy('id')->get(['mls_number', 'views'])->map(fn (Listing $listing) => [$listing->mls_number, $listing->getAttribute('views')])->all());
     }
 
     #[Test]
@@ -372,6 +463,18 @@ final class MassWriterTest extends TestCase
         $this->assertSame($one[1], $hundred[1]);
         $this->assertSame([0, 0, 0], [Job::withTrashed()->whereKey($oak->id)->count(), DB::table('places')->where('job_id', $oak->id)->count(), DB::table('listings_retained')->where('job_id', $oak->id)->count()]);
         $this->assertSame(2, Job::withTrashed()->count());
+    }
+
+    private function createCompanies(): void
+    {
+        Schema::create('companies', function (Blueprint $table): void {
+            $table->uuid('id')->primary();
+        });
+        Schema::create('company_profiles', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->foreignUuid('company_id')->unique()->constrained('companies')->cascadeOnDelete();
+            $table->string('tagline')->nullable();
+        });
     }
 
     /**

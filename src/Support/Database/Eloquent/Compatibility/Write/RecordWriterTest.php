@@ -11,6 +11,8 @@ use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -32,6 +34,9 @@ final class RecordWriterTest extends TestCase
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
+    /** @var null|array{resource, array<int, resource>} */
+    private null|array $concurrent = null;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -45,6 +50,12 @@ final class RecordWriterTest extends TestCase
 
     protected function tearDown(): void
     {
+        if ($this->concurrent !== null) {
+            proc_terminate($this->concurrent[0]);
+            proc_close($this->concurrent[0]);
+            $this->concurrent = null;
+        }
+
         ListingTables::drop();
 
         parent::tearDown();
@@ -130,6 +141,66 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_gives_the_legacy_record_the_stored_values_on_every_record_write_path_before_its_own_events_run(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+        $seen = [];
+
+        foreach (['created', 'updated', 'saved', 'restored'] as $event) {
+            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
+                $seen[] = [$event, $listing->title];
+            });
+        }
+
+        $incremented = Listing::query()->findOrFail(1);
+        $incremented->increment('price', 1, ['title' => 'Oak Manor']);
+        $saved = Listing::query()->findOrFail(3);
+        $saved->title = 'Elm Lodge';
+        $saved->save();
+        $restored = Listing::withTrashed()->findOrFail(2);
+        $restored->title = 'Pine Lodge';
+        $restored->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        $created = Listing::query()->firstOrCreate(['title' => 'Birch House'], ['company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([
+            ['updated', 'OAK MANOR'],
+            ['updated', 'ELM LODGE'],
+            ['saved', 'ELM LODGE'],
+            ['updated', 'PINE LODGE'],
+            ['saved', 'PINE LODGE'],
+            ['restored', 'PINE LODGE'],
+            ['created', 'BIRCH HOUSE'],
+            ['saved', 'BIRCH HOUSE'],
+        ], $seen);
+        $this->assertSame(['OAK MANOR', 'ELM LODGE', 'PINE LODGE', 'BIRCH HOUSE'], array_map(fn (Listing $listing) => $listing->getAttribute('title'), [$incremented, $saved, $restored, $created]));
+        $this->assertSame(['OAK MANOR', 'PINE LODGE', 'ELM LODGE', 'BIRCH HOUSE'], Listing::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_gives_the_legacy_record_the_stored_values_of_a_save_or_ignore_before_its_own_events_run(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+        $seen = [];
+
+        foreach (['created', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
+                $seen[] = [$event, $listing->title];
+            });
+        }
+
+        $listing = new Listing(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        $listing->saveOrIgnore(); // @phpstan-ignore method.notFound
+
+        $this->assertSame([['created', 'BIRCH HOUSE'], ['saved', 'BIRCH HOUSE']], $seen);
+        $this->assertSame(['BIRCH HOUSE', false], [$listing->title, $listing->isDirty()]);
+    }
+
+    #[Test]
     public function it_keeps_the_timestamps_a_legacy_write_sets_when_it_soft_deletes(): void
     {
         $this->freezeSecond();
@@ -178,6 +249,60 @@ final class RecordWriterTest extends TestCase
         $stale->update(['title' => 'Oak House Renamed']);
 
         $this->assertSame(['Oak House Renamed', '1300.00', ListingStatus::Sold], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->price, Listing::query()->findOrFail(1)->status]);
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function concurrentGuardInputs(): iterable
+    {
+        foreach (['update' => 'update', 'increment' => 'increment'] as $label => $write) {
+            yield "a related row, {$label}" => ["update places set city = 'Portland' where street = '1 Oak St'", $write];
+            yield "a retained row, {$label}" => ["update listings_retained set mls_number = 'MLS-HELD' where mls_number = 'MLS-1'", $write];
+        }
+    }
+
+    #[DataProvider('concurrentGuardInputs')]
+    #[Test]
+    public function it_runs_a_guard_against_the_values_a_concurrent_write_committed_to_a_table_the_write_does_not_change(string $concurrent, string $write): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))))
+                    ->guard(
+                        'held listing named',
+                        fn (Model $after, Model $before) => $before->getAttribute('city') === 'Portland' || $before->getAttribute('mls_number') === 'MLS-HELD',
+                        because: 'A held listing keeps its name.',
+                        instead: 'Release the hold first.',
+                    );
+            }
+        };
+        $record = $listing->newQuery()->findOrFail(1);
+        $locked = $this->lockConcurrently($concurrent);
+
+        $refusal = $this->refusal(fn () => $write === 'update' ? $record->update(['title' => 'Oak Manor']) : $record->increment('price', 1, ['title' => 'Oak Manor']));
+
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
+        $this->assertStringEndsWith(" record 1 cannot take this write, because guard 'held listing named' refuses it. Why: A held listing keeps its name. Instead: Release the hold first.", $refusal->getMessage());
+        $this->assertSame(['Oak House', 125050], [Job::query()->where('legacy_id', 1)->value('name'), Job::query()->where('legacy_id', 1)->value('price_cents')]);
     }
 
     #[Test]
@@ -395,6 +520,37 @@ final class RecordWriterTest extends TestCase
         Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Job', false]], $held);
+    }
+
+    private function lockConcurrently(string $sql): string
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $concurrent = '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "locked\n"; fflush(STDOUT); sleep(2); $pdo->commit();';
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($process === false) {
+            $this->fail('The concurrent writer did not start.');
+        }
+
+        $this->concurrent = [$process, $pipes];
+
+        return (string) fgets($pipes[1]);
+    }
+
+    private function concurrentFailure(): string
+    {
+        if ($this->concurrent === null) {
+            $this->fail('No concurrent writer is running.');
+        }
+
+        [$process, $pipes] = $this->concurrent;
+        $failure = (string) stream_get_contents($pipes[2]);
+        proc_close($process);
+        $this->concurrent = null;
+
+        return $failure;
     }
 
     /**

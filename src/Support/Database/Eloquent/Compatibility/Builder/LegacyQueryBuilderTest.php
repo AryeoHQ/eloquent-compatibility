@@ -185,6 +185,28 @@ final class LegacyQueryBuilderTest extends TestCase
     }
 
     #[Test]
+    public function it_returns_the_column_an_insert_get_id_names_as_the_native_insert_does(): void
+    {
+        $native = [
+            Listing::query()->toBase()->insertGetId(['title' => 'Ash House', 'company_id' => ListingTables::COMPANY], 'uuid'),
+            Listing::query()->toBase()->insertGetId(['title' => 'Bay House', 'company_id' => ListingTables::COMPANY], 'id'),
+            Listing::query()->toBase()->insertGetId(['title' => 'Cove House', 'company_id' => ListingTables::COMPANY], 'title'),
+        ];
+        $this->install();
+
+        $served = [
+            Listing::query()->toBase()->insertGetId(['title' => 'Dune House', 'company_id' => ListingTables::COMPANY], 'uuid'),
+            Listing::query()->insertGetId(['title' => 'Elm House', 'company_id' => ListingTables::COMPANY], 'uuid'),
+            Listing::query()->toBase()->insertGetId(['title' => 'Fen House', 'company_id' => ListingTables::COMPANY], 'id'),
+            Listing::query()->toBase()->insertGetId(['title' => 'Glen House', 'company_id' => ListingTables::COMPANY], 'title'),
+        ];
+
+        $this->assertSame([Listing::query()->where('title', 'Ash House')->value('uuid'), 5, 'Cove House'], $native);
+        $this->assertSame([Listing::query()->where('title', 'Dune House')->value('uuid'), Listing::query()->where('title', 'Elm House')->value('uuid'), 9, 'Glen House'], $served);
+        $this->assertTrue(is_string($served[0]) && is_string($served[1]));
+    }
+
+    #[Test]
     public function it_inserts_or_updates_through_update_or_insert(): void
     {
         $this->install();

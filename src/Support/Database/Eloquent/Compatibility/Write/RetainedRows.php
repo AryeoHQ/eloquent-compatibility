@@ -46,7 +46,8 @@ final readonly class RetainedRows
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
         $legacy = SqlFragments::identifier($this->map->table);
         $catalog = new ColumnCatalog($this->connection);
-        $grammar = $this->connection->table($retained)->getGrammar();
+        $query = $this->connection->table($retained);
+        $grammar = $query->getGrammar();
         $selects = [];
         $updates = [];
         $bindings = [];
@@ -86,7 +87,7 @@ final readonly class RetainedRows
             'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
                 .' SELECT '.$source
                 .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
-            [...$bindings, ...$keys->getBindings()],
+            [...$query->cleanBindings($bindings), ...$keys->getBindings()],
         );
     }
 }

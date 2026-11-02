@@ -61,7 +61,7 @@ final readonly class RecordWriter
             }
 
             [$stored, $retained, $states] = $this->split($legacy, $values, $key);
-            $retained = $this->guard($legacy, $key, $values, [], $retained);
+            $retained = $this->guard($legacy, $primary, $key, $values, [], $retained);
             $this->retain($primary, $retained, []);
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
@@ -91,7 +91,7 @@ final readonly class RecordWriter
 
             [$stored, $retained, $states] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
-            $retained = $this->guard($legacy, $key, $extra, $amounts, $retained);
+            $retained = $this->guard($legacy, $primary, $key, $extra, $amounts, $retained);
             $this->retain($primary, $retained, array_diff_key($retainedAmounts, $retained));
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states + array_fill_keys(array_keys($added), []));
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
@@ -240,12 +240,13 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $retained
      * @return array<string, mixed>
      */
-    private function guard(Model $legacy, int|string $key, array $values, array $amounts, array $retained): array
+    private function guard(Model $legacy, Model $primary, int|string $key, array $values, array $amounts, array $retained): array
     {
         if ($this->map->guards === []) {
             return $retained;
         }
 
+        (new MassWriter($this->map, $this->connection))->lockDependentsOf(self::keyOf($primary));
         $before = $legacy->newModelQuery()->where($legacy->getKeyName(), $key)->first();
 
         if ($before === null) {
