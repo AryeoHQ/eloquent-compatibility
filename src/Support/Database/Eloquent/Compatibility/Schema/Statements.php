@@ -535,11 +535,11 @@ final readonly class Statements
         $rows = $connection->select(
             "select case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
                     string_agg(granted.privilege_type, ', ' order by granted.privilege_type) as privileges,
-                    granted.is_grantable as grantable
+                    granted.is_grantable or granted.grantee = relation.relowner as grantable
              from pg_class relation
-             cross join lateral aclexplode(relation.relacl) as granted
-             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and granted.grantee <> relation.relowner
-             group by granted.grantee, granted.is_grantable
+             cross join lateral aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) as granted
+             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and granted.grantee <> (select oid from pg_roles where rolname = current_user)
+             group by granted.grantee, granted.is_grantable, relation.relowner
              order by 1, 3",
             [SqlFragments::identifier($table)],
         );
@@ -549,10 +549,9 @@ final readonly class Statements
                     case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
                     granted.is_grantable as grantable
              from pg_attribute attribute
-             join pg_class relation on relation.oid = attribute.attrelid
              cross join lateral aclexplode(attribute.attacl) as granted
              where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped
-               and granted.grantee <> relation.relowner
+               and granted.grantee <> (select oid from pg_roles where rolname = current_user)
                and attribute.attname in (select jsonb_array_elements_text(cast(? as jsonb)))
              group by granted.grantee, granted.is_grantable
              order by 2, 3",

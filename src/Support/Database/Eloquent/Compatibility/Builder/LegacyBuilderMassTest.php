@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Tests\Fixtures\Support\Listings\Job;
@@ -100,15 +102,35 @@ final class LegacyBuilderMassTest extends TestCase
 
         $listing->increment('price', 2.5, ['mls_number' => 'MLS-1B']);
         $listing->decrement('latitude', 0.25);
+
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $this->assertSame(125300, $job->price_cents);
+        $this->assertSame([47.3562], JobSite::query()->where('job_id', $job->id)->pluck('latitude')->all());
+        $this->assertSame([['MLS-1B', true]], DB::table('listings_retained')->where('job_id', $job->id)->get(['mls_number', 'featured'])->map(fn (object $row) => array_values((array) $row))->all());
+        $this->assertSame(['1253.00', 47.3562], [$listing->price, $listing->latitude]);
+        $this->assertSame([Job::class, JobSite::class], array_values(array_filter($saved, fn (string $model) => $model !== Listing::class)));
+        $this->assertSame(9999, Job::query()->where('legacy_id', 3)->value('price_cents'));
+    }
+
+    #[RequiresMethod(Model::class, 'incrementEach')]
+    #[Test]
+    public function it_increments_each_column_of_one_record_through_a_successor_save(): void
+    {
+        $this->install();
+        $listing = Listing::query()->findOrFail(1);
+        $saved = [];
+        Event::listen('eloquent.saved: *', function (string $event) use (&$saved): void {
+            $saved[] = substr($event, strlen('eloquent.saved: '));
+        });
+
         $listing->incrementEach(['price' => 2, 'latitude' => 2]); // @phpstan-ignore staticMethod.dynamicCall
         $listing->decrementEach(['price' => 1, 'latitude' => 1]); // @phpstan-ignore staticMethod.dynamicCall
 
         $job = Job::query()->where('legacy_id', 1)->firstOrFail();
-        $this->assertSame(125400, $job->price_cents);
-        $this->assertSame([48.3562], JobSite::query()->where('job_id', $job->id)->pluck('latitude')->all());
-        $this->assertSame([['MLS-1B', true]], DB::table('listings_retained')->where('job_id', $job->id)->get(['mls_number', 'featured'])->map(fn (object $row) => array_values((array) $row))->all());
-        $this->assertSame(['1254.00', 48.3562], [$listing->price, $listing->latitude]);
-        $this->assertSame([Job::class, JobSite::class, Job::class, JobSite::class, Job::class, JobSite::class], array_values(array_filter($saved, fn (string $model) => $model !== Listing::class)));
+        $this->assertSame(125150, $job->price_cents);
+        $this->assertSame([48.6062], JobSite::query()->where('job_id', $job->id)->pluck('latitude')->all());
+        $this->assertSame(['1251.50', 48.6062], [$listing->price, $listing->latitude]);
+        $this->assertSame([Job::class, JobSite::class, Job::class, JobSite::class], array_values(array_filter($saved, fn (string $model) => $model !== Listing::class)));
         $this->assertSame(9999, Job::query()->where('legacy_id', 3)->value('price_cents'));
     }
 
@@ -128,7 +150,7 @@ final class LegacyBuilderMassTest extends TestCase
 
         $listing->increment('price');
 
-        $this->assertSame([[1, 'select jobs for update'], [1, 'select listings'], [1, 'update jobs']], $statements);
+        $this->assertSame([[1, "select set_config('TimeZone', ?, true)"], [1, 'select jobs for update'], [1, 'select listings'], [1, 'update jobs'], [1, 'select listings']], $statements);
     }
 
     #[Test]

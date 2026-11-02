@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use DateTimeImmutable;
+use DateTimeZone;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
@@ -264,6 +266,8 @@ final class LegacyBuilderReadTest extends TestCase
         ]);
 
         $this->assertSameFailure(fn () => $model->newQuery()->where('featured', 'maybe')->get(), fn () => DB::table('listings')->where('featured', 'maybe')->get());
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', '')->get(), fn () => DB::table('listings')->where('featured', '')->get());
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', '!=', '  ')->get(), fn () => DB::table('listings')->where('featured', '!=', '  ')->get());
     }
 
     #[Test]
@@ -610,6 +614,325 @@ final class LegacyBuilderReadTest extends TestCase
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
         $this->assertSame([[1, 5], [1, 3, 5]], [$installed, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
+    }
+
+    #[Test]
+    public function it_serves_a_timestamp_with_time_zone_cast_to_text_as_postgresql_casts_it(): void
+    {
+        DB::statement('alter table listings add column listed text');
+        DB::statement('alter table jobs add column listed_at timestamptz');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('listed', fn (Attribute $attribute) => $attribute->from('listed_at')->asType('text')));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where legacy_id = 1");
+        Compatibility::install($model::class);
+
+        $this->assertSame('2026-01-01 23:30:00+00', DB::scalar('select listed from listings where id = 1'));
+    }
+
+    #[Test]
+    public function it_compares_a_wall_clock_in_a_time_zone_with_a_literal_as_postgresql_reads_the_literal(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC')));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a wall clock with an offset' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '2026-01-03 09:15:00+09:00'),
+            'before a wall clock with an offset' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '<', '2026-01-03 09:15:00+09:00'),
+            'a wall clock with a zone name' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '2026-01-03 09:15:00 Asia/Tokyo'),
+            'a wall clock' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '2026-01-03T09:15:00'),
+            'from a date' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '>=', '2026-01-03'),
+        ]);
+        $this->assertSameFailure(fn () => $model->newQuery()->where('created_at', '2026-02-30')->get(), fn () => DB::table('listings')->where('created_at', '2026-02-30')->get());
+    }
+
+    #[Test]
+    public function it_serves_and_filters_a_mapping_to_both_integers_and_strings(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 'Active', 'closed' => 'Sold'])));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSame(['Active', '0', 'Sold', 'Active', '0'], DB::table('listings')->orderBy('id')->pluck('status')->all());
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'an integer' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '0'),
+            'a string' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
+            'an integer or a string' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('status', ['0', 'Sold']),
+        ]);
+    }
+
+    #[Test]
+    public function it_filters_a_mapping_on_its_stored_column_only_where_postgresql_compares_the_keys_as_the_view_does(): void
+    {
+        DB::statement('alter table jobs add column grade numeric, add column floor integer');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('grade')->mapping([1 => 'Active', 2 => 'Sold']))
+                        ->attribute('city', fn (Attribute $attribute) => $attribute->from('floor')->mapping(['01' => 'Ground', '02' => 'First'])));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update('update jobs set grade = 1.00, floor = 1 where legacy_id = 1');
+        DB::update('update jobs set grade = 2, floor = 2 where legacy_id = 3');
+        Compatibility::install($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a key a numeric value prints differently' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
+            'not a key a numeric value prints differently' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', 'Sold'),
+            'a padded key' => fn (Builder|QueryBuilder $listings) => $listings->where('city', 'Ground'),
+            'padded keys' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('city', ['Ground', 'First']),
+        ]);
+    }
+
+    #[Test]
+    public function it_serves_a_multiplied_integer_the_legacy_column_holds_beyond_the_integer_range(): void
+    {
+        DB::statement('alter table listings add column budget numeric(12,2)');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(1000)));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update('update jobs set price_cents = 3000000 where legacy_id = 1');
+        Compatibility::install($model::class);
+
+        $this->assertSame('3000000000.00', DB::scalar('select cast(budget as text) from listings where id = 1'));
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'beyond the integer range' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', '>', 2147483647),
+        ]);
+    }
+
+    #[Test]
+    public function it_compares_a_value_with_an_or_default_default_as_the_served_column_holds_both(): void
+    {
+        DB::statement('alter table listings add column budget numeric(10,2), add column big bigint');
+        DB::statement('alter table jobs add column is_featured boolean, add column budget numeric(10,2), add column big bigint');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('featured', fn (Attribute $attribute) => $attribute->from('is_featured')->orDefault('false'))
+                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('budget')->orDefault(0.001))
+                        ->attribute('big', fn (Attribute $attribute) => $attribute->from('big')->orDefault(9007199254740992)));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update('update jobs set is_featured = true, budget = 5, big = 9007199254740993 where legacy_id = 1');
+        DB::update('update jobs set is_featured = false, budget = 0, big = 1 where legacy_id = 3');
+        Compatibility::install($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'zero against a text default' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '0'),
+            'not one against a text default' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '!=', '1'),
+            'a default the column rounds' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', '0.00'),
+            'not a default the column rounds' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', '!=', '0.00'),
+            'a default beyond double precision' => fn (Builder|QueryBuilder $listings) => $listings->where('big', 9007199254740992),
+            'the value next to a default beyond double precision' => fn (Builder|QueryBuilder $listings) => $listings->where('big', 9007199254740993),
+            'not the value next to a default beyond double precision' => fn (Builder|QueryBuilder $listings) => $listings->where('big', '!=', 9007199254740993),
+        ]);
+    }
+
+    #[Test]
+    public function it_filters_on_the_view_for_a_role_a_successor_policy_limits(): void
+    {
+        $this->install();
+        $role = 'compatibility_policy_filter_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant select on listings, jobs, places, job_sites to {$role}");
+            DB::statement('alter table jobs enable row level security');
+            DB::statement("create policy compatibility_no_jobs on jobs for select to {$role} using (false)");
+            DB::statement("set role {$role}");
+
+            $this->assertSame(
+                [[1, 5], [1, 5]],
+                [
+                    array_map(intval(...), DB::table('listings')->whereNull('deleted_at')->where('price', '>', 100)->orderBy('id')->pluck('id')->all()),
+                    array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all()),
+                ],
+            );
+        } finally {
+            DB::statement('reset role');
+            DB::statement('drop policy if exists compatibility_no_jobs on jobs');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
+    public function it_keeps_a_range_with_a_null_bound_as_the_legacy_table_ran_it(): void
+    {
+        $queries = [
+            'price between null and a value' => fn (Builder $listings) => $listings->whereBetween('price', [null, 100]),
+            'price between a value and null' => fn (Builder $listings) => $listings->whereBetween('price', [100, null]),
+            'price not between null and a value' => fn (Builder $listings) => $listings->whereNotBetween('price', [null, 100]),
+            'or price not between a value and null' => fn (Builder $listings) => $listings->where('title', 'Pine Flat')->orWhereNotBetween('price', [100, null]),
+            'not price between null and a value' => fn (Builder $listings) => $listings->whereNot(fn (Builder $nested) => $nested->whereBetween('price', [null, 100])),
+            'status between null and a value' => fn (Builder $listings) => $listings->whereBetween('status', [null, 'Sold']),
+        ];
+
+        $before = $this->idsFor($queries);
+        $this->install();
+
+        $this->assertSame($before, $this->idsFor($queries));
+        $this->assertSame([[], [1, 5], [3]], [$before['price between null and a value'], $before['price not between null and a value'], $before['or price not between a value and null']]);
+    }
+
+    #[Test]
+    public function it_reads_a_timestamp_domain_in_the_application_zone_whatever_the_session_zone(): void
+    {
+        DB::statement('drop domain if exists compatibility_moment cascade');
+        DB::statement('drop domain if exists compatibility_wall_clock cascade');
+        DB::statement('create domain compatibility_moment as timestamptz');
+        DB::statement('create domain compatibility_wall_clock as timestamp(0)');
+        DB::statement('alter table listings add column listed_wall timestamp(0), add column listed_clock compatibility_wall_clock');
+        DB::statement('alter table jobs add column listed_at compatibility_moment, add column listed_instant timestamptz');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->from('listed_at'))
+                        ->attribute('listed_clock', fn (Attribute $attribute) => $attribute->from('listed_instant')));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where legacy_id = 1");
+        Compatibility::install($model::class);
+        $served = fn (string $zone) => DB::transaction(function () use ($zone): array {
+            DB::statement("set local time zone '{$zone}'");
+
+            return (array) DB::selectOne('select cast(listed_wall as text) as listed_wall, cast(listed_clock as text) as listed_clock from listings where id = 1');
+        });
+
+        $this->assertSame(
+            [['listed_wall' => '2026-01-01 23:30:00', 'listed_clock' => '2026-01-01 23:30:00'], ['listed_wall' => '2026-01-01 23:30:00', 'listed_clock' => '2026-01-01 23:30:00']],
+            [$served('UTC'), $served('Asia/Tokyo')],
+        );
+    }
+
+    #[Test]
+    public function it_compares_a_wall_clock_in_a_time_zone_with_a_date_object_as_laravel_binds_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC')));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a date with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', new DateTimeImmutable('2026-01-03 09:15:00.500000')),
+            'before a date with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '<', new DateTimeImmutable('2026-01-03 09:15:00.500000')),
+            'in dates with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('created_at', [new DateTimeImmutable('2026-01-03 09:15:00.500000'), new DateTimeImmutable('2026-01-04 08:00:00.250000')]),
+            'a date in another zone' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', new DateTimeImmutable('2026-01-03 09:15:00', new DateTimeZone('Asia/Tokyo'))),
+        ]);
+    }
+
+    #[Test]
+    public function it_compares_a_scaled_attribute_with_a_float_as_pdo_sends_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01)));
+            }
+        };
+        $queries = [
+            'a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 0.009999999999999998),
+            'above a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '>', 0.009999999999999998),
+            'not a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '!=', 0.009999999999999998),
+            'in floats' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('price', [0.009999999999999998, 99.99]),
+        ];
+        $this->installMap($model::class);
+        DB::update('update jobs set price_cents = 1 where legacy_id = 4');
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), $queries);
+        $this->assertSameRows(fn () => Listing::query(), fn () => DB::table('listings')->whereNull('deleted_at'), $queries);
+        $this->assertSame([4], array_map(intval(...), DB::table('listings')->where('price', 0.009999999999999998)->pluck('id')->all()));
     }
 
     public static function identified(Compatibility $listing): Compatibility

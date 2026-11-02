@@ -6,10 +6,12 @@ namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -99,14 +101,25 @@ final class LegacyQueryBuilderTest extends TestCase
             ['uuid' => $uuid, 'title' => 'Taken', 'company_id' => ListingTables::COMPANY],
             ['title' => 'Fresh', 'company_id' => ListingTables::COMPANY],
         ]);
-        $taken = new Listing(['uuid' => $uuid, 'title' => 'Taken again', 'company_id' => ListingTables::COMPANY]);
-        $fresh = new Listing(['title' => 'Fresh again', 'company_id' => ListingTables::COMPANY, 'street' => '4 Yew St']);
 
         $this->assertSame(1, $inserted);
+        $this->assertSame(['Oak House', 'Fresh'], Listing::query()->where('title', '!=', 'Elm Cottage')->orderBy('id')->pluck('title')->all());
+        $this->assertSame(0, DB::table('jobs')->where('name', 'like', 'Taken%')->count());
+    }
+
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
+    #[Test]
+    public function it_ignores_a_record_save_whose_unique_identifier_is_taken(): void
+    {
+        $this->install();
+        $uuid = (string) Listing::query()->whereKey(1)->value('uuid');
+        $taken = new Listing(['uuid' => $uuid, 'title' => 'Taken', 'company_id' => ListingTables::COMPANY]);
+        $fresh = new Listing(['title' => 'Fresh', 'company_id' => ListingTables::COMPANY, 'street' => '4 Yew St']);
+
         $this->assertFalse($taken->saveOrIgnore());
         $this->assertTrue($fresh->saveOrIgnore());
-        $this->assertSame(['Oak House', 'Fresh', 'Fresh again'], Listing::query()->where('title', '!=', 'Elm Cottage')->orderBy('id')->pluck('title')->all());
-        $this->assertSame(['4 Yew St', 'Fresh again'], [$fresh->street, Listing::query()->findOrFail($fresh->id)->title]);
+        $this->assertSame(['Oak House', 'Fresh'], Listing::query()->where('title', '!=', 'Elm Cottage')->orderBy('id')->pluck('title')->all());
+        $this->assertSame(['4 Yew St', 'Fresh'], [$fresh->street, Listing::query()->findOrFail($fresh->id)->title]);
         $this->assertSame(0, DB::table('jobs')->where('name', 'like', 'Taken%')->count());
     }
 
@@ -118,9 +131,24 @@ final class LegacyQueryBuilderTest extends TestCase
         $query();
         DB::enableQueryLog();
 
-        $results = [$query()->insert([]), $query()->insertOrIgnore([]), $query()->insertOrIgnoreReturning([])->all()];
+        $results = [$query()->insert([]), $query()->insertOrIgnore([])];
 
-        $this->assertSame([true, 0, []], $results);
+        $this->assertSame([true, 0], $results);
+        $this->assertSame([], DB::getQueryLog());
+        $this->assertSame(3, DB::table('jobs')->count());
+    }
+
+    #[RequiresMethod(QueryBuilder::class, 'insertOrIgnoreReturning')]
+    #[Test]
+    public function it_returns_the_native_empty_result_for_an_empty_insert_or_ignore_returning_before_any_statement(): void
+    {
+        $this->install();
+        $query = Listing::query()->toBase();
+        DB::enableQueryLog();
+
+        $results = $query->insertOrIgnoreReturning([])->all();
+
+        $this->assertSame([], $results);
         $this->assertSame([], DB::getQueryLog());
         $this->assertSame(3, DB::table('jobs')->count());
     }

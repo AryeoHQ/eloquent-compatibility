@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -162,6 +163,42 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_constraint_that_holds_the_name_of_the_check_it_adds(): void
+    {
+        DB::statement("alter table jobs add constraint jobs_legacy_id_filled check (name <> '')");
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: jobs_legacy_id_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.", $exception->getMessage());
+        }
+
+        $this->assertSame("CHECK (((name)::text <> ''::text))", DB::scalar("select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'jobs'::regclass and conname = 'jobs_legacy_id_filled'"));
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function leftoverChecks(): iterable
+    {
+        yield 'a check not yet validated' => ['alter table jobs add constraint jobs_legacy_id_filled check (legacy_id is not null) not valid'];
+        yield 'a validated check' => ['alter table jobs add constraint jobs_legacy_id_filled check (legacy_id is not null)'];
+    }
+
+    #[DataProvider('leftoverChecks')]
+    #[Test]
+    public function it_prepares_again_over_the_check_an_interrupted_prepare_leaves(string $check): void
+    {
+        DB::statement('alter table jobs add column legacy_id integer');
+        DB::statement($check);
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame([], DB::select("select conname from pg_constraint where conrelid = 'jobs'::regclass and conname like '%_filled'"));
+    }
+
+    #[Test]
     public function it_lets_the_successor_update_a_row_the_identifier_fill_has_not_reached(): void
     {
         DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY]);
@@ -309,6 +346,23 @@ final class PreparerTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', 'atMostOne() on the relation from Place to Job needs no index, because the places row names one jobs row by its key'));
 
         Statements::prepare($map, DB::connection());
+    }
+
+    #[Test]
+    public function it_builds_an_at_most_one_index_whose_condition_binds_a_date(): void
+    {
+        $map = (new Compatibility(Listing::class))
+            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->servedFrom(Job::class, fn (Successor $job) => $job
+                ->related(fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', new DateTimeImmutable('2026-01-01')), fn (Successor $place) => $place->atMostOne(because: 'One current address.')))
+            ->resolve();
+
+        (new Installer(DB::connection()))->run(Statements::prepare($map, DB::connection()));
+
+        $this->assertSame(
+            "CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id) WHERE ((created_at >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (deleted_at IS NULL))",
+            DB::scalar("select indexdef from pg_indexes where indexname = 'places_listings_at_most_one'"),
+        );
     }
 
     #[Test]

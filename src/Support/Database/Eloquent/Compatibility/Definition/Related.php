@@ -19,7 +19,9 @@ use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\PostgresConnection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
+use ReflectionProperty;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class Related
 {
@@ -123,7 +125,7 @@ final readonly class Related
             $relatedKey,
             $compiled instanceof BelongsTo,
             $where === '' ? null : Str::after($where, 'where '),
-            array_values($base->bindings['where']),
+            SqlFragments::formatDates(array_values($base->bindings['where']), $grammar->getDateFormat()),
             $orders === [] ? null : implode(', ', $orders),
             in_array(SoftDeletingScope::class, $scopes, true) && method_exists($related, 'getDeletedAtColumn') ? (string) $related->getDeletedAtColumn() : null,
             $query->pendingAttributes,
@@ -137,10 +139,23 @@ final readonly class Related
      */
     private static function call(string $map, string $parent, Closure $relation): Relation
     {
+        $model = new $parent;
+        $model->exists = true;
+        $model->setRawAttributes([]);
+        (new ReflectionProperty(Model::class, 'casts'))->setValue($model, []);
+        $violations = new ReflectionProperty(Model::class, 'missingAttributeViolationCallback');
+        $violation = $violations->getValue();
+        $prevents = Model::preventsAccessingMissingAttributes();
+        Model::preventAccessingMissingAttributes();
+        Model::handleMissingAttributeViolationUsing(fn (Model $model, string $key) => throw InvalidCompatibilityMap::because($map, 'a related() relation closure on '.class_basename($parent)." reads its attribute {$key}, and the view compiles one relation for every ".class_basename($parent).", so a condition cannot follow each row's value"));
+
         try {
-            $compiled = $relation(new $parent);
+            $compiled = $relation($model);
         } catch (BadMethodCallException $exception) {
             throw InvalidCompatibilityMap::because($map, 'a related() relation closure on '.class_basename($parent).' calls a method '.class_basename($parent).' does not have: '.$exception->getMessage());
+        } finally {
+            Model::preventAccessingMissingAttributes($prevents);
+            Model::handleMissingAttributeViolationUsing(is_callable($violation) ? $violation : null);
         }
 
         if (! $compiled instanceof Relation) {

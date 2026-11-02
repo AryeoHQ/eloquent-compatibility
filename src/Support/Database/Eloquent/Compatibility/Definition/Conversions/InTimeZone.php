@@ -36,7 +36,11 @@ final readonly class InTimeZone implements Conversion
 
     public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
-        return in_array($operator, ['=', '!=', '<>', '<', '>', '<=', '>='], true) ? [$operator, $this->write($value)] : null;
+        if (! in_array($operator, ['=', '!=', '<>', '<', '>', '<=', '>='], true) || ($value !== null && ! $value instanceof DateTimeInterface && ! self::isWallClock($value))) {
+            return null;
+        }
+
+        return [$operator, $this->write($value)];
     }
 
     public function order(string $direction): string
@@ -55,5 +59,16 @@ final readonly class InTimeZone implements Conversion
 
         return SqlFragments::isZoned($type) && SqlFragments::isWallClock($served) && SqlFragments::precision($served) >= SqlFragments::precision((string) $type)
             && $transitions !== false && count($transitions) <= 1;
+    }
+
+    private static function isWallClock(mixed $value): bool
+    {
+        if (! is_string($value) || preg_match('/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?)?$/', $value) !== 1) {
+            return false;
+        }
+
+        $parsed = date_parse($value);
+
+        return $parsed['error_count'] === 0 && $parsed['warning_count'] === 0;
     }
 }

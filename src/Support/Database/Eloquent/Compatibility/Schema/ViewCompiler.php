@@ -49,7 +49,7 @@ final readonly class ViewCompiler
             if (! $attribute->isExternal()) {
                 $table = $map->owners[$name]->table;
                 $column = $attribute->column();
-                $stored = $column === null ? null : $this->columnCatalog->type($table, $column);
+                $stored = $column === null ? null : $this->baseType($table, $column);
                 $reads[$name] = [$attribute->read($table, $stored), $attribute->type($stored), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
             }
         }
@@ -63,19 +63,19 @@ final readonly class ViewCompiler
 
             [$read, $type, $raw] = $reads[$name];
 
-            if ($raw && SqlFragments::isNaive($column->type)) {
+            if ($raw && SqlFragments::isNaive($column->baseType ?? $column->type)) {
                 $type = $this->expressionType($map, $read);
             }
 
-            $served[$name] = self::cast($read, $type, $column->type);
+            $served[$name] = self::cast($read, $type, $column->type, $column->baseType);
         }
 
         return $served;
     }
 
-    public static function cast(string $read, null|string $type, string $served): string
+    public static function cast(string $read, null|string $type, string $served, null|string $servedBase = null): string
     {
-        if (SqlFragments::isZoned($type) && SqlFragments::isNaive($served)) {
+        if (SqlFragments::isZoned($type) && SqlFragments::isNaive($servedBase ?? $served)) {
             $read = SqlFragments::inApplicationZone($read);
         }
 
@@ -174,6 +174,10 @@ final readonly class ViewCompiler
             $read = SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier($name);
             $default = $retained[$name]->default;
 
+            if ($retained[$name]->generated) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated or identity column, so the view cannot compute its value for a {$map->primary->table} row without a {$retainedTable} row");
+            }
+
             if ($retained[$name]->needsAValue()) {
                 throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is NOT NULL and has no default, so the view has no value to serve for a {$map->primary->table} row without a {$retainedTable} row");
             }
@@ -196,6 +200,13 @@ final readonly class ViewCompiler
             ."\nFROM ".self::primary($map)
             ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($retainedBy)
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
+    }
+
+    private function baseType(string $table, string $column): null|string
+    {
+        $stored = $this->columnCatalog->of($table)[$column] ?? null;
+
+        return $stored === null ? null : $stored->baseType ?? $stored->type;
     }
 
     private function expressionType(ResolvedMap $map, string $read): null|string
@@ -278,7 +289,8 @@ final readonly class ViewCompiler
             }
 
             $table = $map->owners[$name]->table;
-            $type = $this->columnsOf($map, $table, [$column], "attribute '{$name}' reads it")[$column]->type;
+            $stored = $this->columnsOf($map, $table, [$column], "attribute '{$name}' reads it")[$column];
+            $type = $stored->baseType ?? $stored->type;
 
             foreach ($attribute->conversions() as $conversion) {
                 if ($conversion instanceof InTimeZone && ($type === null || preg_match('/^(timestamp(\(\d\))? with time zone|timestamptz(\(\d\))?)$/i', $type) !== 1)) {
@@ -328,7 +340,7 @@ final readonly class ViewCompiler
                 throw InvalidCompatibilityMap::because($map->table, "a hide() scope compiles to no plain condition on {$map->primary->table}; it takes where clauses only, because \"{$hide->because}\" becomes the view's filter");
             }
 
-            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), array_values($base->getRawBindings()['where']));
+            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), SqlFragments::formatDates(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
         }
 
         return $conditions;

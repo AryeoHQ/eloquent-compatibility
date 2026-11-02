@@ -107,17 +107,20 @@ final class AttributeTest extends TestCase
     {
         $resolve = <<<'PHP'
             $loader = require $argv[1];
-            $loader->addClassMap([Support\Database\Eloquent\StateMachines\Contracts\StateMachineable::class => '/dev/null']);
+            $empty = tempnam(sys_get_temp_dir(), 'absent');
+            $loader->addClassMap([Support\Database\Eloquent\StateMachines\Contracts\StateMachineable::class => $empty]);
 
             try {
                 (new Support\Database\Eloquent\Compatibility\Definition\Attribute('listings', 'status'))->from('lifecycle_status')->transitions()->resolve();
                 echo 'resolved';
             } catch (Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap $invalid) {
                 echo $invalid->getMessage();
+            } finally {
+                unlink($empty);
             }
             PHP;
 
-        $result = Process::run([PHP_BINARY, '-r', $resolve, dirname(__DIR__, 6).'/vendor/autoload.php']);
+        $result = Process::run([PHP_BINARY, '-d', 'display_errors=stderr', '-r', $resolve, dirname(__DIR__, 6).'/vendor/autoload.php']);
 
         $this->assertSame('', $result->errorOutput());
         $this->assertStringEndsWith("attribute 'status' is declared transitions(), which runs a state-machine trigger, and aryeo/eloquent-state-machines is not installed.", $result->output());

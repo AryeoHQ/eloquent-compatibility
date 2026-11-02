@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use DateTimeInterface;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Support\Arrayable;
 use Illuminate\Database\Eloquent\Builder;
@@ -75,20 +76,7 @@ final class LegacyBuilder extends Builder
 
     public static function serves(Model $model): bool
     {
-        $connection = $model->getConnection();
-        $relation = $connection->getName().'.'.$model->getTable();
-
-        if (array_key_exists($relation, self::$tables)) {
-            return false;
-        }
-
-        $view = $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())]) === 'v';
-
-        if (! $view) {
-            self::$tables[$relation] = true;
-        }
-
-        return $view;
+        return $model->getConnection()->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
     }
 
     /**
@@ -187,7 +175,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::incrementEach($columns, $extra) : $this->incrementOwn($model, $columns, $extra);
+        return $model === null ? $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, $columns, $extra);
     }
 
     /**
@@ -198,7 +186,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::decrementEach($columns, $extra) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
+        return $model === null ? $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
     }
 
     /**
@@ -557,6 +545,16 @@ final class LegacyBuilder extends Builder
             return $this;
         }
 
+        $conditions = array_map(fn (array $condition) => [$condition[0], $this->sent($condition[1])], $conditions);
+
+        foreach ($conditions as [$operator, $value]) {
+            if ($value === null && in_array($operator, ['<', '>', '<=', '>='], true)) {
+                $onView();
+
+                return $this;
+            }
+        }
+
         $owner = $map->owners[$attribute]->table;
         $key = $this->model->getKeyName();
         $negated = $this->negations % 2 === 1;
@@ -588,6 +586,15 @@ final class LegacyBuilder extends Builder
         $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
 
         return $this;
+    }
+
+    private function sent(mixed $value): mixed
+    {
+        return match (true) {
+            $value instanceof DateTimeInterface => $value->format($this->model->getConnection()->getQueryGrammar()->getDateFormat()),
+            is_float($value) => (string) $value,
+            default => $value,
+        };
     }
 
     /**
@@ -665,14 +672,15 @@ final class LegacyBuilder extends Builder
         $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
         $definition = $this->definition($attribute);
         $column = $definition->column();
-        $type = $column === null ? null : $catalog->type($owner, $column);
-        $served = $catalog->type($this->map()->table, $attribute);
+        $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
+        $type = $stored === null ? null : $stored->baseType ?? $stored->type;
+        $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || $definition->exact($type, $served)) {
+        if ($served === null || $definition->exact($type, $served->baseType ?? $served->type)) {
             return [$type, null];
         }
 
-        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served)];
+        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served->type, $served->baseType)];
     }
 
     /**
@@ -763,7 +771,7 @@ final class LegacyBuilder extends Builder
         $row = (array) $connection->selectOne(
             "select current_schema() as schema,
                     coalesce((select relkind = 'v' from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)), 'SELECT'), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor), false) as readable",
+                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)) as successor_table), false) as readable",
             [SqlFragments::identifier($this->model->getTable()), json_encode([$map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], JSON_THROW_ON_ERROR)],
         );
 

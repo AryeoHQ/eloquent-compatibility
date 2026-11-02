@@ -70,7 +70,7 @@ final readonly class IsNotNull implements Conversion
 
         return match (strtolower(trim((string) $value))) {
             '1', 'true', 'on', 'yes' => true,
-            '0', 'false', 'off', 'no', '' => false,
+            '0', 'false', 'off', 'no' => false,
             default => null,
         };
     }

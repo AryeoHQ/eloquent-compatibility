@@ -6,11 +6,13 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -19,10 +21,12 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\Place;
 use Tests\TestCase;
 
 #[CoversClass(MassWriter::class)]
@@ -31,6 +35,9 @@ final class MassWriterTest extends TestCase
 {
     /** @var list<string> */
     protected $connectionsToTransact = [];
+
+    /** @var null|array{resource, array<int, resource>} */
+    private null|array $concurrent = null;
 
     protected function setUp(): void
     {
@@ -48,7 +55,15 @@ final class MassWriterTest extends TestCase
 
     protected function tearDown(): void
     {
+        if ($this->concurrent !== null) {
+            proc_terminate($this->concurrent[0]);
+            proc_close($this->concurrent[0]);
+            $this->concurrent = null;
+        }
+
         ListingTables::drop();
+        Schema::dropIfExists('company_profiles');
+        Schema::dropIfExists('companies');
 
         parent::tearDown();
     }
@@ -110,6 +125,76 @@ final class MassWriterTest extends TestCase
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
         $this->assertSame(2, DB::table('places')->where('street', '7 Ash St')->count());
         $this->assertSame(['7 Ash St', 3.5], [Listing::withTrashed()->findOrFail(2)->street, Listing::withTrashed()->findOrFail(2)->latitude]);
+    }
+
+    #[Test]
+    public function it_creates_no_dependent_for_a_record_whose_dependent_the_write_moves_out_of_its_relation(): void
+    {
+        $seattle = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))));
+            }
+        };
+
+        $updated = $seattle->newQuery()->whereKey(1)->update(['street' => '2 Oak St', 'city' => 'Tacoma']);
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+
+        $this->assertSame(1, $updated);
+        $this->assertSame([['2 Oak St', 'Tacoma']], DB::table('places')->where('job_id', $oak->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
+    }
+
+    #[Test]
+    public function it_creates_one_dependent_for_each_parent_that_several_matching_records_share(): void
+    {
+        Schema::create('companies', function (Blueprint $table): void {
+            $table->uuid('id')->primary();
+        });
+        Schema::create('company_profiles', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->foreignUuid('company_id')->unique()->constrained('companies')->cascadeOnDelete();
+            $table->string('tagline')->nullable();
+        });
+        DB::table('companies')->insert(['id' => ListingTables::COMPANY]);
+        $profiled = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->belongsTo(Company::class, 'company_id'), fn (Successor $company) => $company
+                            ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
+                                ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline')))));
+            }
+        };
+
+        $updated = $profiled->newQuery()->whereKey([1, 3])->update(['tagline' => 'Homes by the water']);
+
+        $this->assertSame(2, $updated);
+        $this->assertSame([[ListingTables::COMPANY, 'Homes by the water']], DB::table('company_profiles')->get(['company_id', 'tagline'])->map(fn (object $profile) => array_values((array) $profile))->all());
     }
 
     #[Test]
@@ -198,19 +283,44 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_skips_a_record_a_concurrent_write_moved_out_of_the_filter_while_the_write_waited_for_its_lock(): void
     {
-        $config = DB::connection()->getConfig();
-        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
-        $concurrent = '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
-            .' $pdo->beginTransaction(); $pdo->exec("update jobs set name = \'Changed\' where legacy_id = 1"); echo "locked\n"; fflush(STDOUT); sleep(2); $pdo->commit();';
-        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
-        $locked = fgets($pipes[1]);
+        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where legacy_id = 1");
 
         $updated = Listing::query()->where('title', 'Oak House')->update(['title' => 'Mass']);
-        $failure = stream_get_contents($pipes[2]);
-        proc_close($process);
 
-        $this->assertSame(["locked\n", ''], [$locked, $failure]);
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
         $this->assertSame([0, 'Changed'], [$updated, Listing::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
+    public function it_skips_deleting_a_record_a_concurrent_write_moved_out_of_the_filter_while_the_delete_waited_for_its_lock(): void
+    {
+        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where legacy_id = 1");
+
+        $deleted = Listing::query()->where('title', 'Oak House')->forceDelete();
+
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
+        $this->assertSame([0, 'Changed'], [$deleted, Listing::query()->findOrFail(1)->title]);
+    }
+
+    /**
+     * @return iterable<string, array{string, string, string}>
+     */
+    public static function concurrentMovesOutOfAnotherTable(): iterable
+    {
+        yield 'a related row' => ["update places set city = 'Portland' where street = '1 Oak St'", 'city', 'Seattle'];
+        yield 'a retained row' => ["update listings_retained set mls_number = 'MLS-1B' where mls_number = 'MLS-1'", 'mls_number', 'MLS-1'];
+    }
+
+    #[DataProvider('concurrentMovesOutOfAnotherTable')]
+    #[Test]
+    public function it_skips_a_record_a_concurrent_write_moved_out_of_a_filter_on_another_table_while_the_write_waited(string $concurrent, string $column, string $value): void
+    {
+        $locked = $this->lockConcurrently($concurrent);
+
+        $updated = Listing::query()->where($column, $value)->update(['title' => 'Mass', 'street' => '9 Oak St']);
+
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
+        $this->assertSame([0, 'Oak House', '1 Oak St'], [$updated, Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->street]);
     }
 
     #[Test]
@@ -249,14 +359,17 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_deletes_the_primary_rows_hard_in_one_statement(): void
+    public function it_deletes_the_primary_rows_hard_in_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
     {
         $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
         Listing::query()->where('price', '>', 1000)->get();
-        [$count, $statements] = $this->statements(fn () => Listing::query()->where('price', '>', 1000)->forceDelete());
 
-        $this->assertSame(1, $count);
-        $this->assertSame(1, $statements);
+        $one = $this->statements(fn () => Listing::query()->where('price', '>', 1000)->forceDelete());
+        $hundred = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->forceDelete());
+
+        $this->assertSame([1, 100], [$one[0], $hundred[0]]);
+        $this->assertSame($one[1], $hundred[1]);
         $this->assertSame([0, 0, 0], [Job::withTrashed()->whereKey($oak->id)->count(), DB::table('places')->where('job_id', $oak->id)->count(), DB::table('listings_retained')->where('job_id', $oak->id)->count()]);
         $this->assertSame(2, Job::withTrashed()->count());
     }
@@ -276,6 +389,37 @@ final class MassWriterTest extends TestCase
         }
 
         return [$result, count(array_filter(DB::getQueryLog(), fn (array $query) => ! str_contains((string) $query['query'], 'pg_class')))];
+    }
+
+    private function lockConcurrently(string $sql): string
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $concurrent = '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "locked\n"; fflush(STDOUT); sleep(2); $pdo->commit();';
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($process === false) {
+            $this->fail('The concurrent writer did not start.');
+        }
+
+        $this->concurrent = [$process, $pipes];
+
+        return (string) fgets($pipes[1]);
+    }
+
+    private function concurrentFailure(): string
+    {
+        if ($this->concurrent === null) {
+            $this->fail('No concurrent writer is running.');
+        }
+
+        [$process, $pipes] = $this->concurrent;
+        $failure = (string) stream_get_contents($pipes[2]);
+        proc_close($process);
+        $this->concurrent = null;
+
+        return $failure;
     }
 
     private function refusal(Closure $write): CompatibilityWriteRefused
