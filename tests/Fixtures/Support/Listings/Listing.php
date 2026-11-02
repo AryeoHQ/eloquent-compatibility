@@ -12,6 +12,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
 /**
  * @property int $id
@@ -22,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
  */
 final class Listing extends Model implements Compatible
 {
+    use ServesCompatibility;
     use SoftDeletes;
 
     protected $table = 'listings';

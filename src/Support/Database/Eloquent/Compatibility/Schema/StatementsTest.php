@@ -1,0 +1,291 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Schema;
+
+use Closure;
+use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\TestCase;
+
+#[CoversClass(Statements::class)]
+final class StatementsTest extends TestCase
+{
+    /** @var list<string> */
+    protected $connectionsToTransact = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        ListingTables::create();
+    }
+
+    protected function tearDown(): void
+    {
+        ListingTables::drop();
+
+        parent::tearDown();
+    }
+
+    #[Test]
+    public function it_lists_the_columns_and_the_concurrent_index_prepare_adds(): void
+    {
+        $statements = Statements::prepare($this->map(), DB::connection());
+
+        $this->assertSame('prepare', $statements->operation);
+        $this->assertSame([<<<'SQL'
+            ALTER TABLE "jobs"
+              ADD COLUMN "legacy_id" integer NOT NULL DEFAULT nextval('listings_id_seq'::regclass) CONSTRAINT "jobs_legacy_id_unique" UNIQUE,
+              ADD COLUMN "legacy_uuid" uuid NOT NULL DEFAULT gen_random_uuid() CONSTRAINT "jobs_legacy_uuid_unique" UNIQUE
+            SQL], $statements->transaction);
+        $this->assertSame([
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              duplicated bigint;
+              first_keys text;
+            BEGIN
+              SELECT count(*) INTO duplicated FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL GROUP BY "job_id" HAVING count(*) > 1) AS duplicates;
+              IF duplicated > 0 THEN
+                SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL GROUP BY "job_id" HAVING count(*) > 1 ORDER BY "job_id" LIMIT 5) AS first_duplicates (duplicate);
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: atMostOne() on the relation from Job to Place allows one places row for each job_id, and ' || duplicated || ' values of job_id have more; the first are ' || first_keys;
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'CREATE UNIQUE INDEX CONCURRENTLY "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL',
+        ], $statements->afterwards);
+        $this->assertSame([...$statements->transaction, ...$statements->afterwards], $statements->all());
+    }
+
+    #[Test]
+    public function it_lists_the_statements_that_install_the_view_in_place_of_the_legacy_table(): void
+    {
+        Compatibility::prepare(Listing::class);
+        $view = (new ViewCompiler(new ColumnCatalog(DB::connection())))->create($this->map());
+
+        $statements = Statements::install($this->map(), DB::connection());
+
+        $this->assertSame([
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              missing bigint;
+              first_keys text;
+            BEGIN
+              SELECT count(*) INTO missing FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" IS NOT DISTINCT FROM "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid");
+              IF missing > 0 THEN
+                SELECT string_agg(CAST(missing_key AS text), ', ' ORDER BY missing_key) INTO first_keys FROM (SELECT "listings"."id" FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" IS NOT DISTINCT FROM "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid") ORDER BY "listings"."id" LIMIT 5) AS first_missing (missing_key);
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot install: ' || missing || ' listings rows have no jobs row with the same id and uuid; the first are id ' || first_keys || '. Backfill them before install().';
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "listing_photos"
+              DROP CONSTRAINT "listing_photos_listing_id_foreign",
+              ADD CONSTRAINT "listing_photos_listing_id_foreign" FOREIGN KEY ("listing_id") REFERENCES "jobs" ("legacy_id") ON DELETE CASCADE NOT VALID
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "listing_shares"
+              DROP CONSTRAINT "listing_shares_listing_uuid_foreign",
+              ADD CONSTRAINT "listing_shares_listing_uuid_foreign" FOREIGN KEY ("listing_uuid") REFERENCES "jobs" ("legacy_uuid") ON UPDATE CASCADE ON DELETE SET NULL NOT VALID
+            SQL,
+            'ALTER SEQUENCE public.listings_id_seq OWNED BY "jobs"."legacy_id"',
+            'ALTER TABLE "listings" ADD COLUMN "job_id" uuid',
+            'UPDATE "listings" SET "job_id" = "jobs"."id" FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id"',
+            <<<'SQL'
+            ALTER TABLE "listings"
+              DROP COLUMN "id",
+              DROP COLUMN "uuid",
+              DROP COLUMN "title",
+              DROP COLUMN "company_id",
+              DROP COLUMN "price",
+              DROP COLUMN "status",
+              DROP COLUMN "street",
+              DROP COLUMN "city",
+              DROP COLUMN "latitude",
+              DROP COLUMN "created_at",
+              DROP COLUMN "updated_at",
+              DROP COLUMN "deleted_at"
+            SQL,
+            'ALTER TABLE "listings" RENAME TO "listings_retained"',
+            <<<'SQL'
+            ALTER TABLE "listings_retained"
+              ADD CONSTRAINT "listings_retained_pkey" PRIMARY KEY ("job_id"),
+              ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID
+            SQL,
+            $view,
+            'ALTER VIEW "listings" ALTER COLUMN "id" SET DEFAULT nextval(\'listings_id_seq\'::regclass)',
+            'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
+            'ALTER VIEW "listings" ALTER COLUMN "status" SET DEFAULT \'Draft\'::character varying',
+            'ALTER VIEW "listings" ALTER COLUMN "featured" SET DEFAULT false',
+        ], $statements->transaction);
+        $this->assertSame([
+            'ALTER TABLE "listing_photos" VALIDATE CONSTRAINT "listing_photos_listing_id_foreign"',
+            'ALTER TABLE "listing_shares" VALIDATE CONSTRAINT "listing_shares_listing_uuid_foreign"',
+            'ALTER TABLE "listings_retained" VALIDATE CONSTRAINT "listings_retained_job_id_foreign"',
+        ], $statements->afterwards);
+    }
+
+    #[Test]
+    public function it_lists_the_one_statement_that_recompiles_the_view(): void
+    {
+        Compatibility::prepare(Listing::class);
+        Compatibility::install(Listing::class);
+
+        $this->assertEquals(new Statements('recompile', [(new ViewCompiler(new ColumnCatalog(DB::connection())))->replace($this->map())]), Statements::recompile($this->map(), DB::connection()));
+    }
+
+    #[Test]
+    public function it_lists_the_statements_that_restore_the_legacy_table_from_the_successors(): void
+    {
+        Compatibility::prepare(Listing::class);
+        Compatibility::install(Listing::class);
+
+        $statements = Statements::uninstall($this->map(), DB::connection());
+
+        $this->assertSame([
+            'DROP VIEW "listings"',
+            'ALTER TABLE "listings_retained" RENAME TO "listings"',
+            'INSERT INTO "listings" ("job_id") SELECT "jobs"."id" FROM (SELECT * FROM "jobs" WHERE NOT COALESCE(("merged_into_job_id" is not null), false)) AS "jobs" WHERE NOT EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" = "jobs"."id")',
+            <<<'SQL'
+            ALTER TABLE "listings"
+              ADD COLUMN "id" integer,
+              ADD COLUMN "uuid" uuid,
+              ADD COLUMN "title" character varying(255),
+              ADD COLUMN "company_id" uuid,
+              ADD COLUMN "price" numeric(10,2),
+              ADD COLUMN "status" character varying(255),
+              ADD COLUMN "street" character varying(255),
+              ADD COLUMN "city" character varying(255),
+              ADD COLUMN "latitude" double precision,
+              ADD COLUMN "created_at" timestamp(0) without time zone,
+              ADD COLUMN "updated_at" timestamp(0) without time zone,
+              ADD COLUMN "deleted_at" timestamp(0) without time zone
+            SQL,
+            <<<'SQL'
+            UPDATE "listings" SET
+              "id" = CAST("jobs"."legacy_id" AS integer),
+              "uuid" = CAST("jobs"."legacy_uuid" AS uuid),
+              "title" = CAST("jobs"."name" AS character varying(255)),
+              "company_id" = CAST("jobs"."company_id" AS uuid),
+              "price" = CAST((CAST("jobs"."price_cents" AS numeric) / 100) AS numeric(10,2)),
+              "status" = CAST((CASE "jobs"."lifecycle_status" WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)),
+              "street" = CAST("places"."street" AS character varying(255)),
+              "city" = CAST("places"."city" AS character varying(255)),
+              "latitude" = CAST("job_sites"."latitude" AS double precision),
+              "created_at" = CAST("jobs"."created_at" AS timestamp(0) without time zone),
+              "updated_at" = CAST("jobs"."updated_at" AS timestamp(0) without time zone),
+              "deleted_at" = CAST("jobs"."deleted_at" AS timestamp(0) without time zone)
+            FROM "jobs"
+            LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
+            LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true
+            WHERE "jobs"."id" = "listings"."job_id"
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "listings"
+              ALTER COLUMN "id" SET DEFAULT nextval('listings_id_seq'::regclass),
+              ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid(),
+              ALTER COLUMN "status" SET DEFAULT 'Draft'::character varying
+            SQL,
+            'ALTER SEQUENCE public.listings_id_seq OWNED BY "listings"."id"',
+            'ALTER TABLE "listings" DROP COLUMN "job_id"',
+            <<<'SQL'
+            ALTER TABLE "listings"
+              ADD CONSTRAINT "listings_pkey" PRIMARY KEY ("id"),
+              ADD CONSTRAINT "listings_uuid_unique" UNIQUE ("uuid")
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "listing_photos"
+              DROP CONSTRAINT "listing_photos_listing_id_foreign",
+              ADD CONSTRAINT "listing_photos_listing_id_foreign" FOREIGN KEY ("listing_id") REFERENCES "listings" ("id") ON DELETE CASCADE NOT VALID
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "listing_shares"
+              DROP CONSTRAINT "listing_shares_listing_uuid_foreign",
+              ADD CONSTRAINT "listing_shares_listing_uuid_foreign" FOREIGN KEY ("listing_uuid") REFERENCES "listings" ("uuid") ON UPDATE CASCADE ON DELETE SET NULL NOT VALID
+            SQL,
+        ], $statements->transaction);
+        $this->assertSame([
+            'ALTER TABLE "listing_photos" VALIDATE CONSTRAINT "listing_photos_listing_id_foreign"',
+            'ALTER TABLE "listing_shares" VALIDATE CONSTRAINT "listing_shares_listing_uuid_foreign"',
+        ], $statements->afterwards);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): mixed, Closure(ResolvedMap): Statements, string}>
+     */
+    public static function refusals(): iterable
+    {
+        $prepared = fn () => Compatibility::prepare(Listing::class);
+        $installed = function (): void {
+            Compatibility::prepare(Listing::class);
+            Compatibility::install(Listing::class);
+        };
+        $install = fn (ResolvedMap $map) => Statements::install($map, DB::connection());
+
+        yield 'install over a view' => [$installed, $install, 'listings is not a plain table, so install() cannot serve it through a view; recompile() replaces an installed view'];
+        yield 'recompile without a view' => [$prepared, fn (ResolvedMap $map) => Statements::recompile($map, DB::connection()), 'listings is not a view, so recompile() has nothing to replace; install() creates it'];
+        yield 'uninstall without a view' => [$prepared, fn (ResolvedMap $map) => Statements::uninstall($map, DB::connection()), 'listings is not a view, so uninstall() has nothing to reverse'];
+        yield 'a retained key the legacy table has' => [
+            function (): void {
+                Compatibility::prepare(Listing::class);
+                DB::statement('alter table listings add column job_id uuid');
+            },
+            $install,
+            'listings already has a column job_id, which install() adds as the key of the retained table',
+        ];
+        yield 'a foreign key to a mapped attribute' => [
+            function (): void {
+                Compatibility::prepare(Listing::class);
+                DB::statement('alter table listings add constraint listings_title_unique unique (title)');
+                DB::statement('create table listing_titles (title varchar(255) references listings (title))');
+            },
+            $install,
+            'the foreign key listing_titles_title_fkey on listing_titles references listings.title, which install() moves to a successor; reference an identifier instead',
+        ];
+        yield 'a foreign key over two columns' => [
+            function (): void {
+                Compatibility::prepare(Listing::class);
+                DB::statement('alter table listings add constraint listings_id_uuid_unique unique (id, uuid)');
+                DB::statement('create table listing_pairs (listing_id integer, listing_uuid uuid, foreign key (listing_id, listing_uuid) references listings (id, uuid))');
+            },
+            $install,
+            'the foreign key listing_pairs_listing_id_listing_uuid_fkey on listing_pairs spans 2 columns, and the package repoints a foreign key on one identifier',
+        ];
+    }
+
+    /**
+     * @param  Closure(): mixed  $arrange
+     * @param  Closure(ResolvedMap): Statements  $statements
+     */
+    #[DataProvider('refusals')]
+    #[Test]
+    public function it_refuses_an_operation_the_legacy_shape_cannot_take(Closure $arrange, Closure $statements, string $problem): void
+    {
+        $arrange();
+
+        try {
+            $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', $problem));
+
+            $statements($this->map());
+        } finally {
+            DB::statement('drop table if exists listing_titles, listing_pairs');
+        }
+    }
+
+    private function map(): ResolvedMap
+    {
+        return Compatibility::of(Listing::class)->resolve();
+    }
+}

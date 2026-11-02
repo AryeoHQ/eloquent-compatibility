@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility;
 
 use Closure;
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
@@ -13,6 +15,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 
 final class Compatibility
 {
@@ -60,6 +64,26 @@ final class Compatibility
         }
 
         return $model::compatibility($compatibility);
+    }
+
+    public static function prepare(string $model): void
+    {
+        self::run($model, Statements::prepare(...));
+    }
+
+    public static function install(string $model): void
+    {
+        self::run($model, Statements::install(...));
+    }
+
+    public static function recompile(string $model): void
+    {
+        self::run($model, Statements::recompile(...));
+    }
+
+    public static function uninstall(string $model): void
+    {
+        self::run($model, Statements::uninstall(...));
     }
 
     /**
@@ -187,6 +211,21 @@ final class Compatibility
             $this->guards,
             $this->withoutForwarding,
         );
+    }
+
+    /**
+     * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
+     */
+    private static function run(string $model, Closure $statements): void
+    {
+        $map = self::of($model)->resolve();
+        $connection = (new $map->model)->getConnection();
+
+        try {
+            (new Installer($connection))->run($statements($map, $connection));
+        } finally {
+            LegacyBuilder::forgetViews();
+        }
     }
 
     private function invalid(string $problem): InvalidCompatibilityMap
