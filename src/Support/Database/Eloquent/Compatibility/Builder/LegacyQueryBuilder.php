@@ -312,13 +312,14 @@ final class LegacyQueryBuilder extends QueryBuilder
     private function refuseExternal(): void
     {
         $legacy = $this->legacy;
+        $alias = $legacy === null ? null : $this->alias($legacy);
 
-        if ($legacy === null || $this->from !== $legacy->getTable()) {
+        if ($legacy === null || $alias === null) {
             return;
         }
 
         $externals = ExternalAttributes::of($legacy::class);
-        $reading = $externals === [] ? null : $this->reading($legacy->getTable(), $externals);
+        $reading = $externals === [] ? null : $this->reading($alias, $externals);
 
         if ($reading !== null && LegacyBuilder::serves($legacy)) {
             throw LegacyBuilder::refuseExternal($legacy::class, ...$reading);
@@ -336,7 +337,7 @@ final class LegacyQueryBuilder extends QueryBuilder
             ['select', $this->columns ?? []],
             ['groupBy', $this->groups ?? []],
             ['having', self::havingColumns($this->havings ?? [])],
-            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], $this->orders ?? []),
+            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], [...($this->orders ?? []), ...($this->unionOrders ?? [])]),
             ['where', self::whereColumns($this->wheres)],
         ];
 

@@ -17,6 +17,7 @@ use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\MultipliedBy;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -246,6 +247,57 @@ final readonly class MassWriter
         $this->connection->statement('DROP TABLE '.$typed);
 
         return array_combine(array_keys($values), array_values((array) ($rows[0] ?? throw new LogicException("{$this->map->table} serves no row {$key} for the write."))));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return null|array<string, mixed>
+     */
+    public function served(array $values): null|array
+    {
+        $grammar = $this->connection->getQueryGrammar();
+        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
+        $view = $catalog->of($this->map->table);
+        $inputs = [];
+        $selects = [];
+        $bindings = [];
+
+        foreach (self::named($values) as $name => $value) {
+            $attribute = $this->map->attributes[$name] ?? null;
+
+            if ($attribute === null || $attribute->isExternal() || $value instanceof Expression || ($attribute->conversions()[0] ?? null) instanceof ReadAs || ! array_key_exists($name, $view)) {
+                continue;
+            }
+
+            try {
+                $stored = $attribute->write($value);
+            } catch (LogicException) {
+                return null;
+            }
+
+            $table = $this->map->owners[$name]->table;
+            $column = $attribute->column();
+            $target = $column === null ? null : ($catalog->of($table)[$column] ?? null);
+            $type = $target === null ? null : $target->baseType ?? $target->type;
+            $read = $attribute->read($table, $type);
+            $input = $grammar->wrap('value_'.count($selects));
+
+            if ($column !== null) {
+                $inputs[] = 'CAST(? AS '.($target === null ? 'text' : $target->type).') AS '.$input;
+                $bindings[] = $stored;
+                $read = str_replace(SqlFragments::identifier($table).'.'.SqlFragments::identifier($column), 'input.'.$input, $read);
+            }
+
+            $selects[$name] = ViewCompiler::cast($read, $attribute->type($type), $view[$name]->type, $view[$name]->baseType).' AS '.$grammar->wrap($name);
+        }
+
+        if ($selects === []) {
+            return [];
+        }
+
+        $row = $this->connection->selectOne('SELECT '.implode(', ', $selects).($inputs === [] ? '' : ' FROM (SELECT '.implode(', ', $inputs).') AS input'), $this->connection->table($this->map->table)->cleanBindings($bindings));
+
+        return (array) $row;
     }
 
     /**
@@ -558,6 +610,8 @@ final readonly class MassWriter
             $rows->selectRaw('('.($value instanceof Expression ? $value->getValue($grammar) : '').') as '.$grammar->wrap('compatibility_value_'.$index));
         }
 
+        $served = [];
+
         foreach ($rows->cursor() as $row) {
             $before = (array) $row;
             $evaluated = [];
@@ -567,7 +621,9 @@ final readonly class MassWriter
                 unset($before['compatibility_value_'.$index]);
             }
 
-            $this->refuseMove($before, $this->map->branchFor((new $this->map->model)->setRawAttributes($before)), array_replace($before, $values, $evaluated));
+            $from = $this->map->branchFor((new $this->map->model)->setRawAttributes($before));
+            $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
+            $this->refuseMove($before, $from, array_replace($before, $values, $served[spl_object_id($from)], $evaluated));
         }
     }
 

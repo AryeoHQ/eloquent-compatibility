@@ -775,7 +775,7 @@ final class LegacyBuilder extends Builder
             return [$type, null];
         }
 
-        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served->type, $served->baseType)];
+        return [$type, ViewCompiler::cast($definition->read($owner, $type, $catalog->baseType(...)), $catalog->baseType($definition->type($type)), $served->type, $served->baseType)];
     }
 
     /**

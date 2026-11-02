@@ -60,18 +60,20 @@ final readonly class Preparer
 
         foreach ($map->identifiers as $name => $identifier) {
             $column = $legacy[$name] ?? throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so identifier '{$name}' has no type to take");
+            $existing = $this->columnCatalog->type($map->primary->table, (string) $identifier->column());
+
+            if ($existing !== null && $existing !== $column->type) {
+                throw InvalidCompatibilityMap::because($map->table, $membership === null
+                    ? "{$map->primary->table} already has a column {$identifier->column()} of type {$existing}, and identifier '{$name}' needs {$column->type}, the type of {$map->table}.{$name}; change or drop {$map->primary->table}.{$identifier->column()}, then prepare again"
+                    : "{$map->primary->table}.{$identifier->column()} is {$existing}, and {$map->table}.{$name} is {$column->type}; identifiers that share a successor column take one type");
+            }
+
             $sharesSequence = $membership !== null && $identifier->isInteger();
             $default = match (true) {
                 $identifier->isUuid() => 'gen_random_uuid()',
                 $sharesSequence => $this->sharedDefault($map, $name, $column),
                 default => $this->sequenceDefault($map, $name, $column),
             };
-            $existing = $this->columnCatalog->type($map->primary->table, (string) $identifier->column());
-
-            if ($existing !== null && $existing !== $column->type) {
-                throw InvalidCompatibilityMap::because($map->table, "{$map->primary->table}.{$identifier->column()} is {$existing}, and {$map->table}.{$name} is {$column->type}; identifiers that share a successor column take one type");
-            }
-
             $successorColumn = SqlFragments::identifier((string) $identifier->column());
             $filledName = SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_filled');
             $filled = SqlFragments::identifier($filledName);
@@ -211,7 +213,7 @@ final readonly class Preparer
             throw InvalidCompatibilityMap::because($map->table, "atMostOne() on {$name} needs no index, because the {$related->parentTable} row names one {$related->table} row by its key");
         }
 
-        $index = SqlFragments::objectName($map->table, $related->table.'_'.$map->table.'_at_most_one');
+        [$index, $columns] = $this->atMostOneIndex($map, $related);
         $table = SqlFragments::identifier($related->table);
         $key = SqlFragments::identifier($related->relatedKey);
         $conditions = ViewCompiler::conditions($related, false);
@@ -229,7 +231,7 @@ final readonly class Preparer
                 ."    SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM ({$duplicates} ORDER BY {$key} LIMIT 5) AS first_duplicates (duplicate);\n"
                 ."    RAISE EXCEPTION '%', {$refusal};\n"
                 ."  END IF;\nEND\n\$compatibility\$",
-            $this->uniqueIndex($map->table, $related->table, $index, '('.$key.')'.$where, false),
+            $this->uniqueIndex($map->table, $related->table, $index, $columns, false),
         ];
     }
 
@@ -256,24 +258,87 @@ final readonly class Preparer
     /**
      * @return list<string>
      */
+    public function unfinished(ResolvedMap $map): array
+    {
+        $primary = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($map->primary->table)).')';
+        $refusal = fn (string $what) => SqlFragments::literal("Compatibility map '{$map->table}' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.");
+        $identifiers = '';
+
+        foreach ($map->identifiers as $identifier) {
+            $column = (string) $identifier->column();
+            $discriminator = $map->membership !== null && $identifier->isInteger() ? $map->membership->column : null;
+            $identifiers .= "  IF NOT EXISTS (\n"
+                ."    SELECT FROM pg_attribute attribute\n"
+                .($discriminator === null ? '' : '    JOIN pg_attribute discriminator ON discriminator.attrelid = attribute.attrelid AND discriminator.attname = '.SqlFragments::literal($discriminator)."\n")
+                ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
+                .'      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND '
+                .($discriminator === null ? 'table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum' : 'table_index.indnkeyatts = 2 AND table_index.indkey[0] = discriminator.attnum AND table_index.indkey[1] = attribute.attnum')."\n"
+                ."    WHERE attribute.attrelid = {$primary} AND attribute.attname = ".SqlFragments::literal($column)." AND attribute.attnotnull\n"
+                ."  ) THEN\n"
+                ."    RAISE EXCEPTION '%', ".$refusal("{$map->primary->table}.{$column} is not yet NOT NULL with a unique index ".($discriminator === null ? 'of its own' : "on ({$discriminator}, {$column})")).";\n"
+                ."  END IF;\n";
+        }
+
+        $statements = ["DO \$compatibility\$\nBEGIN\n{$identifiers}END\n\$compatibility\$"];
+
+        foreach ($map->related as $related) {
+            if ($related->successor->atMostOneBecause() !== null && ! $related->belongsTo) {
+                [$index, $columns] = $this->atMostOneIndex($map, $related);
+                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".$this->relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
+                    .$this->definitions($related->table, $index, $columns, true)
+                    ."  IF found IS DISTINCT FROM expected THEN\n"
+                    ."    RAISE EXCEPTION '%', ".$refusal("{$index} is missing, not valid, or not the unique index prepare() builds on {$related->table}").";\n"
+                    ."  END IF;\nEND\n\$compatibility\$";
+            }
+        }
+
+        return $statements;
+    }
+
+    /**
+     * @return array{string, string}
+     */
+    private function atMostOneIndex(ResolvedMap $map, Related $related): array
+    {
+        $conditions = ViewCompiler::conditions($related, false);
+
+        return [
+            SqlFragments::objectName($map->table, $related->table.'_'.$map->table.'_at_most_one'),
+            '('.SqlFragments::identifier($related->relatedKey).')'.($conditions === [] ? '' : ' WHERE '.implode(' AND ', $conditions)),
+        ];
+    }
+
+    private function relation(string $name): string
+    {
+        return 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
+    }
+
+    private function definitions(string $table, string $index, string $columns, bool $valid): string
+    {
+        $definition = "substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING '))";
+
+        return "  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($table).', current_schema(), '.SqlFragments::literal($table).");\n"
+            .'  CREATE UNIQUE INDEX '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns.";\n"
+            .'  SELECT '.$definition.' INTO expected FROM pg_index WHERE indrelid = '.SqlFragments::literal('pg_temp.'.SqlFragments::identifier($table))."::regclass;\n"
+            .'  SELECT '.$definition.' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique'.($valid ? ' AND indisvalid' : '').' AND indrelid = '.$this->relation($table).";\n"
+            .'  DROP TABLE pg_temp.'.SqlFragments::identifier($table).";\n";
+    }
+
+    /**
+     * @return list<string>
+     */
     private function uniqueIndex(string $map, string $table, string $index, string $columns, bool $constraint): array
     {
-        $relation = fn (string $name) => 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
-        $definition = fn (string $of) => "substr(pg_get_indexdef({$of}), strpos(pg_get_indexdef({$of}), ' USING '))";
         $refusal = SqlFragments::literal("Compatibility map '{$map}' cannot prepare: {$index} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.");
         $statements = [
-            "DO \$compatibility\$\nDECLARE\n  existing regclass := {$relation($index)};\n  expected text;\n  found text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  existing regclass := {$this->relation($index)};\n  expected text;\n  found text;\nBEGIN\n"
                 ."  IF existing IS NULL THEN\n    RETURN;\n  END IF;\n"
-                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN\n"
-                .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
-                ."    RETURN;\n  END IF;\n"
-                ."  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($table).', current_schema(), '.SqlFragments::literal($table).");\n"
-                .'  CREATE UNIQUE INDEX '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns.";\n"
-                .'  SELECT '.$definition('indexrelid').' INTO expected FROM pg_index WHERE indrelid = '.SqlFragments::literal('pg_temp.'.SqlFragments::identifier($table))."::regclass;\n"
-                .'  SELECT '.$definition('indexrelid').' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indrelid = '.$relation($table).";\n"
-                .'  DROP TABLE pg_temp.'.SqlFragments::identifier($table).";\n"
+                .$this->definitions($table, $index, $columns, false)
                 ."  IF found IS DISTINCT FROM expected THEN\n"
                 ."    RAISE EXCEPTION '%', {$refusal};\n"
+                ."  END IF;\n"
+                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN\n"
+                ."    EXECUTE format('DROP INDEX %s', existing);\n"
                 ."  END IF;\nEND\n\$compatibility\$",
             'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns,
         ];
