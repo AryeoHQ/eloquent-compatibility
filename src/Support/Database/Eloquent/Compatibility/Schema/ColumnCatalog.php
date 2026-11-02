@@ -14,6 +14,9 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
+    /** @var array<string, string> */
+    private array $baseTypes = [];
+
     public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, private readonly bool $throughSearchPath = false) {}
 
     /**
@@ -103,6 +106,32 @@ final class ColumnCatalog
     public function notNull(string $table, string $column): bool
     {
         return $this->of($table)[$column]->notNull ?? false;
+    }
+
+    public function baseType(null|string $type): null|string
+    {
+        if ($type === null) {
+            return null;
+        }
+
+        return $this->baseTypes[$type] ??= (function () use ($type): string {
+            $base = $this->connection->scalar(
+                "with recursive domain_chain(type, depth) as (
+                     select to_regtype(?)::oid, 0
+                     union all
+                     select declared.typbasetype, domain_chain.depth + 1
+                     from domain_chain join pg_type declared on declared.oid = domain_chain.type
+                     where declared.typtype = 'd'
+                 )
+                 select format_type(declared.typbasetype, declared.typtypmod)
+                 from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = 'd'
+                 order by domain_chain.depth desc
+                 limit 1",
+                [$type],
+            );
+
+            return is_string($base) ? $base : $type;
+        })();
     }
 
     public function equatable(string $type): bool

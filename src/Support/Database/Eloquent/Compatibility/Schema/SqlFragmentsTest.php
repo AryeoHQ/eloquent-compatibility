@@ -33,8 +33,8 @@ final class SqlFragmentsTest extends TestCase
     #[Test]
     #[TestWith(["it's", "'it''s'"])]
     #[TestWith(["''", "''''''"])]
-    #[TestWith(['back\\slash', "'back\\slash'"])]
-    #[TestWith(['trailing\\', "'trailing\\'"])]
+    #[TestWith(['back\\slash', "E'back\\\\slash'"])]
+    #[TestWith(['trailing\\', "E'trailing\\\\'"])]
     #[TestWith(["line\nbreak", "'line\nbreak'"])]
     #[TestWith(['$$ dollar $$', "'$$ dollar $$'"])]
     #[TestWith(['', "''"])]
@@ -60,16 +60,32 @@ final class SqlFragmentsTest extends TestCase
     }
 
     #[Test]
+    #[TestWith(['C:\\new'])]
+    #[TestWith(["it\\'s"])]
+    #[TestWith(['\\\\'])]
+    #[TestWith(["Coeur d'Alene"])]
+    public function it_writes_a_string_literal_postgresql_reads_back_unchanged_whatever_standard_conforming_strings_says(string $value): void
+    {
+        $read = fn (string $setting) => DB::transaction(function () use ($setting, $value): mixed {
+            DB::statement("set local standard_conforming_strings = {$setting}");
+
+            return DB::scalar('select '.SqlFragments::literal($value));
+        });
+
+        $this->assertSame([$value, $value], [$read('on'), $read('off')]);
+    }
+
+    #[Test]
     #[TestWith([null, 'NULL'])]
-    #[TestWith([true, 'true'])]
-    #[TestWith([false, 'false'])]
-    #[TestWith([42, '42'])]
-    #[TestWith([-1.5, '-1.5'])]
+    #[TestWith([true, "'1'"])]
+    #[TestWith([false, "'0'"])]
+    #[TestWith([42, "'42'"])]
+    #[TestWith([-1.5, "'-1.5'"])]
     #[TestWith(["Coeur d'Alene", "'Coeur d''Alene'"])]
-    public function it_writes_a_value_as_a_literal_postgresql_reads_back_unchanged(null|bool|int|float|string $value, string $literal): void
+    public function it_writes_a_binding_as_laravel_sends_it_in_a_literal_postgresql_types_from_its_predicate(null|bool|int|float|string $value, string $literal): void
     {
         $this->assertSame($literal, SqlFragments::value($value));
-        $this->assertEquals($value, DB::selectOne('select '.SqlFragments::value($value).' as value')->value);
+        $this->assertSame('unknown', DB::scalar('select cast(pg_typeof('.SqlFragments::value($value).') as text)'));
     }
 
     #[Test]
@@ -86,7 +102,7 @@ final class SqlFragmentsTest extends TestCase
     public function it_binds_each_placeholder_outside_a_quoted_string_and_unescapes_a_doubled_question_mark(): void
     {
         $this->assertSame(
-            "\"city\" = 'Coeur d''Alene' and \"note\" = 'why?' and \"tags\" ? 'primary' and \"id\" in (1, NULL)",
+            "\"city\" = 'Coeur d''Alene' and \"note\" = 'why?' and \"tags\" ? 'primary' and \"id\" in ('1', NULL)",
             SqlFragments::bind("\"city\" = ? and \"note\" = 'why?' and \"tags\" ?? ? and \"id\" in (?, ?)", ["Coeur d'Alene", 'primary', 1, null]),
         );
     }
@@ -95,7 +111,7 @@ final class SqlFragmentsTest extends TestCase
     public function it_binds_no_placeholder_inside_a_quoted_identifier(): void
     {
         $this->assertSame(
-            "\"question?\" = 'yes' and \"say \"\"why?\"\"\" = 'because' and \"either??\" = 1",
+            "\"question?\" = 'yes' and \"say \"\"why?\"\"\" = 'because' and \"either??\" = '1'",
             SqlFragments::bind('"question?" = ? and "say ""why?""" = ? and "either??" = ?', ['yes', 'because', 1]),
         );
     }

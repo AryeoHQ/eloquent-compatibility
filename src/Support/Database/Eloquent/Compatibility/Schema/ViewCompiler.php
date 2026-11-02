@@ -50,7 +50,7 @@ final readonly class ViewCompiler
                 $table = $map->owners[$name]->table;
                 $column = $attribute->column();
                 $stored = $column === null ? null : $this->baseType($table, $column);
-                $reads[$name] = [$attribute->read($table, $stored), $attribute->type($stored), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
+                $reads[$name] = [$attribute->read($table, $stored, $this->columnCatalog->baseType(...)), $this->columnCatalog->baseType($attribute->type($stored)), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
             }
         }
 
@@ -203,7 +203,7 @@ final readonly class ViewCompiler
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, self::laterals($map))),
         );
 
-        return is_string($type) ? $type : null;
+        return is_string($type) ? $this->columnCatalog->baseType($type) : null;
     }
 
     /**
@@ -284,7 +284,7 @@ final readonly class ViewCompiler
                     throw InvalidCompatibilityMap::because($map->table, "attribute '{$name}' reads {$table}.{$column} in the time zone {$conversion->zone}, and AT TIME ZONE reads a wall clock only from a timestamp with time zone, not from ".($type ?? 'the type the conversions before inTimeZone() give'));
                 }
 
-                $type = $conversion instanceof AsType ? $conversion->type : null;
+                $type = $conversion instanceof AsType ? $this->columnCatalog->baseType($conversion->type) : null;
             }
         }
     }
