@@ -396,13 +396,13 @@ final readonly class MassWriter
 
         foreach ($row as $column => $value) {
             if ($value instanceof Expression) {
-                $selects[] = (string) $value->getValue($this->connection->getQueryGrammar());
+                $selects[] = (string) $value->getValue($grammar);
 
                 continue;
             }
 
             $selects[] = 'CAST(? AS '.($catalog->type($related->table, (string) $column) ?? 'text').')';
-            $bindings[] = $value;
+            $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [(string) $column => $value])];
         }
 
         $source = $this->reached()->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereNull(self::target($index))->whereNotNull(self::parentOf($index));
