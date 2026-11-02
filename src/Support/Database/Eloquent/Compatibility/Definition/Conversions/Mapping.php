@@ -50,8 +50,12 @@ final readonly class Mapping implements Conversion
 
         $stored = $this->stored($value);
 
+        if ($stored === null) {
+            return null;
+        }
+
         if ($operator === '=') {
-            return $stored === null ? null : ['=', self::typed($stored, $type)];
+            return ['=', self::typed($stored, $type)];
         }
 
         $others = array_filter(array_keys($this->values), fn (int|string $key) => $key !== $stored);
