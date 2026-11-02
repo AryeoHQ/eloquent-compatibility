@@ -532,7 +532,7 @@ final class LegacyBuilder extends Builder
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true))) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true) && ! in_array($attribute, $this->nondeterministic($this->map()->table), true))) {
             return [$type, null];
         }
 
