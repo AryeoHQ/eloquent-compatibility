@@ -46,6 +46,24 @@ trait ServesCompatibility
     }
 
     /**
+     * @param  string  $event
+     * @param  bool  $halt
+     * @return mixed
+     */
+    protected function fireModelEvent($event, $halt = true)
+    {
+        $result = parent::fireModelEvent($event, $halt);
+
+        if ($event === 'restoring' && $result !== false) {
+            LegacyBuilder::restoreOf($this);
+        } elseif ($event === 'restored' || $result === false) {
+            LegacyBuilder::forgetRestoreOf($this);
+        }
+
+        return $result;
+    }
+
+    /**
      * @param  Builder<static>  $query
      * @return Builder<static>
      */

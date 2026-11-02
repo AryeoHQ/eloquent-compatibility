@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -22,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
+use Tests\Fixtures\Support\Listings\ConfiguredJob;
 use Tests\Fixtures\Support\Listings\DefaultedPlace;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
@@ -376,6 +378,78 @@ final class MassWriterTest extends TestCase
 
         $this->assertSame([1, 1, 1], [$updated, $eloquent, $incremented]);
         $this->assertSame([['Oak House', 5], ['Pine Flat-5', 5], ['Elm Cottage-5', 7]], [$retained(1), $retained(2), $retained(3)]);
+    }
+
+    #[Test]
+    public function it_writes_a_json_path_into_the_column_that_owns_it_for_a_mapped_a_related_and_a_legacy_only_column(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'settings' => '{"color": "red", "enabled": false}', 'preferences' => '{"theme": "light"}', 'options' => '{"a": 1}'],
+            ['name' => 'Pine', 'settings' => '{"color": "blue"}', 'preferences' => '{"theme": "light", "font": "serif"}', 'options' => null],
+            ['name' => 'Elm', 'settings' => null, 'preferences' => null, 'options' => null],
+        ]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
+                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
+                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('settings', fn (Attribute $attribute) => $attribute->from('settings'))
+                        ->related(fn (ConfiguredJob $job) => $job->site(), fn (Successor $site) => $site
+                            ->attribute('options', fn (Attribute $attribute) => $attribute->from('options'))));
+            }
+        };
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name, settings) select id, name, settings from settings_holders');
+            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.legacy_id = settings_holders.id where settings_holders.options is not null');
+            Compatibility::install($holder::class);
+
+            $updated = [
+                $holder->newQuery()->whereKey([1, 3])->update(['settings->enabled' => true, 'preferences->theme' => 'dark', 'options->b' => 2]),
+                $holder->newQuery()->whereKey(2)->toBase()->update(['settings_holders.settings->size' => ['width' => 3], 'preferences->font' => 'mono']),
+            ];
+            $rows = DB::table('settings_holders')->orderBy('id')->get(['settings', 'preferences', 'options'])->map(fn (object $row) => array_map(fn (mixed $json) => json_decode((string) $json, true), array_values((array) $row)))->all();
+            $sites = DB::table('configured_sites')->count();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_sites, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([2, 1], $updated);
+        $this->assertSame([
+            [['color' => 'red', 'enabled' => true], ['theme' => 'dark'], ['a' => 1, 'b' => 2]],
+            [['size' => ['width' => 3], 'color' => 'blue'], ['font' => 'mono', 'theme' => 'light'], null],
+            [null, null, null],
+        ], $rows);
+        $this->assertSame(1, $sites);
+    }
+
+    #[Test]
+    public function it_refuses_a_json_path_write_into_an_attribute_whose_conversions_read_the_whole_value(): void
+    {
+        $before = DB::table('jobs')->orderBy('legacy_id')->get()->all();
+
+        $refusal = $this->refusal(fn () => Listing::query()->whereKey(1)->update(['price->amount' => 5]));
+
+        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its conversions read the whole stored value, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
+        $this->assertEquals($before, DB::table('jobs')->orderBy('legacy_id')->get()->all());
     }
 
     #[Test]

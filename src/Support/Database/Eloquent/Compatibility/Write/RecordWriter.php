@@ -74,13 +74,13 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    public function update(Model $legacy, array $values, bool $deleting = false): int
+    public function update(Model $legacy, array $values, bool $deleting = false, bool $restoring = false): int
     {
         if ($this->map->branches !== []) {
-            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateBranch($legacy, $values, $deleting));
+            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateBranch($legacy, $values, $deleting, $restoring));
         }
 
-        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values, $deleting): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values, $deleting, $restoring): int {
             $key = self::keyOf($legacy);
             $primary = $this->lock($legacy, $key);
 
@@ -88,13 +88,14 @@ final readonly class RecordWriter
                 return 0;
             }
 
+            $original = $primary->getRawOriginal();
             [$stored, $retained, $states] = $this->split($legacy, $values, $key);
             $retained = $this->guard($legacy, $primary, $key, $values, [], $retained);
             $this->retain($key, $primary, $retained, []);
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], $deleting);
+            $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], $deleting, $restoring);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $this->rekey($legacy, $primary, $key, $values), array_keys($values));
@@ -121,6 +122,7 @@ final readonly class RecordWriter
                 return 0;
             }
 
+            $original = $primary->getRawOriginal();
             [$stored, $retained, $states] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
             $retained = $this->guard($legacy, $primary, $key, $extra, $amounts, $retained);
@@ -129,7 +131,7 @@ final readonly class RecordWriter
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $this->addEach($models, $added, $stored);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], false);
+            $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], false, false);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $names = [...array_keys($amounts), ...array_keys($extra)];
@@ -161,7 +163,7 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function updateBranch(Model $legacy, array $values, bool $deleting): int
+    private function updateBranch(Model $legacy, array $values, bool $deleting, bool $restoring = false): int
     {
         $this->refuseRaw($values);
         $key = self::keyOf($legacy);
@@ -177,7 +179,7 @@ final readonly class RecordWriter
 
         if ($target === $current) {
             (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($values, $this->map->identifiers), $current);
-            $updated = $this->through($current)->update($legacy, $values, $deleting);
+            $updated = $this->through($current)->update($legacy, $values, $deleting, $restoring);
             $this->settle($legacy, $current, $primary, $key, $values, array_keys($values));
 
             return $updated;
@@ -785,14 +787,23 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  array<string, mixed>  $original
      * @param  array<string, mixed>  $values
      */
-    private function savePrimary(Model $legacy, Model $primary, array $values, bool $deleting): void
+    private function savePrimary(Model $legacy, Model $primary, array $original, array $values, bool $deleting, bool $restoring): void
     {
         $deletedAt = method_exists($primary, 'getDeletedAtColumn') ? (string) $primary->getDeletedAtColumn() : null;
+        $trashed = $deletedAt !== null && ($primary->getAttributes()[$deletedAt] ?? null) !== null;
+        $moves = method_exists($primary, 'restore') && $deletedAt !== null && array_key_exists($deletedAt, $values)
+            && ($values[$deletedAt] === null ? $restoring || $trashed : $deleting || ! $trashed);
 
-        if (! method_exists($primary, 'restore') || $deletedAt === null || ! array_key_exists($deletedAt, $values) || (! ($deleting && $values[$deletedAt] !== null) && (($primary->getAttributes()[$deletedAt] ?? null) === null) === ($values[$deletedAt] === null))) {
+        if (! $moves) {
             $this->assign($primary, $values);
+
+            if ($primary->isDirty()) {
+                $this->keepTimestamp($primary, $original, $values);
+            }
+
             $this->saveEach($legacy, [$primary]);
 
             return;
@@ -800,6 +811,7 @@ final readonly class RecordWriter
 
         if ($values[$deletedAt] === null) {
             $this->assign($primary, array_diff_key($values, [$deletedAt => true]));
+            $this->keepTimestamp($primary, $original, $values);
             $this->save($legacy, $primary, fn () => $primary->restore());
 
             return;
@@ -885,6 +897,23 @@ final readonly class RecordWriter
                 $this->save($legacy, $model, fn () => $model->save());
             }
         }
+    }
+
+    /**
+     * @param  array<string, mixed>  $original
+     * @param  array<string, mixed>  $values
+     */
+    private function keepTimestamp(Model $model, array $original, array $values): void
+    {
+        $column = $model->usesTimestamps() ? $model->getUpdatedAtColumn() : null;
+
+        if ($column === null || ! array_key_exists($column, $values) || $model->isDirty($column)) {
+            return;
+        }
+
+        $model->setRawAttributes(array_replace($model->getAttributes(), [$column => $original[$column] ?? null]));
+        $model->syncOriginalAttribute($column);
+        $this->assign($model, [$column => $values[$column]]);
     }
 
     /**
