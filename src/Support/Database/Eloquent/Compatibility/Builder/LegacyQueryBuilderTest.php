@@ -73,6 +73,23 @@ final class LegacyQueryBuilderTest extends TestCase
     }
 
     #[Test]
+    public function it_translates_a_write_that_reads_the_legacy_table_by_an_alias(): void
+    {
+        $this->install();
+
+        $updated = Listing::query()->withoutGlobalScopes()->toBase()->from('listings as legacy')->where('legacy.id', 1)->update(['title' => 'Renamed']);
+        $aliased = Listing::query()->withoutGlobalScopes();
+        $aliased->getQuery()->from('listings AS legacy');
+        $eloquent = $aliased->where('legacy.id', 3)->update(['title' => 'Elm Lodge']);
+        $incremented = Listing::query()->getQuery()->from('listings as legacy')->where('legacy.id', 3)->incrementEach(['price' => 1]);
+        $deleted = Listing::query()->getQuery()->from('listings as legacy')->delete(2);
+
+        $this->assertSame([1, 1, 1, 1], [$updated, $eloquent, $incremented, $deleted]);
+        $this->assertSame(['Renamed', 'Elm Lodge', 10099], [Job::query()->where('legacy_id', 1)->value('name'), Job::query()->where('legacy_id', 3)->value('name'), Job::query()->where('legacy_id', 3)->value('price_cents')]);
+        $this->assertFalse(Job::withTrashed()->where('legacy_id', 2)->exists());
+    }
+
+    #[Test]
     public function it_inserts_each_row_through_the_record_writer(): void
     {
         $this->install();

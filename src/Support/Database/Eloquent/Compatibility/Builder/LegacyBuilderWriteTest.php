@@ -179,7 +179,7 @@ final class LegacyBuilderWriteTest extends TestCase
         $listing->save();
 
         $this->assertSame([
-            [0, "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)"],
+            [0, 'select relkind::text from pg_class where oid = to_regclass(?)'],
             [1, "select set_config('TimeZone', ?, true)"],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],
@@ -318,6 +318,34 @@ final class LegacyBuilderWriteTest extends TestCase
 
         $this->assertSame([1, 4, 1], [$native->getKey(), $served->getKey(), $updated]);
         $this->assertSame(['Birch House', 'Oak Manor'], [$this->job(4)->name, $this->job(1)->name]);
+    }
+
+    #[Test]
+    public function it_routes_a_write_to_the_view_a_later_schema_on_the_search_path_holds_when_the_current_schema_lacks_the_legacy_table(): void
+    {
+        $this->install();
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.invoices (id serial primary key)');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $schema = DB::scalar('select current_schema()');
+            $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+            $listing = Listing::query()->findOrFail(1);
+            $listing->update(['title' => 'Oak Manor']);
+            $listing->increment('price', 1);
+            $mass = Listing::query()->whereKey(3)->update(['title' => 'Elm Lodge']);
+            $base = Listing::query()->whereKey(4)->toBase()->update(['title' => 'Birch Lodge']);
+            $listing->delete();
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame(['compatibility_tenant', 4, 1, 1], [$schema, $created->getKey(), $mass, $base]);
+        $this->assertSame(['Oak Manor', 125150, 'Elm Lodge', 'Birch Lodge'], [$this->job(1)->name, $this->job(1)->price_cents, $this->job(3)->name, $this->job(4)->name]);
+        $this->assertNotNull($this->job(1)->deleted_at);
     }
 
     private function install(): void

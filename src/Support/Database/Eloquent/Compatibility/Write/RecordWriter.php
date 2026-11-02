@@ -10,6 +10,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
@@ -94,7 +95,7 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
-            $this->readBack($legacy, $key, array_keys($values));
+            $this->readBack($legacy, $this->rekey($legacy, $primary, $key, $values), array_keys($values));
 
             return 1;
         });
@@ -129,7 +130,8 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
-            $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
+            $names = [...array_keys($amounts), ...array_keys($extra)];
+            $this->readBack($legacy, $this->rekey($legacy, $primary, $key, $extra + $amounts), $names);
 
             return 1;
         });
@@ -181,7 +183,7 @@ final readonly class RecordWriter
 
         $this->through($target)->split($legacy, $values, $key);
         $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
-        $moved = $this->rekey($legacy, $key, $values);
+        $moved = $this->rekey($legacy, null, $key, $values);
         $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
@@ -192,15 +194,20 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function rekey(Model $legacy, int|string $key, array $values): int|string
+    private function rekey(Model $legacy, null|Model $primary, int|string $key, array $values): int|string
     {
-        $moved = $values[$legacy->getKeyName()] ?? null;
+        $name = $legacy->getKeyName();
+        $moved = match (true) {
+            ! in_array($name, array_map(fn (int|string $column) => Str::afterLast((string) $column, '.'), array_keys($values)), true) => $key,
+            $primary !== null => $this->identify($legacy, $primary),
+            default => $values[$name] ?? null,
+        };
 
         if ((! is_int($moved) && ! is_string($moved)) || (string) $moved === (string) $key) {
             return $key;
         }
 
-        if ($this->map->retainedTable !== null) {
+        if ($this->map->branches !== [] && $this->map->retainedTable !== null) {
             $this->connection->table($this->map->retainedTable)->where((string) $this->map->retainedKey, $key)->update([(string) $this->map->retainedKey => $moved]);
         }
 
@@ -322,7 +329,7 @@ final readonly class RecordWriter
     private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): void
     {
         $this->confirm($legacy, $branch, $key, $values, $this->identifiersWhere($branch, $branch->primary->key, self::keyOf($primary)));
-        $moved = $this->rekey($legacy, $key, $values);
+        $moved = $this->rekey($legacy, null, $key, $values);
 
         if ($moved !== $key) {
             $this->readBack($legacy, $moved, $names);
@@ -855,7 +862,17 @@ final readonly class RecordWriter
     {
         $relation = ($related->relation)($parent);
 
-        return $relation instanceof Relation ? $relation : throw new LogicException('The related() relation from '.class_basename($related->parent).' to '.class_basename($related->model).' returns no relation.');
+        if (! $relation instanceof Relation) {
+            throw new LogicException('The related() relation from '.class_basename($related->parent).' to '.class_basename($related->model).' returns no relation.');
+        }
+
+        $relation->getRelated()->setConnection($this->connection->getName());
+        $query = $relation->getBaseQuery();
+        $query->connection = $this->connection;
+        $query->grammar = $this->connection->getQueryGrammar();
+        $query->processor = $this->connection->getPostProcessor();
+
+        return $relation;
     }
 
     /**
