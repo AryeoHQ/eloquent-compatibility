@@ -6,9 +6,11 @@ namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
@@ -55,6 +57,7 @@ final class TwoSuccessorsTest extends TestCase
 
     protected function tearDown(): void
     {
+        Link::flushEventListeners();
         FileTables::drop();
 
         parent::tearDown();
@@ -282,6 +285,8 @@ final class TwoSuccessorsTest extends TestCase
         foreach ([
             fn () => Video::query()->findOrFail(1)->increment('id'),
             fn () => Video::query()->whereKey(1)->increment('id'),
+            fn () => Video::query()->findOrFail(1)->decrement('id'),
+            fn () => Video::query()->whereKey(1)->toBase()->incrementEach(['videos.id' => 1]),
         ] as $write) {
             try {
                 $write();
@@ -291,7 +296,7 @@ final class TwoSuccessorsTest extends TestCase
             }
         }
 
-        $this->assertSame(array_fill(0, 2, Video::class.' cannot run an increment of its identifier id through its compatibility map'), $messages);
+        $this->assertSame(array_fill(0, 4, Video::class.' cannot run an increment of its identifier id through its compatibility map'), $messages);
         $this->assertSame([['files', 1], ['links', 2], ['files', 3]], $this->holders([1, 2, 3]));
         $this->assertSame([1, 2, 3], DB::table('videos_retained')->orderBy('id')->pluck('id')->all());
     }
@@ -299,42 +304,7 @@ final class TwoSuccessorsTest extends TestCase
     #[Test]
     public function it_chooses_the_branch_from_the_value_a_retained_expression_gives(): void
     {
-        $video = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            protected $table = 'videos';
-
-            protected $guarded = [];
-
-            public function getMorphClass()
-            {
-                return 'video';
-            }
-
-            public static function compatibility(Compatibility $video): Compatibility
-            {
-                return $video
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('videos_retained')
-                    ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('title') !== 'Upload only' ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
-            }
-        };
+        $video = $this->titledVideo();
         $incremented = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine tour'])->id;
         $mass = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/elm', 'title' => 'Elm tour'])->id;
         $outcomes = [];
@@ -359,6 +329,95 @@ final class TwoSuccessorsTest extends TestCase
         ], $outcomes);
         $this->assertSame([['files', 2], ['links', $incremented], ['links', $mass]], $this->holders([2, $incremented, $mass]));
         $this->assertSame([['Upload only', 2], ['Pine tour', 0], ['Elm tour', 0]], Video::query()->whereIn('id', [2, $incremented, $mass])->orderBy('id')->get()->map(fn (Video $video) => [$video->title, $video->views])->all());
+    }
+
+    #[Test]
+    public function it_stores_the_value_a_volatile_retained_expression_gave_the_branch_choice(): void
+    {
+        $video = $this->titledVideo();
+        $ids = array_map(fn (string $name) => Video::query()->create(['youtube_embed_url' => 'https://youtu.be/'.$name, 'title' => ucfirst($name).' tour'])->id, ['pine', 'elm', 'fir']);
+        DB::statement('create temporary sequence volatile_title');
+        $volatile = DB::raw("case when nextval('volatile_title') = 1 then 'Kept as a link' else 'Upload only' end");
+        $draws = [];
+
+        try {
+            foreach ([
+                fn (int $id) => $video->newQuery()->findOrFail($id)->update(['title' => $volatile]),
+                fn (int $id) => $video->newQuery()->findOrFail($id)->increment('views', 1, ['title' => $volatile]),
+                fn (int $id) => $video->newQuery()->whereKey($id)->update(['title' => $volatile]),
+            ] as $index => $write) {
+                DB::statement("select setval('volatile_title', 1, false)");
+                $write($ids[$index]);
+                $draws[] = (int) DB::scalar('select last_value from volatile_title');
+            }
+        } finally {
+            DB::statement('drop sequence if exists volatile_title');
+        }
+
+        $this->assertSame([1, 1, 1], $draws);
+        $this->assertSame(array_map(fn (int $id) => ['links', $id], $ids), $this->holders($ids));
+        $this->assertSame(array_fill(0, 3, 'Kept as a link'), Video::query()->whereIn('id', $ids)->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_writes_each_record_a_joined_mass_write_matches_once(): void
+    {
+        $joined = function () {
+            $query = Video::query()->whereKey(1);
+            $query->getQuery()->crossJoin(DB::raw('generate_series(1, 2) as copies'));
+
+            return $query;
+        };
+        $outcomes = [];
+
+        foreach ([
+            fn () => $joined()->update(['title' => 'Joined']),
+            fn () => $joined()->toBase()->update(['title' => 'Joined through the base']),
+            fn () => $joined()->update(['id' => 50]),
+        ] as $write) {
+            try {
+                $outcomes[] = $write();
+            } catch (QueryException $exception) {
+                $outcomes[] = $exception->getCode();
+            }
+        }
+
+        $this->assertSame([1, 1, 1], $outcomes);
+        $this->assertSame([['files', 50]], $this->holders([1, 50]));
+        $this->assertSame([2, 3, 50], DB::table('videos_retained')->orderBy('id')->pluck('id')->all());
+        $this->assertSame('Joined through the base', Video::query()->findOrFail(50)->title);
+    }
+
+    #[Test]
+    public function it_refuses_an_identifier_a_successor_listener_gives_a_new_record_when_the_other_successor_holds_it(): void
+    {
+        $upload = Video::query()->findOrFail(1);
+        Link::creating(function (Link $link) use ($upload): void {
+            match ($link->url) {
+                'https://youtu.be/uuid' => $link->legacy_uuid = $upload->uuid,
+                'https://youtu.be/id' => $link->legacy_id = $upload->id,
+                default => null,
+            };
+        });
+        $codes = [];
+
+        foreach ([
+            fn () => Video::query()->create(['uuid' => (string) Str::uuid(), 'youtube_embed_url' => 'https://youtu.be/uuid']),
+            fn () => Video::query()->create(['id' => 60, 'youtube_embed_url' => 'https://youtu.be/id']),
+            fn () => Video::query()->findOrFail(3)->update(['youtube_embed_url' => 'https://youtu.be/uuid']),
+        ] as $insert) {
+            try {
+                $insert();
+                $codes[] = 'stored';
+            } catch (UniqueConstraintViolationException $exception) {
+                $codes[] = $exception->getCode();
+            }
+        }
+
+        $this->assertSame(['23505', '23505', '23505'], $codes);
+        $this->assertSame(0, DB::table('links')->whereIn('url', ['https://youtu.be/uuid', 'https://youtu.be/id'])->count());
+        $this->assertSame([['files', 1], ['files', 3]], $this->holders([1, 3]));
+        $this->assertSame([1], Video::query()->where('uuid', $upload->uuid)->pluck('id')->all());
     }
 
     #[Test]
@@ -469,6 +528,46 @@ final class TwoSuccessorsTest extends TestCase
             [[1, '2026-06-07 10:00:00'], [2, '2026-06-07 10:00:00'], [3, '2026-06-07 10:00:00']],
             Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->updated_at?->format('Y-m-d H:i:s')])->all(),
         );
+    }
+
+    private function titledVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('title') !== 'Upload only' ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
     }
 
     /**

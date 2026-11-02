@@ -47,6 +47,9 @@ final class LegacyBuilder extends Builder
     /** @var array<string, true> */
     private static array $tables = [];
 
+    /** @var array<string, list<string>> */
+    private static array $nondeterministic = [];
+
     private int $negations = 0;
 
     private null|Model $writeOf = null;
@@ -58,6 +61,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         self::$tables = [];
+        self::$nondeterministic = [];
     }
 
     public static function insertOf(Model $model): void
@@ -714,11 +718,27 @@ final class LegacyBuilder extends Builder
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || $definition->exact($type, $served->baseType ?? $served->type)) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true))) {
             return [$type, null];
         }
 
         return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served->type, $served->baseType)];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function nondeterministic(string $table): array
+    {
+        $connection = $this->model->getConnection();
+
+        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
+            "select attribute.attname as name
+             from pg_attribute attribute
+             join pg_collation column_collation on column_collation.oid = attribute.attcollation
+             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic",
+            [SqlFragments::identifier($table)],
+        )));
     }
 
     /**

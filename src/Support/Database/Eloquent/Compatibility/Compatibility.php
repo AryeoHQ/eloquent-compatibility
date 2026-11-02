@@ -5,14 +5,18 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\DB;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Branch;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -81,17 +85,17 @@ final class Compatibility
 
     public static function install(string $model): void
     {
-        self::run($model, Statements::install(...));
+        self::run($model, Statements::install(...), 'install');
     }
 
     public static function recompile(string $model): void
     {
-        self::run($model, Statements::recompile(...));
+        self::run($model, Statements::recompile(...), 'recompile');
     }
 
     public static function uninstall(string $model): void
     {
-        self::run($model, Statements::uninstall(...));
+        self::run($model, Statements::uninstall(...), 'uninstall');
     }
 
     /**
@@ -273,19 +277,62 @@ final class Compatibility
         );
     }
 
+    public static function connection(ResolvedMap $map): ConnectionInterface
+    {
+        $legacy = new $map->model;
+        $connection = $legacy->getConnection();
+        $successors = [$map->primary->model => [(new $map->primary->model)->getConnectionName(), 'the successor '.class_basename($map->primary->model)]];
+
+        foreach ($map->related as $related) {
+            $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
+        }
+
+        foreach ($successors as [$name, $successor]) {
+            $name ??= DB::getDefaultConnection();
+
+            if ($name === $connection->getName()) {
+                continue;
+            }
+
+            if (! is_array(Config::get("database.connections.{$name}"))) {
+                throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which config/database.php does not declare");
+            }
+
+            if (self::database(DB::connection($name)) !== self::database($connection)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which reaches another database than the connection {$connection->getName()} of ".class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database');
+            }
+        }
+
+        return $connection;
+    }
+
     /**
      * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
      */
-    private static function run(string $model, Closure $statements): void
+    private static function run(string $model, Closure $statements, null|string $singleSuccessor = null): void
     {
         $map = self::of($model)->resolve();
-        $connection = (new $map->model)->getConnection();
+
+        if ($singleSuccessor !== null) {
+            Statements::refuseBranches($map, $singleSuccessor);
+        }
+
+        $connection = self::connection($map);
+        $tables = array_values(array_unique(array_filter([$map->table, $map->retainedTable, $map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], is_string(...))));
 
         try {
-            (new Installer($connection))->run($connection->transaction(fn () => $statements($map, $connection)));
+            (new Installer($connection))->compileAndRun($tables, fn () => $statements($map, $connection));
         } finally {
             LegacyBuilder::forgetViews();
         }
+    }
+
+    /**
+     * @return list<mixed>
+     */
+    private static function database(Connection $connection): array
+    {
+        return array_map($connection->getConfig(...), ['driver', 'host', 'port', 'database', 'search_path', 'prefix']);
     }
 
     private function invalid(string $problem): InvalidCompatibilityMap
