@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
@@ -36,18 +37,11 @@ final readonly class RetainedRows
      */
     public function upsertAll(QueryBuilder $keys, array $values, array $amounts, null|string $alias = null): void
     {
-        $retained = ViewCompiler::retainedTable($this->map);
-        $paths = array_filter($values, fn (string $column) => str_contains($column, '->'), ARRAY_FILTER_USE_KEY);
-        $values = array_diff_key($values, $paths);
-
-        if ($paths !== []) {
-            $this->connection->table($retained)->whereIn((string) $this->map->retainedKey, $keys)->update($paths);
-        }
-
         if ($values === [] && $amounts === []) {
             return;
         }
 
+        $retained = ViewCompiler::retainedTable($this->map);
         $table = SqlFragments::identifier($retained);
         $primary = SqlFragments::identifier($this->map->primary->table);
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
@@ -57,14 +51,25 @@ final readonly class RetainedRows
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $query = $this->connection->table($retained);
         $grammar = $query->getGrammar();
+        $columns = [];
         $selects = [];
         $updates = [];
         $bindings = [];
         $joined = $amounts !== [];
 
-        foreach ($values as $column => $value) {
+        foreach ($values as $key => $value) {
+            $column = Str::before($key, '->');
             $wrapped = SqlFragments::identifier($column);
+            $columns[] = $wrapped;
             $updates[] = $wrapped.' = excluded.'.$wrapped;
+
+            if ($column !== $key) {
+                $selects[] = Str::after($grammar->compileUpdate($query, [$key => $value]), ' set '.$grammar->wrap($column).' = ');
+                $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [$key => $value])];
+                $joined = true;
+
+                continue;
+            }
 
             if ($value instanceof Expression) {
                 $selects[] = (string) $value->getValue($grammar);
@@ -79,6 +84,7 @@ final readonly class RetainedRows
 
         foreach ($amounts as $column => $amount) {
             $wrapped = SqlFragments::identifier($column);
+            $columns[] = $wrapped;
             $selects[] = $legacy.'.'.$wrapped.' + '.$amount;
             $updates[] = $wrapped.' = '.$table.'.'.$wrapped.' + '.$amount;
         }
@@ -94,7 +100,7 @@ final readonly class RetainedRows
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
 
         $this->connection->affectingStatement(
-            'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
+            'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...$columns]).')'
                 .' SELECT '.$source
                 .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
             [...$query->cleanBindings($bindings), ...$keys->getBindings()],
