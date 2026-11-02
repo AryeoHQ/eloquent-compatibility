@@ -96,6 +96,26 @@ final class TransitionsTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_the_backdated_timestamp_of_a_write_that_changes_the_state_and_another_attribute_and_fires_each_save(): void
+    {
+        Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);
+        Date::setTestNow('2026-06-07 10:00:00');
+        $saves = [];
+        Event::listen('eloquent.updating: '.Job::class, function (Job $job) use (&$saves): void {
+            $saves[] = [$job->getDirty()['lifecycle_status'] ?? null, $job->getDirty()['name'] ?? null];
+        });
+
+        $listing = Listing::query()->findOrFail(1);
+        $listing->update(['status' => ListingStatus::Sold, 'title' => 'Oak Manor', 'updated_at' => '2026-03-04 05:06:07']);
+
+        $this->assertSame([['closed', null], [null, 'Oak Manor']], $saves);
+        $this->assertSame(
+            ['2026-03-04 05:06:07', '2026-03-04 05:06:07', '2026-03-04 05:06:07'],
+            [$listing->updated_at?->format('Y-m-d H:i:s'), Listing::query()->findOrFail(1)->updated_at?->format('Y-m-d H:i:s'), Job::query()->where('legacy_id', 1)->firstOrFail()->updated_at?->format('Y-m-d H:i:s')],
+        );
+    }
+
+    #[Test]
     public function it_runs_no_trigger_for_a_write_that_leaves_the_state_where_it_is(): void
     {
         Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);

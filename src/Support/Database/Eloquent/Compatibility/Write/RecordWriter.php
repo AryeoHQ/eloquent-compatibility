@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final readonly class RecordWriter
@@ -78,13 +79,13 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    public function update(Model $legacy, array $values, bool $deleting = false): int
+    public function update(Model $legacy, array $values, bool $deleting = false, bool $restoring = false): int
     {
         if ($this->map->branches !== []) {
-            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateBranch($legacy, $values, $deleting));
+            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateBranch($legacy, $values, $deleting, $restoring));
         }
 
-        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values, $deleting): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values, $deleting, $restoring): int {
             $key = self::keyOf($legacy);
             $primary = $this->lock($legacy, $key);
 
@@ -92,6 +93,7 @@ final readonly class RecordWriter
                 return 0;
             }
 
+            $original = $primary->getRawOriginal();
             [$stored, $retained, $states, $external] = $this->split($legacy, $values, $key);
             $retained = $this->guard($legacy, $primary, $key, $values, [], $retained);
             $this->retain($key, $primary, $retained, []);
@@ -99,7 +101,7 @@ final readonly class RecordWriter
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $touched = $this->writeExternal($primary, $external);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], $deleting, $touched);
+            $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], $deleting, $restoring, $touched);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $after = $this->rekey($legacy, $primary, $key, $values);
@@ -129,6 +131,7 @@ final readonly class RecordWriter
                 return 0;
             }
 
+            $original = $primary->getRawOriginal();
             [$stored, $retained, $states, $external] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
             $retained = $this->guard($legacy, $primary, $key, $extra, $amounts, $retained);
@@ -138,7 +141,7 @@ final readonly class RecordWriter
             $this->assignEach($models, $stored);
             $this->addEach($models, $added, $stored);
             $touched = $this->writeExternal($primary, $external);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], false, $touched);
+            $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], false, false, $touched);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $after = $this->rekey($legacy, $primary, $key, $extra + $amounts);
@@ -173,7 +176,7 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function updateBranch(Model $legacy, array $values, bool $deleting): int
+    private function updateBranch(Model $legacy, array $values, bool $deleting, bool $restoring = false): int
     {
         $this->refuseRaw($values);
         $key = self::keyOf($legacy);
@@ -189,7 +192,7 @@ final readonly class RecordWriter
 
         if ($target === $current) {
             (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($values, $this->map->identifiers), $current);
-            $updated = $this->through($current)->update($legacy, $values, $deleting);
+            $updated = $this->through($current)->update($legacy, $values, $deleting, $restoring);
             $this->settle($legacy, $current, $primary, $key, $values, array_keys($values));
 
             return $updated;
@@ -253,9 +256,7 @@ final readonly class RecordWriter
      */
     private function evaluateRetained(Model $legacy, null|int|string $key, array $values): array
     {
-        $retained = array_diff_key($values, $this->map->identifiers, $this->map->attributes);
-
-        return array_replace($values, $this->evaluate($legacy, $key, array_filter($retained, fn (mixed $value) => $value instanceof Expression)));
+        return array_replace($values, (new MassWriter($this->map, $this->connection))->typed(array_diff_key($values, $this->map->identifiers, $this->map->attributes), $key));
     }
 
     /**
@@ -309,23 +310,41 @@ final readonly class RecordWriter
         }
 
         $extra = $this->evaluateRetained($legacy, $key, $extra);
-        $after = array_replace($this->before($legacy, $key), $extra);
+        $added = array_diff_key($amounts, $extra);
+        $sums = [];
 
-        foreach (array_diff_key($amounts, $extra) as $name => $amount) {
-            $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
+        foreach (array_diff_key($added, $this->map->attributes) as $name => $amount) {
+            $sums[$name] = new RawExpression(SqlFragments::identifier($this->map->table).'.'.SqlFragments::identifier($name).' + '.($amount + 0));
         }
 
+        $exact = count($sums) === count($added);
+
+        if ($exact) {
+            $this->refuseIncrementMove($legacy, $key, $current, array_replace($this->before($legacy, $key), $extra, (new MassWriter($this->map, $this->connection))->typed($sums, $key)));
+        }
+
+        (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
+        $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
+        $moved = $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
+        $after = $exact ? null : $this->connection->table($this->map->table)->where($legacy->getKeyName(), $moved)->first();
+
+        if ($after !== null) {
+            $this->refuseIncrementMove($legacy, $key, $current, (array) $after);
+        }
+
+        return $incremented;
+    }
+
+    /**
+     * @param  array<string, mixed>  $after
+     */
+    private function refuseIncrementMove(Model $legacy, int|string $key, ResolvedMap $current, array $after): void
+    {
         $target = $this->map->branchFor(self::probe($legacy, $after));
 
         if ($target !== $current) {
             throw CompatibilityWriteRefused::unsupported($legacy::class, 'an increment that moves record '.$key.' to '.class_basename($target->primary->model), 'An increment adds to the values its record stores, and a move recreates the record through another successor model.');
         }
-
-        (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
-        $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
-        $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
-
-        return $incremented;
     }
 
     private function deleteBranch(Model $legacy): int
@@ -380,7 +399,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $values
      * @param  list<int|string>  $names
      */
-    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): void
+    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): int|string
     {
         $this->confirm($legacy, $branch, $key, $values, $this->identifiersWhere($branch, $branch->primary->key, self::keyOf($primary)));
         $moved = $this->rekey($legacy, null, $key, $values);
@@ -388,6 +407,8 @@ final readonly class RecordWriter
         if ($moved !== $key) {
             $this->readBack($legacy, $moved, $names);
         }
+
+        return $moved;
     }
 
     /**
@@ -840,14 +861,23 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  array<string, mixed>  $original
      * @param  array<string, mixed>  $values
      */
-    private function savePrimary(Model $legacy, Model $primary, array $values, bool $deleting, bool $touched): void
+    private function savePrimary(Model $legacy, Model $primary, array $original, array $values, bool $deleting, bool $restoring, bool $touched): void
     {
         $deletedAt = method_exists($primary, 'getDeletedAtColumn') ? (string) $primary->getDeletedAtColumn() : null;
+        $trashed = $deletedAt !== null && ($primary->getAttributes()[$deletedAt] ?? null) !== null;
+        $moves = method_exists($primary, 'restore') && $deletedAt !== null && array_key_exists($deletedAt, $values)
+            && ($values[$deletedAt] === null ? $restoring || $trashed : $deleting || ! $trashed);
 
-        if (! method_exists($primary, 'restore') || $deletedAt === null || ! array_key_exists($deletedAt, $values) || (! ($deleting && $values[$deletedAt] !== null) && (($primary->getAttributes()[$deletedAt] ?? null) === null) === ($values[$deletedAt] === null))) {
+        if (! $moves) {
             $this->assign($primary, $values);
+
+            if ($primary->isDirty()) {
+                $this->keepTimestamp($primary, $original, $values);
+            }
+
             $this->saveEach($legacy, [$primary], $touched);
 
             return;
@@ -855,6 +885,7 @@ final readonly class RecordWriter
 
         if ($values[$deletedAt] === null) {
             $this->assign($primary, array_diff_key($values, [$deletedAt => true]));
+            $this->keepTimestamp($primary, $original, $values);
             $this->save($legacy, $primary, fn () => $primary->restore());
 
             return;
@@ -940,6 +971,23 @@ final readonly class RecordWriter
                 $this->save($legacy, $model, fn () => $model->save());
             }
         }
+    }
+
+    /**
+     * @param  array<string, mixed>  $original
+     * @param  array<string, mixed>  $values
+     */
+    private function keepTimestamp(Model $model, array $original, array $values): void
+    {
+        $column = $model->usesTimestamps() ? $model->getUpdatedAtColumn() : null;
+
+        if ($column === null || ! array_key_exists($column, $values) || $model->isDirty($column)) {
+            return;
+        }
+
+        $model->setRawAttributes(array_replace($model->getAttributes(), [$column => $original[$column] ?? null]));
+        $model->syncOriginalAttribute($column);
+        $this->assign($model, [$column => $values[$column]]);
     }
 
     /**

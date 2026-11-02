@@ -34,6 +34,8 @@ final readonly class MassWriter
 
     private const string EVALUATED = 'pg_temp.compatibility_evaluated';
 
+    private const string TYPED = 'pg_temp.compatibility_typed';
+
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     public static function refuseRaw(ResolvedMap $map, string $name, mixed $value): void
@@ -90,7 +92,7 @@ final readonly class MassWriter
     public function update(QueryBuilder $keys, array $values, array $amounts = [], null|string $alias = null): int
     {
         if ($this->map->branches !== []) {
-            return $this->updateBranches($keys, $values, $amounts);
+            return $this->updateBranches($keys, $values, $amounts, $alias ?? $this->map->table);
         }
 
         [$stored, $retained] = $this->split($values);
@@ -200,10 +202,57 @@ final readonly class MassWriter
     }
 
     /**
+     * @param  array<array-key, mixed>  $values
+     * @return array<array-key, mixed>
+     */
+    public function typed(array $values, null|int|string $key = null): array
+    {
+        if ($values === []) {
+            return [];
+        }
+
+        $grammar = $this->connection->getQueryGrammar();
+        $typed = $grammar->wrapTable(self::TYPED);
+        $retained = ViewCompiler::retainedTable($this->map);
+        $retainedTable = SqlFragments::identifier($retained);
+        $legacy = SqlFragments::identifier($this->map->table);
+        $shape = [];
+        $columns = [];
+        $selects = [];
+        $bindings = [];
+
+        foreach (array_keys($values) as $index => $name) {
+            $value = $values[$name];
+            $column = $grammar->wrap('value_'.$index);
+            $shape[] = $retainedTable.'.'.SqlFragments::identifier(Str::afterLast((string) $name, '.')).' AS '.$column;
+            $columns[] = $column;
+
+            if ($value instanceof Expression) {
+                $selects[] = '('.(string) $value->getValue($grammar).')';
+
+                continue;
+            }
+
+            $selects[] = '?';
+            $bindings[] = $value;
+        }
+
+        $from = $key === null ? '' : ' FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName()).' = ?';
+        $this->connection->statement('CREATE TEMPORARY TABLE '.$typed.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.' WITH NO DATA');
+        $rows = $this->connection->select(
+            'INSERT INTO '.$typed.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).$from.' RETURNING '.implode(', ', $columns),
+            [...$this->connection->table($retained)->cleanBindings($bindings), ...($key === null ? [] : [$key])],
+        );
+        $this->connection->statement('DROP TABLE '.$typed);
+
+        return array_combine(array_keys($values), array_values((array) ($rows[0] ?? throw new LogicException("{$this->map->table} serves no row {$key} for the write."))));
+    }
+
+    /**
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    public function retainByIdentity(QueryBuilder $keys, array $values, array $amounts): void
+    public function retainByIdentity(QueryBuilder $keys, array $values, array $amounts, null|string $alias = null): void
     {
         if ($values === [] && $amounts === []) {
             return;
@@ -211,7 +260,9 @@ final readonly class MassWriter
 
         $retained = ViewCompiler::retainedTable($this->map);
         $table = SqlFragments::identifier($retained);
-        $legacy = SqlFragments::identifier($this->map->table);
+        $alias ??= $this->map->table;
+        $legacy = SqlFragments::identifier($alias);
+        $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
         $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
@@ -244,7 +295,7 @@ final readonly class MassWriter
         }
 
         $source = $joined
-            ? implode(', ', [$legacyKey, ...$selects]).' FROM '.$legacy.' WHERE '.$legacyKey.' IN ('.$keys->toSql().')'
+            ? implode(', ', [$legacyKey, ...$selects]).' FROM '.$from.' WHERE '.$legacyKey.' IN ('.$keys->toSql().')'
             : implode(', ', ['selected.key', ...$selects]).' FROM ('.$keys->toSql().') AS selected (key)';
 
         $this->connection->affectingStatement(
@@ -323,7 +374,7 @@ final readonly class MassWriter
      * @param  array<array-key, mixed>  $values
      * @param  array<array-key, float|int|numeric-string>  $amounts
      */
-    private function updateBranches(QueryBuilder $keys, array $values, array $amounts): int
+    private function updateBranches(QueryBuilder $keys, array $values, array $amounts, string $alias): int
     {
         [$mapped, $retained] = $this->byOwner($values);
         [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
@@ -338,18 +389,32 @@ final readonly class MassWriter
 
         self::refuseIdentifierAmounts($this->map, $mappedAmounts);
 
-        return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $amounts, $mapped, $retained, $mappedAmounts, $retainedAmounts): int {
-            $evaluated = $this->evaluateOnce($selected, $retained);
-            $values = array_replace($values, $evaluated);
-            $retained = array_replace($retained, $evaluated);
-            $this->refuseMoves($selected, $values, $amounts);
+        return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $mapped, $retained, $mappedAmounts, $retainedAmounts, $alias): int {
+            $added = array_map(fn (float|int|string $amount) => $amount + 0, array_diff_key(self::named($retainedAmounts), self::named($retained)));
+            $exact = array_diff_key(self::named($mappedAmounts), self::named($mapped)) === [];
+            $sums = [];
+
+            foreach ($exact ? $added : [] as $column => $amount) {
+                $sums[$column] = new RawExpression(SqlFragments::identifier($alias).'.'.SqlFragments::identifier($column).' + '.$amount);
+            }
+
+            $reads = $this->evaluateOnce($selected, $retained + $sums, $alias);
+            $evaluated = array_intersect_key($reads, $retained);
+            $literals = $this->typed(array_filter($retained, fn (mixed $value) => ! $value instanceof Expression));
+            $values = array_replace($values, $literals, $evaluated);
+            $retained = array_replace($retained, $literals, $evaluated);
+
+            if ($exact) {
+                $this->refuseMoves($selected, array_replace($values, array_intersect_key($reads, $sums)), $alias);
+            }
+
             $identities = array_intersect_key(self::named($mapped), $this->map->identifiers);
 
             if ($identities !== []) {
                 $this->claimAcross($selected, $identities);
             }
 
-            $this->retainByIdentity($selected, self::named($retained), array_map(fn (float|int|string $amount) => $amount + 0, array_diff_key(self::named($retainedAmounts), self::named($retained))));
+            $this->retainByIdentity($selected, self::named($retained), $added, $alias);
             $updated = 0;
 
             foreach ($holding as $branch) {
@@ -362,7 +427,11 @@ final readonly class MassWriter
                 $this->connection->table($this->map->retainedTable)->whereIn((string) $this->map->retainedKey, $selected)->update([(string) $this->map->retainedKey => $identities[$key]]);
             }
 
-            if ($evaluated !== []) {
+            if (! $exact) {
+                $this->refuseMoved(array_key_exists($key, $identities) ? $this->connection->query()->selectRaw('CAST(? AS '.$this->identityType($key).')', [$identities[$key]]) : $selected, $holding);
+            }
+
+            if ($reads !== []) {
                 $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::EVALUATED));
             }
 
@@ -374,7 +443,7 @@ final readonly class MassWriter
      * @param  array<array-key, mixed>  $retained
      * @return array<array-key, Expression>
      */
-    private function evaluateOnce(QueryBuilder $selected, array $retained): array
+    private function evaluateOnce(QueryBuilder $selected, array $retained, string $alias): array
     {
         $expressions = array_filter($retained, fn (mixed $value) => $value instanceof Expression);
 
@@ -385,7 +454,8 @@ final readonly class MassWriter
         $grammar = $this->connection->getQueryGrammar();
         $evaluated = $grammar->wrapTable(self::EVALUATED);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($this->map));
-        $legacy = SqlFragments::identifier($this->map->table);
+        $legacy = SqlFragments::identifier($alias);
+        $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
         $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
         $shape = [$retainedTable.'.'.SqlFragments::identifier((string) $this->map->retainedKey).' AS '.$grammar->wrap('key')];
         $columns = [$grammar->wrap('key')];
@@ -402,7 +472,7 @@ final readonly class MassWriter
         }
 
         $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.' WITH NO DATA');
-        $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
+        $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
         $this->connection->statement('ALTER TABLE '.$evaluated.' ADD PRIMARY KEY ('.$grammar->wrap('key').')');
         $this->connection->statement('ANALYZE '.$evaluated);
 
@@ -469,19 +539,18 @@ final readonly class MassWriter
 
     /**
      * @param  array<array-key, mixed>  $values
-     * @param  array<array-key, float|int|numeric-string>  $amounts
      */
-    private function refuseMoves(QueryBuilder $selected, array $values, array $amounts): void
+    private function refuseMoves(QueryBuilder $selected, array $values, string $alias): void
     {
-        if ($values === [] && $amounts === []) {
+        if ($values === []) {
             return;
         }
 
         $key = (new $this->map->model)->getKeyName();
         $values = self::named($values);
-        $amounts = self::named($amounts);
         $grammar = $this->connection->getQueryGrammar();
-        $rows = $this->connection->table($this->map->table)->select($this->map->table.'.*')->whereIn($key, $selected)->orderBy($key);
+        $from = $alias === $this->map->table ? $this->map->table : $this->map->table.' as '.$alias;
+        $rows = $this->connection->table($from)->select($alias.'.*')->whereIn($alias.'.'.$key, $selected)->orderBy($alias.'.'.$key);
         $expressions = array_keys(array_filter($values, fn (mixed $value) => $value instanceof Expression));
 
         foreach ($expressions as $index => $name) {
@@ -498,20 +567,43 @@ final readonly class MassWriter
                 unset($before['compatibility_value_'.$index]);
             }
 
-            $after = array_replace($before, $values, $evaluated);
+            $this->refuseMove($before, $this->map->branchFor((new $this->map->model)->setRawAttributes($before)), array_replace($before, $values, $evaluated));
+        }
+    }
 
-            foreach (array_diff_key($amounts, $values) as $name => $amount) {
-                $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
+    /**
+     * @param  list<ResolvedMap>  $holding
+     */
+    private function refuseMoved(QueryBuilder $keys, array $holding): void
+    {
+        $key = (new $this->map->model)->getKeyName();
+
+        foreach ($holding as $branch) {
+            $table = $branch->primary->table;
+            $identifier = $table.'.'.(string) $branch->identifiers[$key]->column();
+            $held = $this->connection->table($table)
+                ->where($table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
+                ->whereIn($identifier, $keys)
+                ->select($identifier);
+
+            foreach ($this->connection->table($this->map->table)->whereIn($key, $held)->orderBy($key)->cursor() as $row) {
+                $this->refuseMove((array) $row, $branch, (array) $row);
             }
+        }
+    }
 
-            $from = $this->map->branchFor((new $this->map->model)->setRawAttributes($before));
-            $to = $this->map->branchFor((new $this->map->model)->setRawAttributes($after));
+    /**
+     * @param  array<string, mixed>  $before
+     * @param  array<string, mixed>  $after
+     */
+    private function refuseMove(array $before, ResolvedMap $from, array $after): void
+    {
+        $to = $this->map->branchFor((new $this->map->model)->setRawAttributes($after));
 
-            if ($from !== $to) {
-                $record = $before[$key] ?? null;
+        if ($from !== $to) {
+            $record = $before[(new $this->map->model)->getKeyName()] ?? null;
 
-                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what servedFrom() chooses', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename($from->primary->model).' to '.class_basename($to->primary->model).', and a move deletes and recreates each record through its successor models, one at a time.');
-            }
+            throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what servedFrom() chooses', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename($from->primary->model).' to '.class_basename($to->primary->model).', and a move deletes and recreates each record through its successor models, one at a time.');
         }
     }
 
@@ -565,12 +657,14 @@ final readonly class MassWriter
         $stored = [];
         $retained = [];
 
-        foreach ($values as $name => $value) {
-            $name = Str::afterLast((string) $name, '.');
+        foreach ($values as $key => $value) {
+            [$name, $path] = array_pad(explode('->', (string) $key, 2), 2, null);
+            $name = Str::afterLast($name, '.');
+            $within = $path === null ? '' : '->'.$path;
 
             if (array_key_exists($name, $this->map->identifiers)) {
                 self::refuseRaw($this->map, $name, $value);
-                $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column()] = $value;
+                $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column().$within] = $value;
 
                 continue;
             }
@@ -578,13 +672,25 @@ final readonly class MassWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null) {
-                $retained[$name] = $value;
+                $retained[$name.$within] = $value;
 
                 continue;
             }
 
             $this->refuse($name, null);
             self::refuseRaw($this->map, $name, $value);
+
+            if ($path !== null) {
+                $column = $attribute->column();
+
+                if ($column === null || $attribute->conversions() !== []) {
+                    throw CompatibilityWriteRefused::unsupported($this->map->model, "a JSON path write of \${$name}", 'Its conversions read the whole stored value, so a path inside the legacy value has no one stored path.');
+                }
+
+                $stored[$this->map->owners[$name]->table][$column.$within] = $value;
+
+                continue;
+            }
 
             try {
                 $value = $attribute->write($value);
@@ -721,12 +827,13 @@ final readonly class MassWriter
         }
 
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
-        $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $values, $catalog);
+        $whole = array_filter($values, fn (int|string $column) => ! str_contains((string) $column, '->'), ARRAY_FILTER_USE_KEY);
+        $creates = array_filter($whole, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $whole, $catalog);
         $key = $related->table.'.'.$related->successor->key;
         $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reached()->whereNotNull(self::target($index))->select(self::target($index)))->update($changes);
 
         if ($creates) {
-            $this->createMissing($related, $index, $values, $catalog);
+            $this->createMissing($related, $index, $whole, $catalog);
         }
     }
 

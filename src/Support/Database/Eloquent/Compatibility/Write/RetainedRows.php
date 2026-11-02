@@ -36,11 +36,18 @@ final readonly class RetainedRows
      */
     public function upsertAll(QueryBuilder $keys, array $values, array $amounts, null|string $alias = null): void
     {
+        $retained = ViewCompiler::retainedTable($this->map);
+        $paths = array_filter($values, fn (string $column) => str_contains($column, '->'), ARRAY_FILTER_USE_KEY);
+        $values = array_diff_key($values, $paths);
+
+        if ($paths !== []) {
+            $this->connection->table($retained)->whereIn((string) $this->map->retainedKey, $keys)->update($paths);
+        }
+
         if ($values === [] && $amounts === []) {
             return;
         }
 
-        $retained = ViewCompiler::retainedTable($this->map);
         $table = SqlFragments::identifier($retained);
         $primary = SqlFragments::identifier($this->map->primary->table);
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
