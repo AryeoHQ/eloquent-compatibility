@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use DateTimeInterface;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Support\Arrayable;
 use Illuminate\Database\Eloquent\Builder;
@@ -555,6 +556,8 @@ final class LegacyBuilder extends Builder
             }
         }
 
+        $conditions = array_map(fn (array $condition) => [$condition[0], $this->sent($condition[1])], $conditions);
+
         foreach ($conditions as [$operator, $value]) {
             if ($value === null && in_array($operator, ['<', '>', '<=', '>='], true)) {
                 $onView();
@@ -590,6 +593,15 @@ final class LegacyBuilder extends Builder
         $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
 
         return $this;
+    }
+
+    private function sent(mixed $value): mixed
+    {
+        return match (true) {
+            $value instanceof DateTimeInterface => $value->format($this->model->getConnection()->getQueryGrammar()->getDateFormat()),
+            is_float($value) => (string) $value,
+            default => $value,
+        };
     }
 
     /**

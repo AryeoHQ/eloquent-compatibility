@@ -47,6 +47,7 @@ final readonly class Preparer
         $missing = [];
         $checks = [];
         $notNull = [];
+        $foreignChecks = [];
         $indexes = [];
 
         if ($legacy === []) {
@@ -57,11 +58,13 @@ final readonly class Preparer
             $column = $legacy[$name] ?? throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so identifier '{$name}' has no type to take");
             $default = $identifier->isUuid() ? 'gen_random_uuid()' : $this->sequenceDefault($map, $name, $column);
             $successorColumn = SqlFragments::identifier((string) $identifier->column());
-            $filled = SqlFragments::identifier(SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_filled'));
+            $filledName = SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_filled');
+            $filled = SqlFragments::identifier($filledName);
             $unique = SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_unique');
             $columns[] = 'ADD COLUMN IF NOT EXISTS '.$successorColumn.' '.$column->type;
             $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
             $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
+            $foreignChecks[] = $this->refuseForeignCheck($map, $filledName, (string) $identifier->column());
             $fills[] = $successorColumn.' = COALESCE('.$successorColumn.', '.$default.')';
             $missing[] = $successorColumn.' IS NULL';
             $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
@@ -72,7 +75,7 @@ final readonly class Preparer
         $table = "ALTER TABLE {$primary}\n  ";
 
         return [
-            [$table.implode(",\n  ", $columns), $table.implode(",\n  ", $defaults)],
+            [$table.implode(",\n  ", $columns), "DO \$compatibility\$\nDECLARE\n  found text;\nBEGIN\n".implode('', $foreignChecks)."END\n\$compatibility\$", $table.implode(",\n  ", $defaults)],
             [
                 "DO \$compatibility\$\nDECLARE\n  filled_through {$keyType};\n  fill_upto {$keyType};\nBEGIN\n"
                     ."  LOOP\n"
@@ -91,6 +94,17 @@ final readonly class Preparer
                 ...$indexes,
             ],
         ];
+    }
+
+    private function refuseForeignCheck(ResolvedMap $map, string $name, string $column): string
+    {
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$name} already exists on {$map->primary->table} and is not the check prepare() adds. Drop or rename it, then prepare again.");
+        $expected = "'CHECK ((' || quote_ident(".SqlFragments::literal($column).") || ' IS NOT NULL))'";
+
+        return '  SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($map->primary->table)).') AND conname = '.SqlFragments::literal($name).";\n"
+            ."  IF found NOT IN ({$expected}, {$expected} || ' NOT VALID') THEN\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\n";
     }
 
     private function sequenceDefault(ResolvedMap $map, string $name, Column $column): string
