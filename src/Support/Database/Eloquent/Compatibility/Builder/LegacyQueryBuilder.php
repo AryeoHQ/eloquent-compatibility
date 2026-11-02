@@ -145,7 +145,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        return $legacy === null ? parent::update($values) : $this->massWriter($legacy)->update($this->keys($legacy), $values);
+        return $legacy === null ? parent::update($values) : $this->massWriter($legacy)->update($this->keys($legacy), $values, alias: $this->alias($legacy));
     }
 
     /**
@@ -156,7 +156,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        return $legacy === null ? parent::incrementEach($columns, $extra) : $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1));
+        return $legacy === null ? parent::incrementEach($columns, $extra) : $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1), $this->alias($legacy));
     }
 
     /**
@@ -167,7 +167,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        return $legacy === null ? parent::decrementEach($columns, $extra) : $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1));
+        return $legacy === null ? parent::decrementEach($columns, $extra) : $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1), $this->alias($legacy));
     }
 
     /**

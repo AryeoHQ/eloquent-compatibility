@@ -11,6 +11,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresMethod;
@@ -301,6 +302,53 @@ final class RecordWriterTest extends TestCase
 
         $this->assertStringEndsWith(' cannot take this write, because a listener of JobSite refused its save. Why: The write stores its values through JobSite, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of JobSite.', $refusal->getMessage());
         $this->assertSame($before, $this->snapshot());
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): Listing}>
+     */
+    public static function deletesOfATrashedSuccessor(): iterable
+    {
+        yield 'an already-trashed record' => [fn (): Listing => Listing::withTrashed()->findOrFail(2)];
+        yield 'a stale record whose successor a concurrent writer trashed' => [function (): Listing {
+            $listing = Listing::query()->findOrFail(1);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->delete();
+
+            return $listing;
+        }];
+    }
+
+    /**
+     * @param  Closure(): Listing  $record
+     */
+    #[DataProvider('deletesOfATrashedSuccessor')]
+    #[Test]
+    public function it_runs_the_successor_delete_and_its_veto_when_the_legacy_record_deletes_a_trashed_successor(Closure $record): void
+    {
+        $listing = $record();
+        $before = $this->snapshot();
+        /** @var Collection<int, string> $fired */
+        $fired = new Collection;
+        Event::listen('eloquent.*: '.Job::class, function (string $name) use ($fired): void {
+            $fired->push(Str::before(Str::after($name, 'eloquent.'), ':'));
+        });
+        Event::listen('eloquent.deleting: '.Job::class, function () use ($fired): bool {
+            $fired->push('vetoed');
+
+            return false;
+        });
+
+        $refusal = $this->refusal(fn () => $listing->delete());
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame(['retrieved', 'vetoed'], $fired->all());
+        $this->assertSame($before, $this->snapshot());
+
+        Event::forget('eloquent.deleting: '.Job::class);
+
+        $this->assertTrue($listing->delete());
+        $this->assertSame(['retrieved', 'deleting', 'trashed', 'deleted'], $fired->slice(2)->values()->all());
+        $this->assertSame($listing->deleted_at?->toDateTimeString(), Job::withTrashed()->where('legacy_id', $listing->id)->firstOrFail()->deleted_at?->toDateTimeString());
     }
 
     #[Test]

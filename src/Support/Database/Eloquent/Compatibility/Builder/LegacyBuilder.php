@@ -43,6 +43,9 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $inserts = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $deletes = null;
+
     /** @var array<string, true> */
     private static array $tables = [];
 
@@ -76,6 +79,24 @@ final class LegacyBuilder extends Builder
         $inserts->offsetUnset($model);
 
         return $inserting;
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $delete
+     * @return TResult
+     */
+    public static function deleting(Model $model, Closure $delete): mixed
+    {
+        $deletes = self::$deletes ??= new WeakMap;
+        $deletes[$model] = true;
+
+        try {
+            return $delete();
+        } finally {
+            $deletes->offsetUnset($model);
+        }
     }
 
     public static function serves(Model $model): bool
@@ -130,7 +151,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::update($values) : $this->writer()->update($model, $values);
+        return $model === null ? parent::update($values) : $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false);
     }
 
     public function delete(): mixed

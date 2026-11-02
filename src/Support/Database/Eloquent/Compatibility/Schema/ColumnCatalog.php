@@ -14,7 +14,7 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null) {}
+    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, private readonly bool $throughSearchPath = false) {}
 
     /**
      * @return array<string, Column>
@@ -72,7 +72,7 @@ final class ColumnCatalog
                         (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = \'d\'
              ) column_domain
-             where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
+             where table_column.attrelid = '.($this->throughSearchPath ? 'to_regclass(?)' : "to_regclass(quote_ident(current_schema()) || '.' || ?)").' and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
             [SqlFragments::identifier($table)],
         );
