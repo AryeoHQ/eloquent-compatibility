@@ -22,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
@@ -663,15 +664,17 @@ final class ExternalAttributesTest extends TestCase
                     ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed('text/html'))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed('text/html'))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))));
             }
         };
     }

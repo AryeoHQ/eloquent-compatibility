@@ -34,6 +34,13 @@ final readonly class ResolvedMap
     /** @var array<class-string<Model>, ResolvedMap> */
     public array $branches;
 
+    public null|RelatedMorph $morph;
+
+    /** @var array<class-string<Model>, ResolvedMap> */
+    public array $morphs;
+
+    public null|Related $target;
+
     /**
      * @param  class-string<Model>  $model
      * @param  array<string, Identifier>  $identifiers
@@ -41,6 +48,7 @@ final readonly class ResolvedMap
      * @param  array<string, Guard>  $guards
      * @param  array<class-string, string>  $withoutForwarding
      * @param  array<class-string<Model>, Branch>  $branches
+     * @param  null|class-string<Model>  $variant
      */
     public function __construct(
         public string $model,
@@ -57,6 +65,7 @@ final readonly class ResolvedMap
         null|Closure $selector = null,
         array $branches = [],
         public bool $branch = false,
+        null|string $variant = null,
     ) {
         if ($selector !== null || $branches !== []) {
             $this->resolveBranches($retainedKey, $timestamps, $discriminator, $selector, $branches);
@@ -74,6 +83,18 @@ final readonly class ResolvedMap
         if ($primary->atMostOneBecause() !== null) {
             throw $this->invalid('atMostOne() refuses a second related row, and servedFrom() reads the successor '.class_basename($primary->model).' by its own row');
         }
+
+        $morph = $primary->morph();
+
+        if ($morph !== null && $variant === null) {
+            $this->resolveMorphs($primary, $morph, $retainedKey, $timestamps, $discriminator);
+
+            return;
+        }
+
+        $this->morph = $morph;
+        $this->morphs = [];
+        $this->target = $variant === null || $morph === null ? null : $morph->targets[$variant];
 
         $legacy = new $model;
         $key = $legacy->getKeyName();
@@ -123,12 +144,48 @@ final readonly class ResolvedMap
             return $this->branches[$successor];
         }
 
-        throw $this->invalid('the servedFrom() selector returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and as() declares only '.implode(' and ', array_keys($this->branches)));
+        throw $this->invalid('the servedFrom() choose: closure returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and successors: declares only '.implode(' and ', array_keys($this->branches)));
+    }
+
+    public function morphFor(Model $legacy): self
+    {
+        $morph = $this->morph ?? throw new LogicException("Compatibility map '{$this->table}' declares no relatedMorph(), so it has no target to choose.");
+        $variants = $this->morphs === [] ? throw new LogicException("Compatibility map '{$this->table}' is one target of its relatedMorph(), so it has no other target to choose.") : $this->morphs;
+
+        if ($morph->choose === null) {
+            return reset($variants);
+        }
+
+        $target = ($morph->choose)($legacy);
+
+        if (is_string($target) && array_key_exists($target, $variants)) {
+            return $variants[$target];
+        }
+
+        throw $this->invalid('the relatedMorph() choose: closure returns '.(is_string($target) ? $target : get_debug_type($target)).', and successors: declares only '.implode(' and ', array_keys($variants)));
+    }
+
+    public function morphHolding(mixed $alias): null|self
+    {
+        foreach ($this->morphs as $variant) {
+            if ($variant->target?->morphAlias === $alias) {
+                return $variant;
+            }
+        }
+
+        return null;
+    }
+
+    public function isMorphed(string $name): bool
+    {
+        $owner = $this->owners[$name] ?? null;
+
+        return $owner !== null && array_key_exists($owner->model, $this->morph->targets ?? []);
     }
 
     public function isExternal(string $name): bool
     {
-        foreach ($this->branches === [] ? [$this] : $this->branches as $served) {
+        foreach ($this->branches === [] ? ($this->morphs === [] ? [$this] : $this->morphs) : $this->branches as $served) {
             if (($served->attributes[$name] ?? null)?->isExternal() === true) {
                 return true;
             }
@@ -170,11 +227,17 @@ final readonly class ResolvedMap
     private function resolveBranches(null|string $retainedKey, bool $timestamps, null|string $discriminator, null|Closure $selector, array $branches): void
     {
         if ($selector === null) {
-            throw $this->invalid('as() declares a successor for the servedFrom() selector, and the map says no servedFrom() selector');
+            throw $this->invalid('servedFrom() declares successors: without choose:, so nothing picks between them');
         }
 
         if ($branches === []) {
-            throw $this->invalid('servedFrom() takes a selector, and no as() declares a successor for it to choose');
+            throw $this->invalid('servedFrom() takes choose:, and successors: declares no successor for it to pick');
+        }
+
+        foreach ($branches as $successor => $branch) {
+            if ($branch->successor->morph() !== null) {
+                throw $this->invalid('relatedMorph() on '.class_basename($successor).', one of the successors servedFrom() chooses between, would choose a second time for each record; serve the record from one successor with relatedMorph(), or from several without it');
+            }
         }
 
         $names = implode(' and ', array_map(class_basename(...), array_keys($branches)));
@@ -210,7 +273,7 @@ final readonly class ResolvedMap
             );
         }
 
-        $this->refuseUnreadable($resolved);
+        $this->refuseUnreadable($resolved, 'branch');
         $first = reset($resolved);
         $this->primary = $first->primary;
         $this->retainedKey = $first->retainedKey;
@@ -220,12 +283,63 @@ final readonly class ResolvedMap
         $this->membership = $first->membership;
         $this->selector = $selector;
         $this->branches = $resolved;
+        $this->morph = null;
+        $this->morphs = [];
+        $this->target = null;
+    }
+
+    private function resolveMorphs(Successor $primary, RelatedMorph $morph, null|string $retainedKey, bool $timestamps, null|string $discriminator): void
+    {
+        $variants = [];
+        $tables = [];
+
+        if (in_array($discriminator, [$morph->typeColumn, $morph->idColumn], true)) {
+            throw $this->invalid("discriminatedBy() names {$primary->table}.{$discriminator}, which relatedMorph() reads through ".class_basename($primary->model).'; give the discriminator a column of its own');
+        }
+
+        foreach ($morph->targets as $target => $related) {
+            if (array_key_exists($related->table, $tables)) {
+                throw $this->invalid('relatedMorph() reaches the table '.$related->table.' through '.class_basename($target).' and through '.class_basename($tables[$related->table]).'; give each successors: class a table of its own');
+            }
+
+            $tables[$related->table] = $target;
+            $variants[$target] = new self(
+                $this->model,
+                $this->table,
+                $this->identifiers,
+                $this->retainedTable,
+                $retainedKey,
+                $timestamps,
+                $primary,
+                $this->hides,
+                $this->guards,
+                $this->withoutForwarding,
+                $discriminator,
+                variant: $target,
+            );
+        }
+
+        $this->refuseUnreadable($variants, 'successor');
+        $first = reset($variants);
+
+        if ($first === false) {
+            throw new LogicException("Compatibility map '{$this->table}' resolves no relatedMorph() target.");
+        }
+        $this->primary = $first->primary;
+        $this->retainedKey = $first->retainedKey;
+        $this->related = [...array_values(array_filter($first->related, fn (Related $related) => $related->morphType === null)), ...array_values($morph->targets)];
+        $this->attributes = $first->attributes;
+        $this->owners = $first->owners;
+        $this->membership = $first->membership;
+        $this->morph = $morph;
+        $this->morphs = $variants;
+        $this->target = null;
     }
 
     /**
      * @param  array<class-string<Model>, ResolvedMap>  $branches
      */
-    private function refuseUnreadable(array $branches): void
+    private function refuseUnreadable(array $branches, string $noun): void
     {
         $declaredIn = [];
 
@@ -238,7 +352,7 @@ final readonly class ResolvedMap
         foreach ($branches as $successor => $branch) {
             foreach ($declaredIn as $name => $declared) {
                 if (! array_key_exists($name, $branch->attributes)) {
-                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' branch and not in the '.class_basename($successor).' branch; give it from(), external() or fixed() there');
+                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared)." {$noun} and not in the ".class_basename($successor)." {$noun}; give it from(), external() or fixed() there");
                 }
             }
         }
@@ -250,7 +364,7 @@ final readonly class ResolvedMap
                 $attribute = $branch->attributes[$name];
 
                 if (! $attribute->isExternal() && ! ($attribute->column() === null && ($attribute->conversions()[0] ?? null) instanceof Fixed)) {
-                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external)).' branch and reads SQL in the '.class_basename($successor).' branch, and the view serves an external attribute from no branch; declare it external() or fixed() there');
+                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external))." {$noun} and reads SQL in the ".class_basename($successor)." {$noun}, and the view serves an external attribute from no {$noun}; declare it external() or fixed() there");
                 }
             }
         }
@@ -277,12 +391,21 @@ final readonly class ResolvedMap
                 throw $this->invalid("when() on {$name} decides membership, and only the servedFrom() successor carries the discriminator");
             }
 
+            if ($successor !== $primary && $successor->morph() !== null) {
+                throw $this->invalid("relatedMorph() on {$name} follows a MorphTo of a successor related() reaches, and only the servedFrom() successor ".class_basename($primary->model).' carries a relatedMorph(); declare it there');
+            }
+
             $tables[$successor->table] = $name;
             $successors[] = $successor;
 
             foreach ($successor->relations() as $relation) {
                 $related[] = $relation;
                 $pending[] = [$relation->successor, 'the relation from '.class_basename($relation->parent).' to '.class_basename($relation->model)];
+            }
+
+            if ($successor === $primary && $this->target !== null) {
+                $related[] = $this->target;
+                $pending[] = [$this->target->successor, 'the relatedMorph() target '.class_basename($this->target->model)];
             }
         }
 
@@ -317,10 +440,6 @@ final readonly class ResolvedMap
 
             if (array_key_exists($name, $attributes)) {
                 throw $this->invalid("attribute '{$name}' is declared twice");
-            }
-
-            if ($attribute->isExternal() && $successor !== $successors[0]) {
-                throw $this->invalid("attribute '{$name}' is external() on ".class_basename($successor->model).', which related() reaches, and an external() read and write receive the servedFrom() successor '.class_basename($successors[0]->model).'; declare it on '.class_basename($successors[0]->model));
             }
 
             $attributes[$name] = $attribute->resolve();
@@ -375,6 +494,11 @@ final readonly class ResolvedMap
     private function refuseSharedColumns(Successor $primary, array $attributes, array $owners, null|string $discriminator): void
     {
         $columns = $discriminator === null ? [] : [$primary->table.'.'.$discriminator => 'discriminatedBy()'];
+
+        if ($this->morph !== null) {
+            $columns[$primary->table.'.'.$this->morph->typeColumn] ??= 'relatedMorph()';
+            $columns[$primary->table.'.'.$this->morph->idColumn] ??= 'relatedMorph()';
+        }
 
         foreach ($this->identifiers as $name => $identifier) {
             $column = $primary->table.'.'.$identifier->column();

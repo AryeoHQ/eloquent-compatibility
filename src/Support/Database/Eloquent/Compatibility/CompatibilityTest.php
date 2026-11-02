@@ -14,6 +14,7 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FloorPlan;
@@ -26,6 +27,8 @@ use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\Fixtures\Support\PlaceAssets\AssetFile;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\TestCase;
 
 #[CoversClass(Compatibility::class)]
@@ -212,9 +215,11 @@ final class CompatibilityTest extends TestCase
                     return $video
                         ->discriminatedBy('legacy_type')
                         ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? CompatibilityTest::$reporting : File::class)
-                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                        ->as(CompatibilityTest::$reporting, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                        ->servedFrom(
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? CompatibilityTest::$reporting : File::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(CompatibilityTest::$reporting, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
                 }
             },
             new class extends Model implements Contracts\Compatible
@@ -231,11 +236,13 @@ final class CompatibilityTest extends TestCase
                     return $video
                         ->discriminatedBy('legacy_type')
                         ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                        ->as(Link::class, fn (Successor $link) => $link
-                            ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
-                            ->related(fn (Link $link) => $link->hasOne(CompatibilityTest::$reporting, 'link_id'), fn (Successor $preview) => $preview));
+                        ->servedFrom(
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(Link::class, fn (Successor $link) => $link
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
+                                    ->related(fn (Link $link) => $link->hasOne(CompatibilityTest::$reporting, 'link_id'), fn (Successor $preview) => $preview)));
                 }
             },
         ];
@@ -266,6 +273,55 @@ final class CompatibilityTest extends TestCase
             "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
             "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
         ])), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_a_morph_target_that_reads_another_database_before_reading_the_database(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting']]);
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'asset_links';
+        };
+        self::$reporting = $reporting::class;
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'place_videos';
+
+            public function getMorphClass()
+            {
+                return 'place_video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                        choose: fn (Model $video): string => CompatibilityTest::$reporting,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(AssetFile::class, fn (Successor $file) => $file)
+                            ->as(CompatibilityTest::$reporting, fn (Successor $link) => $link)));
+            }
+        };
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        try {
+            Compatibility::prepare($legacy::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        DB::purge('compatibility_reporting');
+        $this->assertSame("Compatibility map 'place_videos' is declared wrongly: the relation from PlaceAsset to ".class_basename($reporting).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.', $refusal);
         $this->assertSame(0, $queries);
     }
 
@@ -339,12 +395,14 @@ final class CompatibilityTest extends TestCase
         yield 'a discriminator in another table' => [fn (Compatibility $listing) => $listing->discriminatedBy('jobs.legacy_type'), "discriminatedBy() names 'jobs.legacy_type', which names no column of the primary successor's own table"];
         yield 'a successor twice' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(Job::class, $successor), 'servedFrom() is declared twice'];
         yield 'a successor that is no model' => [fn (Compatibility $listing) => $listing->servedFrom(SyncListingToMls::class, $successor), 'servedFrom() names '.SyncListingToMls::class.', which is not an Eloquent model'];
-        yield 'a selector with a definition' => [fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => Job::class, $successor), 'servedFrom() takes a selector closure alone; declare each successor it chooses with as()'];
+        yield 'a closure without a successor' => [fn (Compatibility $listing) => $listing->servedFrom(definition: $successor), 'servedFrom() takes a closure without a successor class; name the class before it, or declare several successors with choose: and successors:'];
+        yield 'a choice without successors' => [fn (Compatibility $listing) => $listing->servedFrom(choose: fn (Listing $listing): string => Job::class), 'servedFrom() names no successor; declare one with servedFrom(Successor::class, fn (Successor $successor) => ...), or several with choose: and successors:'];
         yield 'a successor without a closure' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class), 'servedFrom() names '.Job::class.' without a closure over it'];
-        yield 'a selector after a successor' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(fn (Listing $listing): string => Job::class), 'servedFrom() is declared twice'];
-        yield 'a branch without a selector' => [fn (Compatibility $listing) => $listing->as(Job::class, $successor), 'as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it'];
-        yield 'a branch after a successor' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->as(Place::class, $successor), 'as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it'];
-        yield 'a branch twice' => [fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => Job::class)->as(Job::class, $successor)->as(Job::class, $successor), 'as('.Job::class.') is declared twice'];
+        yield 'a choice after a successor' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(choose: fn (Listing $listing): string => Job::class, successors: fn (Successors $successors) => $successors->as(Job::class, fn (Successor $job) => $job)->as(Place::class, fn (Successor $place) => $place)), 'servedFrom() is declared twice'];
+        yield 'successors without a choice' => [fn (Compatibility $listing) => $listing->servedFrom(successors: fn (Successors $successors) => $successors->as(Job::class, fn (Successor $job) => $job)->as(Place::class, fn (Successor $place) => $place)), 'successors: on servedFrom() declares Job and Place without choose:; give choose: a closure that returns one of them'];
+        yield 'a choice of one successor' => [fn (Compatibility $listing) => $listing->servedFrom(choose: fn (Listing $listing): string => Job::class, successors: fn (Successors $successors) => $successors->as(Job::class, fn (Successor $job) => $job)), 'choose: on servedFrom() picks one of the successors: classes, and successors: declares only Job; declare servedFrom(Job::class, fn (Successor $successor) => ...) instead'];
+        yield 'a successor and successors' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor, successors: fn (Successors $successors) => $successors->as(Place::class, fn (Successor $place) => $place)), 'servedFrom() names '.Job::class.' and also takes choose: or successors:; declare one successor with servedFrom(Job::class, fn (Successor $successor) => ...), or several with choose: and successors: alone'];
+        yield 'a branch twice' => [fn (Compatibility $listing) => $listing->servedFrom(choose: fn (Listing $listing): string => Job::class, successors: fn (Successors $successors) => $successors->as(Job::class, fn (Successor $job) => $job)->as(Job::class, fn (Successor $job) => $job)), 'as('.Job::class.') is declared twice'];
         yield 'a hide rule without a reason' => [fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs, because: ''), 'hide() gives no reason; it takes the reason the legacy model never shows these records'];
         yield 'a guard without a remedy' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, because: 'Frozen.', instead: ' '), "guard 'frozen' needs a name, a reason and what to do instead"];
         yield 'a guard twice' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, 'Frozen.', 'Wait.')->guard('frozen', fn (Model $after, Model $before) => true, 'Frozen.', 'Wait.'), "guard 'frozen' is declared twice"];
@@ -374,7 +432,7 @@ final class CompatibilityTest extends TestCase
         foreach ([
             fn (Compatibility $listing) => $listing->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from($merged)),
             fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute($merged, fn (Attribute $attribute) => $attribute)),
-            fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => $listing->getAttribute($merged) === null ? Job::class : Place::class),
+            fn (Compatibility $listing) => $listing->servedFrom(choose: fn (Listing $listing): string => $listing->getAttribute($merged) === null ? Job::class : Place::class, successors: fn (Successors $successors) => $successors),
             fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs->whereNotNull($merged), because: 'Merged.'),
             fn (Compatibility $listing) => $listing->guard('merged', fn (Model $after, Model $before) => $after->getAttribute($merged) !== null, because: 'Merged.', instead: 'Unmerge.'),
         ] as $declare) {
@@ -388,7 +446,7 @@ final class CompatibilityTest extends TestCase
         $this->assertSame([
             "Compatibility map 'listings' is declared wrongly: the closure of identifier 'id' captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: the servedFrom() closure captures \$merged, and a map reads nothing but its own arguments.",
-            "Compatibility map 'listings' is declared wrongly: the servedFrom() selector captures \$merged, and a map reads nothing but its own arguments.",
+            "Compatibility map 'listings' is declared wrongly: the servedFrom() choose: closure captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: a hide() scope captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: guard 'merged' captures \$merged, and a map reads nothing but its own arguments.",
         ], $refusals);

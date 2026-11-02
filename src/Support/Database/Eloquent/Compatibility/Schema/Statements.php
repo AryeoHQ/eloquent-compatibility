@@ -207,7 +207,7 @@ final readonly class Statements
         $indexed = $prefilled && $connection->scalar('select indisvalid and indisunique from pg_index where indexrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and indrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?)', [SqlFragments::identifier($retainedPrimaryKeyName), SqlFragments::identifier($map->table)]) === true;
         $retainedConstraints = "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY ".($indexed ? "USING INDEX {$retainedPrimaryKey}" : '('.SqlFragments::identifier($retainedKey).')').',';
         $verifications = [
-            ...($branched ? [fn (ConnectionInterface $connection) => (new Backfiller($map, $connection))->refuseMisplaced()] : []),
+            ...($branched || $map->morphs !== [] ? [fn (ConnectionInterface $connection) => (new Backfiller($map, $connection))->refuseMisplaced()] : []),
             ...array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external),
         ];
         $mapped = array_values(array_diff(array_keys($legacy), $map->legacyOnly(array_keys($legacy)), $branched ? [$retainedKey] : []));

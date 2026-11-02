@@ -15,6 +15,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\File;
@@ -122,17 +123,19 @@ final class BranchConcurrencyTest extends TestCase
                     ->retainedIn('videos_retained')
                     ->timestamps()
                     ->guard('held video', fn (Model $after, Model $before) => $before->getAttribute('views') === 99, because: 'A held video keeps its title and source.', instead: 'Release the hold first.')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
         $record = $video->newQuery()->findOrFail(1);

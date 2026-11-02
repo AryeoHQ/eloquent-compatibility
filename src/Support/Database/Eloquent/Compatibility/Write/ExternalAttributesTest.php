@@ -6,6 +6,8 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -15,6 +17,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
@@ -24,6 +27,9 @@ use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\Place;
 use Tests\TestCase;
 
 #[CoversClass(RecordWriter::class)]
@@ -83,6 +89,58 @@ final class ExternalAttributesTest extends TestCase
         $this->assertEquals(new FileMetadata('image/avif'), FakeMediaLibrary::bound()->stored($asset));
         $this->assertSame(['image/avif', false], [$photo->mime_type, $photo->isDirty()]);
         $this->assertSame(['image/jpeg', 'image/avif', 'image/png'], Photo::query()->orderBy('id')->get()->map(fn (Photo $photo) => $photo->mime_type)->all());
+    }
+
+    #[Test]
+    public function it_reads_and_writes_an_external_attribute_of_a_successor_related_reaches_through_that_successor(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->timestamps()
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all(),
+                                write: fn (Place $place, null|string $city) => $place->setAttribute('city', $city)))));
+            }
+        };
+
+        try {
+            Compatibility::prepare($listing::class);
+            ListingTables::backfill();
+            Compatibility::install($listing::class);
+            $read = [];
+            DB::listen(function (QueryExecuted $query) use (&$read): void {
+                $read[] = $query->sql;
+            });
+
+            $cities = $listing::query()->orderBy('id')->get()->map(fn (Model $record) => $record->getAttribute('city'))->all();
+            $places = count(array_filter($read, fn (string $sql) => str_contains($sql, '"places".*')));
+            $listing::query()->findOrFail(3)->update(['city' => 'Tacoma']);
+
+            $this->assertSame([['Seattle', null], 1], [$cities, $places]);
+            $this->assertSame([['Seattle', 'Tacoma'], ['1 Oak St' => 'Seattle', '3 Elm St' => 'Tacoma']], [$listing::query()->orderBy('id')->get()->map(fn (Model $record) => $record->getAttribute('city'))->all(), DB::table('places')->orderBy('street')->pluck('city', 'street')->all()]);
+        } finally {
+            ListingTables::drop();
+        }
     }
 
     #[Test]
@@ -495,19 +553,21 @@ final class ExternalAttributesTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->mime_type = (string) $mimeType))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all(),
+                                    write: fn (File $file, null|string $mimeType) => $file->mime_type = (string) $mimeType))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
         File::creating(function (File $file): void {

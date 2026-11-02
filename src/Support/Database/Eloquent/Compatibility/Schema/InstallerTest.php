@@ -22,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
@@ -37,6 +38,8 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(Installer::class)]
@@ -72,6 +75,31 @@ final class InstallerTest extends TestCase
         FileTables::drop();
 
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_locks_every_morph_target_while_it_installs_and_uninstalls_a_map_through_a_morph(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (str_starts_with($query->sql, 'LOCK TABLE')) {
+                $locks[] = $query->sql;
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            Compatibility::uninstall(PlaceVideo::class);
+        } finally {
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertContains('LOCK TABLE place_videos, place_assets, asset_files, asset_links IN SHARE UPDATE EXCLUSIVE MODE', $locks);
+        $this->assertContains('LOCK TABLE "place_assets", "asset_files", "asset_links" IN SHARE ROW EXCLUSIVE MODE', $locks);
     }
 
     #[Test]
@@ -1397,17 +1425,19 @@ final class InstallerTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained', key: 'video_id')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
 

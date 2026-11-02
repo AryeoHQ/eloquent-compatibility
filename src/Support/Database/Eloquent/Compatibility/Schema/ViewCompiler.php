@@ -42,6 +42,10 @@ final readonly class ViewCompiler
      */
     public function served(ResolvedMap $map, array $shape, array $external = []): array
     {
+        if ($map->morphs !== []) {
+            return $this->morphed($map, $shape, $external);
+        }
+
         $external = [...$external, ...$map->externals()];
         $this->check($map, $shape, $external);
         $reads = [];
@@ -73,6 +77,32 @@ final readonly class ViewCompiler
             }
 
             $served[$name] = self::cast($read, $type, $column->type, $column->baseType);
+        }
+
+        return $served;
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @param  list<string>  $external
+     * @return array<string, string>
+     */
+    private function morphed(ResolvedMap $map, array $shape, array $external): array
+    {
+        $external = [...$external, ...$map->externals()];
+        $variants = array_map(fn (ResolvedMap $variant) => $this->served($variant, $shape, $external), $map->morphs);
+        $type = SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $map->morph?->typeColumn);
+        $served = [];
+
+        foreach (array_values($variants)[0] ?? [] as $name => $read) {
+            if (! $map->isMorphed($name)) {
+                $served[$name] = $read;
+
+                continue;
+            }
+
+            $cases = array_map(fn (ResolvedMap $variant, string $target) => 'WHEN '.SqlFragments::literal((string) $variant->target?->morphAlias).' THEN '.$variants[$target][$name], $map->morphs, array_keys($map->morphs));
+            $served[$name] = 'CAST(CASE '.$type.' '.implode(' ', $cases).' END AS '.$shape[$name]->type.')';
         }
 
         return $served;
@@ -112,7 +142,9 @@ final readonly class ViewCompiler
         $laterals = [];
 
         foreach ($map->related as $related) {
-            if ($path === null || in_array($related->table, $path, true)) {
+            if ($related->morphType !== null && ($path === null || in_array($related->table, $path, true))) {
+                $laterals[] = 'LEFT JOIN '.SqlFragments::identifier($related->table).' ON '.implode(' AND ', self::conditions($related, true));
+            } elseif ($path === null || in_array($related->table, $path, true)) {
                 $laterals[] = 'LEFT JOIN LATERAL (SELECT * FROM '.SqlFragments::identifier($related->table).' WHERE '.implode(' AND ', self::conditions($related, true))
                     .($related->orders === null ? '' : ' ORDER BY '.$related->orders).' LIMIT 1) AS '.SqlFragments::identifier($related->table).' ON true';
             }
@@ -127,7 +159,12 @@ final readonly class ViewCompiler
     public static function conditions(Related $related, bool $joined): array
     {
         $table = SqlFragments::identifier($related->table);
-        $conditions = $joined ? [$table.'.'.SqlFragments::identifier($related->relatedKey).' = '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey)] : [];
+        $parent = SqlFragments::identifier($related->parentTable);
+        $conditions = match (true) {
+            ! $joined => [],
+            $related->morphType !== null => [$parent.'.'.SqlFragments::identifier($related->morphType).' = '.SqlFragments::literal((string) $related->morphAlias), $parent.'.'.SqlFragments::identifier($related->parentKey).' = '.$table.'.'.SqlFragments::identifier($related->relatedKey)],
+            default => [$table.'.'.SqlFragments::identifier($related->relatedKey).' = '.$parent.'.'.SqlFragments::identifier($related->parentKey)],
+        };
 
         if ($related->conditions !== null) {
             $conditions[] = '('.SqlFragments::bind($related->conditions, $related->bindings).')';
@@ -278,7 +315,7 @@ final readonly class ViewCompiler
         $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...($map->membership === null ? [] : [$map->membership->column]), ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
 
         foreach ($map->related as $related) {
-            $this->columnsOf($map, $related->parentTable, [$related->parentKey], 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');
+            $this->columnsOf($map, $related->parentTable, array_values(array_filter([$related->parentKey, $related->morphType], is_string(...))), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');
             $this->columnsOf($map, $related->table, array_values(array_filter([$related->relatedKey, $related->deletedAt], fn (null|string $column) => $column !== null)), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' reads it');
         }
 

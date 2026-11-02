@@ -18,12 +18,15 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use WeakMap;
 use WeakReference;
 
 final class ExternalAttributes
 {
     private const int CHUNK = 500;
+
+    private const string HELD_BY = 'compatibility_held_by';
 
     /** @var array<class-string<Model>, list<string>> */
     private static array $names = [];
@@ -144,16 +147,20 @@ final class ExternalAttributes
     public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
     {
         $values = [];
+        $served = $map->branches === [] ? $map->morphs : $map->branches;
 
-        foreach ($map->branches === [] ? [$map] : $map->branches as $branch) {
+        foreach ($served === [] ? [$map] : $served as $branch) {
             $attribute = $branch->attributes[$name];
+            $owner = $branch->owners[$name];
 
             if ($attribute->isExternal()) {
-                $values += self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...));
+                $values += $owner === $branch->primary
+                    ? self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...))
+                    : self::heldThrough($map, $branch, $owner->model, $keys, $connection, $writePdo, $attribute->readExternally(...));
             }
         }
 
-        foreach ($map->branches as $branch) {
+        foreach ($served as $branch) {
             $attribute = $branch->attributes[$name];
             $fixed = $attribute->conversions()[0] ?? null;
             $remaining = array_values(array_filter($keys, fn (int|string $key) => ! array_key_exists($key, $values)));
@@ -255,6 +262,10 @@ final class ExternalAttributes
             $query->where($branch->membership->column, $branch->membership->alias);
         }
 
+        if ($branch->target !== null && $branch->morph !== null) {
+            $query->where($branch->morph->typeColumn, $branch->target->morphAlias);
+        }
+
         $successors = $query->get();
         $read = $read === null ? null : $read($successors);
         $held = [];
@@ -269,6 +280,53 @@ final class ExternalAttributes
         }
 
         return $held;
+    }
+
+    /**
+     * @param  class-string<Model>  $owner
+     * @param  list<int|string>  $keys
+     * @param  Closure(Collection<array-key, Model>): array<array-key, mixed>  $read
+     * @return array<array-key, mixed>
+     */
+    private static function heldThrough(ResolvedMap $map, ResolvedMap $branch, string $owner, array $keys, null|string $connection, bool $writePdo, Closure $read): array
+    {
+        $identifier = $branch->identifiers[(new $map->model)->getKeyName()];
+        $legacyKey = SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier((string) $identifier->column());
+        $model = (new $owner)->setConnection($connection);
+        $table = $model->getTable();
+        $query = $model->newQuery()
+            ->fromRaw(SqlFragments::identifier($branch->primary->table).' '.implode(' ', ViewCompiler::laterals($branch, $table)))
+            ->select($table.'.*')
+            ->selectRaw($legacyKey.' AS '.SqlFragments::identifier(self::HELD_BY))
+            ->whereRaw($legacyKey.' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral($keys)])
+            ->whereNotNull($table.'.'.$model->getKeyName());
+
+        if ($writePdo) {
+            $query->useWritePdo();
+        }
+
+        if ($branch->membership !== null) {
+            $query->whereRaw($branch->membership->of($branch->primary->table));
+        }
+
+        $heldBy = [];
+        $successors = $model->newCollection();
+
+        foreach ($query->get() as $successor) {
+            $attributes = $successor->getAttributes();
+            $legacy = $attributes[self::HELD_BY] ?? null;
+            $successorKey = $successor->getKey();
+            $successor->setRawAttributes(array_diff_key($attributes, [self::HELD_BY => true]), true);
+
+            if ((is_int($legacy) || is_string($legacy)) && (is_int($successorKey) || is_string($successorKey))) {
+                $heldBy[$legacy] = $successorKey;
+                $successors[$successorKey] ??= $successor;
+            }
+        }
+
+        $values = $read($successors->values());
+
+        return array_map(fn (int|string $successorKey) => $values[$successorKey] ?? null, $heldBy);
     }
 
     private function load(Model $legacy, string $name): void

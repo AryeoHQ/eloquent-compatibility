@@ -20,11 +20,20 @@ use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\Fixtures\Support\PlaceAssets\AssetFile;
+use Tests\Fixtures\Support\PlaceAssets\AssetLink;
+use Tests\Fixtures\Support\PlaceAssets\Image;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(ResolvedMap::class)]
 final class ResolvedMapTest extends TestCase
 {
+    private static string $other = '';
+
+    private static string $untimed = '';
+
     #[Test]
     public function it_resolves_the_listing_map_into_its_identifiers_retained_table_and_successors(): void
     {
@@ -137,7 +146,6 @@ final class ResolvedMapTest extends TestCase
         yield 'timestamps from a successor without them' => [fn (Compatibility $listing) => self::identified($listing)->timestamps()->servedFrom($untimed::class, self::titled(...)), 'timestamps() reads the timestamps of '.class_basename($untimed).', which uses none'];
         yield 'retained in a successor table' => [fn (Compatibility $listing) => self::identified($listing)->retainedIn('places')->servedFrom(Job::class, fn (Successor $job) => $job->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place)), 'retainedIn() names the table places, which the map already reads as another table'];
         yield 'retained in the legacy table' => [fn (Compatibility $listing) => self::identified($listing)->retainedIn('listings')->servedFrom(Job::class, self::titled(...)), 'retainedIn() names the table listings, which the map already reads as another table'];
-        yield 'an external attribute on a related successor' => [fn (Compatibility $listing) => self::identified($listing)->servedFrom(Job::class, fn (Successor $job) => self::titled($job)->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place->attribute('city', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $places) => $places, write: fn (mixed $place, mixed $city) => null)))), "attribute 'city' is external() on Place, which related() reaches, and an external() read and write receive the servedFrom() successor Job; declare it on Job"];
     }
 
     /**
@@ -192,7 +200,7 @@ final class ResolvedMapTest extends TestCase
     {
         $map = self::branched(new Compatibility(Video::class), fn (Video $video): string => Photo::class)->resolve();
 
-        $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', 'the servedFrom() selector returns '.Photo::class.', and as() declares only '.File::class.' and '.Link::class));
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', 'the servedFrom() choose: closure returns '.Photo::class.', and successors: declares only '.File::class.' and '.Link::class));
 
         $map->branchFor(new Video);
     }
@@ -212,40 +220,50 @@ final class ResolvedMapTest extends TestCase
 
             protected $table = 'untimed_links';
         };
+        self::$other = $other::class;
+        self::$untimed = $untimed::class;
 
-        yield 'a selector without a successor' => [fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(fn (Video $video): string => File::class), 'servedFrom() takes a selector, and no as() declares a successor for it to choose'];
+        yield 'a choice without a successor' => [fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(choose: fn (Video $video): string => File::class, successors: fn (Successors $successors) => $successors), 'the successors: of servedFrom() declare no successor; declare each with as()'];
         yield 'branches without a discriminator' => [fn (Compatibility $video) => self::branched(self::identified($video)->retainedIn('videos_retained'), fn (Video $video): string => File::class, discriminated: false), 'servedFrom() chooses between File and Link, and they share one morph identity on one identifier sequence only through discriminatedBy()'];
         yield 'an attribute one branch cannot read' => [
             fn (Compatibility $video) => self::identified($video)
                 ->discriminatedBy('legacy_type')
-                ->servedFrom(fn (Video $video): string => File::class)
-                ->as(File::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
-                ->as(Link::class, fn (Successor $link) => $link),
+                ->servedFrom(
+                    choose: fn (Video $video): string => File::class,
+                    successors: fn (Successors $successors) => $successors
+                        ->as(File::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
+                        ->as(Link::class, fn (Successor $link) => $link)),
             "attribute 'original_file_name' is readable in the File branch and not in the Link branch; give it from(), external() or fixed() there",
         ];
         yield 'an external attribute another branch reads from sql' => [
             fn (Compatibility $video) => self::identified($video)
                 ->discriminatedBy('legacy_type')
-                ->servedFrom(fn (Video $video): string => File::class)
-                ->as(File::class, fn (Successor $file) => $file->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)))
-                ->as(Link::class, fn (Successor $link) => $link->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('url'))),
+                ->servedFrom(
+                    choose: fn (Video $video): string => File::class,
+                    successors: fn (Successors $successors) => $successors
+                        ->as(File::class, fn (Successor $file) => $file->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)))
+                        ->as(Link::class, fn (Successor $link) => $link->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('url')))),
             "attribute 'mime_type' is external() in the File branch and reads SQL in the Link branch, and the view serves an external attribute from no branch; declare it external() or fixed() there",
         ];
         yield 'two branches over one table' => [
             fn (Compatibility $video) => self::identified($video)
                 ->discriminatedBy('legacy_type')
-                ->servedFrom(fn (Video $video): string => File::class)
-                ->as(File::class, fn (Successor $file) => $file)
-                ->as($other::class, fn (Successor $file) => $file),
+                ->servedFrom(
+                    choose: fn (Video $video): string => File::class,
+                    successors: fn (Successors $successors) => $successors
+                        ->as(File::class, fn (Successor $file) => $file)
+                        ->as(self::$other, fn (Successor $file) => $file)),
             'as('.class_basename($other::class).') reads the table files, which as(File) already reads',
         ];
         yield 'a branch timestamps cannot read' => [
             fn (Compatibility $video) => self::identified($video)
                 ->discriminatedBy('legacy_type')
                 ->timestamps()
-                ->servedFrom(fn (Video $video): string => File::class)
-                ->as(File::class, fn (Successor $file) => $file)
-                ->as($untimed::class, fn (Successor $link) => $link),
+                ->servedFrom(
+                    choose: fn (Video $video): string => File::class,
+                    successors: fn (Successors $successors) => $successors
+                        ->as(File::class, fn (Successor $file) => $file)
+                        ->as(self::$untimed, fn (Successor $link) => $link)),
             'timestamps() reads the timestamps of '.class_basename($untimed).', which uses none',
         ];
     }
@@ -312,6 +330,132 @@ final class ResolvedMapTest extends TestCase
         $this->assertSame('oak lane', $map->attributes['title']->write('OAK LANE'));
     }
 
+    #[Test]
+    public function it_resolves_one_target_map_for_each_morph_successor_and_reads_every_target_table(): void
+    {
+        $map = Compatibility::of(PlaceVideo::class)->resolve();
+
+        $this->assertSame([AssetFile::class, AssetLink::class], array_keys($map->morphs));
+        $this->assertSame(['place_videos', 'place_videos_retained', 'place_assets', 'asset_files', 'asset_links'], $map->tables());
+        $this->assertSame([['place_assets', 'asset_files', 'place_asset_file'], ['place_assets', 'asset_links', 'place_asset_link']], array_map(fn (Related $related) => [$related->parentTable, $related->table, $related->morphAlias], $map->related));
+        $this->assertSame(
+            [AssetFile::class => [['asset_files'], 'place_asset_file', 'filename'], AssetLink::class => [['asset_links'], 'place_asset_link', null]],
+            array_map(fn (ResolvedMap $target) => [array_map(fn (Related $related) => $related->table, $target->related), $target->target?->morphAlias, $target->attributes['original_file_name']->column()], $map->morphs),
+        );
+        $this->assertSame(['title' => false, 'original_file_name' => true, 'size_kb' => true, 'youtube_embed_url' => true, 'created_at' => false, 'updated_at' => false], array_map(fn (Attribute $attribute) => $map->isMorphed($attribute->name), $map->attributes));
+        $this->assertSame(
+            [$map->morphs[AssetLink::class], $map->morphs[AssetFile::class], $map->morphs[AssetLink::class], null],
+            [$map->morphFor(new PlaceVideo(['youtube_embed_url' => 'https://youtu.be/oak'])), $map->morphFor(new PlaceVideo), $map->morphHolding('place_asset_link'), $map->morphHolding('place_asset_retired')],
+        );
+    }
+
+    #[Test]
+    public function it_reads_the_one_target_a_morph_declares_without_a_choice(): void
+    {
+        $map = Compatibility::of(Image::class)->resolve();
+
+        $this->assertSame([[AssetFile::class], $map->morphs[AssetFile::class], ['mime_type']], [array_keys($map->morphs), $map->morphFor(new Image), $map->externals()]);
+        $this->assertSame(AssetFile::class, $map->owners['mime_type']->model);
+    }
+
+    #[Test]
+    public function it_resolves_an_external_attribute_on_a_successor_related_reaches(): void
+    {
+        $map = self::identified(new Compatibility(Listing::class))
+            ->servedFrom(Job::class, fn (Successor $job) => self::titled($job)->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place->attribute('city', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $places) => $places, write: fn (mixed $place, mixed $city) => null))))
+            ->resolve();
+
+        $this->assertSame([['city'], Place::class], [$map->externals(), $map->owners['city']->model]);
+    }
+
+    #[Test]
+    public function it_refuses_a_choice_that_returns_a_target_no_successor_declares(): void
+    {
+        $map = self::identified(new Compatibility(PlaceVideo::class))
+            ->discriminatedBy('legacy_type')
+            ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                choose: fn (PlaceVideo $video): string => Photo::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(AssetFile::class, fn (Successor $file) => $file)
+                    ->as(AssetLink::class, fn (Successor $link) => $link)))
+            ->resolve();
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('place_videos', 'the relatedMorph() choose: closure returns '.Photo::class.', and successors: declares only '.AssetFile::class.' and '.AssetLink::class));
+
+        $map->morphFor(new PlaceVideo);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Compatibility): mixed, string}>
+     */
+    public static function invalidMorphMaps(): iterable
+    {
+        yield 'an attribute one target cannot read' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                choose: fn (PlaceVideo $video): string => AssetFile::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(AssetFile::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
+                    ->as(AssetLink::class, fn (Successor $link) => $link))),
+            "attribute 'original_file_name' is readable in the AssetFile successor and not in the AssetLink successor; give it from(), external() or fixed() there",
+        ];
+        yield 'an external attribute another target reads from sql' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                choose: fn (PlaceVideo $video): string => AssetFile::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(AssetFile::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)))
+                    ->as(AssetLink::class, fn (Successor $link) => $link->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('url'))))),
+            "attribute 'original_file_name' is external() in the AssetFile successor and reads SQL in the AssetLink successor, and the view serves an external attribute from no successor; declare it external() or fixed() there",
+        ];
+        yield 'an attribute on the place asset and a target' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link->attribute('title', fn (Attribute $attribute) => $attribute->from('url'))))),
+            "attribute 'title' is declared twice",
+        ];
+        yield 'a writer of the morph type' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->attribute('kind', fn (Attribute $attribute) => $attribute->from('asset_type'))->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link))),
+            "attribute 'kind' writes place_assets.asset_type, which relatedMorph() already owns; make one of them readOnly()",
+        ];
+        yield 'an identifier in the morph id' => [
+            fn (Compatibility $video) => $video->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('asset_id'))->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link))),
+            "identifier 'uuid' reads place_assets.asset_id, which relatedMorph() already reads",
+        ];
+        yield 'a discriminator in the morph type' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('asset_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link))),
+            'discriminatedBy() names place_assets.asset_type, which relatedMorph() reads through PlaceAsset; give the discriminator a column of its own',
+        ];
+        yield 'a morph in one of two successors' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(
+                choose: fn (PlaceVideo $video): string => PlaceAsset::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(), successors: fn (Successors $targets) => $targets->as(AssetLink::class, fn (Successor $link) => $link)))
+                    ->as(File::class, fn (Successor $file) => $file)),
+            'relatedMorph() on PlaceAsset, one of the successors servedFrom() chooses between, would choose a second time for each record; serve the record from one successor with relatedMorph(), or from several without it',
+        ];
+        yield 'a morph through a related successor' => [
+            fn (Compatibility $video) => self::identified($video)->servedFrom(Job::class, fn (Successor $job) => $job->related(fn (Job $job) => $job->hasOne(PlaceAsset::class, 'title', 'name'), fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link)))),
+            'relatedMorph() on the relation from Job to PlaceAsset follows a MorphTo of a successor related() reaches, and only the servedFrom() successor Job carries a relatedMorph(); declare it there',
+        ];
+    }
+
+    /**
+     * @param  Closure(Compatibility): mixed  $declare
+     */
+    #[DataProvider('invalidMorphMaps')]
+    #[Test]
+    public function it_refuses_an_invalid_map_through_a_morph_and_names_it(Closure $declare, string $problem): void
+    {
+        $video = new Compatibility(PlaceVideo::class);
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('place_videos', $problem));
+
+        $declare($video);
+        $video->resolve();
+    }
+
     private static function identified(Compatibility $listing): Compatibility
     {
         return $listing
@@ -325,9 +469,11 @@ final class ResolvedMapTest extends TestCase
     private static function branched(Compatibility $video, Closure $selector, bool $discriminated = true): Compatibility
     {
         return ($discriminated ? self::identified($video)->discriminatedBy('legacy_type') : $video)
-            ->servedFrom($selector)
-            ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-            ->as(Link::class, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            ->servedFrom(
+                choose: $selector,
+                successors: fn (Successors $successors) => $successors
+                    ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
     }
 
     private static function titled(Successor $job): Successor

@@ -50,6 +50,8 @@ final readonly class Related
         public null|string $deletedAt,
         public array $attributes,
         public Successor $successor,
+        public null|string $morphType = null,
+        public null|string $morphAlias = null,
     ) {}
 
     /**
@@ -61,7 +63,12 @@ final readonly class Related
         ResolvedMap::refuseCaptures($map, 'a related() relation closure on '.class_basename($parent), $relation);
         ResolvedMap::refuseCaptures($map, 'a related() definition closure on '.class_basename($parent), $definition);
 
-        $compiled = self::offline($map, fn () => Relation::noConstraints(fn () => self::call($map, $parent, $relation)));
+        $compiled = self::relationOf($map, 'related()', $parent, $relation);
+
+        if ($compiled instanceof MorphTo) {
+            throw InvalidCompatibilityMap::because($map, 'the related() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() is a MorphTo, whose related model varies per record, and related() reads a HasOne or a BelongsTo; declare it with relatedMorph()');
+        }
+
         $related = $compiled->getRelated();
         $name = 'the related() relation from '.class_basename($parent).' to '.class_basename($related);
 
@@ -69,7 +76,7 @@ final readonly class Related
             throw InvalidCompatibilityMap::because($map, "{$name} is a HasMany, and one legacy record reads one row of each related table");
         }
 
-        if ((! $compiled instanceof HasOne && ! $compiled instanceof BelongsTo) || $compiled instanceof MorphTo) {
+        if (! $compiled instanceof HasOne && ! $compiled instanceof BelongsTo) {
             throw InvalidCompatibilityMap::because($map, "{$name} is a ".class_basename($compiled).', and related() reads a HasOne or a BelongsTo');
         }
 
@@ -146,12 +153,48 @@ final readonly class Related
     }
 
     /**
+     * @param  class-string<Model>  $model
+     */
+    public static function morphTarget(RelatedMorph $morph, string $model, Successor $successor, null|string $deletedAt): self
+    {
+        $target = new $model;
+
+        return new self(
+            $morph->relation,
+            $morph->parent,
+            $morph->parentTable,
+            $morph->idColumn,
+            $model,
+            $target->getTable(),
+            $target->getKeyName(),
+            true,
+            null,
+            [],
+            null,
+            $deletedAt,
+            [],
+            $successor,
+            $morph->typeColumn,
+            $target->getMorphClass(),
+        );
+    }
+
+    /**
      * @param  class-string<Model>  $parent
      * @return Relation<Model, Model, mixed>
      */
-    private static function call(string $map, string $parent, Closure $relation): Relation
+    public static function relationOf(string $map, string $method, string $parent, Closure $relation): Relation
     {
-        $reads = fn (string $what) => InvalidCompatibilityMap::because($map, 'a related() relation closure on '.class_basename($parent)." reads its {$what}, and the view compiles one relation for every ".class_basename($parent).", so a condition cannot follow each row's value");
+        return self::offline($map, $method, fn () => Relation::noConstraints(fn () => self::call($map, $method, $parent, $relation)));
+    }
+
+    /**
+     * @param  class-string<Model>  $parent
+     * @return Relation<Model, Model, mixed>
+     */
+    private static function call(string $map, string $method, string $parent, Closure $relation): Relation
+    {
+        $reads = fn (string $what) => InvalidCompatibilityMap::because($map, "a {$method} relation closure on ".class_basename($parent)." reads its {$what}, and the view compiles one relation for every ".class_basename($parent).", so a condition cannot follow each row's value");
         $model = new $parent;
         $model->exists = true;
         $model->setRawAttributes([]);
@@ -192,7 +235,7 @@ final readonly class Related
         try {
             $compiled = $relation($model);
         } catch (BadMethodCallException $exception) {
-            throw InvalidCompatibilityMap::because($map, 'a related() relation closure on '.class_basename($parent).' calls a method '.class_basename($parent).' does not have: '.$exception->getMessage());
+            throw InvalidCompatibilityMap::because($map, "a {$method} relation closure on ".class_basename($parent).' calls a method '.class_basename($parent).' does not have: '.$exception->getMessage());
         } catch (TypeError $exception) {
             throw $exception->getFile() === (new ReflectionClass(HasAttributes::class))->getFileName() ? $reads('original attributes') : $exception;
         } finally {
@@ -201,7 +244,7 @@ final readonly class Related
         }
 
         if (! $compiled instanceof Relation) {
-            throw InvalidCompatibilityMap::because($map, 'a related() relation closure on '.class_basename($parent).' returns '.get_debug_type($compiled).', which is not an Eloquent relation');
+            throw InvalidCompatibilityMap::because($map, "a {$method} relation closure on ".class_basename($parent).' returns '.get_debug_type($compiled).', which is not an Eloquent relation');
         }
 
         return $compiled;
@@ -213,17 +256,17 @@ final readonly class Related
      * @param  Closure(): TResult  $build
      * @return TResult
      */
-    private static function offline(string $map, Closure $build): mixed
+    private static function offline(string $map, string $method, Closure $build): mixed
     {
         $resolver = Model::getConnectionResolver();
 
-        Model::setConnectionResolver(new readonly class($map) implements ConnectionResolverInterface
+        Model::setConnectionResolver(new readonly class($map, $method) implements ConnectionResolverInterface
         {
-            public function __construct(private string $map) {}
+            public function __construct(private string $map, private string $method) {}
 
             public function connection(mixed $name = null): ConnectionInterface
             {
-                $refuse = fn () => throw InvalidCompatibilityMap::because($this->map, 'a related() relation reads the database while Laravel builds it, and resolution opens no connection');
+                $refuse = fn () => throw InvalidCompatibilityMap::because($this->map, "a {$this->method} relation reads the database while Laravel builds it, and resolution opens no connection");
 
                 return new PostgresConnection($refuse, '', '', ['driver' => 'pgsql', 'name' => is_string($name) ? $name : 'compatibility']);
             }

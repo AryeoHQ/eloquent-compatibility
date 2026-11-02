@@ -315,7 +315,7 @@ final class Forwarder
 
     private static function resolve(ResolvedMap $map, string $primary, string $successor): self
     {
-        $served = $map->branches[$primary] ?? $map;
+        $served = $map->branches[$primary] ?? $map->morphs[$successor] ?? $map;
 
         foreach ($served->related as $related) {
             if ($related->model === $successor) {

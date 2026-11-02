@@ -120,16 +120,17 @@ final readonly class Backfiller
             $chosen = [];
 
             foreach ($rows as $row) {
-                $chosen[$this->map->branchFor($this->probe($row))->primary->model][] = self::keyOf($row[$this->key] ?? null);
+                $chosen[$this->chosen($row)][] = self::keyOf($row[$this->key] ?? null);
             }
 
             foreach ($chosen as $model => $keys) {
-                $branch = $this->map->branches[$model];
+                $branch = $this->map->branches[$model] ?? $this->map->morphs[$model];
                 $primary = SqlFragments::identifier($branch->primary->table);
+                $target = $branch->target === null ? '' : ' AND EXISTS (SELECT FROM '.SqlFragments::identifier($branch->target->table).' WHERE '.implode(' AND ', ViewCompiler::conditions($branch->target, true)).')';
                 $misplaced = [...$misplaced, ...array_column($this->connection->select(
                     "SELECT CAST(chosen.key AS {$type}) AS key FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS chosen (key)"
                         ." WHERE NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = CAST(chosen.key AS {$type})"
-                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table)).')',
+                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table)).$target.')',
                     [json_encode($keys, JSON_THROW_ON_ERROR)],
                     false,
                 ), 'key')];
@@ -141,7 +142,7 @@ final readonly class Backfiller
         if ($misplaced !== []) {
             sort($misplaced);
 
-            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', count($misplaced)." {$this->map->table} rows sit in a successor their servedFrom() selector does not choose; the first are {$this->key} ".implode(', ', array_slice($misplaced, 0, 5)).'. Run php artisan compatibility:backfill '.$this->map->model.', then install()');
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', count($misplaced)." {$this->map->table} rows ".($this->map->morphs === [] ? 'sit in a successor their servedFrom() selector does not choose' : 'point at no target their relatedMorph() choose: closure picks')."; the first are {$this->key} ".implode(', ', array_slice($misplaced, 0, 5)).'. Run php artisan compatibility:backfill '.$this->map->model.', then install()');
         }
     }
 
@@ -280,6 +281,10 @@ final readonly class Backfiller
      */
     private function write(array $rows): int
     {
+        if ($this->map->morphs !== []) {
+            return $this->writeMorphs($rows);
+        }
+
         if ($this->map->branches === []) {
             return $this->writeBranch($this->map, $rows);
         }
@@ -307,6 +312,152 @@ final readonly class Backfiller
         }
 
         return $changed;
+    }
+
+    /**
+     * @param  non-empty-list<array<string, mixed>>  $rows
+     */
+    private function writeMorphs(array $rows): int
+    {
+        $routed = [];
+
+        foreach ($rows as $row) {
+            $routed[$this->chosen($row)][] = $row;
+        }
+
+        $changed = 0;
+
+        foreach ($this->map->morphs as $target => $variant) {
+            if (array_key_exists($target, $routed)) {
+                $changed += $this->writeMorph($variant, $routed[$target]);
+            }
+        }
+
+        return $changed;
+    }
+
+    /**
+     * @param  non-empty-list<array<string, mixed>>  $rows
+     */
+    private function writeMorph(ResolvedMap $variant, array $rows): int
+    {
+        $morph = $variant->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' backfills a relatedMorph() target of no relatedMorph().");
+        $related = $variant->target ?? throw new LogicException("Compatibility map '{$this->map->table}' backfills no relatedMorph() target.");
+        $primaryTable = $variant->primary->table;
+        $stored = [];
+        $external = [];
+
+        foreach ($rows as $row) {
+            $key = self::keyOf($row[$this->key] ?? null);
+            [$stored[$key], $external[$key]] = $this->split($variant, $row, $key);
+        }
+
+        $existing = $this->held($variant, array_keys($stored))->keyBy((string) $variant->identifiers[$this->key]->column());
+        $targets = $this->targets($related, $morph->typeColumn, $morph->idColumn, $existing);
+        $read = [];
+
+        foreach ($variant->externals() as $name) {
+            $owned = $variant->owners[$name] === $variant->primary ? $existing : $targets;
+            $read[$name] = $owned->isEmpty() ? [] : $variant->attributes[$name]->readExternally($owned);
+        }
+
+        $changed = 0;
+
+        foreach ($rows as $row) {
+            $key = self::keyOf($row[$this->key] ?? null);
+            $primary = $existing[$key] ?? (new $variant->primary->model)->setConnection($this->connectionName);
+            $type = $primary->getAttributes()[$morph->typeColumn] ?? null;
+            $held = $primary->getAttributes()[$morph->idColumn] ?? null;
+            $target = $type === $related->morphAlias ? $targets[is_scalar($held) ? (string) $held : ''] ?? null : null;
+            $old = $primary->exists && $target === null ? $this->map->morphHolding($type) : null;
+            $target ??= (new $related->model)->setConnection($this->connectionName);
+            $target->setRawAttributes(array_replace($target->getAttributes(), $stored[$key][$related->table]));
+            $changed += $this->saveSuccessor($variant, $target, $external[$key], $read, $key, []);
+            $primary->setRawAttributes(array_replace($primary->getAttributes(), $stored[$key][$primaryTable], [$morph->typeColumn => $related->morphAlias, $morph->idColumn => $target->getKey()]));
+            $changed += $this->saveSuccessor($variant, $primary, $external[$key], $read, $key, array_keys($stored[$key][$primaryTable]));
+
+            if ($old !== null && $old->target !== null) {
+                $changed += $this->deleteTarget($old->target, $held, $key);
+            }
+        }
+
+        foreach ($variant->related as $dependent) {
+            if ($dependent !== $related) {
+                $changed += $this->writeRelated($variant, $dependent, $stored);
+            }
+        }
+
+        return $changed;
+    }
+
+    /**
+     * @param  Collection<array-key, Model>  $primaries
+     * @return Collection<array-key, Model>
+     */
+    private function targets(Related $related, string $type, string $id, Collection $primaries): Collection
+    {
+        $keys = array_values(array_filter($primaries->map(fn (Model $primary) => $primary->getAttributes()[$type] === $related->morphAlias ? $primary->getAttributes()[$id] : null)->all(), fn (mixed $key) => $key !== null));
+        $targets = (new $related->model)->newCollection();
+
+        foreach (array_chunk($keys, self::BINDINGS - 2) as $batch) {
+            $targets = $targets->concat((new $related->model)->setConnection($this->connectionName)->newQuery()->useWritePdo()->whereKey($batch)->get());
+        }
+
+        return $targets->keyBy(fn (Model $target) => self::keyOf($target->getKey()));
+    }
+
+    /**
+     * @param  array<string, mixed>  $external
+     * @param  array<string, array<array-key, mixed>>  $read
+     * @param  list<string>  $mapped
+     */
+    private function saveSuccessor(ResolvedMap $variant, Model $successor, array $external, array $read, int|string $key, array $mapped): int
+    {
+        $written = false;
+
+        foreach ($external as $name => $value) {
+            if ($variant->owners[$name]->table === $successor->getTable() && (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null))) {
+                $variant->attributes[$name]->writeExternally($successor, $value);
+                $written = true;
+            }
+        }
+
+        if ($successor->exists && ! $written && ! $successor->isDirty()) {
+            return 0;
+        }
+
+        if ($this->stamps($successor, $mapped) === [null, null]) {
+            $successor->timestamps = false;
+        }
+
+        if ($successor->save() === false) {
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', 'a '.class_basename($successor).' listener refused the save of the successor of '.$this->map->table.' row '.$this->key.' '.$key);
+        }
+
+        return 1;
+    }
+
+    private function deleteTarget(Related $old, mixed $id, int|string $key): int
+    {
+        $target = $id === null ? null : (new $old->model)->setConnection($this->connectionName)->newQuery()->useWritePdo()->whereKey($id)->first();
+
+        if ($target === null) {
+            return 0;
+        }
+
+        if ($target->forceDelete() === false) {
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', 'a '.class_basename($target).' listener refused the delete that moves '.$this->map->table.' row '.$this->key.' '.$key.' to another relatedMorph() target');
+        }
+
+        return 1;
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     */
+    private function chosen(array $row): string
+    {
+        return $this->map->morphs === [] ? $this->map->branchFor($this->probe($row))->primary->model : (string) $this->map->morphFor($this->probe($row))->target?->model;
     }
 
     /**
@@ -432,6 +583,10 @@ final readonly class Backfiller
         $read = [];
 
         foreach ($branch->externals() as $name) {
+            if ($branch->owners[$name] !== $branch->primary) {
+                throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "attribute '{$name}' is external() on ".class_basename($branch->owners[$name]->model).', which related() reaches, and the backfill writes external() values through the servedFrom() successor '.class_basename($branch->primary->model).' or a relatedMorph() target only; write each value through its external() write before install()');
+            }
+
             $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
         }
 
@@ -724,7 +879,7 @@ final readonly class Backfiller
             throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} is already installed as a view, and the backfill walks the legacy table while it is still a table");
         }
 
-        foreach ($this->map->branches === [] ? [$this->map] : $this->map->branches as $branch) {
+        foreach ($this->map->branches === [] ? ($this->map->morphs === [] ? [$this->map] : $this->map->morphs) : $this->map->branches as $branch) {
             foreach ([...array_keys($branch->identifiers), ...array_keys(array_filter($branch->attributes, fn ($attribute) => $attribute->column() !== null || $attribute->isExternal()))] as $name) {
                 if (! array_key_exists($name, $legacy)) {
                     throw InvalidCompatibilityMap::because($this->map->table, "{$this->map->table} has no column {$name}, so the backfill has no value to write for it");

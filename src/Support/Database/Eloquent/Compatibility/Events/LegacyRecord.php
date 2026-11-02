@@ -451,7 +451,8 @@ final class LegacyRecord
             return null;
         }
 
-        $condition = SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey).' IN ('.implode(', ', array_fill(0, count($values), '?')).')';
+        $condition = SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey).' IN ('.implode(', ', array_fill(0, count($values), '?')).')'
+            .($related->morphType === null ? '' : ' AND '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->morphType).' = '.SqlFragments::literal((string) $related->morphAlias));
 
         while ($related->parentTable !== $primary->table) {
             $parent = $this->relatedTo($related->parentTable);
