@@ -85,17 +85,17 @@ final class Compatibility
 
     public static function install(string $model): void
     {
-        self::run($model, Statements::install(...));
+        self::run($model, Statements::install(...), 'install');
     }
 
     public static function recompile(string $model): void
     {
-        self::run($model, Statements::recompile(...));
+        self::run($model, Statements::recompile(...), 'recompile');
     }
 
     public static function uninstall(string $model): void
     {
-        self::run($model, Statements::uninstall(...));
+        self::run($model, Statements::uninstall(...), 'uninstall');
     }
 
     /**
@@ -309,9 +309,14 @@ final class Compatibility
     /**
      * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
      */
-    private static function run(string $model, Closure $statements): void
+    private static function run(string $model, Closure $statements, null|string $singleSuccessor = null): void
     {
         $map = self::of($model)->resolve();
+
+        if ($singleSuccessor !== null) {
+            Statements::refuseBranches($map, $singleSuccessor);
+        }
+
         $connection = self::connection($map);
         $tables = array_values(array_unique(array_filter([$map->table, $map->retainedTable, $map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], is_string(...))));
 

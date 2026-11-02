@@ -294,7 +294,7 @@ final readonly class Statements
         return [...$this->transaction, ...$this->afterwards];
     }
 
-    private static function refuseBranches(ResolvedMap $map, string $operation): void
+    public static function refuseBranches(ResolvedMap $map, string $operation): void
     {
         if ($map->branches !== []) {
             throw InvalidCompatibilityMap::cannot($map->table, $operation, 'it serves '.$map->table.' from '.implode(' and ', array_map(class_basename(...), array_keys($map->branches))).", and {$operation}() serves a map from one successor only");
