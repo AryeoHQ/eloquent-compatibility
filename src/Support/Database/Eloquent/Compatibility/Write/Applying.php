@@ -52,17 +52,40 @@ final class Applying
 
     /**
      * @param  class-string<Model>  $model
+     * @param  null|Closure(Model): (null|int|string)  $identify
      */
-    public static function writes(string $model, int|string $key): bool
+    public static function writes(string $model, int|string $key, null|Closure $identify = null): bool
     {
-        foreach (self::$writes ?? [] as $legacy) {
-            $written = $legacy->getRawOriginal($legacy->getKeyName()) ?? $legacy->getKey() ?? (self::$keys !== null && self::$keys->offsetExists($legacy) ? self::$keys[$legacy] : null);
+        foreach (self::$writes ?? [] as $successor => $legacy) {
+            if ($legacy::class !== $model) {
+                continue;
+            }
 
-            if ($legacy::class === $model && (is_int($written) || is_string($written)) && (string) $written === (string) $key) {
+            $written = $legacy->getRawOriginal($legacy->getKeyName()) ?? $legacy->getKey() ?? self::identity($legacy, $successor, $identify);
+
+            if ((is_int($written) || is_string($written)) && (string) $written === (string) $key) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * @param  null|Closure(Model): (null|int|string)  $identify
+     */
+    private static function identity(Model $legacy, Model $successor, null|Closure $identify): null|int|string
+    {
+        if (self::$keys !== null && self::$keys->offsetExists($legacy)) {
+            return self::$keys[$legacy];
+        }
+
+        $key = $identify === null ? null : $identify($successor);
+
+        if ($key !== null) {
+            self::identified($legacy, $key);
+        }
+
+        return $key;
     }
 }

@@ -67,7 +67,7 @@ final class LegacyRecord
         }
 
         foreach ($record->stored($successor, false) as $key => $row) {
-            if (Applying::writes($map->model, $key)) {
+            if (Applying::writes($map->model, $key, fn (Model $held) => self::identity($map, $held))) {
                 if ($dependent === null) {
                     return null;
                 }
@@ -75,7 +75,7 @@ final class LegacyRecord
                 continue;
             }
 
-            $legacy = (new $map->model)->newInstance([], true);
+            $legacy = (new $map->model)->setConnection($successor->getConnectionName())->newInstance([], true);
             $legacy->setRawAttributes($row, true);
             $record->records[$key] = $legacy;
             $record->before[$key] = $row;
@@ -87,11 +87,11 @@ final class LegacyRecord
     }
 
     /**
-     * @return list<Model>
+     * @return array<array-key, Model>
      */
     public function records(): array
     {
-        return array_values($this->records);
+        return $this->records;
     }
 
     public function after(Model $successor): void
@@ -116,7 +116,7 @@ final class LegacyRecord
                 return;
             }
 
-            $this->records[$key] ??= new $this->map->model;
+            $this->records[$key] ??= (new $this->map->model)->setConnection($successor->getConnectionName());
             $this->apply($key, $row);
 
             return;
@@ -127,17 +127,24 @@ final class LegacyRecord
         }
     }
 
-    public function changes(): bool
+    /**
+     * @return array<array-key, Model>
+     */
+    public function changed(): array
     {
+        $changed = [];
+
         foreach ($this->records as $key => $legacy) {
             foreach (array_keys($this->columns) as $name) {
                 if (($this->before[$key][$name] ?? null) !== ($legacy->getAttributes()[$name] ?? null)) {
-                    return true;
+                    $changed[$key] = $legacy;
+
+                    break;
                 }
             }
         }
 
-        return false;
+        return $changed;
     }
 
     public function store(Model $successor): void
@@ -192,6 +199,20 @@ final class LegacyRecord
     public function reread(): void
     {
         $this->stored = false;
+    }
+
+    private static function identity(ResolvedMap $map, Model $held): null|int|string
+    {
+        $served = $map->branches === [] ? ($map->primary->model === $held::class ? $map : null) : $map->branches[$held::class] ?? null;
+
+        if ($served === null || ! $held->exists) {
+            return null;
+        }
+
+        $column = (string) $served->identifiers[(new $map->model)->getKeyName()]->column();
+        $key = $held->getAttributes()[$column] ?? $held->newModelQuery()->whereKey($held->getKey())->value($column);
+
+        return is_int($key) || is_string($key) ? $key : null;
     }
 
     private function reload(Model $legacy): void

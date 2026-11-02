@@ -62,6 +62,22 @@ class Provider extends ServiceProvider
 
     private function withoutCache(): bool
     {
-        return $this->app->runningInConsole() && in_array($_SERVER['argv'][1] ?? null, self::WITHOUT_CACHE, true);
+        $argv = $_SERVER['argv'] ?? [];
+
+        return $this->app->runningInConsole() && is_array($argv) && in_array(self::command(array_values($argv)), self::WITHOUT_CACHE, true);
+    }
+
+    /**
+     * @param  list<mixed>  $argv
+     */
+    private static function command(array $argv): null|string
+    {
+        foreach (array_slice($argv, 1, preserve_keys: true) as $index => $token) {
+            if (is_string($token) && ! str_starts_with($token, '-') && $argv[$index - 1] !== '--env') {
+                return $token;
+            }
+        }
+
+        return null;
     }
 }

@@ -54,7 +54,7 @@ final class Forwarder
     private const array FOLLOWING = [
         'saving' => ['saving', 'creating', 'created', 'updating', 'updated', 'saved'],
         'creating' => ['creating', 'created', 'saved'],
-        'updating' => ['updating', 'updated', 'saved'],
+        'updating' => ['updating', 'updated'],
         'restoring' => ['restoring', 'saving', 'updating', 'updated', 'saved', 'restored'],
         'deleting' => ['deleting', 'trashed', 'deleted', 'forceDeleted'],
         'forceDeleting' => ['forceDeleting', 'deleting', 'trashed', 'deleted', 'forceDeleted'],
@@ -69,7 +69,7 @@ final class Forwarder
     private const array ENDS = [
         'saving' => 'saved',
         'creating' => 'saved',
-        'updating' => 'saved',
+        'updating' => 'updated',
         'restoring' => 'restored',
         'deleting' => 'deleted',
         'forceDeleting' => 'forceDeleted',
@@ -128,10 +128,17 @@ final class Forwarder
 
         $ahead = array_key_exists($event, self::FOLLOWING);
         $sequences = $this->sequences[$successor] ?? [];
+        $frames = null;
+
+        while ($sequences !== [] && end($sequences)->frame !== null && ! self::active(end($sequences)->frame, $successor, $frames ??= self::frames())) {
+            array_pop($sequences);
+        }
+
         $top = array_key_last($sequences);
 
         if ($ahead && ($top === null || ! in_array($event, self::CONTINUES[$sequences[$top]->last] ?? [], true))) {
-            $sequences[] = new Sequence($event, $event, $this->start($event, $successor));
+            $record = $this->start($event, $successor);
+            $sequences[] = new Sequence($event, $event, $record, $record === null ? null : self::caller($successor, $frames ??= self::frames()));
             $top = array_key_last($sequences);
         } elseif ($top === null) {
             return null;
@@ -157,6 +164,50 @@ final class Forwarder
         }
 
         return $result;
+    }
+
+    /**
+     * @return list<array{function: string, object?: object}>
+     */
+    private static function frames(): array
+    {
+        return debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT | DEBUG_BACKTRACE_IGNORE_ARGS);
+    }
+
+    /**
+     * @param  list<array{function: string, object?: object}>  $frames
+     * @return null|array{int, string}
+     */
+    private static function caller(Model $successor, array $frames): null|array
+    {
+        foreach ($frames as $index => $frame) {
+            if (($frame['object'] ?? null) !== $successor || $frame['function'] !== 'fireModelEvent') {
+                continue;
+            }
+
+            $caller = $index + 1;
+
+            while (($frames[$caller]['function'] ?? null) === 'fireModelEvent') {
+                $caller++;
+            }
+
+            $frame = $frames[$caller] ?? null;
+
+            return $frame !== null && ($frame['object'] ?? null) === $successor ? [count($frames) - $caller, $frame['function']] : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array{int, string}  $frame
+     * @param  list<array{function: string, object?: object}>  $frames
+     */
+    private static function active(array $frame, Model $successor, array $frames): bool
+    {
+        $caller = $frames[count($frames) - $frame[0]] ?? null;
+
+        return $caller !== null && $caller['function'] === $frame[1] && ($caller['object'] ?? null) === $successor;
     }
 
     private static function resolve(ResolvedMap $map, string $primary, string $successor): self
@@ -200,40 +251,63 @@ final class Forwarder
         }
 
         $events = ($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [];
+        $batches = [[$events, $record->records()]];
 
-        if ($this->dependent !== null && ! $sequence->forwarding) {
-            if (! $ahead || ! $record->changes()) {
+        if ($this->dependent !== null) {
+            $joining = $ahead ? array_diff_key($record->changed(), $sequence->forwarding) : [];
+            $batches = array_filter([
+                [$events, array_intersect_key($record->records(), $sequence->forwarding)],
+                [$event === $sequence->start ? $events : ['saving', ...$events], $joining],
+            ], fn (array $batch) => $batch[1] !== []);
+            $sequence->forwarding += array_fill_keys(array_keys($joining), true);
+
+            if ($batches === []) {
                 return null;
             }
-
-            $sequence->forwarding = true;
-            $events = $event === $sequence->start ? $events : ['saving', ...$events];
         }
 
         if (! $ahead) {
             $record->store($successor);
         }
 
-        foreach ($events as $legacyEvent) {
-            if (! $this->listens($legacyEvent)) {
-                continue;
-            }
-
-            foreach ($record->records() as $legacy) {
-                $before = $legacy->getAttributes();
-                $result = $this->dispatch($legacyEvent, $legacy, $ahead);
-
-                if ($ahead && $result === false) {
-                    return false;
+        foreach ($batches as [$legacyEvents, $legacies]) {
+            foreach ($legacyEvents as $legacyEvent) {
+                if (! $this->listens($legacyEvent)) {
+                    continue;
                 }
 
-                if ($ahead) {
-                    $this->mapBack($legacy, $before, $successor, $record->removes);
+                foreach ($legacies as $legacy) {
+                    if ($this->dependent === null) {
+                        self::forceDeleting($legacy, $successor);
+                    }
+
+                    $before = $legacy->getAttributes();
+                    $result = $this->dispatch($legacyEvent, $legacy, $ahead);
+
+                    if ($ahead && $result === false) {
+                        return false;
+                    }
+
+                    if ($ahead) {
+                        $this->mapBack($legacy, $before, $successor, $record->removes);
+                    }
                 }
             }
         }
 
         return null;
+    }
+
+    private static function forceDeleting(Model $legacy, Model $successor): void
+    {
+        if (! property_exists($legacy, 'forceDeleting')) {
+            return;
+        }
+
+        $forcing = method_exists($successor, 'isForceDeleting') && $successor->isForceDeleting() === true;
+        Closure::bind(function () use ($legacy, $forcing): void {
+            $legacy->forceDeleting = $forcing;
+        }, null, $legacy::class)();
     }
 
     private function start(string $event, Model $successor): null|LegacyRecord

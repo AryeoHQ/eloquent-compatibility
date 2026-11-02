@@ -6,7 +6,11 @@ namespace Support\Database\Eloquent\Compatibility\Events;
 
 final class Sequence
 {
-    public bool $forwarding = false;
+    /** @var array<array-key, true> */
+    public array $forwarding = [];
 
-    public function __construct(public readonly string $start, public string $last, public readonly null|LegacyRecord $record) {}
+    /**
+     * @param  null|array{int, string}  $frame
+     */
+    public function __construct(public readonly string $start, public string $last, public readonly null|LegacyRecord $record, public readonly null|array $frame) {}
 }

@@ -686,6 +686,138 @@ final class ForwarderTest extends TestCase
         $this->assertSame(['5 Oak St', '1250.50'], [Listing::query()->findOrFail(1)->street, Listing::query()->findOrFail(1)->price]);
     }
 
+    #[Test]
+    public function it_gives_the_listing_the_force_deleting_state_of_the_job_write_it_forwards(): void
+    {
+        $this->listen(Listing::class, ['forceDeleting', 'deleting', 'deleted', 'forceDeleted'], fn (Listing $listing) => [$listing->id, $listing->isForceDeleting()]);
+
+        Job::query()->where('legacy_id', 1)->firstOrFail()->forceDelete();
+        Job::query()->where('legacy_id', 3)->firstOrFail()->delete();
+
+        $this->assertSame([
+            ['forceDeleting', 1, false], ['deleting', 1, true], ['deleted', 1, true], ['forceDeleted', 1, false],
+            ['deleting', 3, false], ['deleted', 3, false],
+        ], $this->seen);
+    }
+
+    #[Test]
+    public function it_gives_the_listing_the_connection_the_job_write_it_forwards_runs_on(): void
+    {
+        config(['database.connections.tenant_b' => config('database.connections.'.DB::getDefaultConnection())]);
+        $this->listen(Listing::class, ['saving', 'created', 'updated', 'saved'], fn (Listing $listing) => [$listing->getConnectionName()]);
+
+        Job::on('tenant_b')->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        (new Job(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]))->setConnection('tenant_b')->save();
+
+        $this->assertSame([
+            ['saving', 'tenant_b'], ['updated', 'tenant_b'], ['saved', 'tenant_b'],
+            ['saving', 'tenant_b'], ['created', 'tenant_b'], ['saved', 'tenant_b'],
+        ], $this->seen);
+    }
+
+    #[Test]
+    public function it_gives_the_saved_event_of_a_job_write_to_its_own_listing_after_an_updated_listener_increments_the_job(): void
+    {
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $incremented = false;
+        Event::listen('eloquent.updated: '.Job::class, function () use ($job, &$incremented): void {
+            if (! $incremented) {
+                $incremented = true;
+                $job->increment('price_cents', 5);
+            }
+        });
+        $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [spl_object_id($listing), $listing->price]);
+
+        $job->update(['name' => 'Oak Lodge']);
+
+        $instances = array_values(array_unique(array_column($this->seen, 1)));
+        $this->assertSame([
+            ['saving', 0, '1250.50'], ['updating', 0, '1250.50'], ['updated', 0, '1250.50'],
+            ['updating', 1, '1250.55'], ['updated', 1, '1250.55'],
+            ['saved', 0, '1250.55'],
+        ], array_map(fn (array $seen) => [$seen[0], array_search($seen[1], $instances, true), $seen[2]], $this->seen));
+    }
+
+    #[Test]
+    public function it_forwards_the_saved_event_of_a_job_write_whose_updated_listener_increments_the_job_without_a_listing_listener_for_the_increment(): void
+    {
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $incremented = false;
+        Event::listen('eloquent.updated: '.Job::class, function () use ($job, &$incremented): void {
+            if (! $incremented) {
+                $incremented = true;
+                $job->increment('price_cents', 5);
+            }
+        });
+        $this->listen(Listing::class, ['saved'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->price]);
+
+        $job->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([['saved', 1, 'Oak Lodge', '1250.55']], $this->seen);
+    }
+
+    #[Test]
+    public function it_runs_no_query_of_its_own_for_a_job_increment_when_the_only_listing_listener_takes_the_saved_event_an_increment_never_raises(): void
+    {
+        $this->listen(Listing::class, ['saved'], fn (Listing $listing) => [$listing->id]);
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        DB::enableQueryLog();
+
+        $job->increment('price_cents', 5);
+
+        $this->assertSame(['update "jobs"'], array_map(fn (array $query) => preg_replace('/^(update "\w+").*$/s', '$1', (string) $query['query']), DB::getQueryLog()));
+        $this->assertSame([], $this->seen);
+    }
+
+    #[Test]
+    public function it_reads_a_fresh_record_for_the_next_write_of_an_instance_after_a_job_listener_refuses_a_restore_or_a_force_delete(): void
+    {
+        Event::listen('eloquent.restoring: '.Job::class, fn () => false);
+        Event::listen('eloquent.forceDeleting: '.Job::class, fn () => false);
+        $this->listen(Listing::class, ['restoring', 'forceDeleting', 'deleting', 'updating'], fn (Listing $listing) => [$listing->getOriginal('title'), $listing->title]);
+        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+
+        $refused = [$pine->restore(), $oak->forceDelete()]; // @phpstan-ignore staticMethod.dynamicCall
+        DB::table('jobs')->whereIn('legacy_id', [1, 2])->update(['name' => DB::raw("name || ' II'")]);
+        $pine->fill(['price_cents' => 7])->save();
+        $oak->delete();
+
+        $this->assertSame([false, false], $refused);
+        $this->assertSame([
+            ['restoring', 'Pine Flat', 'Pine Flat'], ['forceDeleting', 'Oak House', 'Oak House'],
+            ['updating', 'Pine Flat II', 'Pine Flat II'], ['deleting', 'Oak House II', 'Oak House II'],
+        ], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_a_dependent_write_only_to_the_records_whose_served_values_it_changes(): void
+    {
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $root = Place::query()->where('job_id', $oak->id)->firstOrFail();
+        $unit = Place::query()->create(['job_id' => $oak->id, 'parent_id' => $root->id, 'street' => 'Unit 2']);
+
+        $unit->update(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id'), 'parent_id' => null]);
+
+        $this->assertSame([['saving', 2, 'Unit 2'], ['updating', 2, 'Unit 2'], ['updated', 2, 'Unit 2'], ['saved', 2, 'Unit 2']], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_no_write_a_job_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
+    {
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
+            Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+
+        Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([['saving', null], ['creating', null], ['created', 4], ['saved', 4]], $this->seen);
+        $this->assertSame(['9 Birch St', '0.01'], [Listing::query()->findOrFail(4)->street, Listing::query()->findOrFail(4)->price]);
+    }
+
     /**
      * @param  Application  $app
      * @return array<int, class-string>

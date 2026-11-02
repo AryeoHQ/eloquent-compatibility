@@ -47,12 +47,14 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_fails_the_boot_outside_local_and_testing_without_a_cache(): void
+    #[TestWith(['about'])]
+    #[TestWith(['--env', 'optimize', 'about'])]
+    public function it_fails_the_boot_outside_local_and_testing_without_a_cache(string ...$command): void
     {
         $bootstrap = $this->temporaryBootstrap();
 
         try {
-            $booted = $this->bootInChild($bootstrap, 'about', '');
+            $booted = $this->bootInChild($bootstrap, $command, '');
         } finally {
             (new Filesystem)->deleteDirectory($bootstrap);
         }
@@ -66,7 +68,10 @@ class ProviderTest extends TestCase
     #[TestWith(['compatibility:cache'])]
     #[TestWith(['compatibility:clear'])]
     #[TestWith(['package:discover'])]
-    public function it_boots_the_command_that_writes_clears_or_discovers_without_a_cache_even_when_a_provider_instantiates_a_served_model(string $command): void
+    #[TestWith(['--no-ansi', 'compatibility:cache'])]
+    #[TestWith(['--env=staging', '-n', 'optimize'])]
+    #[TestWith(['--env', 'staging', 'optimize'])]
+    public function it_boots_the_command_that_writes_clears_or_discovers_without_a_cache_even_when_a_provider_instantiates_a_served_model(string ...$command): void
     {
         $bootstrap = $this->temporaryBootstrap();
 
@@ -104,11 +109,14 @@ class ProviderTest extends TestCase
         return $bootstrap;
     }
 
-    private function bootInChild(string $bootstrap, string $command, string $resolving): string
+    /**
+     * @param  list<string>  $command
+     */
+    private function bootInChild(string $bootstrap, array $command, string $resolving): string
     {
         $child = 'require '.var_export(dirname(__DIR__, 5).'/vendor/autoload.php', true).';'
             .' Tests\\TestCase::optimizeClassmap();'
-            .' $_SERVER[\'argv\'] = [\'artisan\', '.var_export($command, true).'];'
+            .' $_SERVER[\'argv\'] = '.var_export(['artisan', ...$command], true).';'
             .' try {'
             .' Orchestra\\Testbench\\Foundation\\Application::create(null, function ($app): void { $app->useBootstrapPath('.var_export($bootstrap, true).');'.$resolving.' });'
             .' Illuminate\\Support\\Facades\\Artisan::call(\'compatibility:cache\');'
