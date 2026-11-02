@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\AsArrayObject;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -405,6 +406,26 @@ final class ExternalAttributesTest extends TestCase
             $replicated::query()->useWritePdo()->findOrFail(3); // @phpstan-ignore staticMethod.dynamicCall
             $replicated::query()->useWritePdo()->whereKey(3)->cursor()->first(); // @phpstan-ignore staticMethod.dynamicCall
             $replicated::query()->findOrFail(3);
+
+            return $seen;
+        });
+
+        $this->assertSame(['image/png', 'image/png', null], $read);
+    }
+
+    #[Test]
+    public function it_resolves_a_record_through_the_write_connection_a_global_scope_chooses(): void
+    {
+        $read = $this->onReplica(function (string $replicated): array {
+            $writer = fn (Builder $query) => $query->useWritePdo(); // @phpstan-ignore staticMethod.dynamicCall
+            $seen = [];
+            $replicated::retrieved(function (Model $photo) use (&$seen): void {
+                $seen[] = $photo->getAttribute('mime_type');
+            });
+
+            $replicated::query()->withGlobalScope('writer', $writer)->whereKey(3)->cursor()->first();
+            $replicated::query()->withGlobalScope('writer', $writer)->whereKey(3)->get();
+            $replicated::query()->whereKey(3)->cursor()->first();
 
             return $seen;
         });

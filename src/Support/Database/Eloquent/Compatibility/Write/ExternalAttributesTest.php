@@ -291,6 +291,37 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_serves_the_value_a_write_stores_to_a_record_whose_legacy_id_the_same_write_changes(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        Photo::updated(function (Photo $photo) use (&$seen): void {
+            $seen[] = $photo->mime_type;
+        });
+        $updated = Video::query()->findOrFail(1);
+        $incremented = Video::query()->findOrFail(3);
+        $photo = Photo::query()->findOrFail(2);
+
+        $updated->update(['id' => 10, 'mime_type' => 'video/webm']);
+        $incremented->increment('views', 1, ['id' => 30, 'mime_type' => 'video/x-msvideo']);
+        $photo->update(['id' => 20, 'mime_type' => 'image/avif']);
+
+        $this->assertSame(['video/webm', 'video/x-msvideo', 'image/avif'], $seen);
+        $this->assertSame(
+            [[10, 'video/webm'], [30, 'video/x-msvideo'], [20, 'image/avif']],
+            array_map(fn (Model $model) => [$model->getKey(), $model->getAttribute('mime_type')], [$updated, $incremented, $photo]),
+        );
+        $this->assertSame(['video/webm', 'image/avif'], [$updated->getOriginal('mime_type'), $photo->getOriginal('mime_type')]);
+        $this->assertSame(
+            [[2, null], [10, 'video/webm'], [30, 'video/x-msvideo']],
+            Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->mime_type])->all(),
+        );
+        $this->assertSame('image/avif', Photo::query()->findOrFail(20)->mime_type);
+    }
+
+    #[Test]
     public function it_serves_the_value_the_new_branch_holds_to_a_record_that_read_the_attribute_before_its_move(): void
     {
         $seen = [];

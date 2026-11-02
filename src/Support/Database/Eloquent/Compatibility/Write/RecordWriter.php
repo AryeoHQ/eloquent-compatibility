@@ -100,7 +100,7 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, array_keys($values));
-            $this->readBackExternal($legacy, $key, array_keys($external));
+            $this->readBackExternal($legacy, self::keyAfter($legacy, $key, $values), array_keys($external));
 
             return 1;
         });
@@ -137,7 +137,7 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
-            $this->readBackExternal($legacy, $key, array_keys($external));
+            $this->readBackExternal($legacy, self::keyAfter($legacy, $key, $extra), array_keys($external));
 
             return 1;
         });
@@ -208,9 +208,9 @@ final readonly class RecordWriter
      */
     private function rekey(Model $legacy, int|string $key, array $values): int|string
     {
-        $moved = $values[$legacy->getKeyName()] ?? null;
+        $moved = self::keyAfter($legacy, $key, $values);
 
-        if ((! is_int($moved) && ! is_string($moved)) || (string) $moved === (string) $key) {
+        if ($moved === $key) {
             return $key;
         }
 
@@ -219,6 +219,16 @@ final readonly class RecordWriter
         }
 
         return $moved;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    private static function keyAfter(Model $legacy, int|string $key, array $values): int|string
+    {
+        $moved = $values[$legacy->getKeyName()] ?? null;
+
+        return (is_int($moved) || is_string($moved)) && (string) $moved !== (string) $key ? $moved : $key;
     }
 
     /**

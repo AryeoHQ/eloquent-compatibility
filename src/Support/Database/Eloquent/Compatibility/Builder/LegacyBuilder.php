@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
+use Illuminate\Support\LazyCollection;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -123,6 +124,16 @@ final class LegacyBuilder extends Builder
         ExternalAttributes::readFrom($model, $this->query->useWritePdo);
 
         return $model;
+    }
+
+    /**
+     * @return LazyCollection<int, TModel>
+     */
+    public function cursor()
+    {
+        $scoped = $this->applyScopes();
+
+        return $scoped === $this ? parent::cursor() : $scoped->withoutGlobalScopes()->cursor();
     }
 
     /**
