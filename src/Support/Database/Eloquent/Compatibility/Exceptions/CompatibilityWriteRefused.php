@@ -101,9 +101,18 @@ final class CompatibilityWriteRefused extends CompatibilityException
     public static function external(string $model, string $attribute): self
     {
         return new self(
+            "{$model}::\${$attribute} cannot take a mass write",
+            'It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system.',
+            'Write the records one at a time through '.class_basename($model).'.',
+        );
+    }
+
+    public static function declined(string $model, string $attribute, string $because): self
+    {
+        return new self(
             "{$model}::\${$attribute} cannot take a write",
-            'It is declared external(), so its value lives outside the database, and this release writes no external value yet.',
-            'Write the value through the successor model.',
+            $because,
+            "Leave {$attribute} unchanged in writes through ".class_basename($model).'.',
         );
     }
 

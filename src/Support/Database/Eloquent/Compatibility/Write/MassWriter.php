@@ -315,6 +315,10 @@ final readonly class MassWriter
         [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
 
         foreach (self::named($mapped) as $name => $value) {
+            if ($this->map->isExternal($name)) {
+                throw CompatibilityWriteRefused::external($this->map->model, $name);
+            }
+
             self::refuseRaw($this->map, $name, $value);
         }
 

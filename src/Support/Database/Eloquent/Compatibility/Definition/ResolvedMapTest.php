@@ -169,7 +169,7 @@ final class ResolvedMapTest extends TestCase
 
         $this->assertSame([File::class, Link::class], array_keys($map->branches));
         $this->assertSame([
-            File::class => ['files', true, 'id', 'video', ['id' => 'legacy_id', 'uuid' => 'legacy_uuid'], ['original_file_name' => 'filename', 'mime_type' => 'mime_type', 'size_kb' => 'size_bytes', 'youtube_embed_url' => null, 'created_at' => 'created_at', 'updated_at' => 'updated_at']],
+            File::class => ['files', true, 'id', 'video', ['id' => 'legacy_id', 'uuid' => 'legacy_uuid'], ['original_file_name' => 'filename', 'mime_type' => null, 'size_kb' => 'size_bytes', 'youtube_embed_url' => null, 'created_at' => 'created_at', 'updated_at' => 'updated_at']],
             Link::class => ['links', true, 'id', 'video', ['id' => 'legacy_id', 'uuid' => 'legacy_uuid'], ['original_file_name' => null, 'mime_type' => null, 'size_kb' => null, 'youtube_embed_url' => 'url', 'created_at' => 'created_at', 'updated_at' => 'updated_at']],
         ], $branches);
         $this->assertSame([false, 'videos_retained', 'id'], [$map->branch, $map->retainedTable, $map->retainedKey]);
@@ -221,6 +221,14 @@ final class ResolvedMapTest extends TestCase
                 ->as(File::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
                 ->as(Link::class, fn (Successor $link) => $link),
             "attribute 'original_file_name' is readable in the File branch and not in the Link branch; give it from(), external() or fixed() there",
+        ];
+        yield 'an external attribute another branch reads from sql' => [
+            fn (Compatibility $video) => self::identified($video)
+                ->discriminatedBy('legacy_type')
+                ->servedFrom(fn (Video $video): string => File::class)
+                ->as(File::class, fn (Successor $file) => $file->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)))
+                ->as(Link::class, fn (Successor $link) => $link->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('url'))),
+            "attribute 'mime_type' is external() in the File branch and reads SQL in the Link branch, and the view serves an external attribute from no branch; declare it external() or fixed() there",
         ];
         yield 'two branches over one table' => [
             fn (Compatibility $video) => self::identified($video)

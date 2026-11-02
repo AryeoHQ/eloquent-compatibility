@@ -55,7 +55,8 @@ final class TwoSuccessorsTest extends TestCase
     public function it_serves_each_video_from_whichever_successor_holds_it(): void
     {
         $this->assertSame('v', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
-        $this->assertSame($this->before, array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        $this->assertSame(array_map(fn (array $row) => array_diff_key($row, ['mime_type' => true]), $this->before), array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        $this->assertSame(array_column($this->before, 'mime_type'), Video::query()->orderBy('id')->get()->map(fn (Video $video) => $video->mime_type)->all());
         $this->assertSame(
             [[1, 'tour.mp4', null], [2, null, 'https://youtu.be/oak'], [3, 'drone.mov', null]],
             Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all(),

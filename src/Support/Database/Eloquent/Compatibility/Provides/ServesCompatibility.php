@@ -10,6 +10,7 @@ use Illuminate\Database\Query\Builder as QueryBuilder;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyQueryBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
 /**
  * @phpstan-require-extends Model
@@ -28,6 +29,30 @@ trait ServesCompatibility
         $builder = new LegacyBuilder($query);
 
         return $builder;
+    }
+
+    /**
+     * @param  string  $key
+     */
+    public function getAttribute($key): mixed
+    {
+        if (is_string($key) && $this->exists && ! array_key_exists($key, $this->attributes)) {
+            ExternalAttributes::resolve($this, $key);
+        }
+
+        return parent::getAttribute($key);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function attributesToArray(): array
+    {
+        if ($this->exists) {
+            ExternalAttributes::resolveAll($this);
+        }
+
+        return parent::attributesToArray();
     }
 
     protected function newBaseQueryBuilder(): LegacyQueryBuilder

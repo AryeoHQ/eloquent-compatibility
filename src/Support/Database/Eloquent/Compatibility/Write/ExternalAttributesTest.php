@@ -1,0 +1,203 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Write;
+
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
+use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
+use Tests\TestCase;
+
+#[CoversClass(RecordWriter::class)]
+#[CoversClass(MassWriter::class)]
+#[CoversClass(BranchMove::class)]
+final class ExternalAttributesTest extends TestCase
+{
+    /** @var list<string> */
+    protected $connectionsToTransact = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        FileTables::create();
+        FileTables::seed();
+        FileTables::seedMedia();
+        FileTables::install();
+        FileTables::installMedia();
+        FakeMediaLibrary::bound()->calls = [];
+    }
+
+    protected function tearDown(): void
+    {
+        FileTables::drop();
+
+        parent::tearDown();
+    }
+
+    #[Test]
+    public function it_hands_a_new_record_value_to_the_successor_before_the_successor_saves(): void
+    {
+        $saved = [];
+        File::saving(function (File $file) use (&$saved): void {
+            $saved[] = $file->metadata()->mimeType;
+        });
+
+        $photo = Photo::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'image/webp', 'caption' => 'Birch']);
+        $asset = (string) File::query()->where('legacy_type', 'photo')->where('legacy_id', $photo->id)->value('zml_asset_id');
+
+        $this->assertSame(['image/webp'], $saved);
+        $this->assertEquals(new FileMetadata('image/webp'), FakeMediaLibrary::bound()->stored($asset));
+        $this->assertSame(['image/webp', false], [$photo->mime_type, $photo->isDirty()]);
+        $this->assertSame('image/webp', Photo::query()->findOrFail($photo->id)->mime_type);
+        $this->assertSame([], DB::select("select table_name from information_schema.columns where table_name in ('photos', 'photos_retained') and column_name = 'mime_type'"));
+    }
+
+    #[Test]
+    public function it_hands_a_changed_value_to_the_successor_and_saves_it_even_when_nothing_else_changes(): void
+    {
+        $photo = Photo::query()->findOrFail(2);
+        $photo->timestamps = false;
+        $asset = (string) File::query()->where('legacy_type', 'photo')->where('legacy_id', 2)->value('zml_asset_id');
+
+        $photo->update(['mime_type' => 'image/avif']);
+
+        $this->assertEquals(new FileMetadata('image/avif'), FakeMediaLibrary::bound()->stored($asset));
+        $this->assertSame(['image/avif', false], [$photo->mime_type, $photo->isDirty()]);
+        $this->assertSame(['image/jpeg', 'image/avif', 'image/png'], Photo::query()->orderBy('id')->get()->map(fn (Photo $photo) => $photo->mime_type)->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_write_the_map_declines_with_the_declared_reason_and_changes_nothing(): void
+    {
+        $declined = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: Attribute::declined(because: 'The media library sets the type from the upload.')))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        $before = DB::select('select * from files order by legacy_type, legacy_id');
+        $photo = $declined::query()->findOrFail(1);
+
+        try {
+            $photo->update(['file_name' => 'oak-front-2.jpg', 'mime_type' => 'image/png']);
+            $this->fail('The declined write was stored.');
+        } catch (CompatibilityWriteRefused $refusal) {
+            $this->assertSame(['The media library sets the type from the upload.', true], [$refusal->because, str_ends_with($refusal->refused, '::$mime_type cannot take a write')]);
+        }
+
+        $this->assertEquals($before, DB::select('select * from files order by legacy_type, legacy_id'));
+        $this->assertSame([], array_filter(FakeMediaLibrary::bound()->calls, fn (array $call) => $call[0] !== 'fetch'));
+    }
+
+    #[Test]
+    public function it_refuses_a_mass_write_of_an_external_attribute_and_changes_nothing(): void
+    {
+        $before = DB::select('select * from files order by legacy_type, legacy_id');
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->whereKey(1)->update(['mime_type' => 'image/png']),
+            fn () => Photo::query()->toBase()->where('id', 1)->update(['file_name' => 'oak.jpg', 'mime_type' => 'image/png']),
+            fn () => Video::query()->whereIn('id', [1, 2])->update(['mime_type' => 'video/webm']),
+            fn () => Video::query()->whereKey(2)->update(['mime_type' => null]),
+        ] as $write) {
+            try {
+                $write();
+                $refusals[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame([
+            Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.',
+            Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.',
+            Video::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Video.',
+            Video::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Video.',
+        ], $refusals);
+        $this->assertEquals($before, DB::select('select * from files order by legacy_type, legacy_id'));
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
+    public function it_refuses_a_raw_expression_for_an_external_attribute(): void
+    {
+        $this->expectExceptionObject(CompatibilityWriteRefused::rawExpression(Photo::class, 'mime_type', 'It is declared external(), so its value lives outside the database, and no SQL computes it.'));
+
+        Photo::query()->findOrFail(1)->update(['mime_type' => new Expression("'image/png'")]);
+    }
+
+    #[Test]
+    public function it_writes_a_video_value_in_the_branch_that_keeps_it_externally_and_refuses_one_the_other_branch_fixes(): void
+    {
+        $upload = Video::query()->create(['original_file_name' => 'garden.mp4', 'mime_type' => 'video/mp4', 'title' => 'Garden']);
+        Video::query()->findOrFail(3)->update(['mime_type' => 'video/x-msvideo']);
+        $embed = Video::query()->findOrFail(2);
+        $embed->update(['mime_type' => null, 'title' => 'Oak tour']);
+
+        try {
+            Video::query()->findOrFail(2)->update(['mime_type' => 'video/mp4']);
+            $this->fail('The embed stored a mime type.');
+        } catch (CompatibilityWriteRefused $refusal) {
+            $this->assertSame(Video::class.'::$mime_type cannot take a write. Why: The attribute always reads NULL, so it cannot store \'video/mp4\'. Instead: Write a value its conversions can store, or write the stored column through the successor model.', $refusal->getMessage());
+        }
+
+        $this->assertSame(['Oak tour', null], [$embed->title, $embed->mime_type]);
+        $this->assertSame(
+            [[1, 'video/mp4'], [2, null], [3, 'video/x-msvideo'], [$upload->id, 'video/mp4']],
+            Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->mime_type])->all(),
+        );
+    }
+
+    #[Test]
+    public function it_carries_a_value_the_write_names_into_the_successor_a_move_creates(): void
+    {
+        Video::query()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'mime_type' => 'video/mp4']);
+        Video::query()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+        $asset = (string) File::query()->where('legacy_type', 'video')->where('legacy_id', 2)->value('zml_asset_id');
+
+        $this->assertEquals(new FileMetadata('video/mp4'), FakeMediaLibrary::bound()->stored($asset));
+        $this->assertSame([[1, null, 'https://youtu.be/tour'], [2, 'video/mp4', null], [3, 'video/quicktime', null]], Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->mime_type, $video->youtube_embed_url])->all());
+    }
+}

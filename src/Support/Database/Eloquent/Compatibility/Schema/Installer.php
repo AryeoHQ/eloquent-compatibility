@@ -18,8 +18,12 @@ final readonly class Installer
         }
 
         $this->connection->transaction(function () use ($statements): void {
-            foreach ($statements->transaction as $statement) {
+            foreach ($statements->transaction as $index => $statement) {
                 $this->connection->unprepared($statement);
+
+                foreach ($statements->steps[$index] ?? [] as $step) {
+                    $step($this->connection);
+                }
             }
         });
 

@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use ReflectionFunction;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
 final readonly class ResolvedMap
@@ -125,6 +126,25 @@ final readonly class ResolvedMap
         throw $this->invalid('the servedFrom() selector returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and as() declares only '.implode(' and ', array_keys($this->branches)));
     }
 
+    public function isExternal(string $name): bool
+    {
+        foreach ($this->branches === [] ? [$this] : $this->branches as $served) {
+            if (($served->attributes[$name] ?? null)?->isExternal() === true) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function externals(): array
+    {
+        return array_values(array_filter(array_keys($this->attributes), $this->isExternal(...)));
+    }
+
     /**
      * @param  list<string>  $columns
      * @return list<string>
@@ -209,6 +229,18 @@ final readonly class ResolvedMap
             foreach ($declaredIn as $name => $declared) {
                 if (! array_key_exists($name, $branch->attributes)) {
                     throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' branch and not in the '.class_basename($successor).' branch; give it from(), external() or fixed() there');
+                }
+            }
+        }
+
+        foreach (array_keys($declaredIn) as $name) {
+            $external = array_filter($branches, fn (ResolvedMap $branch) => $branch->attributes[$name]->isExternal());
+
+            foreach ($external === [] ? [] : $branches as $successor => $branch) {
+                $attribute = $branch->attributes[$name];
+
+                if (! $attribute->isExternal() && ! ($attribute->column() === null && ($attribute->conversions()[0] ?? null) instanceof Fixed)) {
+                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external)).' branch and reads SQL in the '.class_basename($successor).' branch, and the view serves an external attribute from no branch; declare it external() or fixed() there');
                 }
             }
         }

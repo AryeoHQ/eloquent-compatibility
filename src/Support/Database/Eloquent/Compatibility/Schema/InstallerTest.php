@@ -18,6 +18,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\Photo;
@@ -445,36 +447,47 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_a_map_whose_external_attribute_names_a_legacy_column(): void
+    public function it_refuses_to_install_while_a_legacy_row_holds_an_external_value_its_read_does_not_return(): void
     {
-        $model = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            protected $table = 'listings';
-
-            public static function compatibility(Compatibility $listing): Compatibility
-            {
-                return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $number) => $number)));
-            }
-        };
+        $this->prepareFiles();
+        FakeMediaLibrary::bound()->put((string) DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->value('zml_asset_id'), new FileMetadata('image/png'));
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 3)->update(['zml_asset_id' => null]);
 
         try {
-            Compatibility::install($model::class);
+            Compatibility::install(Photo::class);
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame(InvalidCompatibilityMap::because('listings', "attribute 'mls_number' is external(), and this release neither reads nor restores an external attribute, so install() would drop listings.mls_number and its values")->getMessage(), $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
-        $this->assertSame('r', $this->kind('listings'));
-        $this->assertSame(['MLS-1', null, 'MLS-3'], array_column(DB::select('select mls_number from listings order by id'), 'mls_number'));
+        $this->assertSame('r', $this->kind('photos'));
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+    }
+
+    #[Test]
+    public function it_stores_no_external_value_once_installed_and_restores_each_through_its_read_on_uninstall(): void
+    {
+        $this->prepareFiles();
+        DB::table('photos')->where('id', 2)->update(['mime_type' => 'image/webp']);
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->update(['mime_type' => 'image/webp']);
+        FakeMediaLibrary::bound()->put((string) DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->value('zml_asset_id'), new FileMetadata('image/webp'));
+        $before = DB::select('select id, uuid, file_name, mime_type, caption, views, size_kb, created_at, updated_at from photos order by id');
+
+        Compatibility::install(Photo::class);
+        $installed = DB::select("select table_name from information_schema.columns where table_name in ('photos', 'photos_retained') and column_name = 'mime_type'");
+        Photo::query()->findOrFail(3)->update(['mime_type' => 'image/gif']);
+        Compatibility::uninstall(Photo::class);
+
+        $before[2]->mime_type = 'image/gif';
+        $before[2]->updated_at = DB::scalar('select updated_at from photos where id = 3');
+
+        $this->assertSame([], $installed);
+        $this->assertSame('r', $this->kind('photos'));
+        $this->assertEquals($before, DB::select('select id, uuid, file_name, mime_type, caption, views, size_kb, created_at, updated_at from photos order by id'));
+        $this->assertSame([true, 'character varying(255)'], [
+            DB::scalar("select attnotnull from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+            DB::scalar("select format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+        ]);
     }
 
     #[Test]

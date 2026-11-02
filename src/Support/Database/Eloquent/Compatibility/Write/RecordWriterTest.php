@@ -393,7 +393,7 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_write_of_an_external_attribute_and_a_value_its_conversions_cannot_store(): void
+    public function it_refuses_a_declined_write_of_an_external_attribute_and_a_value_its_conversions_cannot_store(): void
     {
         $before = $this->snapshot();
         $listing = new class extends Model implements Compatible
@@ -413,7 +413,7 @@ final class RecordWriterTest extends TestCase
                     ->retainedIn('listings_retained', key: 'job_id')
                     ->servedFrom(Job::class, fn (Successor $job) => $job
                         ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: fn (Job $job, mixed $value) => $value))
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: Attribute::declined(because: 'The MLS assigns its own numbers.')))
                         ->attribute('featured', fn (Attribute $attribute) => $attribute->fixed(false)));
             }
         };
@@ -423,7 +423,8 @@ final class RecordWriterTest extends TestCase
         $externalRefusal = $this->refusal(fn () => $external->update(['title' => 'Elm House', 'mls_number' => 'MLS-3B']));
         $fixedRefusal = $this->refusal(fn () => $fixed->update(['title' => 'Elm House', 'featured' => true]));
 
-        $this->assertStringEndsWith('::$mls_number cannot take a write. Why: It is declared external(), so its value lives outside the database, and this release writes no external value yet. Instead: Write the value through the successor model.', $externalRefusal->getMessage());
+        $this->assertSame(['The MLS assigns its own numbers.', true], [$externalRefusal->because, str_ends_with($externalRefusal->refused, '::$mls_number cannot take a write')]);
+        $this->assertStringStartsWith('Leave mls_number unchanged in writes through ', $externalRefusal->instead);
         $this->assertStringEndsWith('::$featured cannot take a write. Why: The attribute always reads false, so it cannot store true. Instead: Write a value its conversions can store, or write the stored column through the successor model.', $fixedRefusal->getMessage());
         $this->assertSame($before, $this->snapshot());
     }

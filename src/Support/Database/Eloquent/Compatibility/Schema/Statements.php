@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Closure;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Membership;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
 final readonly class Statements
 {
@@ -19,8 +21,9 @@ final readonly class Statements
     /**
      * @param  list<string>  $transaction
      * @param  list<string>  $afterwards
+     * @param  array<int, list<Closure(ConnectionInterface): void>>  $steps
      */
-    public function __construct(public string $operation, public array $transaction, public array $afterwards = []) {}
+    public function __construct(public string $operation, public array $transaction, public array $afterwards = [], public array $steps = []) {}
 
     public static function prepare(ResolvedMap $map, ConnectionInterface $connection): self
     {
@@ -48,11 +51,7 @@ final readonly class Statements
         $legacy = $columnCatalog->of($map->table);
         $key = (new $map->model)->getKeyName();
 
-        foreach ($map->attributes as $name => $attribute) {
-            if ($attribute->isExternal() && array_key_exists($name, $legacy)) {
-                throw InvalidCompatibilityMap::because($map->table, "attribute '{$name}' is external(), and this release neither reads nor restores an external attribute, so install() would drop {$map->table}.{$name} and its values");
-            }
-        }
+        $external = array_values(array_filter($map->externals(), fn (string $name) => array_key_exists($name, $legacy)));
 
         if (array_key_exists($retainedKey, $legacy)) {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$retainedKey}, which install() adds as the key of the retained table");
@@ -138,7 +137,7 @@ final readonly class Statements
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
-            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, array_column($constants, 1))),
+            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, array_column($constants, 1), $external)),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
             ...self::grants($connection, $map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH))),
@@ -147,7 +146,7 @@ final readonly class Statements
             ...$validations,
             self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'),
             ...$validateCheck,
-        ]);
+        ], $external === [] ? [] : [1 => array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external)]);
     }
 
     public static function recompile(ResolvedMap $map, ConnectionInterface $connection): self
@@ -205,6 +204,7 @@ final readonly class Statements
         $generated = $captured === null ? [] : array_intersect_key($captured['generated'], $served);
         $columns = array_keys(array_diff_key($served, $generated));
         $defaults = array_filter(array_intersect_key($shape, array_flip($columns)), fn (Column $column) => $column->default !== null);
+        $external = $captured === null ? [] : array_intersect_key($captured['external'], array_flip($map->externals()));
         $repointed = [];
 
         $membership = $map->membership;
@@ -215,7 +215,10 @@ final readonly class Statements
             "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE "
                 .($membership === null ? '' : $membership->of($map->primary->table).' AND ')
                 ."NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
-            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns)),
+            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
+                ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns),
+                ...array_map(fn (string $type, string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$type, $external, array_keys($external)),
+            ]),
             "UPDATE {$legacyTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
                 ."\nWHERE {$primary}.{$primaryKey} = {$legacyTable}.{$retainedKey}",
@@ -247,7 +250,7 @@ final readonly class Statements
 
         $statements[] = "ALTER TABLE {$legacyTable} DROP COLUMN {$retainedKey}";
         $statements[] = "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", $constraints);
-        [$replayed, $validations] = $captured === null ? [[], []] : self::replay($captured, $legacyTable, array_keys($served));
+        [$replayed, $validations] = $captured === null ? [[], []] : self::replay($captured, $legacyTable, [...array_keys($served), ...array_keys($external)]);
         $statements = [...$statements, ...$replayed];
         $identifiers = [];
 
@@ -275,7 +278,7 @@ final readonly class Statements
             $statements[] = "ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint());
         }
 
-        return new self('uninstall', $statements, [...$repointed, ...$validations]);
+        return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [5 => array_map(fn (string $type, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $type), $external, array_keys($external))]);
     }
 
     /**
@@ -397,8 +400,9 @@ final readonly class Statements
      * @param  list<string>  $mapped
      * @param  list<array{string, string}>  $moved
      * @param  list<array{string, string}>  $constants
+     * @param  list<string>  $external
      */
-    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $constants): string
+    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $constants, array $external): string
     {
         $table = SqlFragments::identifier($map->table);
         $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
@@ -452,6 +456,7 @@ final readonly class Statements
                 'constants' => $constants,
                 'membership' => ['table' => $map->membership->table, 'column' => $map->membership->column, 'alias' => $map->membership->alias],
             ]),
+            ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => $legacy[$name]->type, $external))]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
@@ -472,7 +477,7 @@ final readonly class Statements
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>}
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, string>}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -507,11 +512,12 @@ final readonly class Statements
             'indexes' => array_values(array_filter(is_array($captured['indexes'] ?? null) ? $captured['indexes'] : [], is_string(...))),
             'moved' => self::pairs($captured['moved'] ?? null),
             'constants' => self::pairs($captured['constants'] ?? null),
+            'external' => array_filter(is_array($captured['external'] ?? null) ? $captured['external'] : [], fn (mixed $type, int|string $name) => is_string($name) && is_string($type), ARRAY_FILTER_USE_BOTH),
         ];
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, string>}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */
