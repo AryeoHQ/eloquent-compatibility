@@ -61,7 +61,7 @@ final readonly class MultipliedBy implements Conversion
     public function exact(null|string $type, string $served): bool
     {
         if (SqlFragments::isFloat($type)) {
-            return ($served === 'double precision' || $served === $type) && $this->doublesOrHalves();
+            return $served === $type && $this->doublesOrHalves();
         }
 
         $places = $this->places();

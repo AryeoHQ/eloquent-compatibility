@@ -278,7 +278,13 @@ final class SqlFragments
             $quoted = self::quoted($sql, $at);
 
             if ($quoted > 0) {
-                $bound .= substr($sql, $at, $quoted);
+                $literal = substr($sql, $at, $quoted);
+
+                if ($literal[0] === "'" && str_contains($literal, '\\')) {
+                    throw new InvalidArgumentException("The SQL [{$sql}] has a backslash in the string literal {$literal}, and PostgreSQL reads that backslash as an escape only while standard_conforming_strings is off; write the string as E'…' so that it reads the same under either setting.");
+                }
+
+                $bound .= $literal;
                 $at += $quoted;
             } elseif (substr($sql, $at, 2) === '??') {
                 $bound .= '?';

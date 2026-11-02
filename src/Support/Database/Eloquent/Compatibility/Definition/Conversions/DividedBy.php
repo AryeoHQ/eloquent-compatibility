@@ -66,6 +66,10 @@ final readonly class DividedBy implements Conversion
     {
         $divisor = abs($this->divisor);
 
+        if ($divisor >= (float) PHP_INT_MAX) {
+            return null;
+        }
+
         if (floor($divisor) !== (float) $divisor) {
             $literal = var_export((float) $divisor, true);
             $fraction = rtrim(substr($literal, (int) strpos($literal, '.') + 1), '0');
