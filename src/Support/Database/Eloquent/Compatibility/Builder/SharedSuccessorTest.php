@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\File;
@@ -123,6 +124,44 @@ final class SharedSuccessorTest extends TestCase
         $this->assertEquals([(object) ['legacy_type' => 'photo', 'filename' => 'birch.jpg', 'size_bytes' => 2000]], $files);
         $this->assertSame(['birch.jpg', 'Birch'], [Photo::query()->findOrFail($photo->id)->file_name, Photo::query()->findOrFail($photo->id)->caption]);
         $this->assertNull(FloorPlan::query()->find($photo->id));
+    }
+
+    #[Test]
+    public function it_refuses_a_record_write_whose_successor_listener_gives_the_row_another_legacy_models_discriminator(): void
+    {
+        File::creating(function (File $file): void {
+            if ($file->filename === 'birch.jpg') {
+                $file->legacy_type = 'legacy_file';
+            }
+        });
+        File::updating(function (File $file): void {
+            if ($file->filename === 'ash-back.jpg') {
+                $file->legacy_type = 'legacy_file';
+            }
+        });
+        $ash = Photo::query()->create(['file_name' => 'ash.jpg', 'mime_type' => 'image/jpeg', 'caption' => 'Ash']);
+        $before = $this->legacyRows();
+        $outcomes = [];
+
+        foreach ([
+            fn () => Photo::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg', 'size_kb' => 2, 'caption' => 'Birch']),
+            fn () => $ash->update(['file_name' => 'ash-back.jpg']),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame([
+            Photo::class.' cannot run a successor listener that gives a new record another legacy model through its compatibility map',
+            Photo::class.' cannot run a successor listener that gives record '.$ash->id.' another legacy model through its compatibility map',
+        ], $outcomes);
+        $this->assertSame($before, $this->legacyRows());
+        $this->assertSame(0, DB::table('files')->whereIn('filename', ['birch.jpg', 'ash-back.jpg'])->count());
+        $this->assertSame(['ash.jpg', 'Ash'], [Photo::query()->findOrFail($ash->id)->file_name, Photo::query()->findOrFail($ash->id)->caption]);
     }
 
     #[Test]
