@@ -42,11 +42,6 @@ final class StatementsTest extends TestCase
         $statements = Statements::prepare($this->map(), DB::connection());
 
         $this->assertSame('prepare', $statements->operation);
-        $this->assertSame([<<<'SQL'
-            ALTER TABLE "jobs"
-              ADD COLUMN "legacy_id" integer NOT NULL DEFAULT nextval('listings_id_seq'::regclass) CONSTRAINT "jobs_legacy_id_unique" UNIQUE,
-              ADD COLUMN "legacy_uuid" uuid NOT NULL DEFAULT gen_random_uuid() CONSTRAINT "jobs_legacy_uuid_unique" UNIQUE
-            SQL], $statements->transaction);
         $this->assertSame([
             <<<'SQL'
             DO $compatibility$
@@ -62,7 +57,101 @@ final class StatementsTest extends TestCase
             END
             $compatibility$
             SQL,
-            'CREATE UNIQUE INDEX CONCURRENTLY "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL',
+            <<<'SQL'
+            ALTER TABLE "jobs"
+              ADD COLUMN IF NOT EXISTS "legacy_id" integer,
+              ADD COLUMN IF NOT EXISTS "legacy_uuid" uuid
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "jobs"
+              ALTER COLUMN "legacy_id" SET DEFAULT nextval('listings_id_seq'::regclass),
+              DROP CONSTRAINT IF EXISTS "jobs_legacy_id_filled",
+              ADD CONSTRAINT "jobs_legacy_id_filled" CHECK ("legacy_id" IS NOT NULL) NOT VALID,
+              ALTER COLUMN "legacy_uuid" SET DEFAULT gen_random_uuid(),
+              DROP CONSTRAINT IF EXISTS "jobs_legacy_uuid_filled",
+              ADD CONSTRAINT "jobs_legacy_uuid_filled" CHECK ("legacy_uuid" IS NOT NULL) NOT VALID
+            SQL,
+        ], $statements->transaction);
+        $this->assertSame([
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              filled_through uuid;
+              fill_upto uuid;
+            BEGIN
+              LOOP
+                SELECT chunk."id" INTO fill_upto FROM (SELECT "id" FROM "jobs" WHERE filled_through IS NULL OR "id" > filled_through ORDER BY "id" LIMIT 1000) AS chunk ORDER BY chunk."id" DESC LIMIT 1;
+                EXIT WHEN fill_upto IS NULL;
+                UPDATE "jobs" SET "legacy_id" = COALESCE("legacy_id", nextval('listings_id_seq'::regclass)), "legacy_uuid" = COALESCE("legacy_uuid", gen_random_uuid()) WHERE ("legacy_id" IS NULL OR "legacy_uuid" IS NULL) AND "id" <= fill_upto AND (filled_through IS NULL OR "id" > filled_through);
+                filled_through := fill_upto;
+                COMMIT;
+              END LOOP;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "jobs"
+              VALIDATE CONSTRAINT "jobs_legacy_id_filled",
+              VALIDATE CONSTRAINT "jobs_legacy_uuid_filled"
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "jobs"
+              ALTER COLUMN "legacy_id" SET NOT NULL,
+              ALTER COLUMN "legacy_uuid" SET NOT NULL
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "jobs"
+              DROP CONSTRAINT "jobs_legacy_id_filled",
+              DROP CONSTRAINT "jobs_legacy_uuid_filled"
+            SQL,
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."jobs_legacy_id_unique"') AND NOT indisvalid) THEN
+                DROP INDEX "jobs_legacy_id_unique";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "jobs_legacy_id_unique" ON "jobs" ("legacy_id")',
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_id_unique') THEN
+                ALTER TABLE "jobs" ADD CONSTRAINT "jobs_legacy_id_unique" UNIQUE USING INDEX "jobs_legacy_id_unique";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."jobs_legacy_uuid_unique"') AND NOT indisvalid) THEN
+                DROP INDEX "jobs_legacy_uuid_unique";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "jobs_legacy_uuid_unique" ON "jobs" ("legacy_uuid")',
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_uuid_unique') THEN
+                ALTER TABLE "jobs" ADD CONSTRAINT "jobs_legacy_uuid_unique" UNIQUE USING INDEX "jobs_legacy_uuid_unique";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."places_listings_at_most_one"') AND NOT indisvalid) THEN
+                DROP INDEX "places_listings_at_most_one";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL',
         ], $statements->afterwards);
         $this->assertSame([...$statements->transaction, ...$statements->afterwards], $statements->all());
     }
@@ -71,25 +160,42 @@ final class StatementsTest extends TestCase
     public function it_lists_the_statements_that_install_the_view_in_place_of_the_legacy_table(): void
     {
         Compatibility::prepare(Listing::class);
-        $view = (new ViewCompiler(new ColumnCatalog(DB::connection())))->create($this->map());
+        $view = (new ViewCompiler(new ColumnCatalog(DB::connection()), DB::connection()))->create($this->map());
 
         $statements = Statements::install($this->map(), DB::connection());
 
         $this->assertSame([
+            'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE',
             <<<'SQL'
             DO $compatibility$
             DECLARE
               missing bigint;
               first_keys text;
             BEGIN
-              SELECT count(*) INTO missing FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" IS NOT DISTINCT FROM "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid");
+              SELECT count(*) INTO missing FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid");
               IF missing > 0 THEN
-                SELECT string_agg(CAST(missing_key AS text), ', ' ORDER BY missing_key) INTO first_keys FROM (SELECT "listings"."id" FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" IS NOT DISTINCT FROM "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid") ORDER BY "listings"."id" LIMIT 5) AS first_missing (missing_key);
+                SELECT string_agg(CAST(missing_key AS text), ', ' ORDER BY missing_key) INTO first_keys FROM (SELECT "listings"."id" FROM "listings" WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid") ORDER BY "listings"."id" LIMIT 5) AS first_missing (missing_key);
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot install: ' || missing || ' listings rows have no jobs row with the same id and uuid; the first are id ' || first_keys || '. Backfill them before install().';
               END IF;
             END
             $compatibility$
             SQL,
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              hidden_rows bigint;
+              first_keys text;
+            BEGIN
+              SELECT count(*) INTO hidden_rows FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND (COALESCE(("merged_into_job_id" is not null), false)));
+              IF hidden_rows > 0 THEN
+                SELECT string_agg(CAST(hidden_key AS text), ', ' ORDER BY hidden_key) INTO first_keys FROM (SELECT "listings"."id" FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND (COALESCE(("merged_into_job_id" is not null), false))) ORDER BY "listings"."id" LIMIT 5) AS first_hidden (hidden_key);
+                RAISE NOTICE '%', 'Compatibility map ''listings'' install hides ' || hidden_rows || ' listings rows, because a hide() rule matches their jobs row; the first are id ' || first_keys || '.';
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'ALTER TABLE "listings" ADD COLUMN "job_id" uuid',
+            'UPDATE "listings" SET "job_id" = "jobs"."id" FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id"',
             <<<'SQL'
             ALTER TABLE "listing_photos"
               DROP CONSTRAINT "listing_photos_listing_id_foreign",
@@ -101,8 +207,6 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listing_shares_listing_uuid_foreign" FOREIGN KEY ("listing_uuid") REFERENCES "jobs" ("legacy_uuid") ON UPDATE CASCADE ON DELETE SET NULL NOT VALID
             SQL,
             'ALTER SEQUENCE public.listings_id_seq OWNED BY "jobs"."legacy_id"',
-            'ALTER TABLE "listings" ADD COLUMN "job_id" uuid',
-            'UPDATE "listings" SET "job_id" = "jobs"."id" FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id"',
             <<<'SQL'
             ALTER TABLE "listings"
               DROP COLUMN "id",
@@ -124,6 +228,7 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listings_retained_pkey" PRIMARY KEY ("job_id"),
               ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID
             SQL,
+            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":[]}\'',
             $view,
             'ALTER VIEW "listings" ALTER COLUMN "id" SET DEFAULT nextval(\'listings_id_seq\'::regclass)',
             'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
@@ -138,12 +243,37 @@ final class StatementsTest extends TestCase
     }
 
     #[Test]
+    public function it_matches_the_legacy_key_by_equality_in_the_install_parity_check(): void
+    {
+        Compatibility::prepare(Listing::class);
+
+        $parity = Statements::install($this->map(), DB::connection())->transaction[1];
+
+        $this->assertStringContainsString('WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid")', $parity);
+    }
+
+    #[Test]
+    public function it_locks_the_legacy_table_first_and_repoints_inbound_keys_only_after_it_fills_the_retained_key(): void
+    {
+        Compatibility::prepare(Listing::class);
+
+        $transaction = Statements::install($this->map(), DB::connection())->transaction;
+        $fill = array_search('UPDATE "listings" SET "job_id" = "jobs"."id" FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id"', $transaction, true);
+        $repoints = array_keys(array_filter($transaction, fn (string $statement) => str_contains($statement, 'DROP CONSTRAINT "listing_')));
+
+        $this->assertSame('LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE', $transaction[0]);
+        $this->assertIsInt($fill);
+        $this->assertCount(2, $repoints);
+        $this->assertGreaterThan($fill, min($repoints));
+    }
+
+    #[Test]
     public function it_lists_the_one_statement_that_recompiles_the_view(): void
     {
         Compatibility::prepare(Listing::class);
         Compatibility::install(Listing::class);
 
-        $this->assertEquals(new Statements('recompile', [(new ViewCompiler(new ColumnCatalog(DB::connection())))->replace($this->map())]), Statements::recompile($this->map(), DB::connection()));
+        $this->assertEquals(new Statements('recompile', [(new ViewCompiler(new ColumnCatalog(DB::connection()), DB::connection()))->replace($this->map())]), Statements::recompile($this->map(), DB::connection()));
     }
 
     #[Test]
@@ -157,7 +287,7 @@ final class StatementsTest extends TestCase
         $this->assertSame([
             'DROP VIEW "listings"',
             'ALTER TABLE "listings_retained" RENAME TO "listings"',
-            'INSERT INTO "listings" ("job_id") SELECT "jobs"."id" FROM (SELECT * FROM "jobs" WHERE NOT COALESCE(("merged_into_job_id" is not null), false)) AS "jobs" WHERE NOT EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" = "jobs"."id")',
+            'INSERT INTO "listings" ("job_id") SELECT "jobs"."id" FROM "jobs" WHERE NOT EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" = "jobs"."id")',
             <<<'SQL'
             ALTER TABLE "listings"
               ADD COLUMN "id" integer,
@@ -180,13 +310,13 @@ final class StatementsTest extends TestCase
               "title" = CAST("jobs"."name" AS character varying(255)),
               "company_id" = CAST("jobs"."company_id" AS uuid),
               "price" = CAST((CAST("jobs"."price_cents" AS numeric) / 100) AS numeric(10,2)),
-              "status" = CAST((CASE "jobs"."lifecycle_status" WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)),
+              "status" = CAST((CASE CAST("jobs"."lifecycle_status" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)),
               "street" = CAST("places"."street" AS character varying(255)),
               "city" = CAST("places"."city" AS character varying(255)),
               "latitude" = CAST("job_sites"."latitude" AS double precision),
-              "created_at" = CAST("jobs"."created_at" AS timestamp(0) without time zone),
-              "updated_at" = CAST("jobs"."updated_at" AS timestamp(0) without time zone),
-              "deleted_at" = CAST("jobs"."deleted_at" AS timestamp(0) without time zone)
+              "created_at" = CAST(("jobs"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone),
+              "updated_at" = CAST(("jobs"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone),
+              "deleted_at" = CAST(("jobs"."deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)
             FROM "jobs"
             LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
             LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true
@@ -205,6 +335,15 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listings_pkey" PRIMARY KEY ("id"),
               ADD CONSTRAINT "listings_uuid_unique" UNIQUE ("uuid")
             SQL,
+            <<<'SQL'
+            ALTER TABLE "listings"
+              ALTER COLUMN "id" SET NOT NULL,
+              ALTER COLUMN "uuid" SET NOT NULL,
+              ALTER COLUMN "title" SET NOT NULL,
+              ALTER COLUMN "company_id" SET NOT NULL,
+              ALTER COLUMN "status" SET NOT NULL
+            SQL,
+            'COMMENT ON TABLE "listings" IS NULL',
             <<<'SQL'
             ALTER TABLE "listing_photos"
               DROP CONSTRAINT "listing_photos_listing_id_foreign",

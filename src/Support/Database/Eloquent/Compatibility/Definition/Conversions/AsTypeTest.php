@@ -28,18 +28,15 @@ final class AsTypeTest extends TestCase
         $this->assertSame('4500.55', (new AsType('numeric(10,2)'))->write('4500.55'));
     }
 
-    /**
-     * @param  null|array{string, mixed}  $filter
-     */
     #[Test]
-    #[TestWith(['=', ['=', '12']])]
-    #[TestWith(['!=', ['!=', '12']])]
-    #[TestWith(['<>', ['<>', '12']])]
-    #[TestWith(['<', null])]
-    #[TestWith(['like', null])]
-    public function it_filters_only_equality_by_the_value_unchanged(string $operator, null|array $filter): void
+    #[TestWith(['='])]
+    #[TestWith(['!='])]
+    #[TestWith(['<'])]
+    #[TestWith(['like'])]
+    public function it_gives_no_stored_value_to_filter_by_because_a_cast_can_change_the_value(string $operator): void
     {
-        $this->assertSame($filter, (new AsType('text'))->filter($operator, '12'));
+        $this->assertNull((new AsType('text'))->filter($operator, '12'));
+        $this->assertFalse((new AsType('text'))->exact('text', 'text'));
     }
 
     #[Test]

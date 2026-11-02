@@ -4,22 +4,24 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\AsType;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\InTimeZone;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
 final readonly class ViewCompiler
 {
-    public function __construct(private ColumnCatalog $columnCatalog) {}
+    public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
     public function create(ResolvedMap $map): string
     {
         $legacy = $this->columnCatalog->of($map->table);
 
-        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $legacy, $legacy);
+        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $legacy, $map->table, $legacy);
     }
 
     public function replace(ResolvedMap $map): string
@@ -27,7 +29,7 @@ final readonly class ViewCompiler
         $shape = $this->columnCatalog->of($map->table);
         $retained = $this->columnCatalog->of(self::retainedTable($map));
 
-        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $shape, $retained);
+        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $shape, self::retainedTable($map), $retained);
     }
 
     /**
@@ -40,24 +42,44 @@ final readonly class ViewCompiler
         $reads = [];
 
         foreach ($map->identifiers as $name => $identifier) {
-            $reads[$name] = SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $identifier->column());
+            $reads[$name] = [SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $identifier->column()), null, false];
         }
 
         foreach ($map->attributes as $name => $attribute) {
             if (! $attribute->isExternal()) {
-                $reads[$name] = $attribute->read($map->owners[$name]->table);
+                $table = $map->owners[$name]->table;
+                $column = $attribute->column();
+                $stored = $column === null ? null : $this->columnCatalog->type($table, $column);
+                $reads[$name] = [$attribute->read($table, $stored), $attribute->type($stored), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
             }
         }
 
         $served = [];
 
         foreach ($shape as $name => $column) {
-            if (array_key_exists($name, $reads)) {
-                $served[$name] = 'CAST('.$reads[$name].' AS '.$column->type.')';
+            if (! array_key_exists($name, $reads)) {
+                continue;
             }
+
+            [$read, $type, $raw] = $reads[$name];
+
+            if ($raw && SqlFragments::isNaive($column->type)) {
+                $type = $this->expressionType($map, $read);
+            }
+
+            $served[$name] = self::cast($read, $type, $column->type);
         }
 
         return $served;
+    }
+
+    public static function cast(string $read, null|string $type, string $served): string
+    {
+        if (SqlFragments::isZoned($type) && SqlFragments::isNaive($served)) {
+            $read = SqlFragments::inApplicationZone($read);
+        }
+
+        return 'CAST('.$read.' AS '.$served.')';
     }
 
     public static function retainedTable(ResolvedMap $map): string
@@ -114,11 +136,12 @@ final readonly class ViewCompiler
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
      */
-    private function select(ResolvedMap $map, array $shape, array $retained): string
+    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
     {
         $served = $this->served($map, $shape);
         $retainedTable = self::retainedTable($map);
         $legacyOnly = $map->legacyOnly(array_keys($shape));
+        $volatile = $this->volatileDefaults($defaultsOn);
         $columns = [];
 
         foreach ($shape as $name => $column) {
@@ -138,7 +161,20 @@ final readonly class ViewCompiler
 
             $read = SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier($name);
             $default = $retained[$name]->default;
-            $columns[] = 'CAST('.($default === null ? $read : 'COALESCE('.$read.', '.$default.')').' AS '.$column->type.') AS '.SqlFragments::identifier($name);
+
+            if ($retained[$name]->needsAValue()) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is NOT NULL and has no default, so the view has no value to serve for a {$map->primary->table} row without a {$retainedTable} row");
+            }
+
+            if ($default !== null && in_array($name, $volatile, true)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} defaults to {$default}, which is not immutable, so the view would serve a new value on each read of a {$map->primary->table} row without a {$retainedTable} row");
+            }
+
+            if ($default !== null) {
+                $read = 'CASE WHEN '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' IS NULL THEN '.$default.' ELSE '.$read.' END';
+            }
+
+            $columns[] = 'CAST('.$read.' AS '.$column->type.') AS '.SqlFragments::identifier($name);
         }
 
         $primary = SqlFragments::identifier($map->primary->table);
@@ -147,6 +183,38 @@ final readonly class ViewCompiler
             ."\nFROM ".self::primary($map)
             ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($map->primary->key)
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
+    }
+
+    private function expressionType(ResolvedMap $map, string $read): null|string
+    {
+        $type = $this->connection->scalar(
+            'SELECT CAST(pg_typeof('.$read.') AS text) FROM (SELECT) AS compatibility_row LEFT JOIN '.SqlFragments::identifier($map->primary->table).' ON false'
+                .implode('', array_map(fn (string $lateral) => ' '.$lateral, self::laterals($map))),
+        );
+
+        return is_string($type) ? $type : null;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function volatileDefaults(string $table): array
+    {
+        $rows = $this->connection->select(
+            "select attribute.attname as name
+             from pg_attrdef column_default
+             join pg_attribute attribute on attribute.attrelid = column_default.adrelid and attribute.attnum = column_default.adnum
+             where column_default.adrelid = to_regclass(quote_ident(current_schema()) || '.' || ?)
+               and (cast(column_default.adbin as text) ~ '\\{(SQLVALUEFUNCTION|NEXTVALUEEXPR) '
+                    or exists (
+                        select from regexp_matches(cast(column_default.adbin as text), ':(funcid|opfuncid) (\\d+)', 'g') as found (ids)
+                        join pg_proc called on called.oid = cast(found.ids[2] as oid)
+                        where called.provolatile <> 'i'
+                    ))",
+            [SqlFragments::identifier($table)],
+        );
+
+        return array_values(array_map(fn (object $row) => (string) $row->name, $rows));
     }
 
     /**
@@ -217,7 +285,7 @@ final readonly class ViewCompiler
     /**
      * @return list<string>
      */
-    private static function hidden(ResolvedMap $map): array
+    public static function hidden(ResolvedMap $map): array
     {
         $conditions = [];
 

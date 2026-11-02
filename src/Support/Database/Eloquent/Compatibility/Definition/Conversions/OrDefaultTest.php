@@ -44,10 +44,12 @@ final class OrDefaultTest extends TestCase
     #[Test]
     #[TestWith(['=', 'Seattle', ['=', 'Seattle']])]
     #[TestWith(['=', 'Unknown', null])]
-    #[TestWith(['!=', 'Seattle', null])]
+    #[TestWith(['!=', 'Seattle', ['is distinct from', 'Seattle']])]
+    #[TestWith(['!=', 'Unknown', ['!=', 'Unknown']])]
     #[TestWith(['<', 'Seattle', null])]
-    #[TestWith(['=', null, null])]
-    public function it_filters_only_equality_with_a_value_other_than_the_default(string $operator, null|string $value, null|array $filter): void
+    #[TestWith(['=', null, ['none', null]])]
+    #[TestWith(['!=', null, ['all', null]])]
+    public function it_filters_equality_with_a_value_other_than_the_default_and_any_inequality(string $operator, null|string $value, null|array $filter): void
     {
         $this->assertSame($filter, (new OrDefault('Unknown'))->filter($operator, $value));
     }

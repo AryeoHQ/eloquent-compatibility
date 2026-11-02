@@ -71,13 +71,24 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_the_query_that_counts_the_legacy_rows_a_hide_rule_hides_at_install(): void
+    {
+        Artisan::call('compatibility:sql', ['model' => Listing::class]);
+
+        $this->assertStringContainsString(
+            '  SELECT count(*) INTO hidden_rows FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND (COALESCE(("merged_into_job_id" is not null), false)));',
+            Artisan::output(),
+        );
+    }
+
+    #[Test]
     public function it_writes_the_statements_to_a_file(): void
     {
         $file = tempnam(sys_get_temp_dir(), 'compatibility');
 
         try {
             $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class, '--for' => 'prepare', '--output' => $file]));
-            $this->assertStringContainsString("Wrote 3 statements to {$file}.", Artisan::output());
+            $this->assertStringContainsString("Wrote 15 statements to {$file}.", Artisan::output());
             $this->assertStringStartsWith('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=prepare:', (string) file_get_contents((string) $file));
         } finally {
             unlink((string) $file);

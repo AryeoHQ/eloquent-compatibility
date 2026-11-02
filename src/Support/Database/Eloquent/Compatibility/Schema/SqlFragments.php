@@ -5,12 +5,83 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use BackedEnum;
+use Illuminate\Support\Facades\Config;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
 final class SqlFragments
 {
     public const int IDENTIFIER_LIMIT = 63;
+
+    private const array INTEGERS = ['smallint', 'integer', 'bigint', 'int', 'int2', 'int4', 'int8'];
+
+    private const array FLOATS = ['double precision', 'real', 'float4', 'float8'];
+
+    public static function isInteger(null|string $type): bool
+    {
+        return in_array($type, self::INTEGERS, true);
+    }
+
+    public static function isFloat(null|string $type): bool
+    {
+        return in_array($type, self::FLOATS, true);
+    }
+
+    public static function isZoned(null|string $type): bool
+    {
+        return $type !== null && preg_match('/^(timestamp(\(\d\))? with time zone|timestamptz(\(\d\))?)$/i', $type) === 1;
+    }
+
+    public static function isNaive(null|string $type): bool
+    {
+        return $type !== null && preg_match('/^(timestamp(\(\d\))?( without time zone)?|date|time(\(\d\))?( without time zone)?)$/i', $type) === 1;
+    }
+
+    public static function inApplicationZone(string $sql): string
+    {
+        return '('.$sql.' AT TIME ZONE '.self::literal(Config::string('app.timezone', 'UTC')).')';
+    }
+
+    public static function isWallClock(null|string $type): bool
+    {
+        return $type !== null && preg_match('/^timestamp(\(\d\))?( without time zone)?$/i', $type) === 1;
+    }
+
+    public static function precision(string $type): int
+    {
+        return preg_match('/\((\d)\)/', $type, $match) === 1 ? (int) $match[1] : 6;
+    }
+
+    public static function scale(null|string $type): null|int
+    {
+        if (self::isInteger($type)) {
+            return 0;
+        }
+
+        return $type !== null && preg_match('/^(numeric|decimal)\(\d+(, ?(\d+))?\)$/i', $type, $match) === 1 ? (int) ($match[3] ?? 0) : null;
+    }
+
+    public static function holds(string $type, int $scale): bool
+    {
+        return in_array(strtolower($type), ['numeric', 'decimal'], true) || (self::scale($type) ?? -1) >= $scale;
+    }
+
+    /**
+     * @return array{string, mixed}
+     */
+    public static function bound(string $operator, mixed $value, null|string $type): array
+    {
+        if (! is_float($value) || ! self::isInteger($type)) {
+            return [$operator, $value];
+        }
+
+        return match ($operator) {
+            '=' => ['none', null],
+            '!=', '<>' => ['!=', null],
+            '>', '>=' => ['>=', (int) ceil($value)],
+            default => ['<=', (int) floor($value)],
+        };
+    }
 
     public static function identifier(string $identifier): string
     {

@@ -251,15 +251,20 @@ final class Attribute
         return $this;
     }
 
-    public function read(string $table): string
+    public function read(string $table, null|string $stored = null): string
     {
         if ($this->external !== null) {
             throw new LogicException("Attribute '{$this->name}' is external, so no SQL reads it.");
         }
 
         $sql = $this->column === null ? 'NULL' : SqlFragments::identifier($table).'.'.SqlFragments::identifier($this->column);
+        $types = $this->types($stored);
 
-        foreach ($this->conversions() as $conversion) {
+        foreach ($this->conversions() as $at => $conversion) {
+            if ($conversion instanceof AsType && SqlFragments::isZoned($types[$at]) && ! SqlFragments::isZoned($conversion->type)) {
+                $sql = SqlFragments::inApplicationZone($sql);
+            }
+
             $sql = $conversion->read($sql);
         }
 
@@ -278,16 +283,21 @@ final class Attribute
     /**
      * @return null|array{string, mixed}
      */
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $stored = null): null|array
     {
         if ($this->external !== null) {
             return null;
         }
 
+        $types = $this->types($stored);
         $filter = [$operator, $value];
 
-        foreach (array_reverse($this->conversions()) as $conversion) {
-            $filter = $conversion->filter($filter[0], $filter[1]);
+        foreach (array_reverse($this->conversions(), true) as $at => $conversion) {
+            $filter = match ($filter[0]) {
+                'none', 'all' => $filter,
+                'in' => self::each($conversion, is_array($filter[1]) ? $filter[1] : [$filter[1]], $types[$at]),
+                default => $conversion->filter($filter[0], $filter[1], $types[$at]),
+            };
 
             if ($filter === null) {
                 return null;
@@ -295,6 +305,29 @@ final class Attribute
         }
 
         return $filter;
+    }
+
+    public function type(null|string $stored): null|string
+    {
+        $types = $this->types($stored);
+
+        return $types[count($types) - 1];
+    }
+
+    public function exact(null|string $stored, string $served): bool
+    {
+        $conversions = $this->conversions();
+        $types = $this->types($stored);
+
+        foreach ($conversions as $at => $conversion) {
+            $output = $at === array_key_last($conversions) ? $served : $types[$at + 1];
+
+            if ($output === null || ! $conversion->exact($types[$at], $output)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public function order(string $direction): null|string
@@ -314,6 +347,43 @@ final class Attribute
         }
 
         return $direction;
+    }
+
+    /**
+     * @return non-empty-list<null|string>
+     */
+    private function types(null|string $stored): array
+    {
+        $types = [$this->column === null ? null : $stored];
+
+        foreach ($this->conversions() as $at => $conversion) {
+            $types[] = $conversion->type($types[$at]);
+        }
+
+        return $types;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return null|array{string, list<mixed>}
+     */
+    private static function each(Conversion $conversion, array $values, null|string $type): null|array
+    {
+        $stored = [];
+
+        foreach ($values as $value) {
+            $filter = $conversion->filter('=', $value, $type);
+
+            if ($filter === null || ! in_array($filter[0], ['=', 'none'], true)) {
+                return null;
+            }
+
+            if ($filter[0] === '=') {
+                $stored[] = $filter[1];
+            }
+        }
+
+        return ['in', $stored];
     }
 
     private function convert(Conversion $conversion): self

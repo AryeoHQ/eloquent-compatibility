@@ -32,15 +32,15 @@ final class ViewCompilerTest extends TestCase
           CAST("jobs"."name" AS character varying(255)) AS "title",
           CAST("jobs"."company_id" AS uuid) AS "company_id",
           CAST((CAST("jobs"."price_cents" AS numeric) / 100) AS numeric(10,2)) AS "price",
-          CAST((CASE "jobs"."lifecycle_status" WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)) AS "status",
+          CAST((CASE CAST("jobs"."lifecycle_status" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)) AS "status",
           CAST("places"."street" AS character varying(255)) AS "street",
           CAST("places"."city" AS character varying(255)) AS "city",
           CAST("job_sites"."latitude" AS double precision) AS "latitude",
           CAST("listings_retained"."mls_number" AS character varying(255)) AS "mls_number",
-          CAST(COALESCE("listings_retained"."featured", false) AS boolean) AS "featured",
-          CAST("jobs"."created_at" AS timestamp(0) without time zone) AS "created_at",
-          CAST("jobs"."updated_at" AS timestamp(0) without time zone) AS "updated_at",
-          CAST("jobs"."deleted_at" AS timestamp(0) without time zone) AS "deleted_at"
+          CAST(CASE WHEN "listings_retained"."job_id" IS NULL THEN false ELSE "listings_retained"."featured" END AS boolean) AS "featured",
+          CAST(("jobs"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "created_at",
+          CAST(("jobs"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "updated_at",
+          CAST(("jobs"."deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "deleted_at"
         FROM (SELECT * FROM "jobs" WHERE NOT COALESCE(("merged_into_job_id" is not null), false)) AS "jobs"
         LEFT JOIN "listings_retained" ON "listings_retained"."job_id" = "jobs"."id"
         LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
@@ -88,7 +88,7 @@ final class ViewCompilerTest extends TestCase
         Compatibility::install(Listing::class);
         $map = $this->listings(fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))));
 
-        $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', 'listings_retained has no column uuid, which listings keeps as a legacy-only column'));
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', 'listings_retained has no column company_id, which listings keeps as a legacy-only column'));
 
         $this->viewCompiler()->replace($map);
     }
@@ -100,6 +100,7 @@ final class ViewCompilerTest extends TestCase
         $map = $this->listings(fn (Compatibility $listing) => $listing
             ->servedFrom(Job::class, fn (Successor $job) => $job
                 ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
                 ->related(fn (Job $job) => $job->hasOne(Place::class)->where('city', "Coeur d'Alene")->whereIn('street', ['1 Oak St', '2 Oak St']), fn (Successor $place) => $place
                     ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))))
             ->hide(fn (Builder $jobs) => $jobs->where('price_cents', '>', 1000000)->orWhere('name', 'like', '%?%'), because: 'Too dear.'));
@@ -121,10 +122,11 @@ final class ViewCompilerTest extends TestCase
 
         $view = $this->viewCompiler()->create($this->listings(fn (Compatibility $listing) => $listing
             ->servedFrom(Job::class, fn (Successor $job) => $job
-                ->attribute('title', fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $title) => $title)))));
+                ->attribute('title', fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $title) => $title))
+                ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')))));
 
         $this->assertStringNotContainsString('"title"', $view);
-        $this->assertStringContainsString('CAST(COALESCE("listings_retained"."uuid", gen_random_uuid()) AS uuid) AS "uuid"', $view);
+        $this->assertStringContainsString('CAST(CASE WHEN "listings_retained"."job_id" IS NULL THEN false ELSE "listings_retained"."featured" END AS boolean) AS "featured"', $view);
     }
 
     #[Test]
@@ -134,6 +136,8 @@ final class ViewCompilerTest extends TestCase
 
         $view = $this->viewCompiler()->create($this->listings(fn (Compatibility $listing) => $listing
             ->servedFrom(Job::class, fn (Successor $job) => $job
+                ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
                 ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/Los_Angeles')))));
 
         $this->assertStringContainsString('CAST(("jobs"."created_at" AT TIME ZONE \'America/Los_Angeles\') AS timestamp(0) without time zone) AS "created_at"', $view);
@@ -146,6 +150,9 @@ final class ViewCompilerTest extends TestCase
     {
         $prepare = fn () => Compatibility::prepare(Listing::class);
         $title = fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+        $required = fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job
+            ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+            ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
 
         yield 'no retained table' => [$prepare, fn (Compatibility $listing) => (new Compatibility(Listing::class))->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))->servedFrom(Job::class, fn (Successor $job) => $job), 'it declares no retainedIn(), and install() keeps the legacy table as the retained table'];
         yield 'no prepared identifier' => [fn () => null, $title, 'jobs has no column legacy_id, and Compatibility::prepare() adds it before install()'];
@@ -168,6 +175,24 @@ final class ViewCompilerTest extends TestCase
             $prepare,
             fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->orDefault('2026-01-01')->inTimeZone('America/Los_Angeles'))),
             "attribute 'created_at' reads jobs.created_at in the time zone America/Los_Angeles, and AT TIME ZONE reads a wall clock only from a timestamp with time zone, not from the type the conversions before inTimeZone() give",
+        ];
+
+        yield 'a legacy-only column that needs a value' => [
+            function () use ($prepare): void {
+                $prepare();
+                DB::statement("alter table listings add column source text not null default 'import'");
+                DB::statement('alter table listings alter column source drop default');
+            },
+            $required,
+            'listings.source is NOT NULL and has no default, so the view has no value to serve for a jobs row without a listings_retained row',
+        ];
+        yield 'a legacy-only column whose default is not immutable' => [
+            function () use ($prepare): void {
+                $prepare();
+                DB::statement('alter table listings add column listed_at timestamp default now()');
+            },
+            $required,
+            'listings.listed_at defaults to now(), which is not immutable, so the view would serve a new value on each read of a jobs row without a listings_retained row',
         ];
     }
 
@@ -194,12 +219,13 @@ final class ViewCompilerTest extends TestCase
     {
         return $declare((new Compatibility(Listing::class))
             ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
             ->retainedIn('listings_retained', key: 'job_id'))
             ->resolve();
     }
 
     private function viewCompiler(): ViewCompiler
     {
-        return new ViewCompiler(new ColumnCatalog(DB::connection()));
+        return new ViewCompiler(new ColumnCatalog(DB::connection()), DB::connection());
     }
 }

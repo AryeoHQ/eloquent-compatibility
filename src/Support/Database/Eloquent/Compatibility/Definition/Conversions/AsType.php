@@ -18,13 +18,23 @@ final readonly class AsType implements Conversion
         return $value;
     }
 
-    public function filter(string $operator, mixed $value): null|array
+    public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
-        return in_array($operator, ['=', '!=', '<>'], true) ? [$operator, $value] : null;
+        return null;
     }
 
     public function order(string $direction): null|string
     {
         return null;
+    }
+
+    public function type(null|string $type): string
+    {
+        return $this->type;
+    }
+
+    public function exact(null|string $type, string $served): bool
+    {
+        return false;
     }
 }

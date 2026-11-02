@@ -41,7 +41,7 @@ final class ResolvedMapTest extends TestCase
             'title' => '"jobs"."name"',
             'company_id' => '"jobs"."company_id"',
             'price' => '(CAST("jobs"."price_cents" AS numeric) / 100)',
-            'status' => "(CASE \"jobs\".\"lifecycle_status\" WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END)",
+            'status' => "(CASE CAST(\"jobs\".\"lifecycle_status\" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END)",
             'street' => '"places"."street"',
             'city' => '"places"."city"',
             'latitude' => '"job_sites"."latitude"',

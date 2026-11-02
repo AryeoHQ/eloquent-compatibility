@@ -4,12 +4,20 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
+use Pdo\Pgsql;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
@@ -152,20 +160,215 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_restores_a_listing_for_every_visible_job_created_while_installed(): void
+    public function it_restores_a_listing_for_every_job_created_while_installed_whether_the_view_hides_it_or_not(): void
     {
         Compatibility::install(Listing::class);
         DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY, 'lifecycle_status' => 'closed']);
         DB::table('jobs')->insert(['name' => 'Merged Mill', 'company_id' => ListingTables::COMPANY, 'merged_into_job_id' => DB::scalar('select id from jobs where legacy_id = 1')]);
+        DB::table('listing_photos')->insert(['listing_id' => DB::scalar("select legacy_id from jobs where name = 'Merged Mill'"), 'path' => 'mill/front.jpg']);
         $served = DB::select('select * from listings order by id');
 
         Compatibility::uninstall(Listing::class);
 
         $this->assertSame(['Oak House', 'Pine Flat', 'Elm Cottage', 'Birch Barn'], array_column($served, 'title'));
         $this->assertSame(
-            [[4, 'Birch Barn', 'Sold', false]],
+            [[4, 'Birch Barn', 'Sold', false], [5, 'Merged Mill', 'Draft', false]],
             array_map(fn (object $row) => array_values((array) $row), DB::select('select id, title, status, featured from listings where id > 3 order by id')),
         );
+        $this->assertTrue(DB::scalar("select convalidated from pg_constraint where conname = 'listing_photos_listing_id_foreign'"));
+    }
+
+    #[Test]
+    public function it_grants_the_view_every_privilege_the_legacy_table_granted(): void
+    {
+        $role = 'compatibility_reader_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant select on listings to {$role}");
+            DB::statement("grant update on listings to {$role} with grant option");
+
+            Compatibility::install(Listing::class);
+
+            $this->assertSame(
+                [['SELECT', 'NO'], ['UPDATE', 'YES']],
+                array_map(fn (object $row) => [$row->privilege_type, $row->is_grantable], DB::select("select privilege_type, is_grantable from information_schema.role_table_grants where table_name = 'listings' and grantee = ? order by privilege_type", [$role])),
+            );
+            DB::statement("set role {$role}");
+            $this->assertSame(3, DB::scalar('select count(*) from listings'));
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
+    public function it_grants_each_view_column_every_privilege_the_legacy_column_granted(): void
+    {
+        $role = 'compatibility_column_reader_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant select (id, title, mls_number) on listings to {$role}");
+
+            Compatibility::install(Listing::class);
+
+            $this->assertSame(
+                ['id', 'mls_number', 'title'],
+                array_column(DB::select("select column_name from information_schema.column_privileges where table_name = 'listings' and grantee = ? and privilege_type = 'SELECT' order by column_name", [$role]), 'column_name'),
+            );
+            DB::statement("set role {$role}");
+            $this->assertSame(3, DB::scalar('select count(*) from (select id, title, mls_number from listings) as granted'));
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
+    public function it_serves_and_restores_a_legacy_timestamp_whatever_the_session_time_zone(): void
+    {
+        $createdAt = fn (string $zone) => DB::transaction(function () use ($zone): mixed {
+            DB::statement("set local time zone '{$zone}'");
+
+            return DB::scalar('select cast(created_at as text) from listings where id = 1');
+        });
+
+        Compatibility::install(Listing::class);
+        $served = [$createdAt('UTC'), $createdAt('America/Denver')];
+        DB::statement("set time zone 'America/Denver'");
+
+        try {
+            Compatibility::uninstall(Listing::class);
+        } finally {
+            DB::statement("set time zone 'UTC'");
+        }
+
+        $this->assertSame(['2026-01-01 10:00:00', '2026-01-01 10:00:00', '2026-01-01 10:00:00'], [...$served, $createdAt('UTC')]);
+    }
+
+    #[Test]
+    public function it_installs_and_uninstalls_over_a_foreign_key_from_the_legacy_table_to_itself(): void
+    {
+        DB::statement('alter table listings add column parent_listing_id integer references listings (id)');
+        DB::update('update listings set parent_listing_id = 1 where id = 3');
+        $foreignKey = fn () => (array) DB::selectOne("select conrelid::regclass::text as on_table, pg_get_constraintdef(oid) as definition, convalidated from pg_constraint where conname = 'listings_parent_listing_id_fkey'");
+
+        Compatibility::install(Listing::class);
+        $installed = $foreignKey();
+        Compatibility::uninstall(Listing::class);
+
+        $this->assertSame(['on_table' => 'listings_retained', 'definition' => 'FOREIGN KEY (parent_listing_id) REFERENCES jobs(legacy_id)', 'convalidated' => true], $installed);
+        $this->assertSame(['on_table' => 'listings', 'definition' => 'FOREIGN KEY (parent_listing_id) REFERENCES listings(id)', 'convalidated' => true], $foreignKey());
+    }
+
+    #[Test]
+    public function it_validates_on_recompile_each_foreign_key_install_left_not_valid(): void
+    {
+        Compatibility::install(Listing::class);
+        DB::update("update pg_constraint set convalidated = false where conname in ('listing_photos_listing_id_foreign', 'listings_retained_job_id_foreign')");
+
+        Compatibility::recompile(Listing::class);
+
+        $this->assertSame(
+            ['listing_photos_listing_id_foreign' => true, 'listings_retained_job_id_foreign' => true],
+            array_column(DB::select("select conname, convalidated from pg_constraint where conname in ('listing_photos_listing_id_foreign', 'listings_retained_job_id_foreign') order by conname"), 'convalidated', 'conname'),
+        );
+    }
+
+    #[Test]
+    public function it_restores_the_not_null_flags_indexes_checks_outbound_foreign_keys_and_comment_install_dropped(): void
+    {
+        DB::statement('create table companies (id uuid primary key)');
+
+        try {
+            DB::insert('insert into companies (id) values (?)', [ListingTables::COMPANY]);
+            DB::statement('alter table listings add constraint listings_company_id_foreign foreign key (company_id) references companies (id)');
+            DB::statement('alter table listings add constraint listings_price_check check (price >= 0)');
+            DB::statement('create index listings_status_index on listings (status)');
+            DB::statement('create index listings_lower_title_index on listings (lower(title)) where deleted_at is null');
+            DB::statement("comment on table listings is 'Every listing an agent published.'");
+            $before = $this->shape();
+
+            Compatibility::install(Listing::class);
+            Compatibility::uninstall(Listing::class);
+
+            $this->assertSame($before, $this->shape());
+            $this->assertSame(['company_id', 'featured', 'id', 'status', 'title', 'uuid'], $before['not null']);
+            $this->assertSame(['listings_company_id_foreign', 'listings_pkey', 'listings_price_check', 'listings_uuid_unique'], array_keys($before['constraints']));
+            $this->assertSame(['listings_lower_title_index', 'listings_pkey', 'listings_status_index', 'listings_uuid_unique'], array_keys($before['indexes']));
+        } finally {
+            DB::statement('drop table if exists companies cascade');
+        }
+    }
+
+    #[Test]
+    public function it_restores_a_generated_column_install_dropped(): void
+    {
+        DB::statement('alter table listings add column title_upper text generated always as (upper(title)) stored');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
+                        ->attribute('title_upper', fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.')));
+            }
+        };
+
+        Compatibility::install($model::class);
+        $served = DB::scalar('select title_upper from listings where id = 1');
+        Compatibility::uninstall($model::class);
+
+        $this->assertSame('OAK HOUSE', $served);
+        $this->assertEquals(
+            (object) ['title_upper' => 'OAK HOUSE', 'generated' => 's', 'expression' => 'upper((title)::text)'],
+            DB::selectOne("select title_upper, (select attgenerated::text from pg_attribute where attrelid = 'listings'::regclass and attname = 'title_upper') as generated, (select pg_get_expr(adbin, adrelid) from pg_attrdef join pg_attribute on attrelid = adrelid and attnum = adnum where adrelid = 'listings'::regclass and attname = 'title_upper') as expression from listings where id = 1"),
+        );
+    }
+
+    #[Test]
+    public function it_serves_a_null_a_retained_row_stores_and_the_default_only_for_a_job_without_a_retained_row(): void
+    {
+        DB::statement("alter table listings add column source text default 'import'");
+        DB::update('update listings set source = null where id = 3');
+
+        Compatibility::install(Listing::class);
+        DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([1 => 'import', 2 => 'import', 3 => null, 4 => 'import'], array_column(DB::select('select id, source from listings order by id'), 'source', 'id'));
+    }
+
+    #[Test]
+    public function it_reports_how_many_legacy_rows_a_hide_rule_hides_at_install(): void
+    {
+        DB::update('update jobs set merged_into_job_id = (select id from jobs where legacy_id = 3) where legacy_id = 1');
+        $notices = [];
+        $pdo = DB::connection()->getPdo();
+        $this->assertInstanceOf(Pgsql::class, $pdo);
+        $pdo->setNoticeCallback(function (string $notice) use (&$notices): void {
+            $notices[] = $notice;
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+        } finally {
+            $pdo->setNoticeCallback(null);
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' install hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1.", implode("\n", $notices));
+        $this->assertSame([2, 3], array_map(intval(...), array_column(DB::select('select id from listings order by id'), 'id')));
     }
 
     #[Test]
@@ -225,6 +428,19 @@ final class InstallerTest extends TestCase
 
         $this->assertSame($before, $this->listings());
         $this->assertSame(1, DB::scalar("select count(*) from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC'"));
+    }
+
+    /**
+     * @return array{'not null': list<string>, constraints: array<string, array{string, bool}>, indexes: array<string, string>, comment: mixed}
+     */
+    private function shape(): array
+    {
+        return [
+            'not null' => array_column(DB::select("select attname from pg_attribute where attrelid = 'listings'::regclass and attnum > 0 and not attisdropped and attnotnull order by attname"), 'attname'),
+            'constraints' => array_map(fn (object $row) => [$row->definition, $row->convalidated], array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition, convalidated from pg_constraint where conrelid = 'listings'::regclass and contype <> 'n' order by conname"), null, 'conname')),
+            'indexes' => array_column(DB::select("select indexname, indexdef from pg_indexes where tablename = 'listings' order by indexname"), 'indexdef', 'indexname'),
+            'comment' => DB::scalar("select obj_description('listings'::regclass, 'pg_class')"),
+        ];
     }
 
     /**

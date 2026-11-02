@@ -91,9 +91,58 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_prepares_again_once_the_duplicates_it_refused_are_gone(): void
+    {
+        $job = DB::table('jobs')->insertGetId(['name' => 'Oak House', 'company_id' => ListingTables::COMPANY]);
+        DB::table('places')->insert([['job_id' => $job, 'street' => '1 Oak St'], ['job_id' => $job, 'street' => '1 Oak St, rear']]);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException) {
+            $this->assertSame([], DB::select("select attname from pg_attribute where attrelid = 'jobs'::regclass and attname like 'legacy%'"));
+        }
+
+        DB::table('places')->where('street', '1 Oak St, rear')->delete();
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(['places_listings_at_most_one' => true], array_column(DB::select("select indexrelid::regclass::text as name, indisvalid from pg_index where indexrelid = 'places_listings_at_most_one'::regclass"), 'indisvalid', 'name'));
+        $this->assertEquals((object) ['legacy_id' => 4, 'has_uuid' => true], DB::selectOne('select legacy_id, legacy_uuid is not null as has_uuid from jobs where id = ?', [$job]));
+    }
+
+    #[Test]
+    public function it_prepares_again_over_the_invalid_index_a_failed_concurrent_build_leaves(): void
+    {
+        Compatibility::prepare(Listing::class);
+        DB::statement('alter table jobs drop constraint jobs_legacy_uuid_unique');
+        DB::statement('create unique index jobs_legacy_uuid_unique on jobs (legacy_uuid)');
+        DB::update("update pg_index set indisvalid = false where indexrelid in ('places_listings_at_most_one'::regclass, 'jobs_legacy_uuid_unique'::regclass)");
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(
+            ['jobs_legacy_uuid_unique' => true, 'places_listings_at_most_one' => true],
+            array_column(DB::select("select indexrelid::regclass::text as name, indisvalid from pg_index where indexrelid in ('places_listings_at_most_one'::regclass, 'jobs_legacy_uuid_unique'::regclass) order by 1"), 'indisvalid', 'name'),
+        );
+        $this->assertSame(['jobs_legacy_id_unique' => 'UNIQUE (legacy_id)', 'jobs_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'], array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'jobs'::regclass and contype = 'u' order by conname"), 'definition', 'conname'));
+    }
+
+    #[Test]
+    public function it_adds_the_identifier_columns_without_rewriting_the_successor_table(): void
+    {
+        DB::table('jobs')->insert([['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Cabin', 'company_id' => ListingTables::COMPANY]]);
+        $file = DB::scalar("select pg_relation_filenode('jobs')");
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame($file, DB::scalar("select pg_relation_filenode('jobs')"));
+        $this->assertEquals([(object) ['legacy_id' => 4, 'has_uuid' => true], (object) ['legacy_id' => 5, 'has_uuid' => true]], DB::select('select legacy_id, legacy_uuid is not null as has_uuid from jobs order by legacy_id'));
+    }
+
+    #[Test]
     public function it_refuses_to_create_an_index_concurrently_inside_a_transaction(): void
     {
-        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 2 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
+        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 12 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
 
         DB::transaction(fn () => Compatibility::prepare(Listing::class));
     }

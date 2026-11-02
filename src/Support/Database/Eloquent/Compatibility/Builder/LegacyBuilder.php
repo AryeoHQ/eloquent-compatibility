@@ -11,11 +11,13 @@ use Illuminate\Contracts\Support\Arrayable;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
@@ -26,17 +28,23 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
  */
 final class LegacyBuilder extends Builder
 {
+    private const array COMPLEMENTS = ['=' => '!=', '!=' => '=', '<>' => '=', '<' => '>=', '>' => '<=', '<=' => '>', '>=' => '<'];
+
     /** @var array<string, ResolvedMap> */
     private static array $maps = [];
 
     /** @var array<string, bool> */
     private static array $views = [];
 
+    /** @var array<string, ColumnCatalog> */
+    private static array $catalogs = [];
+
     private int $negations = 0;
 
     public static function forgetViews(): void
     {
         self::$views = [];
+        self::$catalogs = [];
     }
 
     /**
@@ -66,7 +74,7 @@ final class LegacyBuilder extends Builder
         if (is_array($column) && $this->touchesConversions($column)) {
             $this->where(function (self $query) use ($column, $boolean): void {
                 foreach ($column as $key => $item) {
-                    is_int($key) && is_array($item) ? $query->where(...array_values($item)) : $query->where((string) $key, '=', $item, $boolean);
+                    is_int($key) && is_array($item) ? $query->where(...array_values($item), boolean: $boolean) : $query->where((string) $key, '=', $item, $boolean);
                 }
             }, null, null, $boolean);
 
@@ -88,9 +96,8 @@ final class LegacyBuilder extends Builder
         }
 
         $operator = strtolower($operator);
-        $filter = $this->filter($attribute, $operator, $value, "where {$operator}");
 
-        return $this->translate($attribute, self::negates($boolean), $boolean, fn (QueryBuilder $stored, string $column) => $stored->where($column, ...$filter));
+        return $this->translate($attribute, self::negates($boolean), $boolean, "where {$operator}", [[$operator, $value]], 'and');
     }
 
     /**
@@ -117,19 +124,7 @@ final class LegacyBuilder extends Builder
             throw $this->refuse($attribute, $operation, 'a subquery does not pass through its conversions.');
         }
 
-        $filters = array_map(fn (mixed $value) => $this->filter($attribute, '=', $value, $operation), array_values($values));
-
-        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, function (QueryBuilder $stored, string $column) use ($filters): void {
-            if (array_unique(array_column($filters, 0)) === ['=']) {
-                $stored->whereIn($column, array_column($filters, 1));
-
-                return;
-            }
-
-            foreach ($filters as $filter) {
-                $stored->orWhere($column, ...$filter);
-            }
-        });
+        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, array_map(fn (mixed $value) => ['=', $value], array_values($values)), 'or');
     }
 
     /**
@@ -187,10 +182,8 @@ final class LegacyBuilder extends Builder
         }
 
         [$low, $high] = array_pad(array_slice(Arr::flatten($values), 0, 2), 2, null);
-        $low = $this->filter($attribute, '>=', $low, $operation);
-        $high = $this->filter($attribute, '<=', $high, $operation);
 
-        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, fn (QueryBuilder $stored, string $column) => $stored->where($column, ...$low)->where($column, ...$high));
+        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, [['>=', $low], ['<=', $high]], 'and');
     }
 
     /**
@@ -241,8 +234,7 @@ final class LegacyBuilder extends Builder
                 continue;
             }
 
-            $filter = $this->filter($attribute, $not ? '!=' : '=', null, $not ? 'whereNotNull' : 'whereNull');
-            $this->translate($attribute, self::negates($boolean), $boolean, fn (QueryBuilder $stored, string $column) => $stored->where($column, ...$filter));
+            $this->translate($attribute, self::negates($boolean), $boolean, $not ? 'whereNotNull' : 'whereNull', [[$not ? '!=' : '=', null]], 'and');
         }
 
         return $this;
@@ -391,15 +383,38 @@ final class LegacyBuilder extends Builder
     }
 
     /**
-     * @param  Closure(QueryBuilder, string): mixed  $predicate
+     * @param  list<array{string, mixed}>  $conditions
      * @return $this
      */
-    private function translate(string $attribute, bool $not, string $boolean, Closure $predicate): self
+    private function translate(string $attribute, bool $not, string $boolean, string $operation, array $conditions, string $combine): self
     {
         $map = $this->map();
+        $definition = $this->definition($attribute);
+
+        if ($definition->isExternal()) {
+            throw $this->refuse($attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+        }
+
+        foreach ($conditions as [, $value]) {
+            if ($value instanceof Expression || $value instanceof Closure || $value instanceof Builder || $value instanceof QueryBuilder) {
+                throw $this->refuse($attribute, $operation, 'a raw expression or a subquery does not pass through its conversions.');
+            }
+        }
+
         $owner = $map->owners[$attribute]->table;
         $key = $this->model->getKeyName();
         $negated = $this->negations % 2 === 1;
+        $negate = $not !== $negated;
+        [$type, $served] = $this->served($attribute, $owner);
+
+        if ($served === null) {
+            [$filters, $combine, $negate] = $this->stored($attribute, $operation, $conditions, $combine, $negate, $type);
+            $column = $owner.'.'.$definition->column();
+        } else {
+            $filters = $conditions;
+            $column = new RawExpression($served);
+        }
+
         $stored = $this->query->newQuery()->select($map->primary->table.'.'.$map->identifiers[$key]->column());
 
         if ($owner === $map->primary->table) {
@@ -408,28 +423,92 @@ final class LegacyBuilder extends Builder
             $stored->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
         }
 
-        $stored->where(fn (QueryBuilder $query) => $predicate($query, $owner.'.'.$this->definition($attribute)->column()), null, null, $not === $negated ? 'and' : 'and not');
+        $stored->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
         $this->query->whereIn($this->model->qualifyColumn($key), $stored, str_replace(' not', '', $boolean), $negated);
 
         return $this;
     }
 
     /**
-     * @return array{string, mixed}
+     * @param  list<array{string, mixed}>  $conditions
+     * @return array{list<array{string, mixed}>, string, bool}
      */
-    private function filter(string $attribute, string $operator, mixed $value, string $operation): array
+    private function stored(string $attribute, string $operation, array $conditions, string $combine, bool $negate, null|string $type): array
     {
+        if ($negate) {
+            $complements = $this->filters($attribute, $operation, array_map(fn (array $condition) => [self::COMPLEMENTS[$condition[0]] ?? '', $condition[1]], $conditions), $type, false);
+
+            if ($complements !== null) {
+                return [$complements, $combine === 'and' ? 'or' : 'and', false];
+            }
+        }
+
+        return [(array) $this->filters($attribute, $operation, $conditions, $type, true), $combine, $negate];
+    }
+
+    /**
+     * @param  list<array{string, mixed}>  $conditions
+     * @return null|list<array{string, mixed}>
+     */
+    private function filters(string $attribute, string $operation, array $conditions, null|string $type, bool $refuse): null|array
+    {
+        $filters = [];
+
+        foreach ($conditions as [$operator, $value]) {
+            $filter = $operator === '' ? null : $this->definition($attribute)->filter($operator, $value, $type);
+
+            if ($filter === null && $refuse) {
+                throw $this->refuse($attribute, $operation, 'its conversions give no stored value to compare with '.var_export($value instanceof BackedEnum ? $value->value : $value, true).'.');
+            }
+
+            if ($filter === null) {
+                return null;
+            }
+
+            $filters[] = $filter;
+        }
+
+        return $filters;
+    }
+
+    /**
+     * @param  list<array{string, mixed}>  $filters
+     */
+    private static function apply(QueryBuilder $query, Expression|string $column, array $filters, string $combine): void
+    {
+        if ($combine === 'or' && count($filters) > 1 && array_unique(array_column($filters, 0)) === ['=']) {
+            $query->whereIn($column, array_column($filters, 1));
+
+            return;
+        }
+
+        foreach ($filters as [$operator, $value]) {
+            match ($operator) {
+                'none' => $query->whereRaw('false', [], $combine),
+                'all' => $query->whereRaw('true', [], $combine),
+                'in' => $query->whereIn($column, is_array($value) ? $value : [$value], $combine),
+                default => $query->where($column, $operator, $value, $combine),
+            };
+        }
+    }
+
+    /**
+     * @return array{null|string, null|string}
+     */
+    private function served(string $attribute, string $owner): array
+    {
+        $connection = $this->model->getConnection();
+        $catalog = self::$catalogs[$connection->getName()] ??= new ColumnCatalog($connection);
         $definition = $this->definition($attribute);
+        $column = $definition->column();
+        $type = $column === null ? null : $catalog->type($owner, $column);
+        $served = $catalog->type($this->map()->table, $attribute);
 
-        if ($definition->isExternal()) {
-            throw $this->refuse($attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+        if ($served === null || $definition->exact($type, $served)) {
+            return [$type, null];
         }
 
-        if ($value instanceof Expression || $value instanceof Closure || $value instanceof Builder || $value instanceof QueryBuilder) {
-            throw $this->refuse($attribute, $operation, 'a raw expression or a subquery does not pass through its conversions.');
-        }
-
-        return $definition->filter($operator, $value) ?? throw $this->refuse($attribute, $operation, 'its conversions give no stored value to compare with '.var_export($value instanceof BackedEnum ? $value->value : $value, true).'.');
+        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served)];
     }
 
     /**
