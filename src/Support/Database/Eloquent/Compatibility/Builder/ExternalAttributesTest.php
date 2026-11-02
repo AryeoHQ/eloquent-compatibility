@@ -277,6 +277,72 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_read_of_the_attribute_through_a_table_alias_and_runs_one_of_a_stored_column(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->toBase()->from('photos as p')->select('p.mime_type')->get(),
+            fn () => Photo::query()->toBase()->from('photos as p')->select('id')->where('mime_type', 'image/jpeg')->get(),
+            fn () => Photo::query()->toBase()->from('photos AS p')->orderBy('p.mime_type')->get(),
+            fn () => Photo::query()->from('photos as p')->select('p.mime_type')->get(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->from('photos as p')->select('p.file_name')->where('p.id', 1)->orderBy('file_name')->get(),
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : 'ran';
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $because = 'Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            Photo::class.'::$mime_type cannot take select. '.$because,
+            Photo::class.'::$mime_type cannot take where. '.$because,
+            Photo::class.'::$mime_type cannot take orderBy asc. '.$because,
+            Photo::class.'::$mime_type cannot take select. '.$because,
+            1,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
+    public function it_refuses_a_sort_of_a_union_by_the_attribute_and_runs_one_by_a_stored_column(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->toBase()->unionAll(Photo::query()->toBase())->orderBy('mime_type')->get(),
+            fn () => Photo::query()->toBase()->union(Photo::query()->toBase())->orderByDesc('mime_type')->get(),
+            fn () => Photo::query()->unionAll(Photo::query()->toBase())->orderBy('mime_type')->get(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->unionAll(Photo::query()->toBase())->orderBy('file_name')->get(),
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : 'ran';
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $because = 'Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            Photo::class.'::$mime_type cannot take orderBy asc. '.$because,
+            Photo::class.'::$mime_type cannot take orderBy desc. '.$because,
+            Photo::class.'::$mime_type cannot take orderBy asc. '.$because,
+            6,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
     public function it_reads_the_legacy_column_and_calls_nothing_before_install(): void
     {
         FileTables::create();

@@ -71,6 +71,7 @@ final readonly class RecordWriter
             (new RetainedRows($this->map, $this->connection))->upsert($this->map->branch ? $key : self::keyOf($primary), $retained);
             $this->readBack($legacy, $key, array_keys($values));
             $this->readBackExternal($legacy, $key, array_keys($external));
+            ExternalAttributes::refreshed($legacy, $key);
 
             return $key;
         });
@@ -200,12 +201,12 @@ final readonly class RecordWriter
 
         $this->through($target)->split($legacy, $values, $key);
         $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
-        $moved = $this->rekey($legacy, null, $key, $values);
+        $this->rekey($legacy, null, $key, $values);
         $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
-        $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
-        $this->readBackExternal($legacy, $moved, [...array_keys($legacy->getAttributes()), ...array_keys($values)]);
-        ExternalAttributes::refreshed($legacy, $moved);
+        $this->readBack($legacy, $stored, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
+        $this->readBackExternal($legacy, $stored, [...array_keys($legacy->getAttributes()), ...array_keys($values)]);
+        ExternalAttributes::refreshed($legacy, $stored);
 
         return 1;
     }
