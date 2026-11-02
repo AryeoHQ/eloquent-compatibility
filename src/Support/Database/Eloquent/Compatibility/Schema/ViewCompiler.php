@@ -1,0 +1,259 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Schema;
+
+use Illuminate\Support\Str;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\AsType;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\InTimeZone;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+
+final readonly class ViewCompiler
+{
+    public function __construct(private ColumnCatalog $columnCatalog) {}
+
+    public function create(ResolvedMap $map): string
+    {
+        $legacy = $this->columnCatalog->of($map->table);
+
+        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $legacy, $legacy);
+    }
+
+    public function replace(ResolvedMap $map): string
+    {
+        $shape = $this->columnCatalog->of($map->table);
+        $retained = $this->columnCatalog->of(self::retainedTable($map));
+
+        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $shape, $retained);
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @return array<string, string>
+     */
+    public function served(ResolvedMap $map, array $shape): array
+    {
+        $this->check($map, $shape);
+        $reads = [];
+
+        foreach ($map->identifiers as $name => $identifier) {
+            $reads[$name] = SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $identifier->column());
+        }
+
+        foreach ($map->attributes as $name => $attribute) {
+            if (! $attribute->isExternal()) {
+                $reads[$name] = $attribute->read($map->owners[$name]->table);
+            }
+        }
+
+        $served = [];
+
+        foreach ($shape as $name => $column) {
+            if (array_key_exists($name, $reads)) {
+                $served[$name] = 'CAST('.$reads[$name].' AS '.$column->type.')';
+            }
+        }
+
+        return $served;
+    }
+
+    public static function retainedTable(ResolvedMap $map): string
+    {
+        return $map->retainedTable ?? throw InvalidCompatibilityMap::because($map->table, 'it declares no retainedIn(), and install() keeps the legacy table as the retained table');
+    }
+
+    public static function primary(ResolvedMap $map): string
+    {
+        $table = SqlFragments::identifier($map->primary->table);
+        $hidden = array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map));
+
+        return $hidden === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $hidden).') AS '.$table;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function laterals(ResolvedMap $map, null|string $owner = null): array
+    {
+        $path = $owner === null ? null : self::path($map, $owner);
+        $laterals = [];
+
+        foreach ($map->related as $related) {
+            if ($path === null || in_array($related->table, $path, true)) {
+                $laterals[] = 'LEFT JOIN LATERAL (SELECT * FROM '.SqlFragments::identifier($related->table).' WHERE '.implode(' AND ', self::conditions($related, true))
+                    .($related->orders === null ? '' : ' ORDER BY '.$related->orders).' LIMIT 1) AS '.SqlFragments::identifier($related->table).' ON true';
+            }
+        }
+
+        return $laterals;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function conditions(Related $related, bool $joined): array
+    {
+        $table = SqlFragments::identifier($related->table);
+        $conditions = $joined ? [$table.'.'.SqlFragments::identifier($related->relatedKey).' = '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey)] : [];
+
+        if ($related->conditions !== null) {
+            $conditions[] = '('.SqlFragments::bind($related->conditions, $related->bindings).')';
+        }
+
+        if ($related->deletedAt !== null) {
+            $conditions[] = $table.'.'.SqlFragments::identifier($related->deletedAt).' IS NULL';
+        }
+
+        return $conditions;
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @param  array<string, Column>  $retained
+     */
+    private function select(ResolvedMap $map, array $shape, array $retained): string
+    {
+        $served = $this->served($map, $shape);
+        $retainedTable = self::retainedTable($map);
+        $legacyOnly = $map->legacyOnly(array_keys($shape));
+        $columns = [];
+
+        foreach ($shape as $name => $column) {
+            if (array_key_exists($name, $served)) {
+                $columns[] = $served[$name].' AS '.SqlFragments::identifier($name);
+
+                continue;
+            }
+
+            if (! in_array($name, $legacyOnly, true)) {
+                continue;
+            }
+
+            if (! array_key_exists($name, $retained)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$retainedTable} has no column {$name}, which {$map->table} keeps as a legacy-only column");
+            }
+
+            $read = SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier($name);
+            $default = $retained[$name]->default;
+            $columns[] = 'CAST('.($default === null ? $read : 'COALESCE('.$read.', '.$default.')').' AS '.$column->type.') AS '.SqlFragments::identifier($name);
+        }
+
+        $primary = SqlFragments::identifier($map->primary->table);
+
+        return "SELECT\n  ".implode(",\n  ", $columns)
+            ."\nFROM ".self::primary($map)
+            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($map->primary->key)
+            .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     */
+    private function check(ResolvedMap $map, array $shape): void
+    {
+        self::retainedTable($map);
+
+        if ($shape === []) {
+            throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
+        }
+
+        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
+
+        foreach ($map->related as $related) {
+            $this->columnsOf($map, $related->parentTable, [$related->parentKey], 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');
+            $this->columnsOf($map, $related->table, array_values(array_filter([$related->relatedKey, $related->deletedAt], fn (null|string $column) => $column !== null)), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' reads it');
+        }
+
+        foreach ([...array_keys($map->identifiers), ...array_keys(array_filter($map->attributes, fn ($attribute) => ! $attribute->isExternal()))] as $name) {
+            if (! array_key_exists($name, $shape)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so the view cannot serve it");
+            }
+        }
+
+        foreach ($map->attributes as $name => $attribute) {
+            $column = $attribute->column();
+
+            if ($column === null || $attribute->isExternal()) {
+                continue;
+            }
+
+            $table = $map->owners[$name]->table;
+            $type = $this->columnsOf($map, $table, [$column], "attribute '{$name}' reads it")[$column]->type;
+
+            foreach ($attribute->conversions() as $conversion) {
+                if ($conversion instanceof InTimeZone && ($type === null || preg_match('/^(timestamp(\(\d\))? with time zone|timestamptz(\(\d\))?)$/i', $type) !== 1)) {
+                    throw InvalidCompatibilityMap::because($map->table, "attribute '{$name}' reads {$table}.{$column} in the time zone {$conversion->zone}, and AT TIME ZONE reads a wall clock only from a timestamp with time zone, not from ".($type ?? 'the type the conversions before inTimeZone() give'));
+                }
+
+                $type = $conversion instanceof AsType ? $conversion->type : null;
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return array<string, Column>
+     */
+    private function columnsOf(ResolvedMap $map, string $table, array $columns, string $because): array
+    {
+        $catalog = $this->columnCatalog->of($table);
+
+        if ($catalog === []) {
+            throw InvalidCompatibilityMap::because($map->table, "the successor table {$table} does not exist");
+        }
+
+        foreach ($columns as $column) {
+            if (! array_key_exists($column, $catalog)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$table} has no column {$column}, and {$because}");
+            }
+        }
+
+        return $catalog;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function hidden(ResolvedMap $map): array
+    {
+        $conditions = [];
+
+        foreach ($map->hides as $hide) {
+            $query = (new $map->primary->model)->newModelQuery();
+            ($hide->scope)($query);
+            $base = $query->getQuery();
+            $where = $base->getGrammar()->compileWheres($base);
+
+            if ($where === '' || ($base->joins ?? []) !== [] || ($base->orders ?? []) !== [] || $base->limit !== null || ($base->groups ?? []) !== []) {
+                throw InvalidCompatibilityMap::because($map->table, "a hide() scope compiles to no plain condition on {$map->primary->table}; it takes where clauses only, because \"{$hide->because}\" becomes the view's filter");
+            }
+
+            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), array_values($base->getRawBindings()['where']));
+        }
+
+        return $conditions;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function path(ResolvedMap $map, string $owner): array
+    {
+        $parents = [];
+
+        foreach ($map->related as $related) {
+            $parents[$related->table] = $related->parentTable;
+        }
+
+        $path = [];
+
+        for ($table = $owner; array_key_exists($table, $parents); $table = $parents[$table]) {
+            $path[] = $table;
+        }
+
+        return $path;
+    }
+}

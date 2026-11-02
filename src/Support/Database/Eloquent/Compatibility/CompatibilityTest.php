@@ -68,6 +68,27 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_each_schema_operation_for_a_model_that_declares_no_map_before_reading_the_database(): void
+    {
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([Compatibility::prepare(...), Compatibility::install(...), Compatibility::recompile(...), Compatibility::uninstall(...)] as $operation) {
+            try {
+                $operation(Job::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame(array_fill(0, 4, "Compatibility map 'jobs' is declared wrongly: Job does not implement ".Contracts\Compatible::class.', so it declares no map.'), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
     public function it_refuses_a_class_that_is_no_model(): void
     {
         $this->expectExceptionObject(InvalidCompatibilityMap::because(SyncListingToMls::class, 'it names no Eloquent model'));
