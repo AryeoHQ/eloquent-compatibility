@@ -25,6 +25,9 @@ use Tests\TestCase;
 #[CoversClass(Compatibility::class)]
 final class CompatibilityTest extends TestCase
 {
+    /** @var class-string<Model> */
+    public static string $reporting = Model::class;
+
     #[Test]
     public function it_resolves_the_listing_map_without_a_database_connection(): void
     {
@@ -86,6 +89,93 @@ final class CompatibilityTest extends TestCase
 
         $this->assertSame(array_fill(0, 4, "Compatibility map 'jobs' is declared wrongly: Job does not implement ".Contracts\Compatible::class.', so it declares no map.'), $refusals);
         $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_each_schema_operation_for_a_successor_that_reads_another_database_before_reading_the_database(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting']]);
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'jobs';
+        };
+        self::$reporting = $reporting::class;
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(CompatibilityTest::$reporting, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([Compatibility::prepare(...), Compatibility::install(...), Compatibility::recompile(...), Compatibility::uninstall(...)] as $operation) {
+            try {
+                $operation($legacy::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame(array_fill(0, 4, "Compatibility map 'listings' is declared wrongly: the successor ".class_basename($reporting).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.'), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_a_related_successor_that_reads_another_schema_or_a_connection_nobody_configured(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'search_path' => 'reporting']]);
+        $sites = [
+            new class extends Model
+            {
+                protected $connection = 'compatibility_reporting';
+
+                protected $table = 'job_sites';
+            },
+            new class extends Model
+            {
+                protected $connection = 'compatibility_unconfigured';
+
+                protected $table = 'job_sites';
+            },
+        ];
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(Job::class, fn (Successor $job) => $job->related(fn (Job $job) => $job->hasOne(CompatibilityTest::$reporting, 'job_id'), fn (Successor $site) => $site));
+            }
+        };
+        $refusals = [];
+
+        foreach ($sites as $site) {
+            self::$reporting = $site::class;
+
+            try {
+                Compatibility::install($legacy::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame([
+            "Compatibility map 'listings' is declared wrongly: the relation from Job to ".class_basename($sites[0]).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.',
+            "Compatibility map 'listings' is declared wrongly: the relation from Job to ".class_basename($sites[1]).' reads the connection compatibility_unconfigured, which config/database.php does not declare.',
+        ], $refusals);
     }
 
     #[Test]

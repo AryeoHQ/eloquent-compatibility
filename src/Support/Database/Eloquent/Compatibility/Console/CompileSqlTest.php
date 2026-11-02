@@ -4,12 +4,18 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -19,6 +25,9 @@ use Tests\TestCase;
 #[CoversClass(CompileSql::class)]
 final class CompileSqlTest extends TestCase
 {
+    /** @var class-string<Model> */
+    public static string $successor = Model::class;
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -93,6 +102,81 @@ final class CompileSqlTest extends TestCase
         } finally {
             unlink((string) $file);
         }
+    }
+
+    #[Test]
+    public function it_leaves_the_connection_reading_from_its_replica_once_it_prints_or_refuses(): void
+    {
+        DB::statement('create schema compatibility_replica');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => []]]);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_replicated';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            $exits = [Artisan::call('compatibility:sql', ['model' => $model::class]), Artisan::call('compatibility:sql', ['model' => $model::class, '--for' => 'uninstall'])];
+            $schema = DB::connection('compatibility_replicated')->scalar('select current_schema()');
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame([[0, 1], 'compatibility_replica'], [$exits, $schema]);
+    }
+
+    #[Test]
+    public function it_prints_a_map_whose_successor_names_another_connection_to_the_same_database_and_refuses_one_to_another(): void
+    {
+        config([
+            'database.connections.compatibility_alias' => config('database.connections.pgsql'),
+            'database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting'],
+        ]);
+        $successors = [
+            new class extends Model
+            {
+                protected $connection = 'compatibility_alias';
+
+                protected $table = 'jobs';
+            },
+            new class extends Model
+            {
+                protected $connection = 'compatibility_reporting';
+
+                protected $table = 'jobs';
+            },
+        ];
+        $legacy = new class extends Model implements Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(CompileSqlTest::$successor, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+        $exits = [];
+
+        foreach ($successors as $successor) {
+            self::$successor = $successor::class;
+            $exits[] = Artisan::call('compatibility:sql', ['model' => $legacy::class]);
+        }
+
+        $this->assertSame([0, 1], $exits);
+        $this->assertSame("Compatibility map 'listings' is declared wrongly: the successor ".class_basename($successors[1]).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).", so a map reads one database.\n", Artisan::output());
     }
 
     /**
