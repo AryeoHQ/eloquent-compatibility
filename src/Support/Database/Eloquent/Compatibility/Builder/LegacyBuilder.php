@@ -40,8 +40,8 @@ final class LegacyBuilder extends Builder
     /** @var array<string, true> */
     private static array $tables = [];
 
-    /** @var array<string, list<string>> */
-    private static array $nondeterministic = [];
+    /** @var array<string, array<string, array{name: string, deterministic: bool, declared: bool}>> */
+    private static array $collations = [];
 
     private int $negations = 0;
 
@@ -52,7 +52,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         self::$tables = [];
-        self::$nondeterministic = [];
+        self::$collations = [];
     }
 
     /**
@@ -531,28 +531,23 @@ final class LegacyBuilder extends Builder
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
+        $collation = $this->collations($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true) && ! in_array($attribute, $this->nondeterministic($this->map()->table), true))) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ($this->collations($owner)[(string) $column]['deterministic'] ?? true) && ($collation['deterministic'] ?? true))) {
             return [$type, null];
         }
 
-        return [$type, ViewCompiler::cast($definition->read($owner, $type, $catalog->baseType(...)), $catalog->baseType($definition->type($type)), $served->type, $served->baseType)];
+        return [$type, ViewCompiler::cast($definition->read($owner, $type, $catalog->baseType(...)), $catalog->baseType($definition->type($type)), $served->type, $served->baseType, $collation['name'] ?? null)];
     }
 
     /**
-     * @return list<string>
+     * @return array<string, array{name: string, deterministic: bool, declared: bool}>
      */
-    private function nondeterministic(string $table): array
+    private function collations(string $table): array
     {
         $connection = $this->model->getConnection();
 
-        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
-            "select attribute.attname as name
-             from pg_attribute attribute
-             join pg_collation column_collation on column_collation.oid = attribute.attcollation
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic",
-            [SqlFragments::identifier($table)],
-        )));
+        return self::$collations[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= ViewCompiler::collations($connection, $table);
     }
 
     /**
