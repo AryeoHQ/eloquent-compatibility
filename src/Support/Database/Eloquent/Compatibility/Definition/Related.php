@@ -20,6 +20,7 @@ use Illuminate\Database\PostgresConnection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
 final readonly class Related
 {
@@ -123,7 +124,7 @@ final readonly class Related
             $relatedKey,
             $compiled instanceof BelongsTo,
             $where === '' ? null : Str::after($where, 'where '),
-            array_values($base->bindings['where']),
+            SqlFragments::formatDates(array_values($base->bindings['where']), $grammar->getDateFormat()),
             $orders === [] ? null : implode(', ', $orders),
             in_array(SoftDeletingScope::class, $scopes, true) && method_exists($related, 'getDeletedAtColumn') ? (string) $related->getDeletedAtColumn() : null,
             $query->pendingAttributes,

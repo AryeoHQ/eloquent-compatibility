@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use BackedEnum;
+use DateTimeInterface;
 use Illuminate\Support\Facades\Config;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -256,34 +257,26 @@ final class SqlFragments
     public static function bind(string $sql, array $bindings): string
     {
         $bound = '';
-        $quote = null;
         $next = 0;
 
-        for ($at = 0; $at < strlen($sql); $at++) {
-            $pair = substr($sql, $at, 2);
+        for ($at = 0; $at < strlen($sql);) {
+            $quoted = self::quoted($sql, $at);
 
-            if ($quote !== null && $pair === $quote.$quote) {
-                $bound .= $pair;
-                $at++;
-            } elseif ($sql[$at] === $quote) {
-                $bound .= $quote;
-                $quote = null;
-            } elseif ($quote !== null) {
-                $bound .= $sql[$at];
-            } elseif ($sql[$at] === "'" || $sql[$at] === '"') {
-                $bound .= $sql[$at];
-                $quote = $sql[$at];
-            } elseif ($pair === '??') {
+            if ($quoted > 0) {
+                $bound .= substr($sql, $at, $quoted);
+                $at += $quoted;
+            } elseif (substr($sql, $at, 2) === '??') {
                 $bound .= '?';
-                $at++;
+                $at += 2;
             } elseif ($sql[$at] === '?') {
                 if (! array_key_exists($next, $bindings)) {
                     throw new InvalidArgumentException("The SQL [{$sql}] has more placeholders than its ".count($bindings).' bindings.');
                 }
 
                 $bound .= self::value($bindings[$next++]);
+                $at++;
             } else {
-                $bound .= $sql[$at];
+                $bound .= $sql[$at++];
             }
         }
 
@@ -292,6 +285,53 @@ final class SqlFragments
         }
 
         return $bound;
+    }
+
+    /**
+     * @param  list<mixed>  $bindings
+     * @return list<mixed>
+     */
+    public static function formatDates(array $bindings, string $format): array
+    {
+        return array_map(fn (mixed $binding) => $binding instanceof DateTimeInterface ? $binding->format($format) : $binding, $bindings);
+    }
+
+    private static function quoted(string $sql, int $at): int
+    {
+        $inIdentifier = $at > 0 && preg_match('/[A-Za-z0-9_$]/', $sql[$at - 1]) === 1;
+        $patterns = [
+            '/\G[Ee]\'(?:[^\'\\\\]|\\\\.|\'\')*(?:\'|\z)/s' => ! $inIdentifier,
+            '/\G\'(?:[^\']|\'\')*(?:\'|\z)/' => true,
+            '/\G"(?:[^"]|"")*(?:"|\z)/' => true,
+            '/\G--[^\n]*/' => true,
+            '/\G(\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$).*?(?:\1|\z)/s' => ! $inIdentifier,
+        ];
+
+        foreach ($patterns as $pattern => $applies) {
+            if ($applies && preg_match($pattern, $sql, $match, 0, $at) === 1) {
+                return strlen($match[0]);
+            }
+        }
+
+        if (substr($sql, $at, 2) !== '/*') {
+            return 0;
+        }
+
+        for ($end = $at, $depth = 0; $end < strlen($sql);) {
+            $pair = substr($sql, $end, 2);
+            $depth += match ($pair) {
+                '/*' => 1,
+                '*/' => -1,
+                default => 0,
+            };
+            $end += in_array($pair, ['/*', '*/'], true) ? 2 : 1;
+
+            if ($depth === 0) {
+                return $end - $at;
+            }
+        }
+
+        return strlen($sql) - $at;
     }
 
     public static function objectName(string $map, string $name): string

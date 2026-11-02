@@ -551,6 +551,14 @@ final class LegacyBuilder extends Builder
             }
         }
 
+        foreach ($conditions as [$operator, $value]) {
+            if ($value === null && in_array($operator, ['<', '>', '<=', '>='], true)) {
+                $onView();
+
+                return $this;
+            }
+        }
+
         $owner = $map->owners[$attribute]->table;
         $key = $this->model->getKeyName();
         $negated = $this->negations % 2 === 1;
@@ -655,14 +663,15 @@ final class LegacyBuilder extends Builder
         $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
         $definition = $this->definition($attribute);
         $column = $definition->column();
-        $type = $column === null ? null : $catalog->type($owner, $column);
-        $served = $catalog->type($this->map()->table, $attribute);
+        $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
+        $type = $stored === null ? null : $stored->baseType ?? $stored->type;
+        $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || $definition->exact($type, $served)) {
+        if ($served === null || $definition->exact($type, $served->baseType ?? $served->type)) {
             return [$type, null];
         }
 
-        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served)];
+        return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served->type, $served->baseType)];
     }
 
     /**
@@ -753,7 +762,7 @@ final class LegacyBuilder extends Builder
         $row = (array) $connection->selectOne(
             "select current_schema() as schema,
                     coalesce((select relkind = 'v' from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)), 'SELECT'), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor), false) as readable",
+                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)) as successor_table), false) as readable",
             [SqlFragments::identifier($this->model->getTable()), json_encode([$map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], JSON_THROW_ON_ERROR)],
         );
 
