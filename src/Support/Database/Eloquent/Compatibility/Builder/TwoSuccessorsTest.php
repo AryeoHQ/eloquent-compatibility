@@ -330,6 +330,39 @@ final class TwoSuccessorsTest extends TestCase
     }
 
     #[Test]
+    public function it_chooses_the_branch_of_every_write_from_a_retained_null_expression_without_a_guard(): void
+    {
+        $video = $this->titledVideo();
+        $incremented = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine tour'])->id;
+        $mass = Video::query()->create(['youtube_embed_url' => 'https://youtu.be/elm', 'title' => 'Elm tour'])->id;
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(2)->update(['title' => DB::raw('NULL'), 'original_file_name' => 'oak.mp4', 'mime_type' => 'video/mp4']),
+            fn () => $video->newQuery()->findOrFail($incremented)->increment('views', 1, ['title' => DB::raw('NULL')]),
+            fn () => $video->newQuery()->whereKey($mass)->update(['title' => DB::raw('NULL')]),
+            fn () => $video->newQuery()->create(['youtube_embed_url' => 'https://youtu.be/fir', 'title' => DB::raw('NULL')]),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame([
+            'stored',
+            $video::class.' cannot run an increment that moves record '.$incremented.' to File through its compatibility map',
+            $video::class.' cannot run a mass write that changes what servedFrom() chooses through its compatibility map',
+            $video::class.'::$youtube_embed_url cannot take a write',
+        ], $outcomes);
+        $this->assertSame([['files', 2], ['links', $incremented], ['links', $mass]], $this->holders([2, $incremented, $mass]));
+        $this->assertSame(0, DB::table('links')->where('url', 'https://youtu.be/fir')->count());
+        $this->assertSame([[null, 'oak.mp4', 2], ['Pine tour', null, 0], ['Elm tour', null, 0]], Video::query()->whereIn('id', [2, $incremented, $mass])->orderBy('id')->get()->map(fn (Video $video) => [$video->title, $video->original_file_name, $video->views])->all());
+    }
+
+    #[Test]
     public function it_stores_the_value_a_volatile_retained_expression_gave_the_branch_choice(): void
     {
         $video = $this->titledVideo();
@@ -673,7 +706,7 @@ final class TwoSuccessorsTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('title') !== 'Upload only' ? Link::class : File::class)
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && ! in_array($video->getAttribute('title'), [null, 'Upload only'], true) ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
                         ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))

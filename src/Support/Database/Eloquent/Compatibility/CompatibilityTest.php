@@ -189,9 +189,8 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_before_reading_the_database(): void
+    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_or_schema_before_reading_the_database(): void
     {
-        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting']]);
         $reporting = new class extends Model
         {
             protected $connection = 'compatibility_reporting';
@@ -247,20 +246,26 @@ final class CompatibilityTest extends TestCase
             $queries++;
         });
 
-        foreach ($legacies as $legacy) {
-            try {
-                Compatibility::prepare($legacy::class);
-            } catch (InvalidCompatibilityMap $refusal) {
-                $refusals[] = $refusal->getMessage();
+        foreach ([['database' => 'compatibility_reporting'], ['search_path' => 'reporting']] as $elsewhere) {
+            DB::purge('compatibility_reporting');
+            config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), ...$elsewhere]]);
+
+            foreach ($legacies as $legacy) {
+                try {
+                    Compatibility::prepare($legacy::class);
+                } catch (InvalidCompatibilityMap $refusal) {
+                    $refusals[] = $refusal->getMessage();
+                }
             }
         }
 
+        DB::purge('compatibility_reporting');
         $another = ' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of ';
         $oneDatabase = '; the view and its filters read every successor through the connection of ';
-        $this->assertSame([
+        $this->assertSame(array_merge(...array_fill(0, 2, [
             "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
             "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
-        ], $refusals);
+        ])), $refusals);
         $this->assertSame(0, $queries);
     }
 
