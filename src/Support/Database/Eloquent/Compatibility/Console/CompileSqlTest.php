@@ -88,7 +88,7 @@ final class CompileSqlTest extends TestCase
 
         try {
             $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class, '--for' => 'prepare', '--output' => $file]));
-            $this->assertStringContainsString("Wrote 16 statements to {$file}.", Artisan::output());
+            $this->assertStringContainsString("Wrote 17 statements to {$file}.", Artisan::output());
             $this->assertStringStartsWith('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=prepare:', (string) file_get_contents((string) $file));
         } finally {
             unlink((string) $file);

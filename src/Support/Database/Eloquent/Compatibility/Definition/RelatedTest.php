@@ -119,6 +119,9 @@ final class RelatedTest extends TestCase
         yield 'a database read' => [fn (Job $job) => $job->hasOne(Place::class)->whereIn('street', Place::query()->pluck('street')), $none, 'a related() relation reads the database while Laravel builds it, and resolution opens no connection'];
         yield 'a unique index over a raw condition' => [fn (Job $job) => $job->hasOne(Place::class)->whereRaw('length(street) > 3'), fn (Successor $place) => $place->atMostOne('One.'), 'atMostOne() on the related() relation from Job to Place compiles its conditions into a unique index, and a raw condition is not a plain column predicate'];
         yield 'a unique index over another table' => [fn (Job $job) => $job->hasOne(Place::class)->where('jobs.name', 'Oak'), fn (Successor $place) => $place->atMostOne('One.'), 'atMostOne() on the related() relation from Job to Place compiles its conditions into a unique index on places, and jobs.name is not a column of places'];
+        yield 'a parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('city', $job->name), $none, "a related() relation closure on Job reads its attribute name, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
+        yield 'a cast parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('street', $job->getAttribute('lifecycle_status')), $none, "a related() relation closure on Job reads its attribute lifecycle_status, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
+        yield 'the parent key' => [fn (Job $job) => $job->hasOne(Place::class)->where('parent_id', $job->getKey()), $none, "a related() relation closure on Job reads its attribute id, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
         yield 'a unique index over a column comparison' => [fn (Job $job) => $job->hasOne(Place::class)->whereColumn('street', 'city'), fn (Successor $place) => $place->atMostOne('One.'), 'atMostOne() on the related() relation from Job to Place compiles its conditions into a unique index, and a Column condition is not a plain column predicate'];
     }
 
@@ -132,6 +135,26 @@ final class RelatedTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', $problem));
 
         Related::compile('listings', Job::class, $relation, $definition);
+    }
+
+    #[Test]
+    public function it_leaves_eloquent_missing_attribute_handling_as_it_found_it(): void
+    {
+        Model::preventAccessingMissingAttributes();
+        Model::handleMissingAttributeViolationUsing(fn (Model $model, string $key) => "handled {$key}");
+
+        try {
+            Related::compile('listings', Job::class, fn (Job $job) => $job->hasOne(Place::class)->where('city', $job->name), fn (Successor $place) => $place);
+            $this->fail('compile() did not refuse.');
+        } catch (InvalidCompatibilityMap) {
+            $job = new Job;
+            $job->exists = true;
+
+            $this->assertSame([true, 'handled name'], [Model::preventsAccessingMissingAttributes(), $job->name]);
+        } finally {
+            Model::preventAccessingMissingAttributes(false);
+            Model::handleMissingAttributeViolationUsing(null);
+        }
     }
 
     #[Test]
