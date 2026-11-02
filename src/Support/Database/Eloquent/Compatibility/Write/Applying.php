@@ -54,10 +54,10 @@ final class Applying
      * @param  class-string<Model>  $model
      * @param  null|Closure(Model): (null|int|string)  $identify
      */
-    public static function writes(string $model, int|string $key, null|Closure $identify = null): bool
+    public static function writes(string $model, int|string $key, string $connection, null|Closure $identify = null): bool
     {
         foreach (self::$writes ?? [] as $successor => $legacy) {
-            if ($legacy::class !== $model) {
+            if ($legacy::class !== $model || $successor->getConnection()->getName() !== $connection) {
                 continue;
             }
 

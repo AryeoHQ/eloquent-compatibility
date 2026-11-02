@@ -30,6 +30,7 @@ use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
+use Tests\Fixtures\Support\Listings\JobUpdated;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -53,6 +54,10 @@ final class ForwarderTest extends TestCase
     private array $seen = [];
 
     private null|string $bootstrap = null;
+
+    private bool $tenant = false;
+
+    private null|bool $jobUpdatedReturns = null;
 
     /** @var null|array{string, string} */
     private null|array $writesWhileBooting = null;
@@ -91,6 +96,11 @@ final class ForwarderTest extends TestCase
 
     protected function tearDown(): void
     {
+        if ($this->tenant) {
+            DB::purge('tenant_b');
+            DB::statement('drop schema if exists tenant_b cascade');
+        }
+
         WritesWhileBooting::$writes = null;
         ListingTables::drop();
         FileTables::drop();
@@ -818,6 +828,169 @@ final class ForwarderTest extends TestCase
         $this->assertSame(['9 Birch St', '0.01'], [Listing::query()->findOrFail(4)->street, Listing::query()->findOrFail(4)->price]);
     }
 
+    #[Test]
+    public function it_forwards_no_write_a_job_saved_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
+    {
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            if ($job->wasRecentlyCreated && ! Place::query()->where('job_id', $job->id)->exists()) {
+                Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
+                Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
+            }
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+
+        Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([['saving', null], ['creating', null], ['created', 4], ['saved', 4]], $this->seen);
+        $this->assertSame(['9 Birch St', '0.01'], [Listing::query()->findOrFail(4)->street, Listing::query()->findOrFail(4)->price]);
+    }
+
+    #[Test]
+    public function it_forwards_no_write_a_file_listener_makes_to_the_photo_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        Event::listen('eloquent.created: '.File::class, function (File $file): void {
+            File::query()->findOrFail($file->id)->update(['size_bytes' => 4000]);
+        });
+        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id]);
+
+        Photo::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+
+        $this->assertSame([['saving', null], ['creating', null], ['created', 4], ['saved', 4]], $this->seen);
+        $this->assertSame('4.000', Photo::query()->findOrFail(4)->size_kb);
+    }
+
+    #[Test]
+    public function it_refuses_a_change_a_legacy_listener_makes_to_an_external_fact_after_the_saving_model_ran_its_saving_listeners(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $assigned = [];
+
+        foreach (['creating', 'updating'] as $event) {
+            Event::listen("eloquent.{$event}: ".Photo::class, function (Photo $photo) use ($event, &$assigned): void {
+                $assigned[] = $event;
+                $photo->mime_type = 'image/webp';
+            });
+        }
+
+        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $refusals = [];
+
+        foreach ([fn () => $file->update(['filename' => 'oak-porch.jpg']), fn () => File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])] as $write) {
+            try {
+                $write();
+                $refusals[] = null;
+            } catch (CompatibilityWriteRefused $refused) {
+                $refusals[] = $refused->getMessage();
+            }
+        }
+
+        $this->assertSame(['updating', 'creating'], $assigned);
+        $this->assertSame(array_map(fn (string $event) => 'A listener of a '.Photo::class." event that File forwarded cannot change \$mime_type. Why: It is declared external(), and File raised its {$event} event after its own saving listeners ran, so the write closure reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.", ['updating', 'creating']), $refusals);
+        $this->assertSame(['oak-front.jpg', 'image/jpeg', 0], [File::query()->findOrFail($file->id)->filename, Photo::query()->findOrFail(1)->mime_type, File::query()->where('filename', 'birch.png')->count()]);
+    }
+
+    #[Test]
+    public function it_raises_no_after_event_for_a_record_a_later_successor_listener_moves_out_of_the_legacy_shape(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $elm = Job::query()->where('legacy_id', 3)->value('id');
+        Event::listen('eloquent.updating: '.Job::class, function (Job $job) use ($elm): void {
+            $job->merged_into_job_id = $elm;
+        });
+        Event::listen('eloquent.updating: '.File::class, function (File $file): void {
+            $file->legacy_type = null;
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id]);
+
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        File::query()->where('legacy_type', 'photo')->where('legacy_id', 2)->firstOrFail()->update(['filename' => 'oak-porch.jpg']);
+
+        $this->assertSame([['saving', 1], ['updating', 1], ['saving', 2], ['updating', 2]], $this->seen);
+        $this->assertSame([null, null], [Listing::query()->find(1), Photo::query()->find(2)]);
+    }
+
+    #[DefineEnvironment('listensForJobUpdatesFirst')]
+    #[Test]
+    public function it_forwards_a_job_update_once_ahead_of_the_listeners_of_its_event_object_whatever_they_return(): void
+    {
+        $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+
+        $job->update(['name' => 'Oak Lodge']);
+        $this->jobUpdatedReturns = true;
+        $job->update(['name' => 'Oak Manor']);
+
+        $this->assertSame([
+            ['updated', 1, 'Oak Lodge'], [JobUpdated::class, 'Oak Lodge'],
+            ['updated', 1, 'Oak Manor'], [JobUpdated::class, 'Oak Manor'],
+        ], $this->seen);
+    }
+
+    #[Test]
+    public function it_keeps_a_listener_named_in_without_forwarding_to_from_forwarded_events_when_a_wildcard_registers_it(): void
+    {
+        Event::listen('eloquent.updated: *', SyncListingToMls::class.'@every');
+        Event::listen('eloquent.updated: *', [new SyncListingToMls, 'every']);
+        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        DB::enableQueryLog();
+
+        $job->update(['name' => 'Oak Lodge']);
+        $queries = array_map(fn (array $query) => preg_replace('/^(update "\w+").*$/s', '$1', (string) $query['query']), DB::getQueryLog());
+        DB::disableQueryLog();
+        $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id]);
+        $job->update(['name' => 'Oak Manor']);
+        $forwarded = SyncListingToMls::$synced;
+        Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
+
+        $this->assertSame(['update "jobs"'], $queries);
+        $this->assertSame([[], [3, 3]], [$forwarded, SyncListingToMls::$synced]);
+        $this->assertSame([['updated', 1], ['updated', 3]], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_a_job_write_on_another_connection_while_a_legacy_write_holds_the_same_key_on_this_one(): void
+    {
+        $default = DB::getDefaultConnection();
+        $this->tenant = true;
+        DB::statement('create schema tenant_b');
+        config(['database.connections.tenant_b' => ['search_path' => 'tenant_b'] + (array) config("database.connections.{$default}")]);
+        DB::setDefaultConnection('tenant_b');
+
+        try {
+            ListingTables::create();
+            ListingTables::seed();
+            Compatibility::prepare(Listing::class);
+            ListingTables::backfill();
+            Compatibility::install(Listing::class);
+        } finally {
+            DB::setDefaultConnection($default);
+        }
+
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            if ($job->getConnection()->getName() !== 'tenant_b') {
+                Job::on('tenant_b')->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+            }
+        });
+        $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->getConnection()->getName(), $listing->id, $listing->title]);
+
+        Listing::query()->findOrFail(1)->update(['title' => 'Oak Cabin']);
+
+        $this->assertSame([
+            ['saving', $default, 1, 'Oak Cabin'], ['updating', $default, 1, 'Oak Cabin'],
+            ['saving', 'tenant_b', 1, 'Oak Lodge'], ['updating', 'tenant_b', 1, 'Oak Lodge'], ['updated', 'tenant_b', 1, 'Oak Lodge'], ['saved', 'tenant_b', 1, 'Oak Lodge'],
+            ['updated', $default, 1, 'Oak Cabin'], ['saved', $default, 1, 'Oak Cabin'],
+        ], $this->seen);
+        $this->assertSame(['Oak Cabin', 'Oak Lodge'], [Listing::query()->findOrFail(1)->title, Listing::on('tenant_b')->findOrFail(1)->title]);
+    }
+
     /**
      * @param  Application  $app
      * @return array<int, class-string>
@@ -842,6 +1015,18 @@ final class ForwarderTest extends TestCase
             $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
             Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
         };
+    }
+
+    /**
+     * @param  Application  $app
+     */
+    protected function listensForJobUpdatesFirst($app): void // @phpstan-ignore ergebnis.privateInFinalClass
+    {
+        $app['events']->listen(JobUpdated::class, function (JobUpdated $event): null|bool {
+            $this->seen[] = [JobUpdated::class, $event->job->name];
+
+            return $this->jobUpdatedReturns;
+        });
     }
 
     /**

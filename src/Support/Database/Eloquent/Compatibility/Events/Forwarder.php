@@ -75,8 +75,13 @@ final class Forwarder
         'forceDeleting' => 'forceDeleted',
     ];
 
+    private const array STORED_BEFORE = ['saving', 'restoring'];
+
     /** @var WeakMap<Model, list<Sequence>> */
     private WeakMap $sequences;
+
+    /** @var WeakMap<Model, string> */
+    private WeakMap $fired;
 
     /** @var array<int, array{array<string, string>, list<string>}> */
     private array $compiled = [];
@@ -87,6 +92,7 @@ final class Forwarder
     private function __construct(private readonly ResolvedMap $map, private readonly ResolvedMap $served, private readonly null|Related $dependent)
     {
         $this->sequences = new WeakMap;
+        $this->fired = new WeakMap;
     }
 
     /**
@@ -97,31 +103,83 @@ final class Forwarder
         foreach (Compatibility::of($model)->successors() as $primary => $successors) {
             foreach ($successors as $successor) {
                 $forward = self::lazily($model, $primary, $successor);
+                $forwarded = array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT);
 
-                foreach (array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT) as $event) {
-                    self::prepend($events, "eloquent.{$event}: {$successor}", fn (Model $instance): null|false => $forward($event, $instance));
+                foreach ($forwarded as $event) {
+                    self::prepend($events, "eloquent.{$event}: {$successor}", fn (Model $instance): null|false => $forward($event, $instance, false));
+                }
+
+                foreach (self::objects($successor, $forwarded) as $object) {
+                    self::prepend($events, $object, fn (object $fired): null|false => ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
                 }
             }
         }
     }
 
     /**
+     * @param  class-string<Model>  $successor
+     * @param  list<string>  $events
+     * @return list<class-string>
+     */
+    private static function objects(string $successor, array $events): array
+    {
+        $objects = [];
+
+        foreach (array_intersect_key((new $successor)->dispatchesEvents(), array_flip($events)) as $object) {
+            if (is_string($object) && class_exists($object) && ! in_array($object, $objects, true)) {
+                $objects[] = $object;
+            }
+        }
+
+        return $objects;
+    }
+
+    /**
+     * @return null|array{string, Model}
+     */
+    private static function origin(object $fired, string $successor): null|array
+    {
+        foreach (debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT) as $frame) {
+            $model = $frame['object'] ?? null;
+
+            if ($frame['function'] !== 'fireCustomModelEvent' || ! $model instanceof Model) {
+                continue;
+            }
+
+            $event = $frame['args'][0] ?? null;
+            $object = is_string($event) ? $model->dispatchesEvents()[$event] ?? null : null;
+
+            return $model::class === $successor && is_string($event) && is_string($object) && $fired instanceof $object ? [$event, $model] : null;
+        }
+
+        return null;
+    }
+
+    /**
      * @param  class-string<Model>  $model
-     * @return Closure(string, Model): (null|false)
+     * @return Closure(string, Model, bool): (null|false)
      */
     private static function lazily(string $model, string $primary, string $successor): Closure
     {
         $forwarder = null;
 
-        return function (string $event, Model $instance) use (&$forwarder, $model, $primary, $successor): null|false {
+        return function (string $event, Model $instance, bool $object) use (&$forwarder, $model, $primary, $successor): null|false {
             $forwarder ??= self::resolve(LegacyBuilder::mapOf($model), $primary, $successor);
 
-            return $forwarder->forward($event, $instance);
+            return $forwarder->forward($event, $instance, $object);
         };
     }
 
-    public function forward(string $event, Model $successor): null|false
+    public function forward(string $event, Model $successor, bool $object = false): null|false
     {
+        if ($object) {
+            $this->fired[$successor] = $event;
+        } elseif (($this->fired[$successor] ?? null) === $event) {
+            $this->fired->offsetUnset($successor);
+
+            return null;
+        }
+
         if (Applying::holds($successor)) {
             return null;
         }
@@ -251,7 +309,7 @@ final class Forwarder
         }
 
         $events = ($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [];
-        $batches = [[$events, $record->records()]];
+        $batches = null;
 
         if ($this->dependent !== null) {
             $joining = $ahead ? array_diff_key($record->changed(), $sequence->forwarding) : [];
@@ -270,7 +328,7 @@ final class Forwarder
             $record->store($successor);
         }
 
-        foreach ($batches as [$legacyEvents, $legacies]) {
+        foreach ($batches ?? [[$events, $record->records()]] as [$legacyEvents, $legacies]) {
             foreach ($legacyEvents as $legacyEvent) {
                 if (! $this->listens($legacyEvent)) {
                     continue;
@@ -289,7 +347,7 @@ final class Forwarder
                     }
 
                     if ($ahead) {
-                        $this->mapBack($legacy, $before, $successor, $record->removes);
+                        $this->mapBack($legacy, $before, $successor, $event, $record->removes);
                     }
                 }
             }
@@ -366,7 +424,7 @@ final class Forwarder
     /**
      * @param  array<string, mixed>  $before
      */
-    private function mapBack(Model $legacy, array $before, Model $successor, bool $removes): void
+    private function mapBack(Model $legacy, array $before, Model $successor, string $event, bool $removes): void
     {
         $baseline = $before + $legacy->getRawOriginal();
         $compared = $legacy->newInstance([], true);
@@ -385,7 +443,7 @@ final class Forwarder
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 $attribute->runsTransitions() => 'It is declared transitions(), so only a write through '.class_basename($legacy).' can run the trigger that changes it.',
-                $attribute->isExternal() => $attribute->declinedBecause(),
+                $attribute->isExternal() => $attribute->declinedBecause() ?? (in_array($event, self::STORED_BEFORE, true) ? null : 'It is declared external(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so the write closure reaches no save."),
                 ! $attribute->isWritable() => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
@@ -483,11 +541,11 @@ final class Forwarder
             return $halt ? $dispatcher->until($event, $payload) : $dispatcher->dispatch($event, $payload);
         }
 
-        $exact = $dispatcher->getRawListeners()[$name] ?? [];
+        $raw = $this->raw($dispatcher, $name);
         $responses = [];
 
         foreach ($dispatcher->getListeners($name) as $index => $listener) {
-            if ($index < count($exact) && $this->excluded($exact[$index])) {
+            if ($this->excluded($raw[$index] ?? null)) {
                 continue;
             }
 
@@ -520,24 +578,46 @@ final class Forwarder
             return $dispatcher !== null;
         }
 
-        foreach ($dispatcher->getRawListeners()[$name] ?? [] as $listener) {
+        foreach ($this->raw($dispatcher, $name) as $listener) {
             if (! $this->excluded($listener)) {
                 return true;
             }
         }
 
-        return $dispatcher->hasWildcardListeners($name);
+        return false;
     }
 
     private function excludes(Dispatcher $dispatcher, string $name): bool
     {
-        foreach ($dispatcher->getRawListeners()[$name] ?? [] as $listener) {
+        foreach ($this->raw($dispatcher, $name) as $listener) {
             if ($this->excluded($listener)) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * @return list<mixed>
+     */
+    private function raw(Dispatcher $dispatcher, string $name): array
+    {
+        $raw = array_values($dispatcher->getRawListeners()[$name] ?? []);
+
+        if (! $dispatcher->hasWildcardListeners($name)) {
+            return $raw;
+        }
+
+        $wildcards = Closure::bind(fn (): array => $this->wildcards, $dispatcher, Dispatcher::class)();
+
+        foreach ($wildcards as $pattern => $listeners) {
+            if (Str::is($pattern, $name)) {
+                array_push($raw, ...array_values($listeners));
+            }
+        }
+
+        return $raw;
     }
 
     private function excluded(mixed $listener): bool

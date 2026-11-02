@@ -34,6 +34,10 @@ final class Job extends Model
 
     protected $guarded = [];
 
+    protected $dispatchesEvents = [
+        'updated' => JobUpdated::class,
+    ];
+
     protected function casts(): array
     {
         return ['lifecycle_status' => LifecycleStatus::class];

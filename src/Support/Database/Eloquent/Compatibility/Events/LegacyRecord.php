@@ -67,7 +67,7 @@ final class LegacyRecord
         }
 
         foreach ($record->stored($successor, false) as $key => $row) {
-            if (Applying::writes($map->model, $key, fn (Model $held) => self::identity($map, $held))) {
+            if (Applying::writes($map->model, $key, $successor->getConnection()->getName(), fn (Model $held) => self::identity($map, $held))) {
                 if ($dependent === null) {
                     return null;
                 }
