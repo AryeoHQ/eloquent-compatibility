@@ -85,6 +85,52 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_serves_the_value_the_external_system_keeps_after_a_write_it_normalizes(): void
+    {
+        $normalizing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType === null ? null : strtolower($mimeType)))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        $seen = [];
+        $normalizing::saved(function (Model $photo) use (&$seen): void {
+            $seen[] = $photo->getAttribute('mime_type');
+        });
+
+        $created = $normalizing::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'IMAGE/WEBP', 'caption' => 'Birch']);
+        $updated = $normalizing::query()->findOrFail(2);
+        $updated->update(['mime_type' => 'IMAGE/AVIF']);
+
+        $this->assertSame(['image/webp', 'image/avif'], $seen);
+        $this->assertSame(['image/webp', 'image/avif'], [$created->getAttribute('mime_type'), $updated->getAttribute('mime_type')]);
+        $this->assertSame(['image/webp', 'image/avif'], [$created->getOriginal('mime_type'), $updated->getOriginal('mime_type')]);
+    }
+
+    #[Test]
     public function it_refuses_a_write_the_map_declines_with_the_declared_reason_and_changes_nothing(): void
     {
         $declined = new class extends Model implements Compatible

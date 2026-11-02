@@ -115,6 +115,13 @@ final class CompileSqlTest extends TestCase
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
 
+        $file = sys_get_temp_dir().'/compatibility-photos-'.getmypid().'.sql';
+
+        $this->artisan('compatibility:sql', ['model' => Photo::class, '--output' => $file])
+            ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
+            ->assertFailed();
+        $this->assertFileDoesNotExist($file);
+
         Compatibility::install(Photo::class);
 
         $this->artisan('compatibility:sql', ['model' => Photo::class, '--for' => 'uninstall'])

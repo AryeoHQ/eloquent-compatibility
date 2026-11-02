@@ -335,7 +335,7 @@ final class LegacyQueryBuilder extends QueryBuilder
             ...($this->aggregate === null ? [] : [[$this->aggregate['function'].'()', $this->aggregate['columns'] ?? []]]),
             ['select', $this->columns ?? []],
             ['groupBy', $this->groups ?? []],
-            ['having', array_column($this->havings ?? [], 'column')],
+            ['having', self::havingColumns($this->havings ?? [])],
             ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], $this->orders ?? []),
             ['where', self::whereColumns($this->wheres)],
         ];
@@ -377,6 +377,29 @@ final class LegacyQueryBuilder extends QueryBuilder
             if (is_array($where['columns'] ?? null)) {
                 $columns = [...$columns, ...array_values($where['columns'])];
             }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $havings
+     * @return list<mixed>
+     */
+    private static function havingColumns(array $havings): array
+    {
+        $columns = [];
+
+        foreach ($havings as $having) {
+            if (! is_array($having)) {
+                continue;
+            }
+
+            if (($having['type'] ?? null) === 'Nested' && ($having['query'] ?? null) instanceof QueryBuilder) {
+                $columns = [...$columns, ...self::havingColumns($having['query']->havings ?? [])];
+            }
+
+            $columns[] = $having['column'] ?? null;
         }
 
         return $columns;

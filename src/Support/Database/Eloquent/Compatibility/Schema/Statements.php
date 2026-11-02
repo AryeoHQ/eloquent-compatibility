@@ -57,6 +57,12 @@ final readonly class Statements
 
         $external = array_values(array_filter($map->externals(), fn (string $name) => array_key_exists($name, $legacy)));
 
+        foreach ($external as $name) {
+            if ($legacy[$name]->generated) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated column, and attribute '{$name}' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly()");
+            }
+        }
+
         if (array_key_exists($retainedKey, $legacy)) {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$retainedKey}, which install() adds as the key of the retained table");
         }

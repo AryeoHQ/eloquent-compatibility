@@ -31,6 +31,9 @@ final class ExternalAttributes
     /** @var null|WeakMap<Model, self> */
     private static null|WeakMap $batches = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $written = null;
+
     /** @var array<string, true> */
     private array $loading = [];
 
@@ -73,10 +76,23 @@ final class ExternalAttributes
         $batches = self::$batches ??= new WeakMap;
 
         if (! $batches->offsetExists($legacy)) {
-            $batches[$legacy] = new self([WeakReference::create($legacy)], false);
+            $batches[$legacy] = new self([WeakReference::create($legacy)], self::$written?->offsetExists($legacy) ?? false);
         }
 
         $batches[$legacy]->load($legacy, $name);
+    }
+
+    public static function readFrom(Model $legacy, bool $writePdo): void
+    {
+        if ($writePdo) {
+            $written = self::$written ??= new WeakMap;
+            $written[$legacy] = true;
+        }
+    }
+
+    public static function inherit(Model $from, Model $legacy): void
+    {
+        self::readFrom($legacy, self::$written?->offsetExists($from) ?? false);
     }
 
     public static function refreshed(Model $legacy): void
@@ -87,9 +103,25 @@ final class ExternalAttributes
         }
     }
 
-    public static function resolveAll(Model $legacy): void
+    public static function resolveOriginal(Model $legacy, mixed $key): void
     {
-        foreach (self::of($legacy::class) as $name) {
+        if (! $legacy->exists) {
+            return;
+        }
+
+        if ($key === null) {
+            self::resolveAll($legacy);
+        } elseif (is_string($key) && ! array_key_exists($key, $legacy->getAttributes())) {
+            self::resolve($legacy, $key);
+        }
+    }
+
+    /**
+     * @param  null|list<string>  $names
+     */
+    public static function resolveAll(Model $legacy, null|array $names = null): void
+    {
+        foreach ($names ?? self::of($legacy::class) as $name) {
             if (! array_key_exists($name, $legacy->getAttributes())) {
                 self::resolve($legacy, $name);
             }
@@ -314,7 +346,7 @@ final class ExternalAttributes
 
         return match (true) {
             $stored === null || $read === null => $stored === $read,
-            is_bool($stored) || is_bool($read) => (bool) $stored === (bool) $read,
+            is_bool($stored) || is_bool($read) => $stored === $read,
             is_scalar($stored) && (is_scalar($read) || $read instanceof Stringable) => (string) $stored === (string) $read,
             default => false,
         };

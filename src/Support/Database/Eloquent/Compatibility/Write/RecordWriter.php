@@ -66,6 +66,7 @@ final readonly class RecordWriter
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             (new RetainedRows($this->map, $this->connection))->upsert($this->map->branch ? $key : self::keyOf($primary), $retained);
             $this->readBack($legacy, $key, array_keys($values));
+            $this->readBackExternal($legacy, $key, array_keys($external));
 
             return $key;
         });
@@ -99,6 +100,7 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, array_keys($values));
+            $this->readBackExternal($legacy, $key, array_keys($external));
 
             return 1;
         });
@@ -135,6 +137,7 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
+            $this->readBackExternal($legacy, $key, array_keys($external));
 
             return 1;
         });
@@ -193,7 +196,7 @@ final readonly class RecordWriter
         $moved = $this->rekey($legacy, $key, $values);
         (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
-        $this->readBackExternal($legacy, $moved, $values);
+        $this->readBackExternal($legacy, $moved, [...array_keys($legacy->getAttributes()), ...array_keys($values)]);
 
         return 1;
     }
@@ -581,16 +584,14 @@ final readonly class RecordWriter
     }
 
     /**
-     * @param  array<string, mixed>  $values
+     * @param  list<int|string>  $names
      */
-    private function readBackExternal(Model $legacy, int|string $key, array $values): void
+    private function readBackExternal(Model $legacy, int|string $key, array $names): void
     {
         $read = [];
 
-        foreach ($this->map->externals() as $name) {
-            if (array_key_exists($name, $legacy->getAttributes()) && ! array_key_exists($name, $values)) {
-                $read[$name] = ExternalAttributes::values($this->map, $name, [$key], $this->connection->getName(), true)[$key] ?? null;
-            }
+        foreach (array_intersect($this->map->externals(), $names) as $name) {
+            $read[$name] = ExternalAttributes::values($this->map, $name, [$key], $this->connection->getName(), true)[$key] ?? null;
         }
 
         if ($read !== []) {

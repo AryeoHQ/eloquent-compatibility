@@ -106,6 +106,41 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_no_attribute_that_serialization_hides(): void
+    {
+        $library = FakeMediaLibrary::bound();
+
+        $hidden = Photo::query()->orderBy('id')->get()->makeHidden('mime_type')->toArray();
+        $visible = Photo::query()->orderBy('id')->get()->setVisible(['id'])->toArray();
+        $calls = count($library->calls);
+        $shown = Photo::query()->orderBy('id')->get()->setVisible(['id', 'mime_type'])->toArray();
+
+        $this->assertSame([[1, 2, 3], [['id' => 1], ['id' => 2], ['id' => 3]], 0], [array_column($hidden, 'id'), $visible, $calls]);
+        $this->assertSame([false, ['image/jpeg', 'image/jpeg', 'image/png']], [array_key_exists('mime_type', $hidden[0]), array_column($shown, 'mime_type')]);
+        $this->assertCount(1, $library->calls);
+    }
+
+    #[Test]
+    public function it_resolves_the_original_value_an_original_accessor_or_an_updating_listener_reads(): void
+    {
+        $seen = [];
+        Photo::updating(function (Photo $photo) use (&$seen): void {
+            $seen[] = [$photo->getOriginal('mime_type'), $photo->getRawOriginal('mime_type')];
+        });
+
+        $originals = [
+            Photo::query()->findOrFail(3)->getOriginal('mime_type'),
+            Photo::query()->findOrFail(3)->getRawOriginal('mime_type'),
+            Photo::query()->findOrFail(3)->getOriginal()['mime_type'] ?? 'missing',
+            Photo::query()->findOrFail(3)->getRawOriginal()['mime_type'] ?? 'missing',
+        ];
+        Photo::query()->findOrFail(3)->update(['caption' => 'Pine']);
+
+        $this->assertSame(['image/png', 'image/png', 'image/png', 'image/png'], $originals);
+        $this->assertSame([['image/png', 'image/png']], $seen);
+    }
+
+    #[Test]
     public function it_resolves_each_video_through_the_read_of_its_external_branch_and_from_the_value_its_other_branch_fixes(): void
     {
         $videos = Video::query()->orderBy('id')->get();
@@ -240,6 +275,8 @@ final class ExternalAttributesTest extends TestCase
             fn () => Photo::query()->value('mime_type'),
             fn () => Photo::query()->select('id')->groupBy('mime_type')->get(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall
             fn () => Photo::query()->select('id')->groupBy('id')->having('mime_type', '=', 'image/png')->get(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall, staticMethod.dynamicCall
+            fn () => Photo::query()->select('id')->groupBy('id')->havingNested(fn (QueryBuilder $query) => $query->having('mime_type', '=', 'image/png'))->get(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall, staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->select('id')->groupBy('id')->havingNested(fn (QueryBuilder $query) => $query->havingNested(fn (QueryBuilder $nested) => $nested->having('photos.mime_type', '=', 'image/png')))->get(),
             fn () => Photo::query()->count('mime_type'), // @phpstan-ignore staticMethod.dynamicCall
             fn () => Photo::query()->select('mime_type')->exists(), // @phpstan-ignore staticMethod.dynamicCall, staticMethod.dynamicCall
             fn () => Photo::query()->toBase()->where('mime_type', 'image/jpeg')->get(),
@@ -267,6 +304,8 @@ final class ExternalAttributesTest extends TestCase
             Photo::class.'::$mime_type cannot take select. '.$because,
             Photo::class.'::$mime_type cannot take select. '.$because,
             Photo::class.'::$mime_type cannot take groupBy. '.$because,
+            Photo::class.'::$mime_type cannot take having. '.$because,
+            Photo::class.'::$mime_type cannot take having. '.$because,
             Photo::class.'::$mime_type cannot take having. '.$because,
             Photo::class.'::$mime_type cannot take count(). '.$because,
             Photo::class.'::$mime_type cannot take select. '.$because,
@@ -340,42 +379,37 @@ final class ExternalAttributesTest extends TestCase
     #[Test]
     public function it_resolves_a_record_read_from_the_write_connection_through_the_write_connection(): void
     {
-        DB::statement('create schema compatibility_replica');
-        DB::statement('create table compatibility_replica.files (like public.files)');
-        DB::statement('create view compatibility_replica.photos as select * from public.photos');
-        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
-        $replicated = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            protected $connection = 'compatibility_replicated';
-
-            protected $table = 'photos';
-
-            public function getMorphClass()
-            {
-                return 'photo';
-            }
-
-            public static function compatibility(Compatibility $photo): Compatibility
-            {
-                return Photo::compatibility($photo);
-            }
-        };
-
-        try {
+        $read = $this->onReplica(function (string $replicated): array {
             $written = $replicated::query()->useWritePdo()->findOrFail(1)->getAttribute('mime_type'); // @phpstan-ignore staticMethod.dynamicCall
             $loaded = $replicated::query()->orderBy('id')->findMany([2, 3]);
             $loaded[1]->refresh();
             $replica = $loaded[0]->getAttribute('mime_type');
             $refreshed = $loaded[1]->getAttribute('mime_type');
             $cursor = $replicated::query()->useWritePdo()->whereKey(3)->cursor()->first()?->getAttribute('mime_type'); // @phpstan-ignore staticMethod.dynamicCall
-        } finally {
-            DB::purge('compatibility_replicated');
-            DB::statement('drop schema compatibility_replica cascade');
-        }
 
-        $this->assertSame(['image/jpeg', 'image/png', 'image/png', null], [$written, $refreshed, $cursor, $replica]);
+            return [$written, $refreshed, $cursor, $replica];
+        });
+
+        $this->assertSame(['image/jpeg', 'image/png', 'image/png', null], $read);
+    }
+
+    #[Test]
+    public function it_resolves_the_attribute_a_retrieved_listener_reads_through_the_connection_its_query_chose(): void
+    {
+        $read = $this->onReplica(function (string $replicated): array {
+            $seen = [];
+            $replicated::retrieved(function (Model $photo) use (&$seen): void {
+                $seen[] = $photo->getAttribute('mime_type');
+            });
+
+            $replicated::query()->useWritePdo()->findOrFail(3); // @phpstan-ignore staticMethod.dynamicCall
+            $replicated::query()->useWritePdo()->whereKey(3)->cursor()->first(); // @phpstan-ignore staticMethod.dynamicCall
+            $replicated::query()->findOrFail(3);
+
+            return $seen;
+        });
+
+        $this->assertSame(['image/png', 'image/png', null], $read);
     }
 
     #[Test]
@@ -421,6 +455,45 @@ final class ExternalAttributesTest extends TestCase
         $photos[0]->save();
 
         $this->assertSame('{"a":1,"b":2}', DB::table('photos')->where('id', 1)->value('caption'));
+    }
+
+    /**
+     * @template TRead
+     *
+     * @param  Closure(class-string<Model>): TRead  $read
+     * @return TRead
+     */
+    private function onReplica(Closure $read): mixed
+    {
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.files (like public.files)');
+        DB::statement('create view compatibility_replica.photos as select * from public.photos');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
+        $replicated = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_replicated';
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return Photo::compatibility($photo);
+            }
+        };
+
+        try {
+            return $read($replicated::class);
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
     }
 
     private function embeds(): Model
