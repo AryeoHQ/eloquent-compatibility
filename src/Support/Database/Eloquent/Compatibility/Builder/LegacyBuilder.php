@@ -80,7 +80,7 @@ final class LegacyBuilder extends Builder
 
     public static function serves(Model $model): bool
     {
-        return $model->getConnection()->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
+        return $model->getConnection()->scalar('select relkind::text from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($model->getTable())], false) === 'v';
     }
 
     /**

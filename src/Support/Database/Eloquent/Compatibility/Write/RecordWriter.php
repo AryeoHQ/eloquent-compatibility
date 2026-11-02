@@ -10,6 +10,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
@@ -69,7 +70,7 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
-            $this->readBack($legacy, $key, array_keys($values));
+            $this->readBack($legacy, $this->rekey($legacy, $primary, $key, array_keys($values)), array_keys($values));
 
             return 1;
         });
@@ -100,7 +101,8 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
-            $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
+            $names = [...array_keys($amounts), ...array_keys($extra)];
+            $this->readBack($legacy, $this->rekey($legacy, $primary, $key, $names), $names);
 
             return 1;
         });
@@ -297,6 +299,14 @@ final readonly class RecordWriter
         $row = (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->selectRaw(implode(', ', $selects))->first();
 
         return array_combine(array_keys($expressions), array_values($row));
+    }
+
+    /**
+     * @param  list<int|string>  $names
+     */
+    private function rekey(Model $legacy, Model $primary, int|string $key, array $names): int|string
+    {
+        return in_array($legacy->getKeyName(), array_map(fn (int|string $name) => Str::afterLast((string) $name, '.'), $names), true) ? $this->identify($legacy, $primary) : $key;
     }
 
     /**
@@ -577,7 +587,17 @@ final readonly class RecordWriter
     {
         $relation = ($related->relation)($parent);
 
-        return $relation instanceof Relation ? $relation : throw new LogicException('The related() relation from '.class_basename($related->parent).' to '.class_basename($related->model).' returns no relation.');
+        if (! $relation instanceof Relation) {
+            throw new LogicException('The related() relation from '.class_basename($related->parent).' to '.class_basename($related->model).' returns no relation.');
+        }
+
+        $relation->getRelated()->setConnection($this->connection->getName());
+        $query = $relation->getBaseQuery();
+        $query->connection = $this->connection;
+        $query->grammar = $this->connection->getQueryGrammar();
+        $query->processor = $this->connection->getPostProcessor();
+
+        return $relation;
     }
 
     /**
