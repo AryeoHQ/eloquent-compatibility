@@ -202,12 +202,28 @@ final readonly class ViewCompiler
     {
         $rows = $this->connection->select(
             "select attribute.attname as name
-             from pg_attrdef column_default
-             join pg_attribute attribute on attribute.attrelid = column_default.adrelid and attribute.attnum = column_default.adnum
-             where column_default.adrelid = to_regclass(quote_ident(current_schema()) || '.' || ?)
-               and (cast(column_default.adbin as text) ~ '\\{(SQLVALUEFUNCTION|NEXTVALUEEXPR) '
+             from pg_attribute attribute
+             left join pg_attrdef column_default on column_default.adrelid = attribute.attrelid and column_default.adnum = attribute.attnum
+             cross join lateral (
+                 select coalesce(cast(column_default.adbin as text), (
+                     with recursive domain_chain(type, depth) as (
+                         select attribute.atttypid, 0
+                         union all
+                         select declared.typbasetype, domain_chain.depth + 1
+                         from domain_chain join pg_type declared on declared.oid = domain_chain.type
+                         where declared.typtype = 'd'
+                     )
+                     select cast(declared.typdefaultbin as text)
+                     from domain_chain join pg_type declared on declared.oid = domain_chain.type
+                     where declared.typtype = 'd' and declared.typdefaultbin is not null
+                     order by domain_chain.depth
+                     limit 1
+                 )) as tree
+             ) column_default_tree
+             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped
+               and (column_default_tree.tree ~ '\\{(SQLVALUEFUNCTION|NEXTVALUEEXPR) '
                     or exists (
-                        select from regexp_matches(cast(column_default.adbin as text), ':(funcid|opfuncid) (\\d+)', 'g') as found (ids)
+                        select from regexp_matches(column_default_tree.tree, ':(funcid|opfuncid) (\\d+)', 'g') as found (ids)
                         join pg_proc called on called.oid = cast(found.ids[2] as oid)
                         where called.provolatile <> 'i'
                     ))",

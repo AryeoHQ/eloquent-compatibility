@@ -62,12 +62,11 @@ final readonly class Preparer
             $columns[] = 'ADD COLUMN IF NOT EXISTS '.$successorColumn.' '.$column->type;
             $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
             $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
-            $defaults[] = 'ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID';
             $fills[] = $successorColumn.' = COALESCE('.$successorColumn.', '.$default.')';
             $missing[] = $successorColumn.' IS NULL';
-            $checks[] = 'VALIDATE CONSTRAINT '.$filled;
+            $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
             $notNull[] = ['ALTER COLUMN '.$successorColumn.' SET NOT NULL', 'DROP CONSTRAINT '.$filled];
-            $indexes = [...$indexes, ...$this->uniqueIndex($map->primary->table, $unique, '('.$successorColumn.')', true)];
+            $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, $unique, '('.$successorColumn.')', true)];
         }
 
         $table = "ALTER TABLE {$primary}\n  ";
@@ -84,7 +83,8 @@ final readonly class Preparer
                     ."    COMMIT;\n"
                     ."  END LOOP;\n"
                     ."END\n\$compatibility\$",
-                $table.implode(",\n  ", $checks),
+                $table.implode(",\n  ", array_column($checks, 0)),
+                $table.implode(",\n  ", array_column($checks, 1)),
                 // Two statements: ALTER TABLE drops constraints before SET NOT NULL, which would then scan the table.
                 $table.implode(",\n  ", array_column($notNull, 0)),
                 $table.implode(",\n  ", array_column($notNull, 1)),
@@ -122,7 +122,7 @@ final readonly class Preparer
         $key = SqlFragments::identifier($related->relatedKey);
         $conditions = ViewCompiler::conditions($related, false);
         $where = $conditions === [] ? '' : ' WHERE '.implode(' AND ', $conditions);
-        $duplicates = 'SELECT '.$key.' FROM '.$table.$where.' GROUP BY '.$key.' HAVING count(*) > 1';
+        $duplicates = 'SELECT '.$key.' FROM '.$table.' WHERE '.implode(' AND ', [...$conditions, $key.' IS NOT NULL']).' GROUP BY '.$key.' HAVING count(*) > 1';
         $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: atMostOne() on {$name} allows one {$related->table} row for each {$related->relatedKey}, and ")
             .' || duplicated || '.SqlFragments::literal(" values of {$related->relatedKey} have more; the first are ").' || first_keys';
 
@@ -133,20 +133,31 @@ final readonly class Preparer
                 ."    SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM ({$duplicates} ORDER BY {$key} LIMIT 5) AS first_duplicates (duplicate);\n"
                 ."    RAISE EXCEPTION '%', {$refusal};\n"
                 ."  END IF;\nEND\n\$compatibility\$",
-            $this->uniqueIndex($related->table, $index, '('.$key.')'.$where, false),
+            $this->uniqueIndex($map->table, $related->table, $index, '('.$key.')'.$where, false),
         ];
     }
 
     /**
      * @return list<string>
      */
-    private function uniqueIndex(string $table, string $index, string $columns, bool $constraint): array
+    private function uniqueIndex(string $map, string $table, string $index, string $columns, bool $constraint): array
     {
-        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).')';
+        $relation = fn (string $name) => 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
+        $definition = fn (string $of) => "substr(pg_get_indexdef({$of}), strpos(pg_get_indexdef({$of}), ' USING '))";
+        $refusal = SqlFragments::literal("Compatibility map '{$map}' cannot prepare: {$index} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.");
         $statements = [
-            "DO \$compatibility\$\nBEGIN\n"
-                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = {$relation} AND NOT indisvalid) THEN\n"
+            "DO \$compatibility\$\nDECLARE\n  existing regclass := {$relation($index)};\n  expected text;\n  found text;\nBEGIN\n"
+                ."  IF existing IS NULL THEN\n    RETURN;\n  END IF;\n"
+                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN\n"
                 .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
+                ."    RETURN;\n  END IF;\n"
+                ."  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($table).', current_schema(), '.SqlFragments::literal($table).");\n"
+                .'  CREATE UNIQUE INDEX '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns.";\n"
+                .'  SELECT '.$definition('indexrelid').' INTO expected FROM pg_index WHERE indrelid = '.SqlFragments::literal('pg_temp.'.SqlFragments::identifier($table))."::regclass;\n"
+                .'  SELECT '.$definition('indexrelid').' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indrelid = '.$relation($table).";\n"
+                .'  DROP TABLE pg_temp.'.SqlFragments::identifier($table).";\n"
+                ."  IF found IS DISTINCT FROM expected THEN\n"
+                ."    RAISE EXCEPTION '%', {$refusal};\n"
                 ."  END IF;\nEND\n\$compatibility\$",
             'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns,
         ];

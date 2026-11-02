@@ -91,6 +91,15 @@ final class SqlFragmentsTest extends TestCase
         );
     }
 
+    #[Test]
+    public function it_binds_no_placeholder_inside_a_quoted_identifier(): void
+    {
+        $this->assertSame(
+            "\"question?\" = 'yes' and \"say \"\"why?\"\"\" = 'because' and \"either??\" = 1",
+            SqlFragments::bind('"question?" = ? and "say ""why?""" = ? and "either??" = ?', ['yes', 'because', 1]),
+        );
+    }
+
     /**
      * @param  list<mixed>  $bindings
      */

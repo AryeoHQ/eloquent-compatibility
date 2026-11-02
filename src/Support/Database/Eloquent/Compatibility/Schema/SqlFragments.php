@@ -67,20 +67,158 @@ final class SqlFragments
     }
 
     /**
-     * @return array{string, mixed}
+     * @return null|array{string, mixed}
      */
-    public static function bound(string $operator, mixed $value, null|string $type): array
+    public static function bound(string $operator, mixed $value, int|float $multiplier, int|float $divisor, null|string $type): null|array
     {
-        if (! is_float($value) || ! self::isInteger($type)) {
-            return [$operator, $value];
+        if ($value === null) {
+            return [$operator, null];
+        }
+
+        $value = is_numeric($value) ? self::fraction($value) : null;
+        $multiplier = self::fraction($multiplier);
+        $divisor = self::fraction($divisor);
+        $stored = $value === null || $multiplier === null || $divisor === null ? null : self::product(self::product($value, $multiplier), [$divisor[1], $divisor[0]]);
+
+        if ($stored === null) {
+            return null;
+        }
+
+        if ($stored[1] === 1) {
+            return [$operator, $stored[0]];
+        }
+
+        $scale = self::scale($type);
+
+        if ($scale === null) {
+            $decimal = self::decimal($stored);
+
+            return $decimal === null ? null : [$operator, $decimal];
+        }
+
+        $power = 10 ** $scale;
+        $units = is_int($power) ? self::product($stored, [$power, 1]) : null;
+
+        if ($units === null) {
+            return null;
+        }
+
+        [$numerator, $denominator] = $units;
+
+        if ($denominator === 1) {
+            return [$operator, self::fixed($numerator, $scale)];
         }
 
         return match ($operator) {
             '=' => ['none', null],
             '!=', '<>' => ['!=', null],
-            '>', '>=' => ['>=', (int) ceil($value)],
-            default => ['<=', (int) floor($value)],
+            '>', '>=' => ['>=', self::fixed(intdiv($numerator, $denominator) + ($numerator % $denominator > 0 ? 1 : 0), $scale)],
+            default => ['<=', self::fixed(intdiv($numerator, $denominator) - ($numerator % $denominator < 0 ? 1 : 0), $scale)],
         };
+    }
+
+    /**
+     * @return null|array{int, int}
+     */
+    private static function fraction(int|float|string $value): null|array
+    {
+        $text = is_float($value) ? var_export($value, true) : trim((string) $value);
+
+        if (preg_match('/^([+-]?)(\d*)(?:\.(\d*))?(?:e([+-]?\d+))?$/i', $text, $match) !== 1 || $match[2].($match[3] ?? '') === '') {
+            return null;
+        }
+
+        $fraction = $match[3] ?? '';
+        $digits = ltrim($match[2].$fraction, '0');
+        $exponent = (int) ($match[4] ?? 0) - strlen($fraction);
+
+        if ($digits === '') {
+            return [0, 1];
+        }
+
+        if (strlen($digits) > 18 || abs($exponent) > 18) {
+            return null;
+        }
+
+        $numerator = (int) ($match[1].$digits);
+
+        return $exponent >= 0 ? self::product([$numerator, 1], [10 ** $exponent, 1]) : self::product([$numerator, 1], [1, 10 ** -$exponent]);
+    }
+
+    /**
+     * @param  null|array{int, int}  $first
+     * @param  array{int, int}  $second
+     * @return null|array{int, int}
+     */
+    private static function product(null|array $first, array $second): null|array
+    {
+        if ($first === null || $second[1] === 0) {
+            return null;
+        }
+
+        $across = self::divisor($first[0], $second[1]);
+        $down = self::divisor($second[0], $first[1]);
+        $numerator = self::times(intdiv($first[0], $across), intdiv($second[0], $down));
+        $denominator = self::times(intdiv($first[1], $down), intdiv($second[1], $across));
+
+        if ($numerator === null || $denominator === null) {
+            return null;
+        }
+
+        $common = self::divisor($numerator, $denominator) * ($denominator < 0 ? -1 : 1);
+
+        return [intdiv($numerator, $common), intdiv($denominator, $common)];
+    }
+
+    /**
+     * @param  array{int, int}  $fraction
+     */
+    private static function decimal(array $fraction): null|string
+    {
+        $rest = $fraction[1];
+        $twos = 0;
+        $fives = 0;
+
+        for (; $rest % 2 === 0; $twos++) {
+            $rest = intdiv($rest, 2);
+        }
+
+        for (; $rest % 5 === 0; $fives++) {
+            $rest = intdiv($rest, 5);
+        }
+
+        $places = max($twos, $fives);
+        $widen = 2 ** ($places - $twos) * 5 ** ($places - $fives);
+        $units = $rest === 1 && is_int($widen) ? self::product([$fraction[0], 1], [$widen, 1]) : null;
+
+        return $units === null ? null : (string) self::fixed($units[0], $places);
+    }
+
+    private static function fixed(int $units, int $scale): int|string
+    {
+        if ($scale === 0) {
+            return $units;
+        }
+
+        $digits = str_pad(ltrim((string) $units, '-'), $scale + 1, '0', STR_PAD_LEFT);
+
+        return ($units < 0 ? '-' : '').substr($digits, 0, -$scale).'.'.substr($digits, -$scale);
+    }
+
+    private static function times(int $first, int $second): null|int
+    {
+        return $second !== 0 && abs($first) > intdiv(PHP_INT_MAX, abs($second)) ? null : $first * $second;
+    }
+
+    private static function divisor(int $first, int $second): int
+    {
+        [$first, $second] = [abs($first), abs($second)];
+
+        while ($second !== 0) {
+            [$first, $second] = [$second, $first % $second];
+        }
+
+        return max($first, 1);
     }
 
     public static function identifier(string $identifier): string
@@ -118,22 +256,27 @@ final class SqlFragments
     public static function bind(string $sql, array $bindings): string
     {
         $bound = '';
-        $quoted = false;
+        $quote = null;
         $next = 0;
 
         for ($at = 0; $at < strlen($sql); $at++) {
             $pair = substr($sql, $at, 2);
 
-            if ($pair === "''") {
+            if ($quote !== null && $pair === $quote.$quote) {
                 $bound .= $pair;
                 $at++;
-            } elseif ($pair === '??' && ! $quoted) {
+            } elseif ($sql[$at] === $quote) {
+                $bound .= $quote;
+                $quote = null;
+            } elseif ($quote !== null) {
+                $bound .= $sql[$at];
+            } elseif ($sql[$at] === "'" || $sql[$at] === '"') {
+                $bound .= $sql[$at];
+                $quote = $sql[$at];
+            } elseif ($pair === '??') {
                 $bound .= '?';
                 $at++;
-            } elseif ($sql[$at] === "'") {
-                $bound .= "'";
-                $quoted = ! $quoted;
-            } elseif ($sql[$at] === '?' && ! $quoted) {
+            } elseif ($sql[$at] === '?') {
                 if (! array_key_exists($next, $bindings)) {
                     throw new InvalidArgumentException("The SQL [{$sql}] has more placeholders than its ".count($bindings).' bindings.');
                 }

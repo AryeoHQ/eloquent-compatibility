@@ -222,7 +222,7 @@ final class Compatibility
         $connection = (new $map->model)->getConnection();
 
         try {
-            (new Installer($connection))->run($statements($map, $connection));
+            (new Installer($connection))->run($connection->transaction(fn () => $statements($map, $connection)));
         } finally {
             LegacyBuilder::forgetViews();
         }

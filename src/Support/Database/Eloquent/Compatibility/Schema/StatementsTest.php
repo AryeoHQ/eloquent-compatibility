@@ -49,9 +49,9 @@ final class StatementsTest extends TestCase
               duplicated bigint;
               first_keys text;
             BEGIN
-              SELECT count(*) INTO duplicated FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL GROUP BY "job_id" HAVING count(*) > 1) AS duplicates;
+              SELECT count(*) INTO duplicated FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1) AS duplicates;
               IF duplicated > 0 THEN
-                SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL GROUP BY "job_id" HAVING count(*) > 1 ORDER BY "job_id" LIMIT 5) AS first_duplicates (duplicate);
+                SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1 ORDER BY "job_id" LIMIT 5) AS first_duplicates (duplicate);
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: atMostOne() on the relation from Job to Place allows one places row for each job_id, and ' || duplicated || ' values of job_id have more; the first are ' || first_keys;
               END IF;
             END
@@ -66,10 +66,8 @@ final class StatementsTest extends TestCase
             ALTER TABLE "jobs"
               ALTER COLUMN "legacy_id" SET DEFAULT nextval('listings_id_seq'::regclass),
               DROP CONSTRAINT IF EXISTS "jobs_legacy_id_filled",
-              ADD CONSTRAINT "jobs_legacy_id_filled" CHECK ("legacy_id" IS NOT NULL) NOT VALID,
               ALTER COLUMN "legacy_uuid" SET DEFAULT gen_random_uuid(),
-              DROP CONSTRAINT IF EXISTS "jobs_legacy_uuid_filled",
-              ADD CONSTRAINT "jobs_legacy_uuid_filled" CHECK ("legacy_uuid" IS NOT NULL) NOT VALID
+              DROP CONSTRAINT IF EXISTS "jobs_legacy_uuid_filled"
             SQL,
         ], $statements->transaction);
         $this->assertSame([
@@ -91,6 +89,11 @@ final class StatementsTest extends TestCase
             SQL,
             <<<'SQL'
             ALTER TABLE "jobs"
+              ADD CONSTRAINT "jobs_legacy_id_filled" CHECK ("legacy_id" IS NOT NULL) NOT VALID,
+              ADD CONSTRAINT "jobs_legacy_uuid_filled" CHECK ("legacy_uuid" IS NOT NULL) NOT VALID
+            SQL,
+            <<<'SQL'
+            ALTER TABLE "jobs"
               VALIDATE CONSTRAINT "jobs_legacy_id_filled",
               VALIDATE CONSTRAINT "jobs_legacy_uuid_filled"
             SQL,
@@ -106,9 +109,25 @@ final class StatementsTest extends TestCase
             SQL,
             <<<'SQL'
             DO $compatibility$
+            DECLARE
+              existing regclass := to_regclass(quote_ident(current_schema()) || '."jobs_legacy_id_unique"');
+              expected text;
+              found text;
             BEGIN
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."jobs_legacy_id_unique"') AND NOT indisvalid) THEN
+              IF existing IS NULL THEN
+                RETURN;
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
                 DROP INDEX "jobs_legacy_id_unique";
+                RETURN;
+              END IF;
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'jobs', current_schema(), 'jobs');
+              CREATE UNIQUE INDEX "jobs_legacy_id_unique" ON "jobs" ("legacy_id");
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."jobs"'::regclass;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indrelid = to_regclass(quote_ident(current_schema()) || '."jobs"');
+              DROP TABLE pg_temp."jobs";
+              IF found IS DISTINCT FROM expected THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_id_unique already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
               END IF;
             END
             $compatibility$
@@ -125,9 +144,25 @@ final class StatementsTest extends TestCase
             SQL,
             <<<'SQL'
             DO $compatibility$
+            DECLARE
+              existing regclass := to_regclass(quote_ident(current_schema()) || '."jobs_legacy_uuid_unique"');
+              expected text;
+              found text;
             BEGIN
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."jobs_legacy_uuid_unique"') AND NOT indisvalid) THEN
+              IF existing IS NULL THEN
+                RETURN;
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
                 DROP INDEX "jobs_legacy_uuid_unique";
+                RETURN;
+              END IF;
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'jobs', current_schema(), 'jobs');
+              CREATE UNIQUE INDEX "jobs_legacy_uuid_unique" ON "jobs" ("legacy_uuid");
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."jobs"'::regclass;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indrelid = to_regclass(quote_ident(current_schema()) || '."jobs"');
+              DROP TABLE pg_temp."jobs";
+              IF found IS DISTINCT FROM expected THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_uuid_unique already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
               END IF;
             END
             $compatibility$
@@ -144,9 +179,25 @@ final class StatementsTest extends TestCase
             SQL,
             <<<'SQL'
             DO $compatibility$
+            DECLARE
+              existing regclass := to_regclass(quote_ident(current_schema()) || '."places_listings_at_most_one"');
+              expected text;
+              found text;
             BEGIN
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."places_listings_at_most_one"') AND NOT indisvalid) THEN
+              IF existing IS NULL THEN
+                RETURN;
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
                 DROP INDEX "places_listings_at_most_one";
+                RETURN;
+              END IF;
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'places', current_schema(), 'places');
+              CREATE UNIQUE INDEX "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."places"'::regclass;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indrelid = to_regclass(quote_ident(current_schema()) || '."places"');
+              DROP TABLE pg_temp."places";
+              IF found IS DISTINCT FROM expected THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: places_listings_at_most_one already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
               END IF;
             END
             $compatibility$
@@ -165,7 +216,7 @@ final class StatementsTest extends TestCase
         $statements = Statements::install($this->map(), DB::connection());
 
         $this->assertSame([
-            'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE',
+            'LOCK TABLE "listings", "jobs" IN SHARE ROW EXCLUSIVE MODE',
             <<<'SQL'
             DO $compatibility$
             DECLARE
@@ -228,7 +279,7 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listings_retained_pkey" PRIMARY KEY ("job_id"),
               ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID
             SQL,
-            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":[]}\'',
+            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":[],"moved":[["\\"listing_photos\\"","listing_photos_listing_id_foreign"],["\\"listing_shares\\"","listing_shares_listing_uuid_foreign"]]}\'',
             $view,
             'ALTER VIEW "listings" ALTER COLUMN "id" SET DEFAULT nextval(\'listings_id_seq\'::regclass)',
             'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
@@ -261,10 +312,19 @@ final class StatementsTest extends TestCase
         $fill = array_search('UPDATE "listings" SET "job_id" = "jobs"."id" FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id"', $transaction, true);
         $repoints = array_keys(array_filter($transaction, fn (string $statement) => str_contains($statement, 'DROP CONSTRAINT "listing_')));
 
-        $this->assertSame('LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE', $transaction[0]);
+        $this->assertSame('LOCK TABLE "listings", "jobs" IN SHARE ROW EXCLUSIVE MODE', $transaction[0]);
         $this->assertIsInt($fill);
         $this->assertCount(2, $repoints);
         $this->assertGreaterThan($fill, min($repoints));
+    }
+
+    #[Test]
+    public function it_locks_the_primary_successor_against_writes_before_uninstall_copies_it(): void
+    {
+        Compatibility::prepare(Listing::class);
+        Compatibility::install(Listing::class);
+
+        $this->assertSame('LOCK TABLE "jobs" IN SHARE ROW EXCLUSIVE MODE', Statements::uninstall($this->map(), DB::connection())->transaction[0]);
     }
 
     #[Test]
@@ -285,6 +345,7 @@ final class StatementsTest extends TestCase
         $statements = Statements::uninstall($this->map(), DB::connection());
 
         $this->assertSame([
+            'LOCK TABLE "jobs" IN SHARE ROW EXCLUSIVE MODE',
             'DROP VIEW "listings"',
             'ALTER TABLE "listings_retained" RENAME TO "listings"',
             'INSERT INTO "listings" ("job_id") SELECT "jobs"."id" FROM "jobs" WHERE NOT EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" = "jobs"."id")',
@@ -392,6 +453,14 @@ final class StatementsTest extends TestCase
             },
             $install,
             'the foreign key listing_titles_title_fkey on listing_titles references listings.title, which install() moves to a successor; reference an identifier instead',
+        ];
+        yield 'a legacy table under row-level security' => [
+            function (): void {
+                Compatibility::prepare(Listing::class);
+                DB::statement('alter table listings enable row level security');
+            },
+            $install,
+            "listings enables row-level security, and the view would read its successors with its owner's privileges and serve rows a policy hides",
         ];
         yield 'a foreign key over two columns' => [
             function (): void {

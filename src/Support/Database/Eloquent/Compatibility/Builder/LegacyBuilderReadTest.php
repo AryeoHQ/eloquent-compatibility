@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -19,6 +20,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
@@ -95,6 +98,7 @@ final class LegacyBuilderReadTest extends TestCase
             'unconverted' => fn (Builder $listings) => $listings->where('street', 'like', '%Elm%'),
             'with trashed' => fn (Builder $listings) => $listings->withoutGlobalScope(SoftDeletingScope::class)->whereNull('price'),
             'ordered by price' => fn (Builder $listings) => $listings->reorder()->orderByDesc('price')->orderBy('id'),
+            'ordered by status' => fn (Builder $listings) => $listings->reorder()->orderBy('status')->orderBy('id'),
             'latest' => fn (Builder $listings) => $listings->reorder()->latest()->orderBy('id'),
         ];
 
@@ -104,7 +108,7 @@ final class LegacyBuilderReadTest extends TestCase
         $this->assertSame($before, $this->idsFor($queries));
         $this->assertSame([1, 5], $before['price above']);
         $this->assertSame(
-            ['unconverted', 'ordered by price', 'latest'],
+            ['unconverted', 'ordered by price', 'ordered by status', 'latest'],
             array_keys(array_filter($queries, fn (Closure $query) => ! str_contains($query(Listing::query())->toBase()->toRawSql(), 'select "jobs"."legacy_id"'))),
         );
     }
@@ -158,12 +162,8 @@ final class LegacyBuilderReadTest extends TestCase
         $refusals = [];
 
         foreach ([
-            fn () => Listing::query()->orderBy('status'),
-            fn () => Listing::query()->where('status', 'like', 'Act%'),
-            fn () => Listing::query()->where('status', 'Pending'),
             fn () => Listing::query()->where('price', DB::raw('100')),
             fn () => Listing::query()->whereIn('price', DB::table('listings')->select('price')),
-            fn () => Listing::query()->whereNull('status'),
         ] as $query) {
             try {
                 $query();
@@ -174,13 +174,26 @@ final class LegacyBuilderReadTest extends TestCase
 
         $instead = ' Instead: filter or sort on the stored column through the successor model.';
         $this->assertSame([
-            'Tests\Fixtures\Support\Listings\Listing::$status cannot take orderBy asc. Why: its conversions do not keep the order of the stored values.'.$instead,
-            "Tests\\Fixtures\\Support\\Listings\\Listing::\$status cannot take where like. Why: its conversions give no stored value to compare with 'Act%'.".$instead,
-            "Tests\\Fixtures\\Support\\Listings\\Listing::\$status cannot take where =. Why: its conversions give no stored value to compare with 'Pending'.".$instead,
             'Tests\Fixtures\Support\Listings\Listing::$price cannot take where =. Why: a raw expression or a subquery does not pass through its conversions.'.$instead,
             'Tests\Fixtures\Support\Listings\Listing::$price cannot take whereIn. Why: a subquery does not pass through its conversions.'.$instead,
-            'Tests\Fixtures\Support\Listings\Listing::$status cannot take whereNull. Why: its conversions give no stored value to compare with NULL.'.$instead,
         ], $refusals);
+    }
+
+    #[Test]
+    public function it_filters_the_view_column_when_a_predicate_has_no_stored_inverse(): void
+    {
+        $this->install();
+        DB::table('jobs')->insert(['name' => 'Archived Annex', 'company_id' => ListingTables::COMPANY, 'lifecycle_status' => 'archived']);
+
+        $this->assertSameRows(fn () => Listing::query(), fn () => DB::table('listings')->whereNull('deleted_at'), [
+            'status null' => fn (Builder|QueryBuilder $listings) => $listings->whereNull('status'),
+            'status not null' => fn (Builder|QueryBuilder $listings) => $listings->whereNotNull('status'),
+            'or status null' => fn (Builder|QueryBuilder $listings) => $listings->where('title', 'Oak House')->orWhereNull('status'),
+            'status like' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'like', 'Act%'),
+            'status not like' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('status', 'like', 'Act%'),
+            'nested not status like' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('status', 'like', 'Act%')->orWhereNull('status')),
+            'a status no mapping declares' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Pending'),
+        ]);
     }
 
     #[Test]
@@ -250,9 +263,7 @@ final class LegacyBuilderReadTest extends TestCase
             'not equal to false' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '!=', '0'),
         ]);
 
-        $this->expectExceptionObject(CompatibilityQueryRefused::untranslatable($model::class, 'featured', 'where =', "its conversions give no stored value to compare with 'maybe'."));
-
-        $model->newQuery()->where('featured', 'maybe');
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', 'maybe')->get(), fn () => DB::table('listings')->where('featured', 'maybe')->get());
     }
 
     #[Test]
@@ -286,6 +297,9 @@ final class LegacyBuilderReadTest extends TestCase
             'after a date' => fn (Builder|QueryBuilder $listings) => $listings->where('listed_on', '>', '2026-01-01'),
             'an integer read from text' => fn (Builder|QueryBuilder $listings) => $listings->where('floor', 1),
             'integers read from text' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('floor', [1, 2]),
+            'null read from text' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('floor', [null]),
+            'an integer or null read from text' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('floor', [1, null]),
+            'neither an integer nor null read from text' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('floor', [2, null]),
             'a rounded price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 1.01),
             'above a rounded price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '>', 1.005),
             'not a rounded price' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('price', 1.01),
@@ -326,18 +340,13 @@ final class LegacyBuilderReadTest extends TestCase
             'not equal to true' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '!=', true),
             'not false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('featured', false),
             'nested not true' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('featured', true)),
+            'false' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', false),
+            'zero' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', 0),
+            'zero as text' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '0'),
+            'false as text' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', 'false'),
+            'nested not false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('featured', false)),
         ]);
-        $refusals = [];
-
-        foreach ([false, 0, '0', 'false', 'maybe'] as $value) {
-            try {
-                $model->newQuery()->where('featured', $value);
-            } catch (CompatibilityQueryRefused) {
-                $refusals[] = $value;
-            }
-        }
-
-        $this->assertSame([false, 0, '0', 'false', 'maybe'], $refusals);
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', 'maybe')->get(), fn () => DB::table('listings')->where('featured', 'maybe')->get());
     }
 
     #[Test]
@@ -413,6 +422,196 @@ final class LegacyBuilderReadTest extends TestCase
         ], [$inZone('UTC', $served), $inZone('Asia/Tokyo', $served), $inZone('UTC', $filtered), $inZone('Asia/Tokyo', $filtered)]);
     }
 
+    #[Test]
+    public function it_keeps_the_null_semantics_of_in_and_not_in_once_installed(): void
+    {
+        $queries = [
+            'price in null' => fn (Builder $listings) => $listings->whereIn('price', [null]),
+            'price in null or a value' => fn (Builder $listings) => $listings->whereIn('price', [null, 99.99]),
+            'price not in null' => fn (Builder $listings) => $listings->whereNotIn('price', [null]),
+            'price not in null or a value' => fn (Builder $listings) => $listings->whereNotIn('price', [null, 100]),
+            'not price in null or a value' => fn (Builder $listings) => $listings->whereNot(fn (Builder $nested) => $nested->whereIn('price', [null, 99.99])),
+            'not price not in null or a value' => fn (Builder $listings) => $listings->whereNot(fn (Builder $nested) => $nested->whereNotIn('price', [null, 99.99])),
+            'status in null or a value' => fn (Builder $listings) => $listings->whereIn('status', [null, 'Sold']),
+            'status not in null or a value' => fn (Builder $listings) => $listings->whereNotIn('status', [null, 'Sold']),
+        ];
+
+        $before = $this->idsFor($queries);
+        $this->install();
+
+        $this->assertSame($before, $this->idsFor($queries));
+        $this->assertSame([[], [3], [], [], [], [3]], [$before['price in null'], $before['price in null or a value'], $before['price not in null'], $before['price not in null or a value'], $before['not price in null or a value'], $before['not price not in null or a value']]);
+    }
+
+    #[Test]
+    public function it_compares_a_scaled_attribute_with_every_decimal_place_of_the_value(): void
+    {
+        DB::table('listings')->insert([
+            ['title' => 'Bare Lot', 'company_id' => ListingTables::COMPANY, 'price' => '0.00', 'status' => 'Draft'],
+            ['title' => 'Grand Estate', 'company_id' => ListingTables::COMPANY, 'price' => '12345678.12', 'status' => 'Active'],
+        ]);
+        $queries = [
+            'equal to a trillionth' => fn (Builder $listings) => $listings->where('price', '0.000000000001'),
+            'not equal to a trillionth' => fn (Builder $listings) => $listings->where('price', '!=', '0.000000000001'),
+            'at most a trillionth' => fn (Builder $listings) => $listings->where('price', '<=', '0.000000000001'),
+            'above a trillionth' => fn (Builder $listings) => $listings->where('price', '>', '0.000000000001'),
+            'in a trillionth or a price' => fn (Builder $listings) => $listings->whereIn('price', ['0.000000000001', '99.99']),
+            'a large price as text' => fn (Builder $listings) => $listings->where('price', '12345678.12'),
+            'a large price as a float' => fn (Builder $listings) => $listings->where('price', 12345678.12),
+            'just below a large price' => fn (Builder $listings) => $listings->where('price', '<', '12345678.1199999999'),
+        ];
+
+        $before = $this->idsFor($queries);
+        $this->install();
+
+        $this->assertSame($before, $this->idsFor($queries));
+        $this->assertSame([[], [6], [7]], [$before['equal to a trillionth'], $before['at most a trillionth'], $before['a large price as text']]);
+    }
+
+    #[Test]
+    public function it_compares_a_multiplied_attribute_with_every_decimal_place_of_the_value(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01)));
+            }
+        };
+        $this->installMap($model::class);
+        DB::update('update jobs set price_cents = 0 where legacy_id = 4');
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'equal to a trillionth' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '0.000000000001'),
+            'at most a trillionth' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '<=', '0.000000000001'),
+            'above a trillionth' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '>', '0.000000000001'),
+            'a price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '1250.50'),
+        ]);
+    }
+
+    #[Test]
+    public function it_compares_a_wall_clock_in_a_time_zone_with_every_instant_that_shows_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/New_York')));
+            }
+        };
+        $this->installMap($model::class);
+        DB::table('jobs')->insert([
+            ['name' => 'Before the change', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-11-01 05:30:00+00'],
+            ['name' => 'After the change', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-11-01 06:30:00+00'],
+            ['name' => 'In spring', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-03-08 07:30:00+00'],
+        ]);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a repeated wall clock' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '2026-11-01 01:30:00'),
+            'before a repeated wall clock' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '<', '2026-11-01 01:45:00'),
+            'from a repeated wall clock' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '>=', '2026-11-01 01:15:00'),
+            'a skipped wall clock' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '2026-03-08 02:30:00'),
+        ]);
+    }
+
+    #[Test]
+    public function it_filters_a_mapped_value_the_legacy_column_cannot_hold_as_the_view_serves_it(): void
+    {
+        DB::statement('alter table listings add column code varchar(4)');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('code', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 'Draft', 'live' => 'Active', 'closed' => 'Sold'])));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a value the column cuts short' => fn (Builder|QueryBuilder $listings) => $listings->where('code', 'Active'),
+            'not a value the column cuts short' => fn (Builder|QueryBuilder $listings) => $listings->where('code', '!=', 'Active'),
+            'values the column cuts short or keeps' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('code', ['Draft', 'Sold']),
+        ]);
+    }
+
+    #[Test]
+    public function it_filters_on_the_view_for_a_role_that_cannot_read_the_successors(): void
+    {
+        $this->install();
+        $role = 'compatibility_view_filter_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant select on listings to {$role}");
+            DB::statement("set role {$role}");
+
+            $this->assertSame(
+                [[1, 5], [1, 4], [3]],
+                [
+                    array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all()),
+                    array_map(intval(...), Listing::query()->whereNot(fn (Builder $listings) => $listings->where('status', '!=', 'Active'))->orderBy('id')->pluck('id')->all()),
+                    array_map(intval(...), Listing::query()->whereIn('status', ['Sold', null])->orderBy('id')->pluck('id')->all()),
+                ],
+            );
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
+    public function it_translates_a_filter_only_where_the_current_schema_serves_the_view(): void
+    {
+        DB::statement('create schema compatibility_tenant');
+
+        try {
+            DB::statement('set search_path to compatibility_tenant');
+            ListingTables::create();
+            ListingTables::seed();
+            DB::statement('set search_path to public');
+            $this->install();
+            $installed = array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+            DB::statement('set search_path to compatibility_tenant');
+            $tenant = array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+        } finally {
+            DB::statement('set search_path to public');
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([[1, 5], [1]], [$installed, $tenant]);
+    }
+
+    #[Test]
+    public function it_stops_translating_a_filter_once_another_process_uninstalls_the_view(): void
+    {
+        $this->install();
+        $installed = array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+
+        (new Installer(DB::connection()))->run(Statements::uninstall(Compatibility::of(Listing::class)->resolve(), DB::connection()));
+        DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+
+        $this->assertSame([[1, 5], [1, 3, 5]], [$installed, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
+    }
+
     public static function identified(Compatibility $listing): Compatibility
     {
         return $listing
@@ -465,6 +664,27 @@ final class LegacyBuilderReadTest extends TestCase
         }
 
         $this->assertSame($served, $translated);
+    }
+
+    /**
+     * @param  Closure(): mixed  $eloquent
+     * @param  Closure(): mixed  $raw
+     */
+    private function assertSameFailure(Closure $eloquent, Closure $raw): void
+    {
+        $failures = [];
+
+        foreach ([$raw, $eloquent] as $query) {
+            try {
+                $query();
+                $failures[] = 'no failure';
+            } catch (QueryException $exception) {
+                $failures[] = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+        }
+
+        $this->assertSame([$failures[0], $failures[0]], $failures);
+        $this->assertNotSame('no failure', $failures[0]);
     }
 
     /**

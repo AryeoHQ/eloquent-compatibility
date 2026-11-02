@@ -78,6 +78,10 @@ final readonly class Related
             throw InvalidCompatibilityMap::because($map, "{$name} joins another table");
         }
 
+        if (($base->offset ?? 0) > 0 || ($base->groups ?? []) !== [] || ($base->havings ?? []) !== [] || ($base->unions ?? []) !== []) {
+            throw InvalidCompatibilityMap::because($map, "{$name} applies an offset, a group or a union, and the view reads the first row of its conditions and order");
+        }
+
         if ($base->bindings['order'] !== []) {
             throw InvalidCompatibilityMap::because($map, "{$name} orders by an expression with bindings");
         }
