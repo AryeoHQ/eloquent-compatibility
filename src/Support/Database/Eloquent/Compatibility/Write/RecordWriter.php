@@ -27,7 +27,7 @@ final readonly class RecordWriter
      */
     public function insert(Model $legacy, array $values): int|string
     {
-        return $this->connection->transaction(function () use ($legacy, $values): int|string {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values): int|string {
             [$stored, $retained, $states] = $this->split($legacy, $values, null);
             $primary = $this->successor($this->map->primary->model);
             $table = $this->map->primary->table;
@@ -39,7 +39,7 @@ final readonly class RecordWriter
             $stored = $this->transition($legacy, $key, $models, array_diff_key($states, [$table => true]), $stored);
             $this->assignEach($models, $stored);
             $this->saveEach($legacy, $existing);
-            $this->create($legacy, $models, $missing, $stored);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
             (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
 
             return $key;
@@ -51,7 +51,7 @@ final readonly class RecordWriter
      */
     public function update(Model $legacy, array $values): int
     {
-        return $this->connection->transaction(function () use ($legacy, $values): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values): int {
             $key = self::keyOf($legacy);
             $primary = $this->lock($legacy, $key);
 
@@ -60,14 +60,14 @@ final readonly class RecordWriter
             }
 
             [$stored, $retained, $states] = $this->split($legacy, $values, $key);
-            $this->guard($legacy, $key, $values, []);
+            $retained = $this->guard($legacy, $key, $values, [], $retained);
             $this->retain($primary, $retained, []);
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
-            $this->create($legacy, $models, $missing, $stored);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
 
             return 1;
         });
@@ -79,7 +79,7 @@ final readonly class RecordWriter
      */
     public function increment(Model $legacy, array $amounts, array $extra): int
     {
-        return $this->connection->transaction(function () use ($legacy, $amounts, $extra): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $amounts, $extra): int {
             $key = self::keyOf($legacy);
             $primary = $this->lock($legacy, $key);
 
@@ -89,7 +89,7 @@ final readonly class RecordWriter
 
             [$stored, $retained, $states] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
-            $this->guard($legacy, $key, $extra, $amounts);
+            $retained = $this->guard($legacy, $key, $extra, $amounts, $retained);
             $this->retain($primary, $retained, array_diff_key($retainedAmounts, $retained));
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states + array_fill_keys(array_keys($added), []));
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
@@ -97,7 +97,7 @@ final readonly class RecordWriter
             $this->addEach($models, $added, $stored);
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
-            $this->create($legacy, $models, $missing, $stored);
+            $this->create($legacy, $key, $models, $missing, $stored, $states);
 
             return 1;
         });
@@ -105,7 +105,7 @@ final readonly class RecordWriter
 
     public function delete(Model $legacy): int
     {
-        return $this->connection->transaction(function () use ($legacy): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy): int {
             $primary = $this->lock($legacy, self::keyOf($legacy));
 
             if ($primary === null) {
@@ -234,18 +234,24 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int|numeric-string>  $amounts
+     * @param  array<string, mixed>  $retained
+     * @return array<string, mixed>
      */
-    private function guard(Model $legacy, int|string $key, array $values, array $amounts): void
+    private function guard(Model $legacy, int|string $key, array $values, array $amounts, array $retained): array
     {
         if ($this->map->guards === []) {
-            return;
+            return $retained;
         }
 
         $before = $legacy->newModelQuery()->where($legacy->getKeyName(), $key)->first();
 
         if ($before === null) {
-            return;
+            return $retained;
         }
+
+        $evaluated = $this->evaluate($legacy, $key, array_filter($retained, fn (mixed $value) => $value instanceof Expression));
+        $values = array_replace($values, $evaluated);
+        $retained = array_replace($retained, $evaluated);
 
         foreach ($amounts as $name => $amount) {
             $current = $before->getAttributes()[$name] ?? null;
@@ -263,6 +269,30 @@ final readonly class RecordWriter
                 throw CompatibilityWriteRefused::byGuard($legacy::class, $guard, $key);
             }
         }
+
+        return $retained;
+    }
+
+    /**
+     * @param  array<string, Expression>  $expressions
+     * @return array<string, mixed>
+     */
+    private function evaluate(Model $legacy, int|string $key, array $expressions): array
+    {
+        if ($expressions === []) {
+            return [];
+        }
+
+        $grammar = $this->connection->getQueryGrammar();
+        $selects = [];
+
+        foreach (array_values($expressions) as $index => $expression) {
+            $selects[] = '('.$expression->getValue($grammar).') as '.$grammar->wrap('value_'.$index);
+        }
+
+        $row = (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->selectRaw(implode(', ', $selects))->first();
+
+        return array_combine(array_keys($expressions), array_values($row));
     }
 
     /**
@@ -443,8 +473,9 @@ final readonly class RecordWriter
      * @param  array<string, Model>  $models
      * @param  list<Related>  $missing
      * @param  array<string, array<string, mixed>>  $stored
+     * @param  array<string, array<string, array{string, mixed}>>  $states
      */
-    private function create(Model $legacy, array $models, array $missing, array $stored): void
+    private function create(Model $legacy, int|string $key, array $models, array $missing, array $stored, array $states): void
     {
         foreach ($missing as $related) {
             $values = $stored[$related->table] ?? [];
@@ -455,6 +486,17 @@ final readonly class RecordWriter
 
             $parent = $models[$related->parentTable] ?? throw CompatibilityWriteRefused::noParentRow($legacy::class, $this->written($related, $values), $related->table, $related->parentTable);
             $relation = $this->relation($related, $parent);
+            $created = $relation->getQuery()->lockForUpdate()->first();
+
+            if ($created !== null) {
+                $transitioned = array_intersect_key($states, [$related->table => true]);
+                $this->transition($legacy, $key, [$related->table => $created], $transitioned, []);
+                $this->assign($created, array_diff_key($values, $transitioned[$related->table] ?? []));
+                $this->saveEach($legacy, [$created]);
+                $models[$related->table] = $created;
+
+                continue;
+            }
 
             if (! $relation instanceof HasOneOrMany) {
                 throw CompatibilityWriteRefused::noRelatedRow($legacy::class, $this->written($related, $values), $related->table, $related->parentTable);

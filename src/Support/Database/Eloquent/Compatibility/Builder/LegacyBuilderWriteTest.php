@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use DateTimeInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Date;
@@ -179,6 +180,7 @@ final class LegacyBuilderWriteTest extends TestCase
 
         $this->assertSame([
             [0, "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)"],
+            [1, "select set_config('TimeZone', ?, true)"],
             [1, 'select jobs for update'],
             [1, 'select listings'],
             [1, 'insert listings_retained'],
@@ -202,14 +204,76 @@ final class LegacyBuilderWriteTest extends TestCase
         Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'latitude' => 47.25, 'mls_number' => 'MLS-9']);
 
         $this->assertSame([
+            "select set_config('TimeZone', ?, true)",
             'insert jobs',
             'select jobs',
             'select places for update',
             'select job_sites for update',
+            'select places for update',
             'insert places',
+            'select job_sites for update',
             'insert job_sites',
             'insert listings_retained',
         ], $statements);
+    }
+
+    #[Test]
+    public function it_stores_each_legacy_timestamp_so_the_view_reads_it_back_whatever_the_session_time_zone(): void
+    {
+        $this->install();
+        DB::statement("set time zone 'America/Denver'");
+        Date::setTestNow('2026-06-07 10:00:00');
+
+        $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        $session = DB::transaction(function (): mixed {
+            Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor', 'created_at' => '2026-01-01 08:00:00']);
+
+            return DB::scalar("select current_setting('TimeZone')");
+        });
+        Listing::query()->whereKey(3)->toBase()->update(['title' => 'Elm Lodge']);
+        Listing::query()->whereKey($created->id)->delete();
+
+        $this->assertSame(['America/Denver', 'America/Denver'], [$session, DB::scalar("select current_setting('TimeZone')")]);
+        $this->assertSame([
+            [4, '2026-06-07 10:00:00', '2026-06-07 10:00:00', '2026-06-07 10:00:00'],
+            [1, '2026-01-01 08:00:00', '2026-06-07 10:00:00', null],
+            [3, '2026-01-04 08:00:00', '2026-06-07 10:00:00', null],
+        ], array_map(fn (int $id) => [$id, ...array_map(fn (mixed $at) => $at instanceof DateTimeInterface ? $at->format('Y-m-d H:i:s') : $at, $this->served($id, ['created_at', 'updated_at', 'deleted_at']))], [$created->id, 1, 3]));
+    }
+
+    #[Test]
+    public function it_routes_a_write_by_the_relation_the_write_connection_sees_while_a_replica_still_holds_the_legacy_table(): void
+    {
+        $this->install();
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.listings (id integer, price numeric(10, 2))');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => []]]);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_replicated';
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            $read = $model->newQuery()->where('price', '>', 1000)->toBase()->count();
+            $created = $model->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame([0, 4], [$read, $created->getKey()]);
+        $this->assertSame('Birch House', $this->job(4)->name);
     }
 
     private function install(): void

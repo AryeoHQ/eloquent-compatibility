@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
@@ -26,6 +27,8 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 final readonly class MassWriter
 {
     private const string PINNED = 'pg_temp.compatibility_pinned';
+
+    private const string MISSING = 'pg_temp.compatibility_missing';
 
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
@@ -44,6 +47,27 @@ final readonly class MassWriter
     }
 
     /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $write
+     * @return TResult
+     */
+    public function transaction(Closure $write): mixed
+    {
+        return $this->connection->transaction(function () use ($write): mixed {
+            $session = $this->connection->transactionLevel() > 1 ? $this->connection->scalar("select current_setting('TimeZone')") : null;
+            $this->connection->select("select set_config('TimeZone', ?, true)", [Config::string('app.timezone', 'UTC')]);
+            $result = $write();
+
+            if (is_string($session)) {
+                $this->connection->select("select set_config('TimeZone', ?, true)", [$session]);
+            }
+
+            return $result;
+        });
+    }
+
+    /**
      * @param  array<array-key, mixed>  $values
      * @param  array<array-key, float|int|numeric-string>  $amounts
      */
@@ -52,7 +76,7 @@ final readonly class MassWriter
         [$stored, $retained] = $this->split($values);
         [$added, $retainedAmounts] = $this->amounts($amounts, null);
 
-        return $this->connection->transaction(function () use ($keys, $stored, $retained, $added, $retainedAmounts): int {
+        return $this->transaction(function () use ($keys, $stored, $retained, $added, $retainedAmounts): int {
             $pinned = $this->pin($keys);
 
             if ($pinned > 0) {
@@ -77,9 +101,13 @@ final readonly class MassWriter
 
     public function delete(QueryBuilder $keys): int
     {
-        $primary = $this->map->primary;
+        return $this->transaction(function () use ($keys): int {
+            $primary = $this->map->primary;
+            $deleted = $this->pin($keys) > 0 ? (int) $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$primary->key, $this->pinned())->delete() : 0;
+            $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::PINNED));
 
-        return (int) $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$this->legacyColumn(), $keys)->delete();
+            return $deleted;
+        });
     }
 
     /**
@@ -195,10 +223,31 @@ final readonly class MassWriter
 
         $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::PINNED).' ON COMMIT DROP AS SELECT '.$grammar->wrap($key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
         $locked = $this->connection->table(self::PINNED)->insertUsing(['key'], $this->connection->table($primary->table)->select($key)->whereIn($legacy, $keys)->orderBy($key)->lockForUpdate());
+        $this->lockDependents();
         $filter = $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']);
         $moved = $this->connection->table(self::PINNED.' as pinned')->whereNotExists(fn (QueryBuilder $matching) => $matching->from($primary->table)->whereColumn($key, 'pinned.key')->whereIn($legacy, $filter))->delete();
 
         return $locked - $moved;
+    }
+
+    private function lockDependents(): void
+    {
+        $retained = $this->map->retainedTable;
+
+        if ($retained !== null) {
+            $retainedKey = $retained.'.'.$this->map->retainedKey;
+            $this->lock($this->connection->table($retained)->select($retainedKey)->whereIn($retainedKey, $this->pinned())->orderBy($retainedKey));
+        }
+
+        foreach ($this->map->related as $related) {
+            $key = $related->table.'.'.$related->successor->key;
+            $this->lock($this->connection->table($related->table)->select($key)->whereIn($key, $this->reach($related)->whereNotNull($key)->select($key))->orderBy($key));
+        }
+    }
+
+    private function lock(QueryBuilder $rows): void
+    {
+        $this->connection->query()->fromSub($rows->lockForUpdate(), 'locked')->count();
     }
 
     private function pinned(): QueryBuilder
@@ -218,17 +267,23 @@ final readonly class MassWriter
             return;
         }
 
-        $table = SqlFragments::identifier($related->table);
-        $key = $related->successor->key;
-        $reached = $this->reach($related)->whereNotNull($related->table.'.'.$key)->select($related->table.'.'.$key);
-        $this->successor($related->model)->newModelQuery()->whereIn($related->table.'.'.$key, $reached)->update($changes);
+        $catalog = new ColumnCatalog($this->connection);
+        $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $values, $catalog);
+        $key = $related->table.'.'.$related->successor->key;
+        $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reach($related)->whereNotNull($key)->select($key))->update($changes);
 
-        if (array_filter($values, fn (mixed $value) => $value !== null) === []) {
-            return;
+        if ($creates) {
+            $this->createMissing($related, $values, $catalog);
         }
+    }
 
-        $missing = $table.'.'.SqlFragments::identifier($related->relatedKey).' IS NULL';
-        $parent = SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    private function pinMissing(Related $related, array $values, ColumnCatalog $catalog): bool
+    {
+        $missing = self::missing($related);
+        $parent = self::parent($related);
         $written = array_keys(array_filter($related->successor->attributes(), fn ($attribute) => array_key_exists((string) $attribute->column(), $values)));
 
         if ($related->belongsTo && $this->reach($related)->whereRaw($missing)->exists()) {
@@ -239,27 +294,32 @@ final readonly class MassWriter
             throw CompatibilityWriteRefused::noParentRow($this->map->model, $written, $related->table, $related->parentTable);
         }
 
-        $this->createMissing($related, $values, $written, $missing, $parent);
+        $key = $catalog->of($related->table)[$related->successor->key] ?? null;
+        $lacking = $this->reach($related)->whereRaw($missing)->whereNotNull(new RawExpression($parent));
+
+        if ($key !== null && $key->default === null && ! $key->generated) {
+            if ($lacking->exists()) {
+                throw CompatibilityWriteRefused::noKeyDefault($this->map->model, $written, $related->table, $related->successor->key);
+            }
+
+            return false;
+        }
+
+        $primary = $this->map->primary;
+        $grammar = $this->connection->getQueryGrammar();
+        $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::MISSING).' ON COMMIT DROP AS SELECT '.$grammar->wrap($primary->table.'.'.$primary->key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
+        $this->connection->table(self::MISSING)->insertUsing(['key'], $lacking->select($primary->table.'.'.$primary->key));
+
+        return true;
     }
 
     /**
      * @param  array<string, mixed>  $values
-     * @param  list<string>  $written
      */
-    private function createMissing(Related $related, array $values, array $written, string $missing, string $parent): void
+    private function createMissing(Related $related, array $values, ColumnCatalog $catalog): void
     {
         $model = $this->successor($related->model);
-        $catalog = new ColumnCatalog($this->connection);
-        $key = $catalog->of($related->table)[$related->successor->key] ?? null;
-
-        if ($key !== null && $key->default === null && ! $key->generated) {
-            if ($this->reach($related)->whereRaw($missing)->whereNotNull(new RawExpression($parent))->exists()) {
-                throw CompatibilityWriteRefused::noKeyDefault($this->map->model, $written, $related->table, $related->successor->key);
-            }
-
-            return;
-        }
-
+        $parent = self::parent($related);
         $row = [$related->relatedKey => new RawExpression($parent), ...$related->attributes, ...$values];
 
         if ($model->usesTimestamps()) {
@@ -288,7 +348,20 @@ final readonly class MassWriter
             $bindings[] = $value;
         }
 
-        $model->newModelQuery()->insertUsing(array_map(fn (int|string $column) => (string) $column, array_keys($row)), $this->reach($related)->selectRaw(implode(', ', $selects), $bindings)->whereRaw($missing)->whereNotNull(new RawExpression($parent)));
+        $primary = $this->map->primary;
+        $source = $this->reach($related)->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereIn($primary->table.'.'.$primary->key, $this->connection->table(self::MISSING)->select('key'))->whereRaw(self::missing($related));
+        $model->newModelQuery()->insertUsing(array_map(fn (int|string $column) => (string) $column, array_keys($row)), $source);
+        $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::MISSING));
+    }
+
+    private static function missing(Related $related): string
+    {
+        return SqlFragments::identifier($related->table).'.'.SqlFragments::identifier($related->relatedKey).' IS NULL';
+    }
+
+    private static function parent(Related $related): string
+    {
+        return SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
     }
 
     private function reach(Related $related): QueryBuilder

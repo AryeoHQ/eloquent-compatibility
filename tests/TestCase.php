@@ -6,6 +6,7 @@ namespace Tests;
 
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Provider;
@@ -15,6 +16,17 @@ abstract class TestCase extends Testbench\TestCase
     use RefreshDatabase;
 
     protected $enablesPackageDiscoveries = true;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->beforeApplicationDestroyed(function (): void {
+            foreach (DB::getConnections() as $connection) {
+                $connection->disconnect();
+            }
+        });
+    }
 
     /**
      * @param  Application  $app

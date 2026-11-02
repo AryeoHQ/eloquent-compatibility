@@ -151,6 +151,39 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_runs_a_guard_against_the_value_a_raw_expression_stores_in_a_legacy_only_attribute(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')))
+                    ->guard('mls number kept', fn (Model $after) => $after->getAttribute('mls_number') === '', because: 'A listing keeps an MLS number.', instead: 'Write the new MLS number.');
+            }
+        };
+        $before = $this->snapshot();
+
+        $refusal = $this->refusal(fn () => $listing->newQuery()->findOrFail(1)->update(['mls_number' => DB::raw("''")]));
+        $refused = $this->snapshot();
+        $listing->newQuery()->findOrFail(3)->update(['mls_number' => DB::raw("'MLS-' || id || 'B'")]);
+
+        $this->assertStringEndsWith(" record 1 cannot take this write, because guard 'mls number kept' refuses it. Why: A listing keeps an MLS number. Instead: Write the new MLS number.", $refusal->getMessage());
+        $this->assertSame($before, $refused);
+        $this->assertSame(['MLS-1', 'MLS-3B'], Listing::query()->orderBy('id')->pluck('mls_number')->all());
+    }
+
+    #[Test]
     public function it_rounds_a_fractional_record_increment_as_the_mass_increment_does(): void
     {
         Listing::query()->findOrFail(1)->increment('price', 0.005);
@@ -267,6 +300,23 @@ final class RecordWriterTest extends TestCase
         $job = Job::query()->where('legacy_id', $listing->id)->firstOrFail();
 
         $this->assertSame([['9 Birch St', 'Tacoma']], DB::table('places')->where('job_id', $job->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
+    }
+
+    #[Test]
+    public function it_writes_to_a_dependent_a_listener_of_the_primary_save_created_during_an_update_rather_than_create_a_second(): void
+    {
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            if ($job->rootPlace()->doesntExist()) {
+                $job->rootPlace()->create(['street' => 'To be confirmed']);
+            }
+        });
+        $listing = Listing::withTrashed()->findOrFail(2);
+
+        $listing->update(['title' => 'Pine Lodge', 'street' => '2 Pine St']);
+        $job = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $this->assertSame([['2 Pine St', null]], DB::table('places')->where('job_id', $job->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
+        $this->assertSame(['Pine Lodge', '2 Pine St'], [Listing::withTrashed()->findOrFail(2)->title, Listing::withTrashed()->findOrFail(2)->street]);
     }
 
     #[Test]

@@ -45,6 +45,9 @@ final class LegacyBuilder extends Builder
     /** @var array<string, true> */
     private static array $tables = [];
 
+    /** @var array<string, true> */
+    private static array $writtenTables = [];
+
     private int $negations = 0;
 
     private null|Model $writeOf = null;
@@ -56,6 +59,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         self::$tables = [];
+        self::$writtenTables = [];
     }
 
     public static function insertOf(Model $model): void
@@ -78,14 +82,14 @@ final class LegacyBuilder extends Builder
         $connection = $model->getConnection();
         $relation = $connection->getName().'.'.$model->getTable();
 
-        if (array_key_exists($relation, self::$tables)) {
+        if (array_key_exists($relation, self::$writtenTables)) {
             return false;
         }
 
-        $view = $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())]) === 'v';
+        $view = $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
 
         if (! $view) {
-            self::$tables[$relation] = true;
+            self::$writtenTables[$relation] = true;
         }
 
         return $view;
@@ -187,7 +191,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::incrementEach($columns, $extra) : $this->incrementOwn($model, $columns, $extra);
+        return $model === null ? $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, $columns, $extra);
     }
 
     /**
@@ -198,7 +202,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::decrementEach($columns, $extra) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
+        return $model === null ? $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
     }
 
     /**
