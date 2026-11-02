@@ -9,13 +9,17 @@ use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Str;
+use Illuminate\Support\Testing\Fakes\EventFake;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Write\Applying;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
+use Throwable;
 use WeakMap;
 
 final class Forwarder
@@ -62,36 +66,58 @@ final class Forwarder
         'forceDeleting' => ['deleting'],
     ];
 
-    /** @var WeakMap<Model, string> */
-    private WeakMap $last;
+    private const array ENDS = [
+        'saving' => 'saved',
+        'creating' => 'saved',
+        'updating' => 'saved',
+        'restoring' => 'restored',
+        'deleting' => 'deleted',
+        'forceDeleting' => 'forceDeleted',
+    ];
 
-    /** @var WeakMap<Model, LegacyRecord> */
-    private WeakMap $records;
+    /** @var WeakMap<Model, list<Sequence>> */
+    private WeakMap $sequences;
 
     /** @var array<int, array{array<string, string>, list<string>}> */
     private array $compiled = [];
 
+    /** @var null|array<string, class-string> */
+    private null|array $objects = null;
+
     private function __construct(private readonly ResolvedMap $map, private readonly ResolvedMap $served, private readonly null|Related $dependent)
     {
-        $this->last = new WeakMap;
-        $this->records = new WeakMap;
+        $this->sequences = new WeakMap;
     }
 
-    public static function register(DispatcherContract $events, ResolvedMap $map): void
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function register(DispatcherContract $events, string $model): void
     {
-        foreach ($map->branches === [] ? [$map] : $map->branches as $served) {
-            $forwarders = [$served->primary->model => new self($map, $served, null)];
+        foreach (Compatibility::of($model)->successors() as $primary => $successors) {
+            foreach ($successors as $successor) {
+                $forward = self::lazily($model, $primary, $successor);
 
-            foreach ($served->related as $related) {
-                $forwarders[$related->model] = new self($map, $served, $related);
-            }
-
-            foreach ($forwarders as $successor => $forwarder) {
-                foreach (array_keys($forwarder->dependent === null ? self::PRIMARY : self::DEPENDENT) as $event) {
-                    $events->listen("eloquent.{$event}: {$successor}", fn (Model $model): null|false => $forwarder->forward($event, $model));
+                foreach (array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT) as $event) {
+                    self::prepend($events, "eloquent.{$event}: {$successor}", fn (Model $instance): null|false => $forward($event, $instance));
                 }
             }
         }
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     * @return Closure(string, Model): (null|false)
+     */
+    private static function lazily(string $model, string $primary, string $successor): Closure
+    {
+        $forwarder = null;
+
+        return function (string $event, Model $instance) use (&$forwarder, $model, $primary, $successor): null|false {
+            $forwarder ??= self::resolve(LegacyBuilder::mapOf($model), $primary, $successor);
+
+            return $forwarder->forward($event, $instance);
+        };
     }
 
     public function forward(string $event, Model $successor): null|false
@@ -101,22 +127,69 @@ final class Forwarder
         }
 
         $ahead = array_key_exists($event, self::FOLLOWING);
-        $last = $this->last[$successor] ?? null;
+        $sequences = $this->sequences[$successor] ?? [];
+        $top = array_key_last($sequences);
 
-        if ($ahead && ($last === null || ! in_array($event, self::CONTINUES[$last] ?? [], true))) {
-            $started = $this->start($event, $successor);
-
-            if ($started === null) {
-                $this->records->offsetUnset($successor);
-            } else {
-                $this->records->offsetSet($successor, $started);
-            }
-        } elseif ($last === null) {
+        if ($ahead && ($top === null || ! in_array($event, self::CONTINUES[$sequences[$top]->last] ?? [], true))) {
+            $sequences[] = new Sequence($event, $event, $this->start($event, $successor));
+            $top = array_key_last($sequences);
+        } elseif ($top === null) {
             return null;
         }
 
-        $this->last[$successor] = $event;
-        $record = $this->records[$successor] ?? null;
+        $sequence = $sequences[$top];
+        $sequence->last = $event;
+        $result = $this->raise($event, $successor, $sequence, $ahead);
+
+        if ($result === false || self::ENDS[$sequence->start] === $event) {
+            array_pop($sequences);
+            $outer = array_key_last($sequences);
+
+            if ($outer !== null && $result !== false) {
+                $sequences[$outer]->record?->reread();
+            }
+        }
+
+        if ($sequences === []) {
+            $this->sequences->offsetUnset($successor);
+        } else {
+            $this->sequences->offsetSet($successor, $sequences);
+        }
+
+        return $result;
+    }
+
+    private static function resolve(ResolvedMap $map, string $primary, string $successor): self
+    {
+        $served = $map->branches[$primary] ?? $map;
+
+        foreach ($served->related as $related) {
+            if ($related->model === $successor) {
+                return new self($map, $served, $related);
+            }
+        }
+
+        return new self($map, $served, null);
+    }
+
+    private static function prepend(DispatcherContract $events, string $event, Closure $listener): void
+    {
+        $listeners = $events instanceof Dispatcher ? $events->getRawListeners()[$event] ?? [] : [];
+
+        if ($listeners !== []) {
+            $events->forget($event);
+        }
+
+        $events->listen($event, $listener);
+
+        foreach ($listeners as $existing) {
+            $events->listen($event, $existing);
+        }
+    }
+
+    private function raise(string $event, Model $successor, Sequence $sequence, bool $ahead): null|false
+    {
+        $record = $sequence->record;
 
         if ($record === null) {
             return null;
@@ -126,11 +199,22 @@ final class Forwarder
             $record->after($successor);
         }
 
+        $events = ($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [];
+
+        if ($this->dependent !== null && ! $sequence->forwarding) {
+            if (! $ahead || ! $record->changes()) {
+                return null;
+            }
+
+            $sequence->forwarding = true;
+            $events = $event === $sequence->start ? $events : ['saving', ...$events];
+        }
+
         if (! $ahead) {
             $record->store($successor);
         }
 
-        foreach (($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [] as $legacyEvent) {
+        foreach ($events as $legacyEvent) {
             if (! $this->listens($legacyEvent)) {
                 continue;
             }
@@ -181,7 +265,7 @@ final class Forwarder
         if ($this->dependent !== null) {
             $record->after($successor);
 
-            return $record->changes() ? $record : null;
+            return $record;
         }
 
         if ($removes) {
@@ -190,7 +274,7 @@ final class Forwarder
             }
         }
 
-        return $removes && $record->records() === [] ? null : $record;
+        return ($removes || $successor->exists) && $record->records() === [] ? null : $record;
     }
 
     private function member(Model $successor): bool
@@ -201,7 +285,8 @@ final class Forwarder
             return true;
         }
 
-        return in_array($membership->alias, [$successor->getAttributes()[$membership->column], $successor->getRawOriginal($membership->column)], true);
+        return $successor->getAttributes()[$membership->column] === $membership->alias
+            && (! $successor->exists || $successor->getRawOriginal($membership->column) === $membership->alias);
     }
 
     /**
@@ -210,9 +295,12 @@ final class Forwarder
     private function mapBack(Model $legacy, array $before, Model $successor, bool $removes): void
     {
         $baseline = $before + $legacy->getRawOriginal();
+        $compared = $legacy->newInstance([], true);
+        $compared->setRawAttributes($baseline, true);
+        $compared->setRawAttributes($legacy->getAttributes());
 
         foreach ($legacy->getAttributes() as $name => $value) {
-            if (array_key_exists($name, $baseline) && $baseline[$name] === $value) {
+            if (array_key_exists($name, $baseline) && self::equivalent($compared, $name)) {
                 continue;
             }
 
@@ -223,12 +311,19 @@ final class Forwarder
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 $attribute->runsTransitions() => 'It is declared transitions(), so only a write through '.class_basename($legacy).' can run the trigger that changes it.',
-                ! $attribute->isWritable() => $attribute->readOnlyBecause() ?? 'It is declared fixed() or external(), so it stores no column of '.class_basename($successor).'.',
+                $attribute->isExternal() => $attribute->declinedBecause(),
+                ! $attribute->isWritable() => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
 
             if ($because !== null || $attribute === null) {
                 throw CompatibilityWriteRefused::byForwardedMutation($legacy::class, $name, $successor, (string) $because);
+            }
+
+            if ($attribute->isExternal()) {
+                $attribute->writeExternally($successor, $value);
+
+                continue;
             }
 
             try {
@@ -241,23 +336,88 @@ final class Forwarder
         }
     }
 
+    private static function equivalent(Model $compared, string $name): bool
+    {
+        try {
+            return $compared->originalIsEquivalent($name);
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
     private function dispatch(string $event, Model $legacy, bool $halt): mixed
     {
         $dispatcher = Model::getEventDispatcher();
-        $name = "eloquent.{$event}: ".$legacy::class;
 
-        if (! $dispatcher instanceof Dispatcher) {
-            return $halt ? $dispatcher?->until($name, $legacy) : $dispatcher?->dispatch($name, $legacy);
+        if ($dispatcher === null) {
+            return null;
+        }
+
+        $object = $legacy->dispatchesEvents()[$event] ?? null;
+
+        if (is_string($object) && class_exists($object)) {
+            $result = $this->send($dispatcher, new $object($legacy), [], $halt);
+            $result = is_array($result) ? array_filter($result, fn (mixed $response) => $response !== null) : $result;
+
+            if (! in_array($result, [null, 0, 0.0, '', '0', []], true)) {
+                return $result;
+            }
+        }
+
+        return $this->send($dispatcher, "eloquent.{$event}: ".$legacy::class, $legacy, $halt);
+    }
+
+    private function send(DispatcherContract $dispatcher, string|object $event, mixed $payload, bool $halt): mixed
+    {
+        while ($dispatcher instanceof EventFake) {
+            $probe = new class extends Dispatcher
+            {
+                public bool $reached = false;
+
+                /**
+                 * @param  string|object  $event
+                 * @param  mixed  $payload
+                 * @param  bool  $halt
+                 * @return null|array<array-key, mixed>
+                 */
+                public function dispatch($event, $payload = [], $halt = false)
+                {
+                    $this->reached = true;
+
+                    return null;
+                }
+            };
+            $real = $dispatcher->dispatcher;
+            $dispatcher->dispatcher = $probe;
+
+            try {
+                $faked = $dispatcher->dispatch($event, $payload, $halt);
+            } finally {
+                $dispatcher->dispatcher = $real;
+            }
+
+            if (! $probe->reached) {
+                return $faked;
+            }
+
+            $dispatcher = $real;
+        }
+
+        $name = is_object($event) ? $event::class : $event;
+
+        if (! $dispatcher instanceof Dispatcher || ! $this->excludes($dispatcher, $name)) {
+            return $halt ? $dispatcher->until($event, $payload) : $dispatcher->dispatch($event, $payload);
         }
 
         $exact = $dispatcher->getRawListeners()[$name] ?? [];
+        $responses = [];
 
         foreach ($dispatcher->getListeners($name) as $index => $listener) {
             if ($index < count($exact) && $this->excluded($exact[$index])) {
                 continue;
             }
 
-            $response = $listener($name, [$legacy]);
+            $response = $listener($name, is_object($event) ? [$event] : [$payload]);
 
             if ($halt && $response !== null) {
                 return $response;
@@ -266,13 +426,19 @@ final class Forwarder
             if ($response === false) {
                 break;
             }
+
+            $responses[] = $response;
         }
 
-        return null;
+        return $halt ? null : $responses;
     }
 
     private function listens(string $event): bool
     {
+        if (array_key_exists($event, $this->objects ??= (new $this->map->model)->dispatchesEvents())) {
+            return true;
+        }
+
         $dispatcher = Model::getEventDispatcher();
         $name = "eloquent.{$event}: ".$this->map->model;
 
@@ -287,6 +453,17 @@ final class Forwarder
         }
 
         return $dispatcher->hasWildcardListeners($name);
+    }
+
+    private function excludes(Dispatcher $dispatcher, string $name): bool
+    {
+        foreach ($dispatcher->getRawListeners()[$name] ?? [] as $listener) {
+            if ($this->excluded($listener)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function excluded(mixed $listener): bool

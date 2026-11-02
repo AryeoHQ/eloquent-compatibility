@@ -110,10 +110,14 @@ final class LegacyRecord
             $key = array_key_first($this->records) ?? '';
             $row = reset($rows);
 
-            if ($row !== false) {
-                $this->records[$key] ??= new $this->map->model;
-                $this->apply($key, $row);
+            if ($row === false || ($this->before !== [] && $this->records === [])) {
+                $this->records = [];
+
+                return;
             }
+
+            $this->records[$key] ??= new $this->map->model;
+            $this->apply($key, $row);
 
             return;
         }
@@ -154,6 +158,12 @@ final class LegacyRecord
 
         $rows = $this->stored($successor, true);
 
+        if ($this->dependent === null && $rows === []) {
+            $this->records = [];
+
+            return;
+        }
+
         foreach ($this->records as $key => $legacy) {
             $row = $this->dependent === null ? reset($rows) : $rows[$key] ?? false;
 
@@ -163,16 +173,45 @@ final class LegacyRecord
 
             $legacy->setRawAttributes(array_replace($legacy->getAttributes(), $row));
 
-            if ($legacy->exists) {
-                $legacy->syncChanges();
+            if (! $legacy->exists) {
+                $legacy->exists = true;
+                $legacy->wasRecentlyCreated = true;
+                ExternalAttributes::gather([$legacy], true);
 
                 continue;
             }
 
-            $legacy->exists = true;
-            $legacy->wasRecentlyCreated = true;
-            ExternalAttributes::gather([$legacy], true);
+            $this->reload($legacy);
+
+            if (! $legacy->wasRecentlyCreated) {
+                $legacy->syncChanges();
+            }
         }
+    }
+
+    public function reread(): void
+    {
+        $this->stored = false;
+    }
+
+    private function reload(Model $legacy): void
+    {
+        $resolved = array_intersect_key($legacy->getAttributes(), array_flip($this->map->externals()));
+
+        if ($resolved === []) {
+            return;
+        }
+
+        $original = $legacy->getRawOriginal();
+        $legacy->setRawAttributes(array_diff_key($legacy->getAttributes(), $resolved));
+
+        foreach (array_keys($resolved) as $name) {
+            $legacy->getAttribute($name);
+        }
+
+        $after = $legacy->getAttributes();
+        $legacy->setRawAttributes($original, true);
+        $legacy->setRawAttributes($after);
     }
 
     /**

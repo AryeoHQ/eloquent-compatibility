@@ -11,6 +11,7 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
@@ -160,5 +161,25 @@ final class LegacyRecordTest extends TestCase
 
         $this->assertSame([['updating', 3, 'image/png', true], ['deleted', 3, 'image/png', false]], $seen);
         $this->assertSame([['fetch', [(string) $file->zml_asset_id]]], array_slice(FakeMediaLibrary::bound()->calls, $calls));
+    }
+
+    #[Test]
+    public function it_gives_an_after_event_the_external_value_the_written_successor_reads_and_keeps_the_stored_one_as_the_original(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $seen = [];
+        Event::listen('eloquent.updating: '.Photo::class, function (Photo $photo) use (&$seen): void {
+            $seen[] = ['updating', $photo->mime_type];
+        });
+        Event::listen('eloquent.updated: '.Photo::class, function (Photo $photo) use (&$seen): void {
+            $seen[] = ['updated', $photo->mime_type, $photo->getOriginal('mime_type'), $photo->wasChanged('mime_type')];
+        });
+        $asset = FakeMediaLibrary::bound()->store(new FileMetadata('image/webp'));
+
+        File::query()->where('legacy_type', 'photo')->where('legacy_id', 3)->firstOrFail()->update(['zml_asset_id' => $asset]);
+
+        $this->assertSame([['updating', 'image/png'], ['updated', 'image/webp', 'image/png', true]], $seen);
     }
 }

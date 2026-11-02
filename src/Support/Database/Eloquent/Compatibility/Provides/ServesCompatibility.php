@@ -23,15 +23,25 @@ use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
  */
 trait ServesCompatibility
 {
+    /** @var array<class-string, true> */
+    private static array $admittedServedModels = [];
+
     public static function bootServesCompatibility(): void
     {
-        if ((new ReflectionClass(static::class))->isAnonymous()) {
+        unset(self::$admittedServedModels[static::class]);
+    }
+
+    public function initializeServesCompatibility(): void
+    {
+        if (array_key_exists(static::class, self::$admittedServedModels)) {
             return;
         }
 
-        if (! Container::getInstance()->make(ServedModels::class)->contains(static::class)) {
+        if (! (new ReflectionClass(static::class))->isAnonymous() && ! Container::getInstance()->make(ServedModels::class)->admits(static::class)) {
             throw UndiscoveredServedModel::named(static::class);
         }
+
+        self::$admittedServedModels[static::class] = true;
     }
 
     /**

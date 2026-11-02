@@ -30,6 +30,11 @@ final class LegacyFile extends Model implements Compatible
 
     protected $guarded = [];
 
+    protected $dispatchesEvents = [
+        'saving' => LegacyFileSaving::class,
+        'updated' => LegacyFileUpdated::class,
+    ];
+
     protected static function booted(): void
     {
         Relation::morphMap(['legacy_file' => self::class]);

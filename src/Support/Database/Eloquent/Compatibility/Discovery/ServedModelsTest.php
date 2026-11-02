@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Discovery;
 
+use Composer\Autoload\ClassLoader;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
+use Tests\Fixtures\Support\Discovery\InheritedServed;
+use Tests\Fixtures\Support\Discovery\TraitServed;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\LegacyFile;
@@ -33,6 +36,7 @@ final class ServedModelsTest extends TestCase
         $this->bootstrap = sys_get_temp_dir().'/compatibility-'.bin2hex(random_bytes(8));
         (new Filesystem)->ensureDirectoryExists("{$this->bootstrap}/cache");
         $this->app->useBootstrapPath($this->bootstrap);
+        $this->app->forgetInstance(ServedModels::class);
     }
 
     protected function tearDown(): void
@@ -46,7 +50,7 @@ final class ServedModelsTest extends TestCase
     public function it_finds_every_classmap_model_that_serves_compatibility_and_nothing_else(): void
     {
         $this->assertSame(
-            [FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class],
+            [InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class],
             $this->app->make(ServedModels::class)->all(),
         );
     }
@@ -60,6 +64,40 @@ final class ServedModelsTest extends TestCase
 
         $this->assertTrue($this->app->make(ServedModels::class)->contains(Listing::class));
         $this->assertSame([], DB::getConnections());
+    }
+
+    #[Test]
+    public function it_discovers_the_served_models_of_a_path_repository_package_whether_composer_symlinks_or_mirrors_it_and_no_other_vendor_package(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $classmap = [
+            "Acme\\Symlinked\\Served{$suffix}" => $this->package("{$this->bootstrap}/packages/symlinked", 'Acme\\Symlinked', "Served{$suffix}"),
+            "Acme\\Mirrored\\Served{$suffix}" => $this->package("{$vendor}/acme/mirrored", 'Acme\\Mirrored', "Served{$suffix}"),
+            "Acme\\Registry\\Served{$suffix}" => $this->package("{$vendor}/acme/registry", 'Acme\\Registry', "Served{$suffix}"),
+        ];
+        symlink("{$this->bootstrap}/packages/symlinked", "{$vendor}/acme/symlinked");
+        $classmap["Acme\\Symlinked\\Served{$suffix}"] = "{$vendor}/acme/symlinked/src/Served{$suffix}.php";
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+        file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => [
+            ['name' => 'acme/mirrored', 'dist' => ['type' => 'path', 'url' => '../packages/mirrored'], 'install-path' => '../acme/mirrored'],
+            ['name' => 'acme/registry', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/registry.zip'], 'install-path' => '../acme/registry'],
+            ['name' => 'acme/symlinked', 'dist' => ['type' => 'path', 'url' => '../packages/symlinked'], 'install-path' => '../acme/symlinked'],
+        ]], JSON_THROW_ON_ERROR));
+        $loader = new ClassLoader($vendor);
+        $loader->addClassMap($classmap);
+        $loader->register();
+
+        try {
+            $served = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertSame(
+            [true, true, false],
+            [in_array("Acme\\Symlinked\\Served{$suffix}", $served, true), in_array("Acme\\Mirrored\\Served{$suffix}", $served, true), in_array("Acme\\Registry\\Served{$suffix}", $served, true)],
+        );
     }
 
     #[Test]
@@ -85,13 +123,45 @@ final class ServedModelsTest extends TestCase
     {
         $this->app->detectEnvironment(fn () => 'production');
         Artisan::call('optimize', ['--except' => 'config,events,routes,views']);
+        $this->app->forgetInstance(ServedModels::class);
         $cached = $this->app->make(ServedModels::class)->all();
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return ['.var_export(Photo::class, true).'];');
         $this->app->forgetInstance(ServedModels::class);
         $stale = $this->app->make(ServedModels::class);
 
-        $this->assertSame([FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class], $cached);
+        $this->assertSame([InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class], $cached);
         $this->assertSame([Photo::class], $stale->all());
         $this->assertFalse($stale->contains(Listing::class));
+    }
+
+    #[Test]
+    public function it_skips_a_cached_class_that_no_longer_exists(): void
+    {
+        $this->app->detectEnvironment(fn () => 'production');
+        file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return '.var_export([Photo::class, 'Tests\Fixtures\Support\Files\RemovedPhoto'], true).';');
+
+        $this->assertSame([Photo::class], $this->app->make(ServedModels::class)->all());
+    }
+
+    private function package(string $directory, string $namespace, string $class): string
+    {
+        (new Filesystem)->ensureDirectoryExists("{$directory}/src");
+        file_put_contents("{$directory}/src/{$class}.php", <<<PHP
+            <?php
+
+            namespace {$namespace};
+
+            final class {$class} extends \Illuminate\Database\Eloquent\Model implements \Support\Database\Eloquent\Compatibility\Contracts\Compatible
+            {
+                use \Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+
+                public static function compatibility(\Support\Database\Eloquent\Compatibility\Compatibility \$compatibility): \Support\Database\Eloquent\Compatibility\Compatibility
+                {
+                    return \$compatibility;
+                }
+            }
+            PHP);
+
+        return "{$directory}/src/{$class}.php";
     }
 }

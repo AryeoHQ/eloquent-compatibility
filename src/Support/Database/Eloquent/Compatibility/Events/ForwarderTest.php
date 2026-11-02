@@ -8,7 +8,6 @@ use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
-use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Orchestra\Testbench\Attributes\DefineEnvironment;
@@ -18,11 +17,14 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provider;
+use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\LegacyFile;
+use Tests\Fixtures\Support\Files\LegacyFileSaving;
+use Tests\Fixtures\Support\Files\LegacyFileUpdated;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
@@ -33,6 +35,7 @@ use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\Fixtures\Support\Listings\WritesWhileBooting;
 use Tests\TestCase;
 
 #[CoversClass(Forwarder::class)]
@@ -44,12 +47,34 @@ final class ForwarderTest extends TestCase
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
+    protected $enablesPackageDiscoveries = false;
+
     /** @var list<array<int, mixed>> */
     private array $seen = [];
 
     private null|string $bootstrap = null;
 
-    private bool $discovered = true;
+    /** @var null|array{string, string} */
+    private null|array $writesWhileBooting = null;
+
+    public static function setUpBeforeClass(): void
+    {
+        parent::setUpBeforeClass();
+
+        $_SERVER['APP_SERVICES_CACHE'] = $_ENV['APP_SERVICES_CACHE'] = sys_get_temp_dir().'/compatibility-services-'.bin2hex(random_bytes(8)).'.php';
+    }
+
+    public static function tearDownAfterClass(): void
+    {
+        $services = $_SERVER['APP_SERVICES_CACHE'] ?? null;
+        unset($_SERVER['APP_SERVICES_CACHE'], $_ENV['APP_SERVICES_CACHE']);
+
+        if (is_string($services) && is_file($services)) {
+            unlink($services);
+        }
+
+        parent::tearDownAfterClass();
+    }
 
     protected function setUp(): void
     {
@@ -58,16 +83,15 @@ final class ForwarderTest extends TestCase
         SyncListingToMls::$synced = [];
         ListingTables::create();
 
-        if ($this->discovered) {
-            ListingTables::seed();
-            Compatibility::prepare(Listing::class);
-            ListingTables::backfill();
-            Compatibility::install(Listing::class);
-        }
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(Listing::class);
     }
 
     protected function tearDown(): void
     {
+        WritesWhileBooting::$writes = null;
         ListingTables::drop();
         FileTables::drop();
 
@@ -462,24 +486,9 @@ final class ForwarderTest extends TestCase
         $this->assertSame('Oak House', DB::table('listings')->where('id', 1)->value('title'));
     }
 
-    #[DefineEnvironment('servesOutsideTestingWithoutACache')]
-    #[Test]
-    public function it_boots_and_optimizes_outside_local_and_testing_without_a_cache_and_forwards_nothing_until_one_exists(): void
-    {
-        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
-        Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY])->update(['name' => 'Birch Lodge']);
-        $this->bootstrap = $this->temporaryBootstrap();
-        $this->app->useBootstrapPath($this->bootstrap);
-
-        $optimized = Artisan::call('optimize', ['--except' => 'config,events,routes,views']);
-
-        $this->assertSame(['staging', [], 0], [$this->app->environment(), $this->seen, $optimized]);
-        $this->assertContains(Listing::class, require "{$this->bootstrap}/cache/compatibility.php");
-    }
-
     #[DefineEnvironment('servesOutsideTestingFromACache')]
     #[Test]
-    public function it_forwards_from_the_first_successor_write_outside_local_and_testing_once_the_cache_exists(): void
+    public function it_forwards_from_the_first_successor_write_outside_local_and_testing_from_a_cache_that_names_a_removed_class(): void
     {
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
 
@@ -488,13 +497,219 @@ final class ForwarderTest extends TestCase
         $this->assertSame(['staging', [['updated', 1, 'Oak Lodge']]], [$this->app->environment(), $this->seen]);
     }
 
+    #[DefineEnvironment('writesWhileBooting')]
+    #[Test]
+    public function it_forwards_a_successor_write_another_provider_makes_while_the_application_boots(): void
+    {
+        $this->writesWhileBooting = [DB::connection()->getName(), DB::connection()->getDatabaseName()];
+
+        $this->refreshApplication();
+
+        $this->assertSame([['updated', 1, 'Oak Lodge']], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_no_save_a_successor_listener_makes_to_the_record_a_legacy_create_is_creating(): void
+    {
+        Event::listen('eloquent.saved: '.Place::class, function (Place $place): void {
+            $job = Job::query()->findOrFail($place->job_id);
+
+            if ($job->price_cents !== 1) {
+                $job->update(['price_cents' => 1]);
+            }
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+
+        Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St']);
+
+        $this->assertSame([['saving', null], ['creating', null], ['created', 4], ['saved', 4]], $this->seen);
+        $this->assertSame('0.01', Listing::query()->findOrFail(4)->price);
+    }
+
+    #[Test]
+    public function it_keeps_the_record_of_an_outer_write_while_a_successor_listener_saves_the_same_instance_again(): void
+    {
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            $job->update(['price_cents' => 5]);
+        });
+        $this->listen(Listing::class, ['saving', 'creating', 'created', 'updating', 'updated', 'saved'], fn (Listing $listing) => [spl_object_id($listing), $listing->price]);
+
+        Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $instances = array_values(array_unique(array_column($this->seen, 1)));
+        $this->assertSame([
+            ['saving', 0, null], ['creating', 0, null], ['created', 0, null],
+            ['saving', 1, '0.05'], ['updating', 1, '0.05'], ['updated', 1, '0.05'], ['saved', 1, '0.05'],
+            ['saved', 0, '0.05'],
+        ], array_map(fn (array $seen) => [$seen[0], array_search($seen[1], $instances, true), $seen[2]], $this->seen));
+    }
+
+    #[Test]
+    public function it_reads_a_fresh_record_for_the_next_write_of_an_instance_after_a_legacy_listener_refuses_one(): void
+    {
+        Event::listen('eloquent.restoring: '.Listing::class, fn () => false);
+        $this->listen(Listing::class, ['updating'], fn (Listing $listing) => [$listing->getOriginal('title'), $listing->title]);
+        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $restored = $pine->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        DB::table('jobs')->where('legacy_id', 2)->update(['name' => 'Pine Lodge']);
+        $pine->fill(['price_cents' => 7])->save();
+
+        $this->assertSame([false, [['updating', 'Pine Lodge', 'Pine Lodge']]], [$restored, $this->seen]);
+    }
+
+    #[Test]
+    public function it_forwards_nothing_for_a_successor_write_that_moves_a_record_into_or_out_of_the_legacy_shape(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+
+        foreach ([Photo::class, FloorPlan::class, LegacyFile::class] as $model) {
+            $this->listen($model, self::EVENTS, fn (Model $legacy) => [class_basename($legacy), $legacy->getKey()]);
+        }
+
+        $file = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png']);
+        $this->seen = [];
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+
+        $oak->update(['merged_into_job_id' => Job::query()->where('legacy_id', 3)->value('id')]);
+        $oak->update(['merged_into_job_id' => null]);
+        DB::enableQueryLog();
+        $file->update(['legacy_type' => 'floorplan']);
+        $reclassified = implode("\n", array_column(DB::getQueryLog(), 'query'));
+        DB::disableQueryLog();
+        $file->update(['legacy_type' => null]);
+        $file->update(['legacy_type' => 'legacy_file']);
+
+        $this->assertSame([], $this->seen);
+        $this->assertSame([false, false], [str_contains($reclassified, '"photos"'), str_contains($reclassified, '"floorplans"')]);
+        $this->assertSame([true, 'birch.png'], [Listing::query()->find(1) !== null, LegacyFile::query()->findOrFail(File::query()->whereKey($file->id)->value('legacy_id'))->file_name]);
+    }
+
+    #[Test]
+    public function it_writes_a_change_a_legacy_listener_makes_to_an_external_fact_of_the_saving_model_through_its_write_closure(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
+            if ($photo->file_name === 'oak-porch.jpg') {
+                $photo->mime_type = 'image/webp';
+            }
+        });
+        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+
+        $file->update(['filename' => 'oak-porch.jpg']);
+
+        $this->assertSame(
+            ['image/webp', 'image/webp', 'image/webp'],
+            [FakeMediaLibrary::bound()->stored((string) $file->zml_asset_id)?->mimeType, File::query()->findOrFail($file->id)->mime_type, Photo::query()->findOrFail(1)->mime_type],
+        );
+    }
+
+    #[Test]
+    public function it_forwards_an_event_object_a_legacy_model_dispatches_even_when_only_that_object_has_a_listener(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $seen = [];
+        Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$seen): void {
+            $seen[] = [$event->legacyFile->id, $event->legacyFile->file_name];
+        });
+
+        File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-2.pdf']);
+
+        $this->assertSame([[1, 'contract-2.pdf']], $seen);
+    }
+
+    #[Test]
+    public function it_forwards_an_event_object_before_the_string_event_and_lets_its_listener_refuse_the_write(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $seen = [];
+        Event::listen(LegacyFileSaving::class, function (LegacyFileSaving $event) use (&$seen): null|false {
+            $seen[] = [LegacyFileSaving::class, $event->legacyFile->file_name];
+
+            return $event->legacyFile->file_name === 'refused.pdf' ? false : null;
+        });
+        Event::listen('eloquent.saving: '.LegacyFile::class, function (LegacyFile $legacyFile) use (&$seen): void {
+            $seen[] = ['saving', $legacyFile->file_name];
+        });
+        $file = File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail();
+
+        $saved = [$file->fill(['filename' => 'contract-2.pdf'])->save(), $file->fill(['filename' => 'refused.pdf'])->save()];
+
+        $this->assertSame([true, false], $saved);
+        $this->assertSame([[LegacyFileSaving::class, 'contract-2.pdf'], ['saving', 'contract-2.pdf'], [LegacyFileSaving::class, 'refused.pdf']], $seen);
+        $this->assertSame('contract-2.pdf', LegacyFile::query()->findOrFail(1)->file_name);
+    }
+
+    #[Test]
+    public function it_keeps_a_listener_named_in_without_forwarding_to_from_forwarded_events_while_another_event_is_faked(): void
+    {
+        Event::fake(['compatibility.unrelated']);
+        Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);
+        $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id]);
+
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([[], [['updated', 1]]], [SyncListingToMls::$synced, $this->seen]);
+    }
+
+    #[Test]
+    public function it_forwards_a_dependent_write_whose_own_later_listener_changes_a_value_the_listing_serves(): void
+    {
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->city]);
+        Event::listen('eloquent.saving: '.Place::class, function (Place $place): void {
+            $place->city = 'Tacoma';
+        });
+
+        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->touch();
+
+        $this->assertSame([['saving', 1, 'Tacoma'], ['updating', 1, 'Tacoma'], ['updated', 1, 'Tacoma'], ['saved', 1, 'Tacoma']], $this->seen);
+    }
+
+    #[Test]
+    public function it_accepts_a_legacy_listener_assignment_the_legacy_casts_hold_equal_to_the_stored_value(): void
+    {
+        Event::listen('eloquent.saving: '.Listing::class, function (Listing $listing): void {
+            $listing->price = '1250.5';
+        });
+
+        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->update(['street' => '5 Oak St']);
+
+        $this->assertSame(['5 Oak St', '1250.50'], [Listing::query()->findOrFail(1)->street, Listing::query()->findOrFail(1)->price]);
+    }
+
+    /**
+     * @param  Application  $app
+     * @return array<int, class-string>
+     */
+    protected function getPackageProviders($app): array // @phpstan-ignore ergebnis.privateInFinalClass
+    {
+        return [WritesWhileBooting::class, ...parent::getPackageProviders($app)];
+    }
+
     /**
      * @param  Application  $app
      */
-    protected function servesOutsideTestingWithoutACache($app): void // @phpstan-ignore ergebnis.privateInFinalClass
+    protected function writesWhileBooting($app): void // @phpstan-ignore ergebnis.privateInFinalClass
     {
-        $this->discovered = false;
-        $app->detectEnvironment(fn () => 'staging');
+        if ($this->writesWhileBooting === null) {
+            return;
+        }
+
+        [$connection, $database] = $this->writesWhileBooting;
+        $app['config']->set("database.connections.{$connection}.database", $database);
+        WritesWhileBooting::$writes = function (): void {
+            $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        };
     }
 
     /**
@@ -503,7 +718,7 @@ final class ForwarderTest extends TestCase
     protected function servesOutsideTestingFromACache($app): void // @phpstan-ignore ergebnis.privateInFinalClass
     {
         $this->bootstrap = $this->temporaryBootstrap();
-        file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return '.var_export([Listing::class], true).';');
+        file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return '.var_export([Listing::class, 'Tests\Fixtures\Support\Listings\RemovedListing'], true).';');
         $app->useBootstrapPath($this->bootstrap);
         $app->detectEnvironment(fn () => 'staging');
     }

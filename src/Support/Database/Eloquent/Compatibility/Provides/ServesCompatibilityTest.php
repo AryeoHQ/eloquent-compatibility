@@ -13,11 +13,14 @@ use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
+use Tests\Fixtures\Support\Discovery\InheritedServed;
+use Tests\Fixtures\Support\Discovery\TraitServed;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversTrait(ServesCompatibility::class)]
 final class ServesCompatibilityTest extends TestCase
@@ -59,11 +62,26 @@ final class ServesCompatibilityTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_boot_a_named_served_model_that_discovery_did_not_find(): void
+    public function it_refuses_every_instance_of_a_named_served_model_that_discovery_did_not_find(): void
     {
-        $this->expectExceptionObject(UndiscoveredServedModel::named(Unmapped::class));
+        $refusals = [];
 
-        new Unmapped;
+        foreach ([1, 2] as $attempt) {
+            try {
+                new Unmapped;
+            } catch (Throwable $refusal) {
+                $refusals[] = [$refusal::class, $refusal->getMessage()];
+            }
+        }
+
+        $expected = UndiscoveredServedModel::named(Unmapped::class);
+        $this->assertSame([[$expected::class, $expected->getMessage()], [$expected::class, $expected->getMessage()]], $refusals);
+    }
+
+    #[Test]
+    public function it_boots_a_model_that_inherits_serving_compatibility_from_a_parent_or_a_trait(): void
+    {
+        $this->assertSame([true, true], [(new InheritedServed)->newQuery() instanceof LegacyBuilder, (new TraitServed)->newQuery() instanceof LegacyBuilder]);
     }
 
     #[Test]

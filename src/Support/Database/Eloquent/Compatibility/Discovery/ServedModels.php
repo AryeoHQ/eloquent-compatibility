@@ -20,6 +20,7 @@ final class ServedModels
     public function __construct(
         private readonly string $cache,
         private readonly bool $scans,
+        private readonly bool $withoutCache,
         private readonly Filesystem $files,
     ) {}
 
@@ -31,14 +32,14 @@ final class ServedModels
         return $this->models ??= $this->scans ? $this->scan() : $this->cached();
     }
 
-    public function available(): bool
-    {
-        return $this->scans || $this->files->isFile($this->cache);
-    }
-
     public function contains(string $model): bool
     {
         return in_array($model, $this->all(), true);
+    }
+
+    public function admits(string $model): bool
+    {
+        return $this->withoutCache || $this->contains($model);
     }
 
     public function cache(): void
@@ -61,8 +62,10 @@ final class ServedModels
             throw UndiscoveredServedModel::withoutCache($this->cache);
         }
 
-        /** @var list<class-string<Model&Compatible>> */
-        return $this->files->getRequire($this->cache);
+        /** @var list<class-string<Model&Compatible>> $models */
+        $models = $this->files->getRequire($this->cache);
+
+        return array_values(array_filter($models, fn (string $model) => class_exists($model)));
     }
 
     /**
@@ -70,34 +73,105 @@ final class ServedModels
      */
     private function scan(): array
     {
+        $files = $this->classmap();
         $models = [];
+        $checked = [];
+        $mentions = '/ServesCompatibility/';
 
-        foreach (ClassLoader::getRegisteredLoaders() as $vendor => $loader) {
-            $vendor = realpath($vendor).DIRECTORY_SEPARATOR;
+        while ($mentions !== null) {
+            $inherited = [];
 
-            foreach ($loader->getClassMap() as $class => $file) {
-                $file = realpath($file);
+            foreach ($files as $class => $file) {
+                if (array_key_exists($class, $checked) || preg_match($mentions, (string) file_get_contents($file)) !== 1) {
+                    continue;
+                }
 
-                if ($file !== false && ! str_starts_with($file, $vendor) && $this->serves($class, $file)) {
+                $checked[$class] = true;
+
+                if (! (class_exists($class) || trait_exists($class)) || ! in_array(ServesCompatibility::class, class_uses_recursive($class), true)) {
+                    continue;
+                }
+
+                $reflection = new ReflectionClass($class);
+
+                if ($reflection->isTrait()) {
+                    $inherited[] = '\buse\s+[^;]*\b'.preg_quote($reflection->getShortName(), '/').'\b';
+
+                    continue;
+                }
+
+                if (! $reflection->isFinal()) {
+                    $inherited[] = '\bextends\s+\\\\?(?:\w+\\\\)*'.preg_quote($reflection->getShortName(), '/').'\b|\b'.preg_quote($reflection->getShortName(), '/').'\s+as\s+\w';
+                }
+
+                if (! $reflection->isAbstract() && is_subclass_of($class, Model::class) && is_subclass_of($class, Compatible::class)) {
                     $models[] = $class;
                 }
             }
+
+            $mentions = $inherited === [] ? null : '/'.implode('|', $inherited).'/';
         }
 
-        $models = array_values(array_unique($models));
         sort($models);
 
         return $models;
     }
 
     /**
-     * @phpstan-assert-if-true class-string<Model&Compatible> $class
+     * @return array<string, string>
      */
-    private function serves(string $class, string $file): bool
+    private function classmap(): array
     {
-        return str_contains((string) file_get_contents($file), 'ServesCompatibility')
-            && class_exists($class)
-            && ! (new ReflectionClass($class))->isAbstract()
-            && in_array(ServesCompatibility::class, class_uses_recursive($class), true);
+        $files = [];
+
+        foreach (ClassLoader::getRegisteredLoaders() as $vendor => $loader) {
+            $real = realpath($vendor);
+            $vendor = ($real === false ? $vendor : $real).DIRECTORY_SEPARATOR;
+            $packages = $this->pathPackages($vendor);
+
+            foreach ($loader->getClassMap() as $class => $file) {
+                $real = realpath($file);
+
+                if ($real === false) {
+                    continue;
+                }
+
+                $vendored = str_starts_with($file, $vendor) || str_starts_with($real, $vendor);
+
+                if (! $vendored || array_filter($packages, fn (string $package) => str_starts_with($real, $package)) !== []) {
+                    $files[$class] ??= $real;
+                }
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function pathPackages(string $vendor): array
+    {
+        $installed = "{$vendor}composer/installed.json";
+
+        if (! $this->files->isFile($installed)) {
+            return [];
+        }
+
+        $decoded = json_decode($this->files->get($installed), true);
+        $packages = is_array($decoded) ? $decoded['packages'] ?? $decoded : [];
+        $paths = [];
+
+        foreach (is_array($packages) ? $packages : [] as $package) {
+            $path = is_array($package) && ($package['dist']['type'] ?? null) === 'path' && is_string($package['install-path'] ?? null)
+                ? realpath("{$vendor}composer/{$package['install-path']}")
+                : false;
+
+            if ($path !== false) {
+                $paths[] = $path.DIRECTORY_SEPARATOR;
+            }
+        }
+
+        return $paths;
     }
 }
