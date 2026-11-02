@@ -63,6 +63,22 @@ final class StatementsTest extends TestCase
               ADD COLUMN IF NOT EXISTS "legacy_uuid" uuid
             SQL,
             <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              found text;
+            BEGIN
+              SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_id_filled';
+              IF found NOT IN ('CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))' || ' NOT VALID') THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_id_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.';
+              END IF;
+              SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_uuid_filled';
+              IF found NOT IN ('CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))' || ' NOT VALID') THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_uuid_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.';
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
             ALTER TABLE "jobs"
               ALTER COLUMN "legacy_id" SET DEFAULT nextval('listings_id_seq'::regclass),
               DROP CONSTRAINT IF EXISTS "jobs_legacy_id_filled",

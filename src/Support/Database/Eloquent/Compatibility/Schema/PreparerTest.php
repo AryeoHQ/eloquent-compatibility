@@ -159,6 +159,42 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_constraint_that_holds_the_name_of_the_check_it_adds(): void
+    {
+        DB::statement("alter table jobs add constraint jobs_legacy_id_filled check (name <> '')");
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: jobs_legacy_id_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.", $exception->getMessage());
+        }
+
+        $this->assertSame("CHECK (((name)::text <> ''::text))", DB::scalar("select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'jobs'::regclass and conname = 'jobs_legacy_id_filled'"));
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function leftoverChecks(): iterable
+    {
+        yield 'a check not yet validated' => ['alter table jobs add constraint jobs_legacy_id_filled check (legacy_id is not null) not valid'];
+        yield 'a validated check' => ['alter table jobs add constraint jobs_legacy_id_filled check (legacy_id is not null)'];
+    }
+
+    #[DataProvider('leftoverChecks')]
+    #[Test]
+    public function it_prepares_again_over_the_check_an_interrupted_prepare_leaves(string $check): void
+    {
+        DB::statement('alter table jobs add column legacy_id integer');
+        DB::statement($check);
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame([], DB::select("select conname from pg_constraint where conrelid = 'jobs'::regclass and conname like '%_filled'"));
+    }
+
+    #[Test]
     public function it_lets_the_successor_update_a_row_the_identifier_fill_has_not_reached(): void
     {
         DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY]);

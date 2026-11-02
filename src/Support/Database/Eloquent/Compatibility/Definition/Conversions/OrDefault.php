@@ -74,7 +74,7 @@ final readonly class OrDefault implements Conversion
     private static function canonical(mixed $value, null|string $type): null|string
     {
         if ($type === 'boolean') {
-            $boolean = $value === '' ? null : IsNotNull::boolean($value);
+            $boolean = IsNotNull::boolean($value);
 
             return $boolean === null ? null : ($boolean ? 'true' : 'false');
         }

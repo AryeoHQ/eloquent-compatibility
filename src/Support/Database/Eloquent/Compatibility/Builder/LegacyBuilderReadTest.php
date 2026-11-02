@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use DateTimeImmutable;
+use DateTimeZone;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
@@ -264,6 +266,8 @@ final class LegacyBuilderReadTest extends TestCase
         ]);
 
         $this->assertSameFailure(fn () => $model->newQuery()->where('featured', 'maybe')->get(), fn () => DB::table('listings')->where('featured', 'maybe')->get());
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', '')->get(), fn () => DB::table('listings')->where('featured', '')->get());
+        $this->assertSameFailure(fn () => $model->newQuery()->where('featured', '!=', '  ')->get(), fn () => DB::table('listings')->where('featured', '!=', '  ')->get());
     }
 
     #[Test]
@@ -873,6 +877,62 @@ final class LegacyBuilderReadTest extends TestCase
             [['listed_wall' => '2026-01-01 23:30:00', 'listed_clock' => '2026-01-01 23:30:00'], ['listed_wall' => '2026-01-01 23:30:00', 'listed_clock' => '2026-01-01 23:30:00']],
             [$served('UTC'), $served('Asia/Tokyo')],
         );
+    }
+
+    #[Test]
+    public function it_compares_a_wall_clock_in_a_time_zone_with_a_date_object_as_laravel_binds_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC')));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a date with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', new DateTimeImmutable('2026-01-03 09:15:00.500000')),
+            'before a date with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', '<', new DateTimeImmutable('2026-01-03 09:15:00.500000')),
+            'in dates with microseconds' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('created_at', [new DateTimeImmutable('2026-01-03 09:15:00.500000'), new DateTimeImmutable('2026-01-04 08:00:00.250000')]),
+            'a date in another zone' => fn (Builder|QueryBuilder $listings) => $listings->where('created_at', new DateTimeImmutable('2026-01-03 09:15:00', new DateTimeZone('Asia/Tokyo'))),
+        ]);
+    }
+
+    #[Test]
+    public function it_compares_a_scaled_attribute_with_a_float_as_pdo_sends_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01)));
+            }
+        };
+        $queries = [
+            'a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 0.009999999999999998),
+            'above a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '>', 0.009999999999999998),
+            'not a float one cent rounds to' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '!=', 0.009999999999999998),
+            'in floats' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('price', [0.009999999999999998, 99.99]),
+        ];
+        $this->installMap($model::class);
+        DB::update('update jobs set price_cents = 1 where legacy_id = 4');
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), $queries);
+        $this->assertSameRows(fn () => Listing::query(), fn () => DB::table('listings')->whereNull('deleted_at'), $queries);
+        $this->assertSame([4], array_map(intval(...), DB::table('listings')->where('price', 0.009999999999999998)->pluck('id')->all()));
     }
 
     public static function identified(Compatibility $listing): Compatibility
