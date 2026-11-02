@@ -244,27 +244,7 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_creates_a_dependent_under_a_parent_the_same_write_creates(): void
     {
-        $sited = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            public $timestamps = false;
-
-            protected $table = 'listings';
-
-            public static function compatibility(Compatibility $listing): Compatibility
-            {
-                return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
-                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')))));
-            }
-        };
+        $sited = $this->sited();
         $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
 
         $updated = $sited->newQuery()->whereKey([1, 2])->update(['street' => '7 Ash St', 'latitude' => 3.5]);
@@ -273,6 +253,24 @@ final class MassWriterTest extends TestCase
         $this->assertSame(['7 Ash St'], DB::table('places')->where('job_id', $pine->id)->pluck('street')->all());
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
         $this->assertSame([3.5, 3.5], DB::table('job_sites')->join('jobs', 'jobs.id', '=', 'job_sites.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('latitude')->all());
+    }
+
+    #[Test]
+    public function it_writes_the_existing_dependent_that_a_parent_the_same_write_creates_reaches_rather_than_create_a_second(): void
+    {
+        $sited = $this->sited();
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $elm = Job::query()->where('legacy_id', 3)->firstOrFail();
+        DB::table('places')->whereIn('job_id', [$oak->id, $elm->id])->delete();
+
+        $updated = [
+            $sited->newQuery()->whereKey(1)->update(['street' => '7 Ash St', 'latitude' => 3.5]),
+            $sited->newQuery()->findOrFail(3)->forceFill(['street' => '8 Ash St', 'latitude' => 4.5])->save(),
+        ];
+
+        $this->assertSame([1, true], $updated);
+        $this->assertSame([[$oak->id, '7 Ash St'], [$elm->id, '8 Ash St']], DB::table('places')->whereIn('job_id', [$oak->id, $elm->id])->orderBy('street')->get(['job_id', 'street'])->map(fn (object $place) => [$place->job_id, $place->street])->all());
+        $this->assertSame([[$oak->id, 3.5], [$elm->id, 4.5]], DB::table('job_sites')->whereIn('job_id', [$oak->id, $elm->id])->orderBy('latitude')->get(['job_id', 'latitude'])->map(fn (object $site) => [$site->job_id, $site->latitude])->all());
     }
 
     #[Test]
@@ -534,5 +532,30 @@ final class MassWriterTest extends TestCase
         }
 
         $this->fail('The write was not refused.');
+    }
+
+    private function sited(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')))));
+            }
+        };
     }
 }

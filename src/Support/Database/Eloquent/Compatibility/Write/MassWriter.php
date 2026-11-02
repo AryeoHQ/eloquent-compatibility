@@ -717,23 +717,39 @@ final readonly class MassWriter
         $this->adopt($related, $index);
     }
 
-    private function adopt(Related $created, int $index): void
+    private function adopt(Related $reachable, int $index): void
     {
         $grammar = $this->connection->getQueryGrammar();
-        $table = SqlFragments::identifier($created->table);
+        $children = array_filter(array_values($this->map->related), fn (Related $related) => $related->parentTable === $reachable->table);
+        $unresolved = 'reached.'.$grammar->wrap(self::target($index)).' IS NULL AND reached.'.$grammar->wrap(self::parentOf($index)).' IS NOT NULL';
 
-        foreach (array_values($this->map->related) as $child => $related) {
-            if ($related->parentTable !== $created->table) {
-                continue;
+        foreach ($children as $child => $related) {
+            $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::parentOf($child)).' = '.$this->first($reachable, $index, $related->parentKey).' WHERE '.$unresolved.' AND reached.'.$grammar->wrap(self::parentOf($child)).' IS NULL AND reached.'.$grammar->wrap(self::target($child)).' IS NULL');
+        }
+
+        $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::target($index)).' = '.$this->first($reachable, $index, $reachable->successor->key).' WHERE '.$unresolved);
+
+        foreach ($children as $child => $related) {
+            $key = $related->table.'.'.$related->successor->key;
+            $rows = $this->connection->table($related->table)->select($key)->whereIn($related->table.'.'.$related->relatedKey, $this->reached()->whereNull(self::target($child))->whereNotNull(self::parentOf($child))->select(self::parentOf($child)));
+
+            foreach (ViewCompiler::conditions($related, false) as $condition) {
+                $rows->whereRaw($condition);
             }
 
-            $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::parentOf($child)).' = '.$table.'.'.SqlFragments::identifier($related->parentKey).' FROM '.$table.' WHERE '.implode(' AND ', [
-                'reached.'.$grammar->wrap(self::target($index)).' IS NULL',
-                'reached.'.$grammar->wrap(self::parentOf($child)).' IS NULL',
-                $table.'.'.SqlFragments::identifier($created->relatedKey).' = reached.'.$grammar->wrap(self::parentOf($index)),
-                ...ViewCompiler::conditions($created, false),
-            ]));
+            $this->lock($rows->orderBy($key));
+            $this->adopt($related, $child);
         }
+    }
+
+    private function first(Related $related, int $index, string $column): string
+    {
+        $table = SqlFragments::identifier($related->table);
+
+        return '(SELECT '.$table.'.'.SqlFragments::identifier($column).' FROM '.$table.' WHERE '.implode(' AND ', [
+            $table.'.'.SqlFragments::identifier($related->relatedKey).' = reached.'.$this->connection->getQueryGrammar()->wrap(self::parentOf($index)),
+            ...ViewCompiler::conditions($related, false),
+        ]).($related->orders === null ? '' : ' ORDER BY '.$related->orders).' LIMIT 1)';
     }
 
     private static function parent(Related $related): string
