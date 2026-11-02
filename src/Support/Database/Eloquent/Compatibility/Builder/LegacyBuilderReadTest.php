@@ -313,6 +313,148 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
+    public function it_compares_an_attribute_divided_by_a_fraction_without_an_integer_reciprocal_as_the_view_serves_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(0.3333333333333333)));
+            }
+        };
+        $this->installMap($model::class);
+        DB::table('jobs')->where('legacy_id', 1)->update(['price_cents' => 1]);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a whole price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 3),
+            'not a whole price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '!=', 3),
+            'whole prices' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('price', [3, 4]),
+        ]);
+        $this->assertSame([1], array_map(intval(...), DB::table('listings')->where('price', 3)->pluck('id')->all()));
+    }
+
+    #[Test]
+    public function it_compares_a_bound_beyond_the_range_of_the_stored_integer_as_the_view_does(): void
+    {
+        $this->install();
+
+        $this->assertSameRows(fn () => Listing::withTrashed(), fn () => DB::table('listings'), [
+            'below a bound beyond the range' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '<', '99999999.99'),
+            'a price beyond the range' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 99999999),
+            'not a price beyond the range' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '!=', 99999999),
+            'prices in and beyond the range' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('price', [99999999, '99.99']),
+            'between bounds beyond the range' => fn (Builder|QueryBuilder $listings) => $listings->whereBetween('price', [-99999999, 99999999]),
+        ]);
+    }
+
+    #[Test]
+    public function it_filters_a_mapping_on_the_served_value_when_the_stored_collation_is_not_deterministic(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+
+        try {
+            DB::statement('alter table jobs alter column lifecycle_status type varchar(255) collate compatibility_case_insensitive');
+            $model = new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return LegacyBuilderReadTest::identified($listing)
+                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'LIVE' => 'Draft', 'closed' => 'Sold'])));
+                }
+            };
+            $this->installMap($model::class);
+            DB::table('jobs')->where('legacy_id', 4)->update(['lifecycle_status' => 'LIVE']);
+
+            $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+                'a value whose key equals another key' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Draft'),
+                'not a value whose key equals another key' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', 'Draft'),
+                'the value of the first key' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
+                'values in' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('status', ['Draft', 'Sold']),
+            ]);
+            $this->assertSame([1, 4], array_map(intval(...), DB::table('listings')->where('status', 'Active')->orderBy('id')->pluck('id')->all()));
+        } finally {
+            ListingTables::drop();
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    #[Test]
+    public function it_filters_a_mapping_on_the_served_value_when_the_served_collation_is_not_deterministic(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+        DB::statement('create domain compatibility_case_insensitive_text as varchar(255) collate compatibility_case_insensitive');
+
+        try {
+            DB::statement('alter table listings alter column status type compatibility_case_insensitive_text');
+            $model = new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return LegacyBuilderReadTest::identified($listing)
+                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'ACTIVE', 'closed' => 'Sold'])));
+                }
+            };
+            $this->installMap($model::class);
+
+            $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+                'a value another value equals' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
+                'not a value in another case' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', 'sold'),
+                'not values in another case' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('status', ['sold']),
+            ]);
+            $this->assertSame([1, 2, 4, 5], array_map(intval(...), DB::table('listings')->where('status', 'active')->orderBy('id')->pluck('id')->all()));
+        } finally {
+            ListingTables::drop();
+            DB::statement('drop domain if exists compatibility_case_insensitive_text');
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    #[Test]
+    public function it_filters_a_mapping_on_the_served_value_when_the_value_maps_from_no_key_but_the_served_type_reads_it_as_a_mapped_value(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 1, 'closed' => 2])));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::statement("alter table listings alter column status drop default, alter column status type integer using case status when 'Draft' then 0 when 'Active' then 1 when 'Sold' then 2 end, alter column status set default 0");
+        Compatibility::install($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a padded value' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '01'),
+            'not a padded value' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', '01'),
+            'not padded values in' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('status', ['01']),
+        ]);
+        $this->assertSame([2, 3, 5], array_map(intval(...), DB::table('listings')->where('status', '!=', '01')->orderBy('id')->pluck('id')->all()));
+    }
+
+    #[Test]
     public function it_filters_an_or_default_attribute_by_a_value_normalised_to_the_default_type(): void
     {
         DB::statement('alter table jobs add column is_featured boolean');

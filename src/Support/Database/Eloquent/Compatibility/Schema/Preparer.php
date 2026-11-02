@@ -80,6 +80,8 @@ final readonly class Preparer
             $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
             $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
             $foreignChecks[] = $this->refuseForeignCheck($map, $filledName, (string) $identifier->column());
+            $foreignChecks[] = $identifier->isUuid() ? '' : $this->refuseUnusableSequence($map, $map->primary->table, (string) $identifier->column(), $default);
+            $foreignChecks[] = $sharesSequence ? $this->refuseUnusableSequence($map, $map->table, $name, $default) : '';
             $fills[] = $successorColumn.' = COALESCE('.$successorColumn.', '.$default.')';
             $missing[] = $successorColumn.' IS NULL';
             $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
@@ -167,6 +169,24 @@ final readonly class Preparer
             ."  END IF;\n";
     }
 
+    private function refuseUnusableSequence(ResolvedMap $map, string $table, string $column, string $default): string
+    {
+        $sequence = (string) preg_replace('/^(?:pg_catalog\.)?nextval\((.+)\)$/s', '$1', $default);
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')';
+        $grantee = "CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee";
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$table}.{$column} draws from ")
+            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(', and ').' || found || '.SqlFragments::literal(" can insert into {$table} without USAGE on it. Grant USAGE ON SEQUENCE ")
+            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(' to each of them, then prepare again.');
+
+        return "  SELECT string_agg(inserter, ', ' ORDER BY inserter) INTO found FROM (\n"
+            ."    SELECT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = {$relation} AND granted.privilege_type = 'INSERT'\n"
+            ."    UNION SELECT {$grantee} FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = {$relation} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'\n"
+            ."  ) AS inserters WHERE NOT has_sequence_privilege(CAST(CASE WHEN grantee = 0 THEN 'public' ELSE pg_get_userbyid(grantee) END AS name), CAST({$sequence} AS oid), 'USAGE, UPDATE');\n"
+            ."  IF found IS NOT NULL THEN\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\n";
+    }
+
     private function sequenceDefault(ResolvedMap $map, string $name, Column $column): string
     {
         if ($column->generated) {
@@ -199,9 +219,11 @@ final readonly class Preparer
         $duplicates = 'SELECT '.$key.' FROM '.$table.' WHERE '.implode(' AND ', [...$conditions, $key.' IS NOT NULL']).' GROUP BY '.$key.' HAVING count(*) > 1';
         $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: atMostOne() on {$name} allows one {$related->table} row for each {$related->relatedKey}, and ")
             .' || duplicated || '.SqlFragments::literal(" values of {$related->relatedKey} have more; the first are ").' || first_keys';
+        $zoned = $related->conditions === null ? '' : $this->refuseZonedCondition($map, $name, $related->table, $key, $where);
 
         return [
-            "DO \$compatibility\$\nDECLARE\n  duplicated bigint;\n  first_keys text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  duplicated bigint;\n  first_keys text;\n".($zoned === '' ? '' : "  zone text := current_setting('TimeZone');\n  west text;\n  east text;\n")."BEGIN\n"
+                .$zoned
                 ."  SELECT count(*) INTO duplicated FROM ({$duplicates}) AS duplicates;\n"
                 ."  IF duplicated > 0 THEN\n"
                 ."    SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM ({$duplicates} ORDER BY {$key} LIMIT 5) AS first_duplicates (duplicate);\n"
@@ -209,6 +231,26 @@ final readonly class Preparer
                 ."  END IF;\nEND\n\$compatibility\$",
             $this->uniqueIndex($map->table, $related->table, $index, '('.$key.')'.$where, false),
         ];
+    }
+
+    private function refuseZonedCondition(ResolvedMap $map, string $name, string $relation, string $key, string $where): string
+    {
+        $table = SqlFragments::identifier($relation);
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: atMostOne() on {$name} has a condition whose instant follows the session time zone, and the index and the view would each read it in the time zone of their own session. Compare a timestamp with time zone with a value that names its offset.");
+        $predicate = fn (string $index) => "  SELECT pg_get_expr(indpred, indrelid) INTO {$index} FROM pg_index WHERE indexrelid = ".SqlFragments::literal('pg_temp.compatibility_'.$index)."::regclass;\n";
+
+        return "  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($relation).', current_schema(), '.SqlFragments::literal($relation).");\n"
+            ."  PERFORM set_config('TimeZone', 'Etc/GMT+12', true);\n"
+            ."  CREATE INDEX compatibility_west ON {$table} ({$key}){$where};\n"
+            ."  PERFORM set_config('TimeZone', 'Etc/GMT-14', true);\n"
+            ."  CREATE INDEX compatibility_east ON {$table} ({$key}){$where};\n"
+            ."  PERFORM set_config('TimeZone', zone, true);\n"
+            .$predicate('west')
+            .$predicate('east')
+            ."  DROP TABLE pg_temp.{$table};\n"
+            ."  IF west IS DISTINCT FROM east THEN\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\n";
     }
 
     /**

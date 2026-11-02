@@ -48,7 +48,22 @@ final class StatementsTest extends TestCase
             DECLARE
               duplicated bigint;
               first_keys text;
+              zone text := current_setting('TimeZone');
+              west text;
+              east text;
             BEGIN
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'places', current_schema(), 'places');
+              PERFORM set_config('TimeZone', 'Etc/GMT+12', true);
+              CREATE INDEX compatibility_west ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              PERFORM set_config('TimeZone', 'Etc/GMT-14', true);
+              CREATE INDEX compatibility_east ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              PERFORM set_config('TimeZone', zone, true);
+              SELECT pg_get_expr(indpred, indrelid) INTO west FROM pg_index WHERE indexrelid = 'pg_temp.compatibility_west'::regclass;
+              SELECT pg_get_expr(indpred, indrelid) INTO east FROM pg_index WHERE indexrelid = 'pg_temp.compatibility_east'::regclass;
+              DROP TABLE pg_temp."places";
+              IF west IS DISTINCT FROM east THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: atMostOne() on the relation from Job to Place has a condition whose instant follows the session time zone, and the index and the view would each read it in the time zone of their own session. Compare a timestamp with time zone with a value that names its offset.';
+              END IF;
               SELECT count(*) INTO duplicated FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1) AS duplicates;
               IF duplicated > 0 THEN
                 SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1 ORDER BY "job_id" LIMIT 5) AS first_duplicates (duplicate);
@@ -70,6 +85,13 @@ final class StatementsTest extends TestCase
               SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_id_filled';
               IF found NOT IN ('CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))' || ' NOT VALID') THEN
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_id_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.';
+              END IF;
+              SELECT string_agg(inserter, ', ' ORDER BY inserter) INTO found FROM (
+                SELECT CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND granted.privilege_type = 'INSERT'
+                UNION SELECT CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'
+              ) AS inserters WHERE NOT has_sequence_privilege(CAST(CASE WHEN grantee = 0 THEN 'public' ELSE pg_get_userbyid(grantee) END AS name), CAST('listings_id_seq'::regclass AS oid), 'USAGE, UPDATE');
+              IF found IS NOT NULL THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs.legacy_id draws from ' || CAST('listings_id_seq'::regclass AS text) || ', and ' || found || ' can insert into jobs without USAGE on it. Grant USAGE ON SEQUENCE ' || CAST('listings_id_seq'::regclass AS text) || ' to each of them, then prepare again.';
               END IF;
               SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_uuid_filled';
               IF found NOT IN ('CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))' || ' NOT VALID') THEN
@@ -275,6 +297,23 @@ final class StatementsTest extends TestCase
             SQL,
             'ALTER SEQUENCE public.listings_id_seq OWNED BY "jobs"."legacy_id"',
             <<<'SQL'
+            SELECT set_config('compatibility.grants', coalesce(json_agg(grants.statement ORDER BY grants.position, grants.statement)::text, '[]'), true)
+            FROM (
+              SELECT 1 AS position, 'GRANT ' || string_agg(granted.privilege_type, ', ' ORDER BY granted.privilege_type) || ' ON "listings" TO ' || CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END || CASE WHEN granted.is_grantable OR granted.grantee = relation.relowner THEN ' WITH GRANT OPTION' ELSE '' END AS statement
+              FROM pg_class relation
+              CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted
+              WHERE relation.oid = to_regclass(quote_ident(current_schema()) || '."listings"') AND granted.grantee <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+              GROUP BY granted.grantee, granted.is_grantable, relation.relowner
+              UNION ALL
+              SELECT 2, 'GRANT ' || string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' ORDER BY attribute.attnum, granted.privilege_type) || ' ON "listings" TO ' || CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END || CASE WHEN granted.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+              FROM pg_attribute attribute
+              CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted
+              WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."listings"') AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.grantee <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('["id","uuid","title","company_id","price","status","street","city","latitude","mls_number","featured","created_at","updated_at","deleted_at"]' AS jsonb)))
+              GROUP BY granted.grantee, granted.is_grantable
+            ) AS grants
+            SQL,
+            <<<'SQL'
             ALTER TABLE "listings"
               DROP COLUMN "id",
               DROP COLUMN "uuid",
@@ -301,6 +340,17 @@ final class StatementsTest extends TestCase
             'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
             'ALTER VIEW "listings" ALTER COLUMN "status" SET DEFAULT \'Draft\'::character varying',
             'ALTER VIEW "listings" ALTER COLUMN "featured" SET DEFAULT false',
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              granted text;
+            BEGIN
+              FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP
+                EXECUTE granted;
+              END LOOP;
+            END
+            $compatibility$
+            SQL,
         ], $statements->transaction);
         $this->assertSame([
             'ALTER TABLE "listing_photos" VALIDATE CONSTRAINT "listing_photos_listing_id_foreign"',

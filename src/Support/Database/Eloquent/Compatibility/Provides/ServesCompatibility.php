@@ -57,6 +57,22 @@ trait ServesCompatibility
     }
 
     /**
+     * @param  array<string, mixed>  $attributes
+     * @param  bool  $exists
+     * @return static
+     */
+    public function newInstance($attributes = [], $exists = false)
+    {
+        $model = parent::newInstance($attributes, $exists);
+
+        if ($exists) {
+            ExternalAttributes::inherit($this, $model);
+        }
+
+        return $model;
+    }
+
+    /**
      * @param  string  $key
      */
     public function getAttribute($key): mixed
@@ -88,10 +104,32 @@ trait ServesCompatibility
     public function attributesToArray(): array
     {
         if ($this->exists) {
-            ExternalAttributes::resolveAll($this);
+            ExternalAttributes::resolveAll($this, array_keys($this->getArrayableItems(array_fill_keys(ExternalAttributes::of(static::class), true))));
         }
 
         return parent::attributesToArray();
+    }
+
+    /**
+     * @param  null|string  $key
+     * @param  mixed  $default
+     */
+    public function getOriginal($key = null, $default = null): mixed
+    {
+        ExternalAttributes::resolveOriginal($this, $key);
+
+        return parent::getOriginal($key, $default);
+    }
+
+    /**
+     * @param  null|string  $key
+     * @param  mixed  $default
+     */
+    public function getRawOriginal($key = null, $default = null): mixed
+    {
+        ExternalAttributes::resolveOriginal($this, $key);
+
+        return parent::getRawOriginal($key, $default);
     }
 
     /**
@@ -123,6 +161,14 @@ trait ServesCompatibility
         $connection = $this->getConnection();
 
         return new LegacyQueryBuilder($connection, $connection->getQueryGrammar(), $connection->getPostProcessor(), $this);
+    }
+
+    /**
+     * @return null|bool
+     */
+    public function delete()
+    {
+        return LegacyBuilder::deleting($this, fn () => parent::delete());
     }
 
     /**

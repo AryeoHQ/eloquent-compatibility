@@ -101,7 +101,7 @@ final readonly class Transitions
             return self::stored($default);
         }
 
-        $expression = (new ColumnCatalog($this->connection))->of($successor->getTable())[$column]->default ?? null;
+        $expression = (new ColumnCatalog($this->connection, throughSearchPath: true))->of($successor->getTable())[$column]->default ?? null;
 
         return $expression === null ? null : self::stored($this->connection->scalar('select ('.$expression.')::text'));
     }

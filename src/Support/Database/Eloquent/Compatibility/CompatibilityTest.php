@@ -31,6 +31,9 @@ use Tests\TestCase;
 #[CoversClass(Compatibility::class)]
 final class CompatibilityTest extends TestCase
 {
+    /** @var class-string<Model> */
+    public static string $reporting = Model::class;
+
     #[Test]
     public function it_resolves_the_listing_map_without_a_database_connection(): void
     {
@@ -143,6 +146,174 @@ final class CompatibilityTest extends TestCase
 
         $this->assertSame(array_fill(0, 4, "Compatibility map 'jobs' is declared wrongly: Job does not implement ".Contracts\Compatible::class.', so it declares no map.'), $refusals);
         $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_each_schema_operation_for_a_successor_that_reads_another_database_before_reading_the_database(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting']]);
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'jobs';
+        };
+        self::$reporting = $reporting::class;
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(CompatibilityTest::$reporting, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([Compatibility::prepare(...), Compatibility::install(...), Compatibility::recompile(...), Compatibility::uninstall(...)] as $operation) {
+            try {
+                $operation($legacy::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame(array_fill(0, 4, "Compatibility map 'listings' is declared wrongly: the successor ".class_basename($reporting).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.'), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_or_schema_before_reading_the_database(): void
+    {
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'link_previews';
+        };
+        $legacies = [
+            new class extends Model implements Contracts\Compatible
+            {
+                protected $table = 'videos';
+
+                public function getMorphClass()
+                {
+                    return 'video';
+                }
+
+                public static function compatibility(Compatibility $video): Compatibility
+                {
+                    return $video
+                        ->discriminatedBy('legacy_type')
+                        ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? CompatibilityTest::$reporting : File::class)
+                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                        ->as(CompatibilityTest::$reporting, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                }
+            },
+            new class extends Model implements Contracts\Compatible
+            {
+                protected $table = 'videos';
+
+                public function getMorphClass()
+                {
+                    return 'video';
+                }
+
+                public static function compatibility(Compatibility $video): Compatibility
+                {
+                    return $video
+                        ->discriminatedBy('legacy_type')
+                        ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                        ->as(Link::class, fn (Successor $link) => $link
+                            ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
+                            ->related(fn (Link $link) => $link->hasOne(CompatibilityTest::$reporting, 'link_id'), fn (Successor $preview) => $preview));
+                }
+            },
+        ];
+        self::$reporting = $reporting::class;
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([['database' => 'compatibility_reporting'], ['search_path' => 'reporting']] as $elsewhere) {
+            DB::purge('compatibility_reporting');
+            config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), ...$elsewhere]]);
+
+            foreach ($legacies as $legacy) {
+                try {
+                    Compatibility::prepare($legacy::class);
+                } catch (InvalidCompatibilityMap $refusal) {
+                    $refusals[] = $refusal->getMessage();
+                }
+            }
+        }
+
+        DB::purge('compatibility_reporting');
+        $another = ' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of ';
+        $oneDatabase = '; the view and its filters read every successor through the connection of ';
+        $this->assertSame(array_merge(...array_fill(0, 2, [
+            "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
+            "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
+        ])), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_a_related_successor_that_reads_another_schema_or_a_connection_nobody_configured(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'search_path' => 'reporting']]);
+        $sites = [
+            new class extends Model
+            {
+                protected $connection = 'compatibility_reporting';
+
+                protected $table = 'job_sites';
+            },
+            new class extends Model
+            {
+                protected $connection = 'compatibility_unconfigured';
+
+                protected $table = 'job_sites';
+            },
+        ];
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(Job::class, fn (Successor $job) => $job->related(fn (Job $job) => $job->hasOne(CompatibilityTest::$reporting, 'job_id'), fn (Successor $site) => $site));
+            }
+        };
+        $refusals = [];
+
+        foreach ($sites as $site) {
+            self::$reporting = $site::class;
+
+            try {
+                Compatibility::install($legacy::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame([
+            "Compatibility map 'listings' is declared wrongly: the relation from Job to ".class_basename($sites[0]).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.',
+            "Compatibility map 'listings' is declared wrongly: the relation from Job to ".class_basename($sites[1]).' reads the connection compatibility_unconfigured, which config/database.php does not declare.',
+        ], $refusals);
     }
 
     #[Test]

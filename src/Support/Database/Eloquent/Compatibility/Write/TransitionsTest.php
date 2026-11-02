@@ -329,6 +329,25 @@ final class TransitionsTest extends TestCase
     }
 
     #[Test]
+    public function it_takes_the_initial_state_from_the_column_default_when_a_later_schema_on_the_search_path_holds_the_successor(): void
+    {
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.invoices (id serial primary key)');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $schema = DB::scalar('select current_schema()');
+            $listing = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Draft]);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame(['compatibility_tenant', 'drafting'], [$schema, DB::table('jobs')->where('legacy_id', $listing->id)->value('lifecycle_status')]);
+    }
+
+    #[Test]
     public function it_refuses_an_insert_of_a_state_when_its_successor_declares_no_initial_state(): void
     {
         DB::statement('alter table jobs alter column lifecycle_status drop default');

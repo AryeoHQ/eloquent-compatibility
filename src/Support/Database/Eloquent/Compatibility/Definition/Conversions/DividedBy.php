@@ -67,7 +67,11 @@ final readonly class DividedBy implements Conversion
         $divisor = abs($this->divisor);
 
         if (floor($divisor) !== (float) $divisor) {
-            return floor(1 / $divisor) === 1 / $divisor ? 0 : null;
+            $literal = var_export((float) $divisor, true);
+            $fraction = rtrim(substr($literal, (int) strpos($literal, '.') + 1), '0');
+            $digits = (int) ltrim(strstr($literal, '.', true).$fraction, '0');
+
+            return str_contains($literal, 'E') || strlen($fraction) > 18 || $digits === 0 || 10 ** strlen($fraction) % $digits !== 0 ? null : 0;
         }
 
         $remaining = (int) $divisor;

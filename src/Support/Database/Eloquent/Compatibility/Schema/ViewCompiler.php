@@ -17,9 +17,12 @@ final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
-    public function create(ResolvedMap $map): string
+    /**
+     * @param  list<string>  $omitted
+     */
+    public function create(ResolvedMap $map, array $omitted = []): string
     {
-        $legacy = $this->columnCatalog->of($map->table);
+        $legacy = array_diff_key($this->columnCatalog->of($map->table), array_flip($omitted));
 
         return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
     }
@@ -344,7 +347,7 @@ final readonly class ViewCompiler
                 throw InvalidCompatibilityMap::because($map->table, "a hide() scope compiles to no plain condition on {$map->primary->table}; it takes where clauses only, because \"{$hide->because}\" becomes the view's filter");
             }
 
-            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), SqlFragments::formatDates(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
+            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), SqlFragments::asSent(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
         }
 
         return $conditions;

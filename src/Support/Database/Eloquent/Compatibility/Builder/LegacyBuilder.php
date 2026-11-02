@@ -45,8 +45,14 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $inserts = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $deletes = null;
+
     /** @var array<string, true> */
     private static array $tables = [];
+
+    /** @var array<string, list<string>> */
+    private static array $nondeterministic = [];
 
     private int $negations = 0;
 
@@ -59,6 +65,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         self::$tables = [];
+        self::$nondeterministic = [];
     }
 
     public static function insertOf(Model $model): void
@@ -76,9 +83,27 @@ final class LegacyBuilder extends Builder
         return $inserting;
     }
 
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $delete
+     * @return TResult
+     */
+    public static function deleting(Model $model, Closure $delete): mixed
+    {
+        $deletes = self::$deletes ??= new WeakMap;
+        $deletes[$model] = true;
+
+        try {
+            return $delete();
+        } finally {
+            $deletes->offsetUnset($model);
+        }
+    }
+
     public static function serves(Model $model): bool
     {
-        return $model->getConnection()->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
+        return $model->getConnection()->scalar('select relkind::text from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($model->getTable())], false) === 'v';
     }
 
     /**
@@ -111,17 +136,25 @@ final class LegacyBuilder extends Builder
     }
 
     /**
+     * @param  array<array-key, mixed>  $attributes
+     * @return TModel
+     */
+    public function newModelInstance($attributes = [])
+    {
+        $model = parent::newModelInstance($attributes);
+        ExternalAttributes::readFrom($model, $this->query->useWritePdo);
+
+        return $model;
+    }
+
+    /**
      * @return LazyCollection<int, TModel>
      */
     public function cursor()
     {
-        $writePdo = $this->query->useWritePdo;
+        $scoped = $this->applyScopes();
 
-        return parent::cursor()->map(function (Model $model) use ($writePdo): Model {
-            ExternalAttributes::gather([$model], $writePdo);
-
-            return $model;
-        });
+        return $scoped === $this ? parent::cursor() : $scoped->withoutGlobalScopes()->cursor();
     }
 
     /**
@@ -167,7 +200,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::update($values) : $this->writer()->update($model, $values);
+        return $model === null ? parent::update($values) : $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false);
     }
 
     public function delete(): mixed
@@ -717,11 +750,27 @@ final class LegacyBuilder extends Builder
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || $definition->exact($type, $served->baseType ?? $served->type)) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true) && ! in_array($attribute, $this->nondeterministic($this->map()->table), true))) {
             return [$type, null];
         }
 
         return [$type, ViewCompiler::cast($definition->read($owner, $type), $definition->type($type), $served->type, $served->baseType)];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function nondeterministic(string $table): array
+    {
+        $connection = $this->model->getConnection();
+
+        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
+            "select attribute.attname as name
+             from pg_attribute attribute
+             join pg_collation column_collation on column_collation.oid = attribute.attcollation
+             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic",
+            [SqlFragments::identifier($table)],
+        )));
     }
 
     /**
@@ -772,13 +821,18 @@ final class LegacyBuilder extends Builder
      */
     private function incrementOwn(Model $model, array $amounts, array $extra): int
     {
+        $named = [];
         $values = [];
+
+        foreach ($amounts as $name => $amount) {
+            $named[Str::afterLast((string) $name, '.')] = $amount;
+        }
 
         foreach ($this->addUpdatedAtColumn($extra) as $name => $value) {
             $values[Str::afterLast((string) $name, '.')] = $value;
         }
 
-        return $this->writer()->increment($model, $amounts, $values);
+        return $this->writer()->increment($model, $named, $values);
     }
 
     private function ownWrite(): null|Model
