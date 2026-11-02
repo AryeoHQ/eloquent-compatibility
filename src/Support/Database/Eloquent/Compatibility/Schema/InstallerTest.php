@@ -572,7 +572,7 @@ final class InstallerTest extends TestCase
         $concurrent = null;
 
         DB::listen(function (QueryExecuted $query) use (&$concurrent, $change): void {
-            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, "privilege_type || ' ('")) {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'obj_description(')) {
                 return;
             }
 
@@ -597,6 +597,60 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame(['55P03', 0, 'v'], $outcome);
+    }
+
+    /**
+     * @return array<string, array{null|string, string, bool, bool}>
+     */
+    public static function concurrentPrivilegeChanges(): array
+    {
+        return [
+            'a grant' => [null, 'grant select on listings to %s', true, true],
+            'a revoke' => ['grant select on listings to %s', 'revoke select on listings from %s', false, false],
+            'a column grant' => [null, 'grant select (title) on listings to %s', false, true],
+        ];
+    }
+
+    #[DataProvider('concurrentPrivilegeChanges')]
+    #[Test]
+    public function it_serves_through_the_view_a_privilege_change_that_commits_after_install_compiles(null|string $before, string $change, bool $table, bool $column): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $role = 'compatibility_grantee_'.getmypid();
+        $concurrent = null;
+        DB::statement("create role {$role}");
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent, $change, $role): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'IN SHARE ROW EXCLUSIVE MODE')) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function () use ($change, $role): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement(sprintf($change, $role));
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            if ($before !== null) {
+                DB::statement(sprintf($before, $role));
+            }
+
+            Compatibility::install(Listing::class);
+            $outcome = [$concurrent, DB::scalar("select has_table_privilege(?, 'listings', 'SELECT')", [$role]), DB::scalar("select has_column_privilege(?, 'listings', 'title', 'SELECT')", [$role])];
+        } finally {
+            DB::purge('compatibility_concurrent');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(['committed', $table, $column], $outcome);
     }
 
     #[Test]

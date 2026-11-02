@@ -88,6 +88,7 @@ final readonly class Statements
         usort($mapped, fn (string $first, string $second) => $legacy[$second]->alwaysGenerated <=> $legacy[$first]->alwaysGenerated);
         $defaults = array_filter($legacy, fn (Column $column, string $name) => $column->default !== null && ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH);
         $hidden = self::reportHidden($map, $key);
+        [$readGrants, $grant] = self::grants($map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH)));
 
         return new self('install', [
             "LOCK TABLE {$legacyTable}, {$primary} IN SHARE ROW EXCLUSIVE MODE",
@@ -97,13 +98,14 @@ final readonly class Statements
             "UPDATE {$legacyTable} SET ".SqlFragments::identifier($retainedKey)." = {$primary}.{$primaryKey} FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $map->identifiers[$key]->column())." = {$legacyTable}.".SqlFragments::identifier($key),
             ...$repoints,
             ...$sequences,
+            $readGrants,
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
             "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved)),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
-            ...self::grants($connection, $map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH))),
+            $grant,
         ], [
             ...$validations,
             self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'),
@@ -403,37 +405,37 @@ final readonly class Statements
 
     /**
      * @param  list<string>  $columns
-     * @return list<string>
+     * @return array{string, string}
      */
-    private static function grants(ConnectionInterface $connection, string $table, string $view, array $columns): array
+    private static function grants(string $table, string $view, array $columns): array
     {
-        $rows = $connection->select(
-            "select case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
-                    string_agg(granted.privilege_type, ', ' order by granted.privilege_type) as privileges,
-                    granted.is_grantable or granted.grantee = relation.relowner as grantable
-             from pg_class relation
-             cross join lateral aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) as granted
-             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and granted.grantee <> (select oid from pg_roles where rolname = current_user)
-             group by granted.grantee, granted.is_grantable, relation.relowner
-             order by 1, 3",
-            [SqlFragments::identifier($table)],
-        );
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')';
+        $on = SqlFragments::literal(' ON '.$view.' TO ');
+        $grantee = "CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END";
+        $installer = '(SELECT oid FROM pg_roles WHERE rolname = current_user)';
 
-        $columnRows = $connection->select(
-            "select string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' order by attribute.attnum, granted.privilege_type) as privileges,
-                    case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
-                    granted.is_grantable as grantable
-             from pg_attribute attribute
-             cross join lateral aclexplode(attribute.attacl) as granted
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped
-               and granted.grantee <> (select oid from pg_roles where rolname = current_user)
-               and attribute.attname in (select jsonb_array_elements_text(cast(? as jsonb)))
-             group by granted.grantee, granted.is_grantable
-             order by 2, 3",
-            [SqlFragments::identifier($table), json_encode($columns, JSON_THROW_ON_ERROR)],
-        );
-
-        return array_values(array_map(fn (object $row) => 'GRANT '.$row->privileges.' ON '.$view.' TO '.$row->grantee.($row->grantable === true ? ' WITH GRANT OPTION' : ''), [...$rows, ...$columnRows]));
+        return [
+            "SELECT set_config('compatibility.grants', coalesce(json_agg(grants.statement ORDER BY grants.position, grants.statement)::text, '[]'), true)\n"
+                ."FROM (\n"
+                ."  SELECT 1 AS position, 'GRANT ' || string_agg(granted.privilege_type, ', ' ORDER BY granted.privilege_type) || {$on} || {$grantee} || CASE WHEN granted.is_grantable OR granted.grantee = relation.relowner THEN ' WITH GRANT OPTION' ELSE '' END AS statement\n"
+                ."  FROM pg_class relation\n"
+                ."  CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted\n"
+                ."  WHERE relation.oid = {$relation} AND granted.grantee <> {$installer}\n"
+                ."  GROUP BY granted.grantee, granted.is_grantable, relation.relowner\n"
+                ."  UNION ALL\n"
+                ."  SELECT 2, 'GRANT ' || string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' ORDER BY attribute.attnum, granted.privilege_type) || {$on} || {$grantee} || CASE WHEN granted.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END\n"
+                ."  FROM pg_attribute attribute\n"
+                ."  CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted\n"
+                ."  WHERE attribute.attrelid = {$relation} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.grantee <> {$installer}\n"
+                .'    AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('.SqlFragments::literal(json_encode($columns, JSON_THROW_ON_ERROR)).' AS jsonb)))'."\n"
+                ."  GROUP BY granted.grantee, granted.is_grantable\n"
+                .') AS grants',
+            "DO \$compatibility\$\nDECLARE\n  granted text;\nBEGIN\n"
+                ."  FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP\n"
+                ."    EXECUTE granted;\n"
+                ."  END LOOP;\n"
+                ."END\n\$compatibility\$",
+        ];
     }
 
     private static function repoint(ResolvedMap $map, object $foreignKey, string $on, string $table, string $column): string
