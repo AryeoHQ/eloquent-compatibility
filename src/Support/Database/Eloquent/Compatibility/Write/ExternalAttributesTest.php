@@ -243,4 +243,22 @@ final class ExternalAttributesTest extends TestCase
         $this->assertEquals(new FileMetadata('video/mp4'), FakeMediaLibrary::bound()->stored($asset));
         $this->assertSame([[1, null, 'https://youtu.be/tour'], [2, 'video/mp4', null], [3, 'video/quicktime', null]], Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->mime_type, $video->youtube_embed_url])->all());
     }
+
+    #[Test]
+    public function it_serves_the_value_the_new_branch_holds_to_a_record_that_read_the_attribute_before_its_move(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        $video = Video::query()->findOrFail(1);
+        $read = $video->mime_type;
+
+        $video->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+
+        $this->assertSame(
+            ['video/mp4', [null], null, ['mime_type' => null], false, true],
+            [$read, $seen, $video->mime_type, array_intersect_key($video->toArray(), ['mime_type' => true]), $video->isDirty(), $video->wasChanged('mime_type')],
+        );
+    }
 }

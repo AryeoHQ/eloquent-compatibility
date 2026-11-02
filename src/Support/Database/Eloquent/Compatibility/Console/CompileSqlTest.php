@@ -11,6 +11,8 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -35,6 +37,7 @@ final class CompileSqlTest extends TestCase
     protected function tearDown(): void
     {
         ListingTables::drop();
+        FileTables::drop();
 
         parent::tearDown();
     }
@@ -93,6 +96,31 @@ final class CompileSqlTest extends TestCase
         } finally {
             unlink((string) $file);
         }
+    }
+
+    #[Test]
+    public function it_refuses_to_print_an_operation_that_reads_an_external_attribute_between_its_statements(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+
+        foreach (FileTables::MODELS as $model) {
+            Compatibility::prepare($model);
+        }
+
+        FileTables::backfill();
+
+        $this->artisan('compatibility:sql', ['model' => Photo::class])
+            ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
+
+        Compatibility::install(Photo::class);
+
+        $this->artisan('compatibility:sql', ['model' => Photo::class, '--for' => 'uninstall'])
+            ->expectsOutputToContain('Compatibility::uninstall() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::uninstall() instead.')
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
     }
 
     /**

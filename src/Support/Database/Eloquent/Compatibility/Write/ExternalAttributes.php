@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use BackedEnum;
 use Closure;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use Stringable;
@@ -105,56 +106,29 @@ final class ExternalAttributes
     }
 
     /**
-     * @param  array<array-key, null|Model>  $records
+     * @param  list<int|string>  $keys
      * @return array<array-key, mixed>
      */
-    public static function values(ResolvedMap $map, string $name, array $records, null|string $connection, bool $writePdo): array
+    public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
     {
-        $legacyKey = (new $map->model)->getKeyName();
         $values = [];
 
         foreach ($map->branches === [] ? [$map] : $map->branches as $branch) {
             $attribute = $branch->attributes[$name];
 
-            if (! $attribute->isExternal()) {
-                continue;
-            }
-
-            $identifier = $branch->identifiers[$legacyKey];
-            $column = (string) $identifier->column();
-            $primary = (new $branch->primary->model)->setConnection($connection);
-            $query = $primary->newModelQuery();
-            $query->whereRaw($query->getQuery()->getGrammar()->wrap($primary->qualifyColumn($column)).' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral(array_keys($records))]);
-
-            if ($writePdo) {
-                $query->useWritePdo();
-            }
-
-            if ($branch->membership !== null) {
-                $query->where($branch->membership->column, $branch->membership->alias);
-            }
-
-            $successors = $query->get();
-            $read = $attribute->readExternally($successors);
-
-            foreach ($successors as $successor) {
-                $key = $successor->getAttribute($column);
-                $successorKey = $successor->getKey();
-
-                if ((is_int($key) || is_string($key)) && (is_int($successorKey) || is_string($successorKey))) {
-                    $values[$key] = $read[$successorKey];
-                }
+            if ($attribute->isExternal()) {
+                $values += self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...));
             }
         }
 
-        foreach ($records as $key => $record) {
-            if (array_key_exists($key, $values) || $record === null || $map->branches === []) {
-                continue;
-            }
-
-            $attribute = $map->branchFor($record)->attributes[$name];
+        foreach ($map->branches as $branch) {
+            $attribute = $branch->attributes[$name];
             $fixed = $attribute->conversions()[0] ?? null;
-            $values[$key] = ! $attribute->isExternal() && $fixed instanceof Fixed ? $fixed->value : null;
+            $remaining = array_values(array_filter($keys, fn (int|string $key) => ! array_key_exists($key, $values)));
+
+            if ($remaining !== [] && ! $attribute->isExternal() && $fixed instanceof Fixed && $fixed->value !== null) {
+                $values += array_fill_keys(array_keys(self::held($map, $branch, $remaining, $connection, $writePdo)), $fixed->value);
+            }
         }
 
         return $values;
@@ -174,7 +148,7 @@ final class ExternalAttributes
                 $stored[self::key($row[$key] ?? null)] = $row[$name] ?? null;
             }
 
-            $values = self::values($map, $name, array_fill_keys(array_keys($stored), null), (new $map->model)->getConnectionName(), true);
+            $values = self::values($map, $name, array_keys($stored), (new $map->model)->getConnectionName(), true);
 
             foreach ($stored as $legacyKey => $value) {
                 if (! self::same($value, $values[$legacyKey] ?? null)) {
@@ -209,7 +183,7 @@ final class ExternalAttributes
 
             $bindings = [];
 
-            foreach (self::values($map, $name, array_fill_keys(array_keys($retained), null), (new $map->model)->getConnectionName(), true) as $legacyKey => $value) {
+            foreach (self::values($map, $name, array_keys($retained), (new $map->model)->getConnectionName(), true) as $legacyKey => $value) {
                 if ($value !== null) {
                     array_push($bindings, (string) $retained[$legacyKey], self::bindable($map, $name, $value));
                 }
@@ -226,6 +200,43 @@ final class ExternalAttributes
                 $bindings,
             );
         }, $retainedKey);
+    }
+
+    /**
+     * @param  list<int|string>  $keys
+     * @param  null|Closure(Collection<array-key, Model>): array<array-key, mixed>  $read
+     * @return array<array-key, mixed>
+     */
+    private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, null|Closure $read = null): array
+    {
+        $identifier = $branch->identifiers[(new $map->model)->getKeyName()];
+        $column = (string) $identifier->column();
+        $primary = (new $branch->primary->model)->setConnection($connection);
+        $query = $primary->newModelQuery();
+        $query->whereRaw($query->getQuery()->getGrammar()->wrap($primary->qualifyColumn($column)).' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral($keys)]);
+
+        if ($writePdo) {
+            $query->useWritePdo();
+        }
+
+        if ($branch->membership !== null) {
+            $query->where($branch->membership->column, $branch->membership->alias);
+        }
+
+        $successors = $query->get();
+        $read = $read === null ? null : $read($successors);
+        $held = [];
+
+        foreach ($successors as $successor) {
+            $key = $successor->getAttribute($column);
+            $successorKey = $successor->getKey();
+
+            if ((is_int($key) || is_string($key)) && (is_int($successorKey) || is_string($successorKey))) {
+                $held[$key] = $read === null ? null : $read[$successorKey];
+            }
+        }
+
+        return $held;
     }
 
     private function load(Model $legacy, string $name): void
@@ -258,7 +269,7 @@ final class ExternalAttributes
         $this->loading[$name] = true;
 
         try {
-            $values = self::values(LegacyBuilder::mapOf($legacy::class), $name, array_map(fn (array $models) => $models[0], $pending), $legacy->getConnectionName(), $this->writePdo);
+            $values = self::values(LegacyBuilder::mapOf($legacy::class), $name, array_keys($pending), $legacy->getConnectionName(), $this->writePdo);
         } finally {
             unset($this->loading[$name]);
         }
