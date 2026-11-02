@@ -160,6 +160,31 @@ final class BranchConcurrencyTest extends TestCase
         $this->assertSame([0, 'Retitled', 'video/mp4'], [$updated, Video::query()->findOrFail(1)->title, Video::query()->findOrFail(1)->mime_type]);
     }
 
+    /**
+     * @return iterable<string, array{Closure(Video): mixed}>
+     */
+    public static function retainedExpressionWrites(): iterable
+    {
+        yield 'a record update' => [fn (Video $video) => $video->update(['title' => DB::raw("title || '!'")])];
+        yield 'a record increment' => [fn (Video $video) => $video->increment('views', 1, ['title' => DB::raw("title || '!'")])];
+    }
+
+    /**
+     * @param  Closure(Video): mixed  $write
+     */
+    #[DataProvider('retainedExpressionWrites')]
+    #[Test]
+    public function it_evaluates_a_retained_expression_of_a_record_write_against_the_value_a_concurrent_retained_write_commits(Closure $write): void
+    {
+        $video = Video::query()->findOrFail(1);
+        $locked = $this->lockConcurrently("update videos_retained set title = 'Retitled' where id = 1");
+
+        $write($video);
+
+        $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
+        $this->assertSame(['Retitled!', 'Retitled!'], [$video->title, Video::query()->findOrFail(1)->title]);
+    }
+
     private function writeConcurrently(string $write): string
     {
         $concurrent = 'require '.var_export(dirname(__DIR__, 6).'/vendor/autoload.php', true).';'
