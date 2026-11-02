@@ -38,6 +38,8 @@ final class CompatibilityWriteRefusedTest extends TestCase
             CompatibilityWriteRefused::bySuccessorListener(Listing::class, new Place),
             CompatibilityWriteRefused::noParentRow(Listing::class, ['street', 'city'], 'places', 'job_sites'),
             CompatibilityWriteRefused::noRelatedRow(Listing::class, ['street'], 'places', 'jobs'),
+            CompatibilityWriteRefused::rawExpression(Listing::class, 'title', 'It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead.'),
+            CompatibilityWriteRefused::noKeyDefault(Listing::class, ['street', 'city'], 'places', 'id'),
         ];
 
         $this->assertSame([
@@ -55,6 +57,8 @@ final class CompatibilityWriteRefusedTest extends TestCase
             'Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Place refused its save. Why: The write stores its values through Place, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Place.',
             'Tests\Fixtures\Support\Listings\Listing cannot write $street, $city. Why: They live on a places row, and the record has no job_sites row to hold one. Instead: Write a value that creates the job_sites row in the same write, or create that row through its own model first.',
             'Tests\Fixtures\Support\Listings\Listing cannot write $street. Why: They live on a places row the record does not have, and jobs reaches that row through a belongs-to relation, which creates no row. Instead: Create the places row through its own model and associate it with the jobs row first.',
+            'Tests\Fixtures\Support\Listings\Listing::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.',
+            'Tests\Fixtures\Support\Listings\Listing cannot write $street, $city in one statement to records that have no places row. Why: A set-based write creates the missing places rows in SQL, and places.id has no database default to key them. Instead: Write the records one at a time through Listing, or give places.id a database default.',
         ], array_map(fn (CompatibilityWriteRefused $refusal) => $refusal->getMessage(), $refusals));
         $this->assertContainsOnlyInstancesOf(CompatibilityException::class, $refusals);
     }

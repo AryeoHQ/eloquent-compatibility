@@ -170,7 +170,7 @@ final class MassWriterTest extends TestCase
         $raw = $this->refusal(fn () => Listing::query()->update(['price' => DB::raw('price + 1')]));
         $readOnly = $this->refusal(fn () => Listing::query()->update(['company_id' => ListingTables::COMPANY]));
 
-        $this->assertSame(Listing::class.' cannot run a raw expression for $price through its compatibility map. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write each record through Listing, or write the successor models directly.', $raw->getMessage());
+        $this->assertSame(Listing::class.'::$price cannot take a raw expression. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write the computed value, or write the stored column through the successor model.', $raw->getMessage());
         $this->assertSame(Listing::class.' records cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
         $this->assertSame([125050, 9999], DB::table('jobs')->whereNotNull('price_cents')->orderBy('legacy_id')->pluck('price_cents')->all());
     }
@@ -185,11 +185,67 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_passes_a_raw_expression_for_an_unconverted_attribute_through(): void
+    public function it_refuses_a_raw_expression_for_a_successor_attribute_and_reads_a_legacy_only_one_against_the_row_before_the_write(): void
     {
-        Listing::query()->whereKey(1)->update(['updated_at' => DB::raw("timestamp '2026-03-04 05:06:07'")]);
+        $refused = $this->refusal(fn () => Listing::query()->whereKey(3)->update(['title' => DB::raw("'Listing ' || id")]));
+        $updated = Listing::query()->whereKey(1)->update(['title' => 'Oak Manor', 'mls_number' => DB::raw("title || ' ' || id")]);
 
-        $this->assertSame('2026-03-04 05:06:07', Listing::query()->findOrFail(1)->updated_at?->toDateTimeString());
+        $this->assertSame(Listing::class.'::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.', $refused->getMessage());
+        $this->assertSame('Elm Cottage', Job::query()->where('legacy_id', 3)->value('name'));
+        $this->assertSame([1, 'Oak Manor', 'Oak House 1'], [$updated, Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->mls_number]);
+    }
+
+    #[Test]
+    public function it_skips_a_record_a_concurrent_write_moved_out_of_the_filter_while_the_write_waited_for_its_lock(): void
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $concurrent = '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->exec("update jobs set name = \'Changed\' where legacy_id = 1"); echo "locked\n"; fflush(STDOUT); sleep(2); $pdo->commit();';
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $locked = fgets($pipes[1]);
+
+        $updated = Listing::query()->where('title', 'Oak House')->update(['title' => 'Mass']);
+        $failure = stream_get_contents($pipes[2]);
+        proc_close($process);
+
+        $this->assertSame(["locked\n", ''], [$locked, $failure]);
+        $this->assertSame([0, 'Changed'], [$updated, Listing::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
+    public function it_writes_only_the_records_a_limited_query_chooses(): void
+    {
+        $updated = Listing::query()->orderBy('price')->limit(1)->update(['title' => 'Cheapest', 'mls_number' => 'MLS-C']); // @phpstan-ignore staticMethod.dynamicCall
+
+        $this->assertSame(1, $updated);
+        $this->assertSame([['Oak House', 'MLS-1'], ['Cheapest', 'MLS-C']], Listing::query()->orderBy('id')->get(['title', 'mls_number'])->map(fn (Listing $listing) => [$listing->title, $listing->mls_number])->all());
+    }
+
+    #[Test]
+    public function it_refuses_to_create_a_missing_dependent_whose_key_has_no_database_default(): void
+    {
+        DB::statement('alter table places alter column id drop default');
+
+        $refused = $this->refusal(fn () => Listing::withTrashed()->whereKey([1, 2])->update(['title' => 'Renamed', 'street' => '2 Pine St']));
+        Listing::query()->whereKey(1)->update(['street' => '2 Oak St']);
+
+        $this->assertSame(Listing::class.' cannot write $street in one statement to records that have no places row. Why: A set-based write creates the missing places rows in SQL, and places.id has no database default to key them. Instead: Write the records one at a time through Listing, or give places.id a database default.', $refused->getMessage());
+        $this->assertSame(['Oak House', 'Pine Flat'], Job::withTrashed()->whereIn('legacy_id', [1, 2])->orderBy('legacy_id')->pluck('name')->all());
+        $this->assertSame(['2 Oak St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
+    }
+
+    #[Test]
+    public function it_binds_no_matched_key_into_a_statement(): void
+    {
+        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
+        $keys = DB::table('jobs')->where('name', 'Bulk')->pluck('id')->all();
+
+        [$updated] = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update(['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B']));
+        $bound = (string) json_encode(array_column(DB::getQueryLog(), 'bindings'));
+
+        $this->assertSame(100, $updated);
+        $this->assertSame([], array_values(array_filter($keys, fn (mixed $key) => str_contains($bound, (string) $key))));
     }
 
     #[Test]

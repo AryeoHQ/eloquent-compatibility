@@ -5,13 +5,19 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -102,6 +108,52 @@ final class LegacyQueryBuilderTest extends TestCase
         $this->assertSame(['Oak House', 'Fresh', 'Fresh again'], Listing::query()->where('title', '!=', 'Elm Cottage')->orderBy('id')->pluck('title')->all());
         $this->assertSame(['4 Yew St', 'Fresh again'], [$fresh->street, Listing::query()->findOrFail($fresh->id)->title]);
         $this->assertSame(0, DB::table('jobs')->where('name', 'like', 'Taken%')->count());
+    }
+
+    #[Test]
+    public function it_returns_the_native_empty_result_for_an_empty_insert_before_any_statement(): void
+    {
+        $this->install();
+        $query = fn () => Listing::query()->toBase();
+        $query();
+        DB::enableQueryLog();
+
+        $results = [$query()->insert([]), $query()->insertOrIgnore([]), $query()->insertOrIgnoreReturning([])->all()];
+
+        $this->assertSame([true, 0, []], $results);
+        $this->assertSame([], DB::getQueryLog());
+        $this->assertSame(3, DB::table('jobs')->count());
+    }
+
+    #[Test]
+    public function it_returns_a_string_key_from_insert_get_id(): void
+    {
+        $this->install();
+        $keyed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $incrementing = false;
+
+            protected $table = 'listings';
+
+            protected $primaryKey = 'uuid';
+
+            protected $keyType = 'string';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+
+        $key = $keyed->newQuery()->toBase()->insertGetId(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame(Job::query()->where('name', 'Birch House')->value('legacy_uuid'), $key);
     }
 
     #[Test]

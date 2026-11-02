@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Closure;
+use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
@@ -14,6 +15,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final readonly class RecordWriter
@@ -58,14 +60,14 @@ final readonly class RecordWriter
             }
 
             [$stored, $retained, $states] = $this->split($legacy, $values, $key);
-            $this->guard($legacy, $key);
+            $this->guard($legacy, $key, $values, []);
+            $this->retain($primary, $retained, []);
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], array_keys($values));
+            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $models, $missing, $stored);
-            (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
 
             return 1;
         });
@@ -87,26 +89,15 @@ final readonly class RecordWriter
 
             [$stored, $retained, $states] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = (new MassWriter($this->map, $this->connection))->amounts($amounts, $key);
-            $this->guard($legacy, $key);
+            $this->guard($legacy, $key, $extra, $amounts);
+            $this->retain($primary, $retained, array_diff_key($retainedAmounts, $retained));
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states + array_fill_keys(array_keys($added), []));
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-
-            foreach ($added as $table => $columns) {
-                foreach ($columns as $column => $amount) {
-                    $current = ($models[$table] ?? null)?->getAttributes()[$column] ?? null;
-
-                    if (is_numeric($current) && ! array_key_exists($column, $stored[$table] ?? [])) {
-                        $this->assign($models[$table], [$column => $current + $amount]);
-                    }
-                }
-            }
-
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], array_keys($extra));
+            $this->addEach($models, $added, $stored);
+            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $models, $missing, $stored);
-            (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
-            (new RetainedRows($this->map, $this->connection))->upsertAll([self::keyOf($primary)], [], array_diff_key($retainedAmounts, $retained));
 
             return 1;
         });
@@ -142,6 +133,7 @@ final readonly class RecordWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if (array_key_exists($name, $this->map->identifiers)) {
+                MassWriter::refuseRaw($this->map, $name, $value);
                 $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column()] = $value;
 
                 continue;
@@ -163,6 +155,8 @@ final readonly class RecordWriter
             if ($refusal !== null) {
                 throw $refusal;
             }
+
+            MassWriter::refuseRaw($this->map, $name, $value);
 
             try {
                 $value = $attribute->write($value);
@@ -237,7 +231,11 @@ final readonly class RecordWriter
         }
     }
 
-    private function guard(Model $legacy, int|string $key): void
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  array<string, float|int|numeric-string>  $amounts
+     */
+    private function guard(Model $legacy, int|string $key, array $values, array $amounts): void
     {
         if ($this->map->guards === []) {
             return;
@@ -249,10 +247,84 @@ final readonly class RecordWriter
             return;
         }
 
+        foreach ($amounts as $name => $amount) {
+            $current = $before->getAttributes()[$name] ?? null;
+
+            if (is_numeric($current) && ! array_key_exists($name, $values)) {
+                $values[$name] = $current + $amount;
+            }
+        }
+
+        $after = clone $before;
+        $after->setRawAttributes(array_replace($before->getAttributes(), $values));
+
         foreach ($this->map->guards as $guard) {
-            if ($guard->refuses($legacy, $before)) {
+            if ($guard->refuses($after, $before)) {
                 throw CompatibilityWriteRefused::byGuard($legacy::class, $guard, $key);
             }
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  array<string, float|int>  $amounts
+     */
+    private function retain(Model $primary, array $values, array $amounts): void
+    {
+        $retained = new RetainedRows($this->map, $this->connection);
+
+        if ($amounts === [] && array_filter($values, fn (mixed $value) => $value instanceof Expression) === []) {
+            $retained->upsert(self::keyOf($primary), $values);
+
+            return;
+        }
+
+        $key = $this->map->primary->table.'.'.$this->map->primary->key;
+        $retained->upsertAll($this->connection->table($this->map->primary->table)->where($key, self::keyOf($primary))->select($key), $values, $amounts);
+    }
+
+    /**
+     * @param  array<string, Model>  $models
+     * @param  array<string, array<string, float|int>>  $added
+     * @param  array<string, array<string, mixed>>  $stored
+     */
+    private function addEach(array $models, array $added, array $stored): void
+    {
+        $catalog = new ColumnCatalog($this->connection);
+        $grammar = $this->connection->getQueryGrammar();
+        $sums = [];
+        $bindings = [];
+        $targets = [];
+
+        foreach ($added as $table => $columns) {
+            foreach ($columns as $column => $amount) {
+                $current = ($models[$table] ?? null)?->getAttributes()[$column] ?? null;
+
+                if ($current === null || array_key_exists($column, $stored[$table] ?? [])) {
+                    continue;
+                }
+
+                if (is_int($current) && is_int($amount)) {
+                    $this->assign($models[$table], [$column => $current + $amount]);
+
+                    continue;
+                }
+
+                $type = $catalog->type($table, $column) ?? 'numeric';
+                $sums[] = 'cast(cast(? as '.$type.') + cast(? as numeric) as '.$type.') as '.$grammar->wrap('sum_'.count($targets));
+                array_push($bindings, $current, $amount);
+                $targets[] = [$table, $column];
+            }
+        }
+
+        if ($targets === []) {
+            return;
+        }
+
+        $sum = (array) $this->connection->selectOne('select '.implode(', ', $sums), $bindings);
+
+        foreach ($targets as $index => [$table, $column]) {
+            $this->assign($models[$table], [$column => $sum['sum_'.$index]]);
         }
     }
 
@@ -327,9 +399,8 @@ final readonly class RecordWriter
 
     /**
      * @param  array<string, mixed>  $values
-     * @param  list<string>  $written
      */
-    private function savePrimary(Model $legacy, Model $primary, array $values, array $written): void
+    private function savePrimary(Model $legacy, Model $primary, array $values): void
     {
         $deletedAt = method_exists($primary, 'getDeletedAtColumn') ? (string) $primary->getDeletedAtColumn() : null;
 
@@ -355,13 +426,16 @@ final readonly class RecordWriter
         }
 
         $this->save($legacy, $primary, fn () => $primary->delete());
+        $stamped = array_filter(
+            array_intersect_key($values, array_flip(array_filter([$deletedAt, $updatedAt], fn (null|string $column) => $column !== null))),
+            fn (mixed $value, string $column) => $value !== ($primary->getAttributes()[$column] ?? null),
+            ARRAY_FILTER_USE_BOTH,
+        );
 
-        foreach ($written as $name) {
-            $attribute = $this->map->attributes[$name] ?? null;
-
-            if ($attribute !== null && $attribute->conversions() === [] && $this->map->owners[$name] === $this->map->primary && in_array($attribute->column(), [$deletedAt, $updatedAt], true)) {
-                $legacy->setAttribute($name, $primary->getAttribute((string) $attribute->column()));
-            }
+        if ($stamped !== []) {
+            $primary->newQueryWithoutScopes()->toBase()->where($primary->getKeyName(), $primary->getKey())->update($stamped);
+            $primary->setRawAttributes(array_replace($primary->getAttributes(), $stamped));
+            $primary->syncOriginalAttributes(array_keys($stamped));
         }
     }
 

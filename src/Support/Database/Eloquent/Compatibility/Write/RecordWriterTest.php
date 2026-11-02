@@ -100,21 +100,63 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_gives_the_legacy_record_the_timestamps_its_primary_stored_on_a_soft_delete(): void
+    public function it_keeps_the_timestamps_a_legacy_write_sets_when_it_soft_deletes(): void
     {
         $this->freezeSecond();
         $deleting = Date::now()->toDateTimeString();
         Event::listen('eloquent.deleting: '.Job::class, function (): void {
             $this->travel(1)->minutes();
         });
-        $listing = Listing::query()->findOrFail(1);
+        $deleted = Listing::query()->findOrFail(1);
+        $backdated = Listing::query()->findOrFail(3);
 
-        $listing->delete();
-        $stored = Listing::withTrashed()->findOrFail(1);
+        $deleted->delete();
+        $backdated->update(['deleted_at' => '2020-01-01 00:00:00']);
+        $timestamps = fn (Listing $listing) => [$listing->deleted_at?->toDateTimeString(), $listing->updated_at?->toDateTimeString()];
 
-        $this->assertNotSame($deleting, $stored->deleted_at?->toDateTimeString());
-        $this->assertSame([$stored->deleted_at?->toDateTimeString(), $stored->updated_at?->toDateTimeString()], [$listing->deleted_at?->toDateTimeString(), $listing->updated_at?->toDateTimeString()]);
-        $this->assertFalse($listing->isDirty());
+        $this->assertSame([$deleting, $deleting], $timestamps(Listing::withTrashed()->findOrFail(1)));
+        $this->assertSame([$deleting, $deleting], $timestamps($deleted));
+        $this->assertFalse($deleted->isDirty());
+        $this->assertSame($timestamps($backdated), $timestamps(Listing::withTrashed()->findOrFail(3)));
+        $this->assertSame('2020-01-01 00:00:00', $backdated->deleted_at?->toDateTimeString());
+    }
+
+    #[Test]
+    public function it_refuses_a_raw_expression_for_a_successor_attribute_and_reads_a_legacy_only_one_against_the_row_before_the_write(): void
+    {
+        $before = $this->snapshot();
+        $elm = Listing::query()->findOrFail(3);
+        $elm->setAttribute('title', DB::raw("'Listing ' || id"));
+
+        $refused = $this->refusal(fn () => $elm->save());
+        $unchanged = $this->snapshot();
+        Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor', 'mls_number' => DB::raw("title || ' ' || id")]);
+
+        $this->assertSame(Listing::class.'::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.', $refused->getMessage());
+        $this->assertSame($before, $unchanged);
+        $this->assertSame(['Oak Manor', 'Oak House 1'], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->mls_number]);
+    }
+
+    #[Test]
+    public function it_runs_a_guard_against_the_stored_record_with_only_the_written_values_applied(): void
+    {
+        $stale = Listing::query()->findOrFail(1);
+        $current = Listing::query()->findOrFail(1);
+        $current->update(['price' => '1300.00']);
+        $current->update(['status' => ListingStatus::Sold]);
+
+        $stale->update(['title' => 'Oak House Renamed']);
+
+        $this->assertSame(['Oak House Renamed', '1300.00', ListingStatus::Sold], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->price, Listing::query()->findOrFail(1)->status]);
+    }
+
+    #[Test]
+    public function it_rounds_a_fractional_record_increment_as_the_mass_increment_does(): void
+    {
+        Listing::query()->findOrFail(1)->increment('price', 0.005);
+        Listing::query()->whereKey(3)->increment('price', 0.005);
+
+        $this->assertSame([125051, 10000], DB::table('jobs')->whereIn('legacy_id', [1, 3])->orderBy('legacy_id')->pluck('price_cents')->all());
     }
 
     #[Test]

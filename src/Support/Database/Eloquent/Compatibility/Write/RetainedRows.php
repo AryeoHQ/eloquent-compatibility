@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
@@ -30,23 +31,23 @@ final readonly class RetainedRows
     }
 
     /**
-     * @param  list<int|string>  $keys
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    public function upsertAll(array $keys, array $values, array $amounts): void
+    public function upsertAll(QueryBuilder $keys, array $values, array $amounts): void
     {
-        if ($keys === [] || ($values === [] && $amounts === [])) {
+        if ($values === [] && $amounts === []) {
             return;
         }
 
         $retained = ViewCompiler::retainedTable($this->map);
         $table = SqlFragments::identifier($retained);
         $primary = SqlFragments::identifier($this->map->primary->table);
+        $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
         $legacy = SqlFragments::identifier($this->map->table);
         $catalog = new ColumnCatalog($this->connection);
         $grammar = $this->connection->table($retained)->getGrammar();
-        $selects = [$primary.'.'.SqlFragments::identifier($this->map->primary->key)];
+        $selects = [];
         $updates = [];
         $bindings = [];
         $joined = $amounts !== [];
@@ -73,15 +74,19 @@ final readonly class RetainedRows
         }
 
         $key = (new $this->map->model)->getKeyName();
-        $join = $joined ? ' JOIN '.$legacy.' ON '.$legacy.'.'.SqlFragments::identifier($key).' = '.$primary.'.'.SqlFragments::identifier((string) $this->map->identifiers[$key]->column()) : '';
+        $legacyKey = $legacy.'.'.SqlFragments::identifier($key);
+        $identifier = $primary.'.'.SqlFragments::identifier((string) $this->map->identifiers[$key]->column());
+        $keyed = $primaryKey.' IN ('.$keys->toSql().')';
+        $source = $joined
+            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.'), '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
+            : implode(', ', [$primaryKey, ...$selects]).' FROM '.$primary.' WHERE '.$keyed;
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
 
         $this->connection->affectingStatement(
             'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
-                .' SELECT '.implode(', ', $selects).' FROM '.$primary.$join
-                .' WHERE '.$primary.'.'.SqlFragments::identifier($this->map->primary->key).' = any(?)'
+                .' SELECT '.$source
                 .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
-            [...$bindings, MassWriter::arrayOf($keys)],
+            [...$bindings, ...$keys->getBindings()],
         );
     }
 }

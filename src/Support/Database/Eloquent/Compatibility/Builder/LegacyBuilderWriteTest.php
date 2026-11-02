@@ -180,10 +180,10 @@ final class LegacyBuilderWriteTest extends TestCase
         $this->assertSame([
             [1, 'select jobs for update'],
             [1, 'select listings'],
+            [1, 'insert listings_retained'],
             [1, 'select places for update'],
             [1, 'update jobs'],
             [1, 'update places'],
-            [1, 'insert listings_retained'],
         ], $statements);
     }
 

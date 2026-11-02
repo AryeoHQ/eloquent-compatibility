@@ -30,7 +30,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        if ($legacy === null) {
+        if ($legacy === null || $values === []) {
             return parent::insert($values);
         }
 
@@ -47,17 +47,11 @@ final class LegacyQueryBuilder extends QueryBuilder
      * @param  array<array-key, mixed>  $values
      * @param  null|string  $sequence
      */
-    public function insertGetId(array $values, $sequence = null): int
+    public function insertGetId(array $values, $sequence = null): int|string // @phpstan-ignore method.childReturnType
     {
         $legacy = $this->served();
 
-        if ($legacy === null) {
-            return parent::insertGetId($values, $sequence);
-        }
-
-        $key = $this->writer($legacy)->insert($legacy->newInstance(), $values);
-
-        return is_int($key) ? $key : throw $this->unsupported('insertGetId()', "It returns an integer, and the new record's key is not one.");
+        return $legacy === null ? parent::insertGetId($values, $sequence) : $this->writer($legacy)->insert($legacy->newInstance(), $values);
     }
 
     /**
@@ -67,7 +61,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        if ($legacy === null) {
+        if ($legacy === null || $values === []) {
             return parent::insertOrIgnore($values);
         }
 
@@ -92,7 +86,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        if ($legacy === null) {
+        if ($legacy === null || $values === []) {
             return parent::insertOrIgnoreReturning($values, $returning, $uniqueBy);
         }
 

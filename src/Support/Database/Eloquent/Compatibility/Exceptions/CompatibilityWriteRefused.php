@@ -125,6 +125,27 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
+    public static function rawExpression(string $model, string $attribute, string $because): self
+    {
+        return new self(
+            "{$model}::\${$attribute} cannot take a raw expression",
+            $because,
+            'Write the computed value, or write the stored column through the successor model.',
+        );
+    }
+
+    /**
+     * @param  list<string>  $attributes
+     */
+    public static function noKeyDefault(string $model, array $attributes, string $table, string $column): self
+    {
+        return new self(
+            "{$model} cannot write \$".implode(', $', $attributes)." in one statement to records that have no {$table} row",
+            "A set-based write creates the missing {$table} rows in SQL, and {$table}.{$column} has no database default to key them.",
+            'Write the records one at a time through '.class_basename($model).", or give {$table}.{$column} a database default.",
+        );
+    }
+
     public static function byGuard(string $model, Guard $guard, int|string $key): self
     {
         return new self("{$model} record {$key} cannot take this write, because guard '{$guard->name}' refuses it", $guard->because, $guard->instead);
