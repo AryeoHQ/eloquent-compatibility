@@ -172,12 +172,14 @@ final readonly class MassWriter
         $stored = [];
         $retained = [];
 
-        foreach ($values as $name => $value) {
-            $name = Str::afterLast((string) $name, '.');
+        foreach ($values as $key => $value) {
+            [$name, $path] = array_pad(explode('->', (string) $key, 2), 2, null);
+            $name = Str::afterLast($name, '.');
+            $within = $path === null ? '' : '->'.$path;
 
             if (array_key_exists($name, $this->map->identifiers)) {
                 self::refuseRaw($this->map, $name, $value);
-                $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column()] = $value;
+                $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column().$within] = $value;
 
                 continue;
             }
@@ -185,13 +187,25 @@ final readonly class MassWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null) {
-                $retained[$name] = $value;
+                $retained[$name.$within] = $value;
 
                 continue;
             }
 
             $this->refuse($name, null);
             self::refuseRaw($this->map, $name, $value);
+
+            if ($path !== null) {
+                $column = $attribute->column();
+
+                if ($column === null || $attribute->conversions() !== []) {
+                    throw CompatibilityWriteRefused::unsupported($this->map->model, "a JSON path write of \${$name}", 'Its conversions read the whole stored value, so a path inside the legacy value has no one stored path.');
+                }
+
+                $stored[$this->map->owners[$name]->table][$column.$within] = $value;
+
+                continue;
+            }
 
             try {
                 $value = $attribute->write($value);
@@ -319,12 +333,13 @@ final readonly class MassWriter
         }
 
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
-        $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $values, $catalog);
+        $whole = array_filter($values, fn (int|string $column) => ! str_contains((string) $column, '->'), ARRAY_FILTER_USE_KEY);
+        $creates = array_filter($whole, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $whole, $catalog);
         $key = $related->table.'.'.$related->successor->key;
         $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reached()->whereNotNull(self::target($index))->select(self::target($index)))->update($changes);
 
         if ($creates) {
-            $this->createMissing($related, $index, $values, $catalog);
+            $this->createMissing($related, $index, $whole, $catalog);
         }
     }
 
