@@ -10,8 +10,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
-use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
-use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final class FileTables
 {
@@ -147,21 +145,7 @@ final class FileTables
         Compatibility::prepare(InteractiveContent::class);
         self::backfillMedia();
         Compatibility::install(InteractiveContent::class);
-
-        $connection = DB::connection();
-        $catalog = new ColumnCatalog($connection);
-        $map = Compatibility::of(Video::class)->resolve();
-        $view = (new ViewCompiler($catalog, $connection))->create($map);
-        $legacy = array_keys($catalog->of('videos'));
-        $served = array_values(array_diff($legacy, $map->legacyOnly($legacy), [(string) $map->retainedKey]));
-
-        DB::transaction(function () use ($view, $served): void {
-            DB::statement('alter table videos '.implode(', ', array_map(fn (string $column) => "drop column {$column}", $served)));
-            DB::statement('alter table videos rename to videos_retained');
-            DB::statement($view);
-        });
-
-        LegacyBuilder::forgetViews();
+        Compatibility::install(Video::class);
     }
 
     public static function backfill(): void

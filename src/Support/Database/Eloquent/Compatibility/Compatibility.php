@@ -81,7 +81,14 @@ final class Compatibility
 
     public static function install(string $model): void
     {
-        self::run($model, Statements::install(...));
+        $map = self::of($model)->resolve();
+        $connection = (new $map->model)->getConnection();
+
+        try {
+            (new Installer($connection))->install($map, fn () => $connection->transaction(fn () => Statements::install($map, $connection)));
+        } finally {
+            LegacyBuilder::forgetViews();
+        }
     }
 
     public static function recompile(string $model): void

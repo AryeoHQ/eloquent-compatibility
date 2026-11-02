@@ -219,6 +219,16 @@ final class StatementsTest extends TestCase
             $compatibility$
             SQL,
             'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL',
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."listings_updated_at_index"') AND NOT indisvalid) THEN
+                DROP INDEX "listings_updated_at_index";
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            'CREATE INDEX CONCURRENTLY IF NOT EXISTS "listings_updated_at_index" ON "listings" ("updated_at")',
         ], $statements->afterwards);
         $this->assertSame([...$statements->transaction, ...$statements->afterwards], $statements->all());
     }
@@ -295,7 +305,7 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listings_retained_pkey" PRIMARY KEY ("job_id"),
               ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID
             SQL,
-            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":[],"moved":[["\\"listing_photos\\"","listing_photos_listing_id_foreign"],["\\"listing_shares\\"","listing_shares_listing_uuid_foreign"]]}\'',
+            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":["CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)"],"moved":[["\\"listing_photos\\"","listing_photos_listing_id_foreign"],["\\"listing_shares\\"","listing_shares_listing_uuid_foreign"]]}\'',
             $view,
             'ALTER VIEW "listings" ALTER COLUMN "id" SET DEFAULT nextval(\'listings_id_seq\'::regclass)',
             'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
@@ -420,6 +430,7 @@ final class StatementsTest extends TestCase
               ALTER COLUMN "company_id" SET NOT NULL,
               ALTER COLUMN "status" SET NOT NULL
             SQL,
+            'CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)',
             'COMMENT ON TABLE "listings" IS NULL',
             <<<'SQL'
             ALTER TABLE "listing_photos"

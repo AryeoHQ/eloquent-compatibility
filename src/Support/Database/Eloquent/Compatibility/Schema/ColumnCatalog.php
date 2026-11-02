@@ -105,6 +105,18 @@ final class ColumnCatalog
         return $this->of($table)[$column]->notNull ?? false;
     }
 
+    public function leadsAnIndex(string $table, string $column): bool
+    {
+        return $this->connection->scalar(
+            "select exists (
+                 select from pg_index table_index
+                 join pg_attribute attribute on attribute.attrelid = table_index.indrelid and attribute.attnum = table_index.indkey[0]
+                 where table_index.indrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and table_index.indisvalid and attribute.attname = ?
+             )",
+            [SqlFragments::identifier($table), $column],
+        ) === true;
+    }
+
     public function equatable(string $type): bool
     {
         return $this->equatable[$type] ??= $this->connection->scalar(

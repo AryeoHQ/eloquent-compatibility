@@ -71,7 +71,7 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_recompile_or_uninstall_a_map_over_two_successors_before_reading_the_database(): void
+    public function it_reads_the_catalog_to_install_recompile_or_uninstall_a_map_over_two_successors(): void
     {
         $refusals = [];
         $queries = 0;
@@ -88,11 +88,11 @@ final class CompatibilityTest extends TestCase
         }
 
         $this->assertSame([
-            "Compatibility map 'videos' cannot install: it serves videos from File and Link, and install() serves a map from one successor only.",
-            "Compatibility map 'videos' cannot recompile: it serves videos from File and Link, and recompile() serves a map from one successor only.",
-            "Compatibility map 'videos' cannot uninstall: it serves videos from File and Link, and uninstall() serves a map from one successor only.",
+            "Compatibility map 'videos' is declared wrongly: the legacy table videos does not exist.",
+            "Compatibility map 'videos' is declared wrongly: videos is not a view, so recompile() has nothing to replace; install() creates it.",
+            "Compatibility map 'videos' is declared wrongly: videos is not a view, so uninstall() has nothing to reverse.",
         ], $refusals);
-        $this->assertSame(0, $queries);
+        $this->assertGreaterThan(0, $queries);
     }
 
     #[Test]

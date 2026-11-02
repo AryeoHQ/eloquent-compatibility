@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -19,11 +20,15 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -37,6 +42,9 @@ final class InstallerTest extends TestCase
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
+    /** @var null|array{resource, array<int, resource>} */
+    private null|array $concurrent = null;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -49,6 +57,12 @@ final class InstallerTest extends TestCase
 
     protected function tearDown(): void
     {
+        if ($this->concurrent !== null) {
+            proc_terminate($this->concurrent[0]);
+            proc_close($this->concurrent[0]);
+            $this->concurrent = null;
+        }
+
         ListingTables::drop();
         FileTables::drop();
 
@@ -328,7 +342,7 @@ final class InstallerTest extends TestCase
             $this->assertSame($before, $this->shape());
             $this->assertSame(['company_id', 'featured', 'id', 'status', 'title', 'uuid'], $before['not null']);
             $this->assertSame(['listings_company_id_foreign', 'listings_pkey', 'listings_price_check', 'listings_uuid_unique'], array_keys($before['constraints']));
-            $this->assertSame(['listings_lower_title_index', 'listings_pkey', 'listings_status_index', 'listings_uuid_unique'], array_keys($before['indexes']));
+            $this->assertSame(['listings_lower_title_index', 'listings_pkey', 'listings_status_index', 'listings_updated_at_index', 'listings_uuid_unique'], array_keys($before['indexes']));
         } finally {
             DB::statement('drop table if exists companies cascade');
         }
@@ -749,6 +763,285 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('r', $this->kind('photos'));
+    }
+
+    #[Test]
+    public function it_catches_up_the_inserts_updates_and_hard_deletes_that_land_after_its_last_pass_before_it_takes_the_lock(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::table('jobs')->insert(['name' => 'Native job', 'company_id' => ListingTables::COMPANY]);
+        DB::update('update jobs set merged_into_job_id = (select id from jobs where legacy_id = 1) where legacy_id = 2');
+        $writer = $this->writer();
+        $landed = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$landed): void {
+            if (! $landed && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "listings" IS')) {
+                $landed = true;
+                $writer->insert("insert into listings (title, company_id) values ('Ash Barn', ?)", [ListingTables::COMPANY]);
+                $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+                $writer->delete('delete from listings where id in (2, 3)');
+            }
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertTrue($landed);
+        $this->assertSame([[1, 'Oak Manor'], [4, 'Native job'], [5, 'Ash Barn']], array_map(fn (array $row) => [$row['id'], $row['title']], $this->listings()));
+        $this->assertSame([1, 2, 4, 5], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+    }
+
+    #[Test]
+    public function it_refuses_to_take_the_lock_while_its_last_catch_up_pass_still_changes_a_thousand_rows(): void
+    {
+        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), localtimestamp(0) from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $churn = fn () => $writer->update("update listings set title = title || '.', updated_at = localtimestamp(0) where title like 'Bulk %'");
+        $passes = 0;
+        DB::listen(function (QueryExecuted $query) use ($churn, &$passes): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "listings" IS')) {
+                $passes++;
+                $churn();
+            }
+        });
+        $churn();
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still changed 1100 successor rows, and install() takes the lock only once a pass changes fewer than 1000. Run php artisan compatibility:backfill ".Listing::class.' --since=', $exception->getMessage());
+        }
+
+        $this->assertSame([5, 'r'], [$passes, $this->kind('listings')]);
+    }
+
+    #[Test]
+    public function it_retries_the_lock_after_a_legacy_writer_holds_it_past_the_lock_timeout(): void
+    {
+        $holding = $this->holdConcurrently('update listings set title = title where id = 1', 6);
+        $attempts = 0;
+        DB::listen(function (QueryExecuted $query) use (&$attempts): void {
+            if (str_starts_with($query->sql, 'SET LOCAL lock_timeout')) {
+                $attempts++;
+            }
+        });
+        $started = microtime(true);
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame(["locked\n", 2, 'v'], [$holding, $attempts, $this->kind('listings')]);
+        $this->assertGreaterThanOrEqual(5.0, microtime(true) - $started);
+        $this->assertSame('', $this->concurrentFailure());
+    }
+
+    #[Test]
+    public function it_blocks_legacy_writes_only_while_it_holds_the_lock_and_serves_every_row_written_before_it(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $writer = $this->start('$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
+            .' $writes = []; echo "writing\n"; fflush(STDOUT); $deadline = microtime(true) + 30;'
+            .' for ($write = 0; microtime(true) < $deadline; $write++) {'
+            .'   $started = microtime(true);'
+            .'   try {'
+            .'     if ($write % 2 === 0) { $id = (int) $pdo->query("insert into listings (title, company_id, updated_at) values (\'Row $write\', \''.ListingTables::COMPANY.'\', localtimestamp(0)) returning id")->fetchColumn(); }'
+            .'     else { $id = (int) $pdo->query("update listings set title = \'Edit $write\', updated_at = localtimestamp(0) where id = (select max(id) from listings) returning id")->fetchColumn(); }'
+            .'     $writes[] = [$started, microtime(true), $id, $write % 2 === 0 ? "Row $write" : "Edit $write"];'
+            .'   } catch (PDOException $exception) { $writes[] = [$started, microtime(true), null, $exception->getCode()]; break; }'
+            .'   usleep(5000);'
+            .' }'
+            .' echo json_encode($writes);');
+        usleep(300000);
+        $locked = null;
+        DB::listen(function (QueryExecuted $query) use (&$locked): void {
+            if ($locked === null && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $locked = microtime(true);
+                usleep(500000);
+            }
+        });
+
+        Compatibility::install(Listing::class);
+        $writes = json_decode($this->concurrentFailure(), true);
+
+        $this->assertSame(["writing\n", 'v'], [$writer, $this->kind('listings')]);
+        $this->assertIsArray($writes);
+        $this->assertIsFloat($locked);
+        $written = array_filter($writes, fn (array $write) => $write[2] !== null);
+        $blocked = end($writes);
+        $last = [];
+
+        foreach ($written as [, , $id, $title]) {
+            $last[$id] = $title;
+        }
+
+        ksort($last);
+        $this->assertNotEmpty(array_filter($written, fn (array $write) => $write[1] < $locked));
+        $this->assertLessThan(0.3, max(array_map(fn (array $write) => $write[1] - $write[0], $written)));
+        $this->assertIsArray($blocked);
+        $this->assertSame([null, '55000'], [$blocked[2], $blocked[3]]);
+        $this->assertGreaterThanOrEqual($locked - 0.05, $blocked[0]);
+        $this->assertGreaterThanOrEqual(0.3, $blocked[1] - $blocked[0]);
+        $this->assertSame($last, array_column(DB::select('select id, title from listings where id in ('.implode(', ', array_keys($last)).') order by id'), 'title', 'id'));
+        $this->assertSame(0, DB::scalar('select count(*) from listings_retained left join jobs on jobs.id = listings_retained.job_id where jobs.id is null'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_legacy_row_whose_primary_went_missing_outside_its_watermark(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::delete('delete from jobs where legacy_id = 2');
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot install: 1 listings rows have no jobs row with the same id and uuid; the first are id 2. Backfill them before install().", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_map_over_two_successors_while_a_legacy_row_is_in_neither_or_in_both(): void
+    {
+        $this->prepareMedia();
+        DB::delete("delete from links where legacy_type = 'video' and legacy_id = 2");
+        $refusals = [];
+
+        foreach ([fn () => null, fn () => DB::insert("insert into links (legacy_type, legacy_id, legacy_uuid, url) select 'video', id, uuid, 'https://youtu.be/tour' from videos where id = 1")] as $break) {
+            $break();
+
+            try {
+                Compatibility::install(Video::class);
+            } catch (QueryException $exception) {
+                $refusals[] = substr($exception->getMessage(), (int) strpos($exception->getMessage(), 'Compatibility map'), (int) strpos($exception->getMessage(), 'install().') + 10 - (int) strpos($exception->getMessage(), 'Compatibility map'));
+            }
+
+            DB::insert("insert into links (legacy_type, legacy_id, legacy_uuid, url) select 'video', id, uuid, youtube_embed_url from videos where id = 2 on conflict do nothing");
+        }
+
+        $this->assertSame([
+            "Compatibility map 'videos' cannot install: 1 videos rows have no files or links row with the same id and uuid; the first are id 2. Backfill them before install().",
+            "Compatibility map 'videos' cannot install: 1 videos rows have a row with the same id and uuid in more than one of files or links; the first are id 1. Backfill them before install().",
+        ], $refusals);
+        $this->assertSame('r', $this->kind('videos'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_map_over_two_successors_that_a_foreign_key_references(): void
+    {
+        $this->prepareMedia();
+        DB::statement('create table video_comments (id serial primary key, video_id integer references videos (id))');
+
+        try {
+            $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', 'the foreign key video_comments_video_id_fkey on video_comments references videos.id, and install() serves videos from File and Link, so no one table can take the reference'));
+
+            Compatibility::install(Video::class);
+        } finally {
+            DB::statement('drop table video_comments');
+        }
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_map_over_two_successors_whose_retained_rows_take_another_key(): void
+    {
+        $this->prepareMedia();
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained', key: 'video_id')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', 'retainedIn() keys videos_retained by video_id, and install() keeps the retained rows of a map over File and Link under the legacy key id'));
+
+        Compatibility::install($video::class);
+    }
+
+    private function prepareMedia(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        Compatibility::prepare(Video::class);
+        FileTables::backfillMedia();
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    private function backfiller(string $model): Backfiller
+    {
+        return new Backfiller(Compatibility::of($model)->resolve(), DB::connection());
+    }
+
+    private function writer(): ConnectionInterface
+    {
+        config(['database.connections.writer' => config('database.connections.'.DB::getDefaultConnection())]);
+
+        return DB::connection('writer');
+    }
+
+    private function holdConcurrently(string $sql, int $seconds): string
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+
+        return $this->start('$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "locked\n"; fflush(STDOUT); sleep('.$seconds.'); $pdo->commit();');
+    }
+
+    private function start(string $concurrent): string
+    {
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($process === false) {
+            $this->fail('The concurrent writer did not start.');
+        }
+
+        $this->concurrent = [$process, $pipes];
+
+        return (string) fgets($pipes[1]);
+    }
+
+    private function concurrentFailure(): string
+    {
+        if ($this->concurrent === null) {
+            $this->fail('No concurrent writer is running.');
+        }
+
+        [$process, $pipes] = $this->concurrent;
+        $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
+        proc_close($process);
+        $this->concurrent = null;
+
+        return $output;
     }
 
     private function prepareFiles(): void

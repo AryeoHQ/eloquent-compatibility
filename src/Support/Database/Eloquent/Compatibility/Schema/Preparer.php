@@ -125,6 +125,29 @@ final readonly class Preparer
         ];
     }
 
+    /**
+     * @return list<string>
+     */
+    public function updatedAtIndex(ResolvedMap $map): array
+    {
+        $legacy = new $map->model;
+        $column = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;
+
+        if ($column === null || ! array_key_exists($column, $this->columnCatalog->of($map->table)) || $this->columnCatalog->leadsAnIndex($map->table, $column)) {
+            return [];
+        }
+
+        $index = SqlFragments::objectName($map->table, $map->table.'_'.$column.'_index');
+
+        return [
+            "DO \$compatibility\$\nBEGIN\n"
+                .'  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).") AND NOT indisvalid) THEN\n"
+                .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
+                ."  END IF;\nEND\n\$compatibility\$",
+            'CREATE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($map->table).' ('.SqlFragments::identifier($column).')',
+        ];
+    }
+
     public static function advance(string $table, string $column): string
     {
         $next = 'CASE WHEN is_called THEN last_value + 1 ELSE last_value END';

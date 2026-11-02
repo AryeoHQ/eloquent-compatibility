@@ -13,6 +13,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -96,6 +97,24 @@ final class CompileSqlTest extends TestCase
         } finally {
             unlink((string) $file);
         }
+    }
+
+    #[Test]
+    public function it_prints_the_union_view_a_map_over_two_successors_recompiles_to(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        FileTables::installMedia();
+
+        $exit = Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile']);
+        $printed = Artisan::output();
+
+        $this->assertSame(0, $exit);
+        $this->assertStringContainsString("COMMIT;\n", $printed);
+        $this->assertStringContainsString('CREATE OR REPLACE VIEW "videos" AS', $printed);
+        $this->assertSame(1, substr_count($printed, "\nUNION ALL\n"));
+        $this->assertStringContainsString("FROM (SELECT * FROM \"files\" WHERE \"files\".\"legacy_type\" = 'video') AS \"files\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"files\".\"legacy_id\"", $printed);
+        $this->assertStringContainsString("FROM (SELECT * FROM \"links\" WHERE \"links\".\"legacy_type\" = 'video') AS \"links\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"links\".\"legacy_id\"", $printed);
     }
 
     #[Test]

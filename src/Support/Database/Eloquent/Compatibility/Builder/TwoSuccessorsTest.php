@@ -74,6 +74,32 @@ final class TwoSuccessorsTest extends TestCase
     }
 
     #[Test]
+    public function it_uninstalls_a_map_over_two_successors_into_the_rows_each_successor_holds_and_installs_it_again(): void
+    {
+        $created = Link::query()->create(['legacy_type' => 'video', 'url' => 'https://youtu.be/elm', 'created_at' => '2026-03-01 10:00:00', 'updated_at' => '2026-03-01 10:00:00'])->refresh();
+
+        Compatibility::uninstall(Video::class);
+        $restored = array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'));
+        $constraints = $this->constraintsOf('videos');
+        Compatibility::install(Video::class);
+
+        $this->assertSame(array_map($this->sorted(...), [...$this->before, ['id' => $created->legacy_id, 'uuid' => $created->legacy_uuid, 'original_file_name' => null, 'mime_type' => null, 'size_kb' => null, 'youtube_embed_url' => 'https://youtu.be/elm', 'title' => null, 'views' => 0, 'created_at' => '2026-03-01 10:00:00', 'updated_at' => '2026-03-01 10:00:00']]), array_map($this->sorted(...), $restored));
+        $this->assertSame([['videos_pkey' => 'PRIMARY KEY (id)', 'videos_uuid_unique' => 'UNIQUE (uuid)'], ['videos_pkey' => 'PRIMARY KEY (id)']], [$constraints, $this->constraintsOf('videos_retained')]);
+        $this->assertSame(array_map(fn (array $row) => $this->sorted(array_diff_key($row, ['mime_type' => true])), $restored), array_map(fn (object $row) => $this->sorted((array) $row), DB::select('select * from videos order by id')));
+    }
+
+    #[Test]
+    public function it_recompiles_the_view_over_both_successors_in_place(): void
+    {
+        $view = DB::scalar("select oid from pg_class where oid = to_regclass('videos')");
+
+        Compatibility::recompile(Video::class);
+
+        $this->assertSame([$view, 'v'], [DB::scalar("select oid from pg_class where oid = to_regclass('videos')"), DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')")]);
+        $this->assertSame(array_map(fn (array $row) => array_diff_key($row, ['mime_type' => true]), $this->before), array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+    }
+
+    #[Test]
     public function it_prepares_both_successors_and_the_legacy_table_to_draw_ids_from_one_sequence(): void
     {
         $this->assertSame(
@@ -469,6 +495,25 @@ final class TwoSuccessorsTest extends TestCase
             [[1, '2026-06-07 10:00:00'], [2, '2026-06-07 10:00:00'], [3, '2026-06-07 10:00:00']],
             Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->updated_at?->format('Y-m-d H:i:s')])->all(),
         );
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private function sorted(array $row): array
+    {
+        ksort($row);
+
+        return $row;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function constraintsOf(string $table): array
+    {
+        return array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = to_regclass(?) and contype <> 'n' order by conname", [$table]), 'definition', 'conname');
     }
 
     /**
