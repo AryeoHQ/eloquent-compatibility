@@ -569,6 +569,49 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_and_filters_a_timestamp_with_time_zone_cast_to_a_domain_or_read_raw_through_a_domain_in_the_application_zone_whatever_the_session_zone(): void
+    {
+        DB::statement('drop domain if exists compatibility_moment cascade');
+        DB::statement('drop domain if exists compatibility_wall_clock cascade');
+        DB::statement('create domain compatibility_moment as timestamptz');
+        DB::statement('create domain compatibility_wall_clock as timestamp(0)');
+        DB::statement('alter table listings add column listed_cast timestamp(0), add column listed_raw timestamp(0)');
+        DB::statement('alter table jobs add column listed_at compatibility_moment, add column listed_instant timestamptz');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('listed_cast', fn (Attribute $attribute) => $attribute->from('listed_instant')->asType('compatibility_wall_clock'))
+                        ->attribute('listed_raw', fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.')));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where legacy_id = 1");
+        Compatibility::install($model::class);
+        $inZone = fn (string $zone, Closure $read) => DB::transaction(function () use ($zone, $read): mixed {
+            DB::statement("set local time zone '{$zone}'");
+
+            return $read();
+        });
+        $served = fn () => (array) DB::selectOne('select cast(listed_cast as text) as listed_cast, cast(listed_raw as text) as listed_raw from listings where id = 1');
+        $filtered = fn () => array_map(intval(...), $model->newQuery()->where('listed_cast', '2026-01-01 23:30:00')->pluck('id')->all());
+
+        $this->assertSame([
+            ['listed_cast' => '2026-01-01 23:30:00', 'listed_raw' => '2026-01-01 23:30:00'],
+            ['listed_cast' => '2026-01-01 23:30:00', 'listed_raw' => '2026-01-01 23:30:00'],
+            [1],
+            [1],
+        ], [$inZone('UTC', $served), $inZone('Asia/Tokyo', $served), $inZone('UTC', $filtered), $inZone('Asia/Tokyo', $filtered)]);
+    }
+
+    #[Test]
     public function it_keeps_the_null_semantics_of_in_and_not_in_once_installed(): void
     {
         $queries = [

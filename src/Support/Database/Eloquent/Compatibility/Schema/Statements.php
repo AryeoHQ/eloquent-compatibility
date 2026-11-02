@@ -78,6 +78,7 @@ final readonly class Statements
         $validations = [];
         $moved = [];
         $constants = [];
+        $notValid = [];
 
         foreach (self::foreignKeysTo($connection, $map->table) as $foreignKey) {
             if (array_key_exists($foreignKey->referencedColumn, $map->attributes)) {
@@ -100,8 +101,13 @@ final readonly class Statements
                 }
 
                 $repoints[] = self::repoint($map, $foreignKey, $foreignKey->qualifiedTable, $map->primary->table, (string) $identifier->column(), composite: $composite);
-                $validations[] = self::validate($installed, $foreignKey->name);
                 $moved[] = [$installed, $foreignKey->name];
+
+                if ($foreignKey->validated) {
+                    $validations[] = self::validate($installed, $foreignKey->name);
+                } else {
+                    $notValid[] = [$installed, $foreignKey->name];
+                }
             }
         }
 
@@ -135,8 +141,11 @@ final readonly class Statements
         $hidden = self::reportHidden($map, $key);
         [$readGrants, $grant] = self::grants($map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH)));
 
+        $unfinished = (new Preparer($columnCatalog))->unfinished($map);
+
         return new self('install', [
             "LOCK TABLE {$legacyTable}, {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            ...$unfinished,
             self::refuseMissingPrimaries($map, $key),
             ...$refuseOutsiders,
             ...($hidden === null ? [] : [$hidden]),
@@ -150,7 +159,7 @@ final readonly class Statements
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
-            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, array_column($constants, 1), $external)),
+            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, $notValid, array_column($constants, 1), $external)),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
             $grant,
@@ -159,7 +168,7 @@ final readonly class Statements
             ...$validations,
             self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'),
             ...$validateCheck,
-        ], $external === [] ? [] : [1 => array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external)]);
+        ], $external === [] ? [] : [1 + count($unfinished) => array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external)]);
     }
 
     public static function recompile(ResolvedMap $map, ConnectionInterface $connection): self
@@ -178,12 +187,13 @@ final readonly class Statements
         $view = (new ViewCompiler(new ColumnCatalog($connection), $connection))->replace($map);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $identifiers = array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers));
+        $notValid = self::captured($connection, ViewCompiler::retainedTable($map))['notValid'] ?? [];
         $validations = [];
 
         foreach (self::foreignKeysTo($connection, $map->primary->table) as $foreignKey) {
             $retained = $foreignKey->qualifiedTable === $retainedTable && $foreignKey->column === $map->retainedKey && $foreignKey->referencedColumn === $map->primary->key;
 
-            if (! $foreignKey->validated && ($retained || in_array($foreignKey->referencedColumn, $identifiers, true))) {
+            if (! $foreignKey->validated && ! in_array([$foreignKey->qualifiedTable, $foreignKey->name], $notValid, true) && ($retained || in_array($foreignKey->referencedColumn, $identifiers, true))) {
                 $validations[] = self::validate($foreignKey->qualifiedTable, $foreignKey->name);
             }
         }
@@ -228,10 +238,11 @@ final readonly class Statements
         $defaults = array_filter(array_intersect_key($shape, array_flip($columns)), fn (Column $column) => $column->default !== null);
         $external = $captured === null ? [] : array_intersect_key($captured['external'], array_flip($map->externals()));
         $repointed = [];
+        $locked = implode(', ', array_values(array_unique([$primary, ...array_map(fn ($related) => SqlFragments::identifier($related->table), $map->related)])));
 
         $membership = $map->membership;
         $statements = [
-            "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
             ...($membership === null ? [] : [self::refuseReclassified($map, $membership, $key)]),
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
@@ -292,7 +303,10 @@ final readonly class Statements
             if (array_key_exists($foreignKey->referencedColumn, $identifiers) && ($captured === null || in_array([$foreignKey->qualifiedTable, $foreignKey->name], $captured['moved'], true))) {
                 $on = $foreignKey->qualifiedTable === $retainedTable ? $legacyTable : $foreignKey->qualifiedTable;
                 $statements[] = self::repoint($map, $foreignKey, $on, $map->table, $identifiers[$foreignKey->referencedColumn], columns: $composite ? 2 : 1);
-                $repointed[] = self::validate($on, $foreignKey->name);
+
+                if ($captured === null || ! in_array([$foreignKey->qualifiedTable, $foreignKey->name], $captured['notValid'], true)) {
+                    $repointed[] = self::validate($on, $foreignKey->name);
+                }
             }
         }
 
@@ -305,6 +319,45 @@ final readonly class Statements
         }
 
         return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [$filled => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function guard(ResolvedMap $map, ConnectionInterface $connection, string $operation): array
+    {
+        $relations = 'ARRAY['.implode(', ', array_map(fn (string $table) => 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')', $map->tables())).']::oid[]';
+        $fingerprint = "SELECT encode(sha256(convert_to(coalesce(string_agg(entry, E'\\n' ORDER BY entry), ''), 'UTF8')), 'hex') FROM (\n"
+            ."  SELECT 'relation ' || relation.oid::regclass::text || ' ' || relation.relkind::text || ' ' || relation.relrowsecurity::text || ' ' || relation.relforcerowsecurity::text || ' ' || coalesce(obj_description(relation.oid, 'pg_class'), '') AS entry\n"
+            ."  FROM pg_class relation WHERE relation.oid = ANY ({$relations})\n"
+            ."  UNION ALL\n"
+            ."  SELECT 'column ' || attribute.attrelid::regclass::text || ' ' || attribute.attnum::text || ' ' || quote_ident(attribute.attname) || ' ' || format_type(attribute.atttypid, attribute.atttypmod) || ' ' || attribute.attnotnull::text || ' ' || attribute.attidentity::text || attribute.attgenerated::text || ' ' || attribute.attcollation::text || ' ' || coalesce(pg_get_expr(column_default.adbin, column_default.adrelid), '')\n"
+            ."  FROM pg_attribute attribute LEFT JOIN pg_attrdef column_default ON column_default.adrelid = attribute.attrelid AND column_default.adnum = attribute.attnum\n"
+            ."  WHERE attribute.attrelid = ANY ({$relations}) AND attribute.attnum > 0 AND NOT attribute.attisdropped\n"
+            ."  UNION ALL\n"
+            ."  SELECT 'constraint ' || constraint_row.conrelid::regclass::text || ' ' || quote_ident(constraint_row.conname) || ' ' || pg_get_constraintdef(constraint_row.oid) || ' ' || constraint_row.convalidated::text\n"
+            ."  FROM pg_constraint constraint_row WHERE constraint_row.conrelid = ANY ({$relations}) OR constraint_row.confrelid = ANY ({$relations})\n"
+            ."  UNION ALL\n"
+            ."  SELECT 'index ' || pg_get_indexdef(table_index.indexrelid) || ' ' || table_index.indisvalid::text\n"
+            ."  FROM pg_index table_index WHERE table_index.indrelid = ANY ({$relations})\n"
+            ."  UNION ALL\n"
+            ."  SELECT 'sequence ' || dependency.objid::regclass::text || ' ' || dependency.refobjid::regclass::text || ' ' || dependency.refobjsubid::text\n"
+            ."  FROM pg_depend dependency JOIN pg_class sequence ON sequence.oid = dependency.objid AND sequence.relkind = 'S'\n"
+            ."  WHERE dependency.classid = 'pg_class'::regclass AND dependency.refclassid = 'pg_class'::regclass AND dependency.refobjid = ANY ({$relations}) AND dependency.deptype IN ('a', 'i')\n"
+            .') AS entries';
+        $locked = array_values(array_filter(array_map(
+            fn (string $table) => $connection->scalar("select cast(to_regclass(quote_ident(current_schema()) || '.' || ?) as text)", [SqlFragments::identifier($table)]),
+            $map->tables(),
+        ), is_string(...)));
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot {$operation}: ".implode(', ', array_slice($map->tables(), 0, -1)).(count($map->tables()) > 1 ? ' or ' : '').implode('', array_slice($map->tables(), -1)).' changed after compatibility:sql read them. Print the statements again.');
+
+        return [
+            ...($locked === [] ? [] : ['LOCK TABLE '.implode(', ', $locked).' IN SHARE UPDATE EXCLUSIVE MODE']),
+            "DO \$compatibility\$\nBEGIN\n"
+                ."  IF ({$fingerprint}) IS DISTINCT FROM ".SqlFragments::literal((string) $connection->scalar($fingerprint))." THEN\n"
+                ."    RAISE EXCEPTION '%', {$refusal};\n"
+                ."  END IF;\nEND\n\$compatibility\$",
+        ];
     }
 
     /**
@@ -510,10 +563,11 @@ final readonly class Statements
      * @param  array<string, Column>  $legacy
      * @param  list<string>  $mapped
      * @param  list<array{string, string}>  $moved
+     * @param  list<array{string, string}>  $notValid
      * @param  list<array{string, string}>  $constants
      * @param  list<string>  $external
      */
-    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $constants, array $external): string
+    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $notValid, array $constants, array $external): string
     {
         $table = SqlFragments::identifier($map->table);
         $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
@@ -563,6 +617,7 @@ final readonly class Statements
             'constraints' => array_values($constraints),
             'indexes' => array_values($indexes),
             'moved' => $moved,
+            'notValid' => $notValid,
             ...($map->membership === null ? [] : [
                 'constants' => $constants,
                 'membership' => self::claim($map->membership),
@@ -588,7 +643,7 @@ final readonly class Statements
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -630,13 +685,14 @@ final readonly class Statements
             'constraints' => $constraints,
             'indexes' => array_values(array_filter(is_array($captured['indexes'] ?? null) ? $captured['indexes'] : [], is_string(...))),
             'moved' => self::pairs($captured['moved'] ?? null),
+            'notValid' => self::pairs($captured['notValid'] ?? null),
             'constants' => self::pairs($captured['constants'] ?? null),
             'external' => $external,
         ];
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */

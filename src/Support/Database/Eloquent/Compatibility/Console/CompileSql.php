@@ -46,7 +46,8 @@ final class CompileSql extends Command
         try {
             $map = Compatibility::of($model)->resolve();
             $connection = Compatibility::connection($map);
-            [$statements, $server] = $connection->transaction(fn () => [
+            [$guard, $statements, $server] = $connection->transaction(fn () => [
+                Statements::guard($map, $connection, $for),
                 $statementsFor($map, $connection),
                 (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version"),
             ]);
@@ -66,7 +67,7 @@ final class CompileSql extends Command
             '-- Compiled at '.Date::now()->toIso8601String(),
         ]);
         $terminate = fn (string $statement) => $statement."\n;";
-        $sql = implode("\n", $header)."\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, $statements->transaction))."\n\nCOMMIT;\n";
+        $sql = implode("\n", $header)."\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, [...$guard, ...$statements->transaction]))."\n\nCOMMIT;\n";
 
         if ($statements->afterwards !== []) {
             $sql .= "\n-- After the transaction commits, outside any transaction\n\n".implode("\n\n", array_map($terminate, $statements->afterwards))."\n";
@@ -82,7 +83,7 @@ final class CompileSql extends Command
             return $this->refuse("Could not write the statements to {$file}.");
         }
 
-        $count = count($statements->all());
+        $count = count($guard) + count($statements->all());
         $this->components->info("Wrote {$count} ".($count === 1 ? 'statement' : 'statements')." to {$file}.");
 
         return self::SUCCESS;
