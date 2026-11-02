@@ -22,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
+use Tests\Fixtures\Support\Listings\DefaultedPlace;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -152,6 +153,44 @@ final class MassWriterTest extends TestCase
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
         $this->assertSame([false, false], DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('featured')->all());
         $this->assertSame([[3.5, false], [3.5, false]], Listing::withTrashed()->whereKey([1, 2])->orderBy('id')->get()->map(fn (Listing $listing) => [$listing->latitude, $listing->featured])->all());
+    }
+
+    #[Test]
+    public function it_creates_a_missing_dependent_with_the_attribute_defaults_of_its_model_as_a_record_write_does(): void
+    {
+        $defaulted = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->hasOne(DefaultedPlace::class), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))));
+            }
+        };
+        DB::table('jobs')->insert([['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Lodge', 'company_id' => ListingTables::COMPANY]]);
+        $legacyId = fn (string $name): int => (int) Job::query()->where('name', $name)->value('legacy_id');
+        $places = fn (int $legacyId): array => DB::table('places')->join('jobs', 'jobs.id', '=', 'places.job_id')->where('jobs.legacy_id', $legacyId)->get(['places.street', 'places.city', 'places.created_at'])->map(fn (object $place) => [$place->street, $place->city, $place->created_at !== null])->all();
+
+        $defaulted->newQuery()->whereKey(2)->update(['city' => 'Tacoma']);
+        $defaulted->newQuery()->whereKey($legacyId('Birch Lodge'))->update(['street' => '9 Birch St']);
+        $defaulted->newQuery()->findOrFail($legacyId('Cedar Lodge'))->update(['street' => '9 Cedar St']);
+
+        $this->assertSame([['Unknown St', 'Tacoma', true]], $places(2));
+        $this->assertSame([['9 Birch St', 'Unknown', true]], $places($legacyId('Birch Lodge')));
+        $this->assertSame([['9 Cedar St', 'Unknown', true]], $places($legacyId('Cedar Lodge')));
     }
 
     #[Test]
@@ -323,6 +362,20 @@ final class MassWriterTest extends TestCase
         $this->assertSame([42, 7, 10], Listing::withTrashed()->orderBy('id')->pluck('views')->all());
         $this->assertSame(['MLS-Z', 'MLS-Z', 'MLS-Z'], Listing::withTrashed()->orderBy('id')->pluck('mls_number')->all());
         $this->assertSame([47.1062, null, -122.8321], Listing::withTrashed()->orderBy('id')->pluck('latitude')->all());
+    }
+
+    #[Test]
+    public function it_reads_a_raw_expression_for_a_legacy_only_column_by_the_alias_the_write_reads_the_legacy_table_by(): void
+    {
+        $updated = Listing::query()->withoutGlobalScopes()->toBase()->from('listings as legacy')->where('legacy.id', 1)->update(['mls_number' => DB::raw('legacy.title')]);
+        $aliased = Listing::query()->withoutGlobalScopes();
+        $aliased->getQuery()->from('listings AS legacy');
+        $eloquent = $aliased->where('legacy.id', 2)->update(['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
+        $incremented = Listing::query()->withoutGlobalScopes()->getQuery()->from('listings as legacy')->where('legacy.id', 3)->incrementEach(['views' => 2], ['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
+        $retained = fn (int $legacyId): array => array_values((array) DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->where('jobs.legacy_id', $legacyId)->first(['mls_number', 'views']));
+
+        $this->assertSame([1, 1, 1], [$updated, $eloquent, $incremented]);
+        $this->assertSame([['Oak House', 5], ['Pine Flat-5', 5], ['Elm Cottage-5', 7]], [$retained(1), $retained(2), $retained(3)]);
     }
 
     #[Test]

@@ -71,12 +71,12 @@ final readonly class MassWriter
      * @param  array<array-key, mixed>  $values
      * @param  array<array-key, float|int|numeric-string>  $amounts
      */
-    public function update(QueryBuilder $keys, array $values, array $amounts = []): int
+    public function update(QueryBuilder $keys, array $values, array $amounts = [], null|string $alias = null): int
     {
         [$stored, $retained] = $this->split($values);
         [$added, $retainedAmounts] = $this->amounts($amounts, null);
 
-        return $this->transaction(function () use ($keys, $stored, $retained, $added, $retainedAmounts): int {
+        return $this->transaction(function () use ($keys, $stored, $retained, $added, $retainedAmounts, $alias): int {
             $pinned = $this->pin($keys);
 
             if ($pinned > 0) {
@@ -88,7 +88,7 @@ final readonly class MassWriter
                     $this->capture();
                 }
 
-                (new RetainedRows($this->map, $this->connection))->upsertAll($this->pinned(), $retained, array_diff_key($retainedAmounts, $retained));
+                (new RetainedRows($this->map, $this->connection))->upsertAll($this->pinned(), $retained, array_diff_key($retainedAmounts, $retained), $alias);
                 $values = $this->withAmounts($stored[$primary->table] ?? [], $added[$primary->table] ?? []);
 
                 if ($values !== []) {
@@ -364,19 +364,17 @@ final readonly class MassWriter
         $model = $this->successor($related->model);
         $grammar = $this->connection->getQueryGrammar();
         $parent = $grammar->wrap(self::parentOf($index));
-        $row = [$related->relatedKey => new RawExpression($parent), ...$related->attributes, ...$values];
+        $timestamps = [];
 
         if ($model->usesTimestamps()) {
-            $timestamps = [];
-
             foreach ([$model->getCreatedAtColumn(), $model->getUpdatedAtColumn()] as $column) {
                 if ($column !== null) {
                     $timestamps[$column] = $model->freshTimestampString();
                 }
             }
-
-            $row = [...$timestamps, ...$row];
         }
+
+        $row = [...$timestamps, ...array_diff_key($model->getAttributes(), $timestamps), $related->relatedKey => new RawExpression($parent), ...$related->attributes, ...$values];
 
         $selects = [];
         $bindings = [];

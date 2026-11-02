@@ -51,9 +51,9 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    public function update(Model $legacy, array $values): int
+    public function update(Model $legacy, array $values, bool $deleting = false): int
     {
-        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values): int {
+        return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values, $deleting): int {
             $key = self::keyOf($legacy);
             $primary = $this->lock($legacy, $key);
 
@@ -67,7 +67,7 @@ final readonly class RecordWriter
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states);
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
+            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], $deleting);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $this->rekey($legacy, $primary, $key, array_keys($values)), array_keys($values));
@@ -98,7 +98,7 @@ final readonly class RecordWriter
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $this->addEach($models, $added, $stored);
-            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
+            $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? [], false);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $names = [...array_keys($amounts), ...array_keys($extra)];
@@ -193,6 +193,10 @@ final readonly class RecordWriter
 
         foreach ($states as $table => $columns) {
             $model = $models[$table] ?? $this->successor($this->ownerOf($table));
+
+            if ($key !== null && $model->exists && $model->usesTimestamps()) {
+                $this->assign($model, array_intersect_key($stored[$table] ?? [], [(string) $model->getUpdatedAtColumn() => true]));
+            }
 
             foreach ($columns as $column => [$name, $value]) {
                 if ($key !== null && $model->exists) {
@@ -460,11 +464,11 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function savePrimary(Model $legacy, Model $primary, array $values): void
+    private function savePrimary(Model $legacy, Model $primary, array $values, bool $deleting): void
     {
         $deletedAt = method_exists($primary, 'getDeletedAtColumn') ? (string) $primary->getDeletedAtColumn() : null;
 
-        if (! method_exists($primary, 'restore') || $deletedAt === null || ! array_key_exists($deletedAt, $values) || (($primary->getAttributes()[$deletedAt] ?? null) === null) === ($values[$deletedAt] === null)) {
+        if (! method_exists($primary, 'restore') || $deletedAt === null || ! array_key_exists($deletedAt, $values) || (! ($deleting && $values[$deletedAt] !== null) && (($primary->getAttributes()[$deletedAt] ?? null) === null) === ($values[$deletedAt] === null))) {
             $this->assign($primary, $values);
             $this->saveEach($legacy, [$primary]);
 

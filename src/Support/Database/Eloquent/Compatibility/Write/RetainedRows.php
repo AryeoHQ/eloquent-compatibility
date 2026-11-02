@@ -34,7 +34,7 @@ final readonly class RetainedRows
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    public function upsertAll(QueryBuilder $keys, array $values, array $amounts): void
+    public function upsertAll(QueryBuilder $keys, array $values, array $amounts, null|string $alias = null): void
     {
         if ($values === [] && $amounts === []) {
             return;
@@ -44,7 +44,9 @@ final readonly class RetainedRows
         $table = SqlFragments::identifier($retained);
         $primary = SqlFragments::identifier($this->map->primary->table);
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
-        $legacy = SqlFragments::identifier($this->map->table);
+        $alias ??= $this->map->table;
+        $legacy = SqlFragments::identifier($alias);
+        $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $query = $this->connection->table($retained);
         $grammar = $query->getGrammar();
@@ -79,7 +81,7 @@ final readonly class RetainedRows
         $identifier = $primary.'.'.SqlFragments::identifier((string) $this->map->identifiers[$key]->column());
         $keyed = $primaryKey.' IN ('.$keys->toSql().')';
         $source = $joined
-            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.'), '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
+            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.'), '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
             : implode(', ', [$primaryKey, ...$selects]).' FROM '.$primary.' WHERE '.$keyed;
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
 
