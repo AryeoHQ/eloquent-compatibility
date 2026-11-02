@@ -187,6 +187,55 @@ final class PreparerTest extends TestCase
         }
     }
 
+    /**
+     * @return iterable<string, array{list<string>, string, string}>
+     */
+    public static function foreignInvalidIndexes(): iterable
+    {
+        yield 'on another table' => [['create table job_notes (job_id uuid)', 'create unique index jobs_legacy_uuid_unique on job_notes (job_id)'], 'jobs_legacy_uuid_unique', 'CREATE UNIQUE INDEX jobs_legacy_uuid_unique ON public.job_notes USING btree (job_id)'];
+        yield 'on the table, over another definition' => [['create unique index places_listings_at_most_one on places (job_id)'], 'places_listings_at_most_one', 'CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id)'];
+    }
+
+    /**
+     * @param  list<string>  $create
+     */
+    #[DataProvider('foreignInvalidIndexes')]
+    #[Test]
+    public function it_refuses_and_keeps_an_invalid_index_that_holds_the_name_of_an_index_it_builds_but_not_its_table_or_definition(array $create, string $name, string $definition): void
+    {
+        foreach ($create as $statement) {
+            DB::statement($statement);
+        }
+
+        DB::update('update pg_index set indisvalid = false where indexrelid = cast(? as regclass)', [$name]);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: {$name} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.", $exception->getMessage());
+            $this->assertSame([$definition, false], [DB::scalar('select pg_get_indexdef(to_regclass(?))', [$name]), DB::scalar('select indisvalid from pg_index where indexrelid = to_regclass(?)', [$name])]);
+        } finally {
+            DB::statement('drop table if exists job_notes');
+        }
+    }
+
+    #[Test]
+    public function it_refuses_an_identifier_column_the_successor_already_has_with_another_type_and_changes_nothing(): void
+    {
+        DB::statement('alter table jobs add column legacy_id bigint');
+        DB::insert("insert into jobs (name, company_id, legacy_id) values ('Birch Barn', ?, 2147483648)", [ListingTables::COMPANY]);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'listings' is declared wrongly: jobs already has a column legacy_id of type bigint, and identifier 'id' needs integer, the type of listings.id; change or drop jobs.legacy_id, then prepare again.", $exception->getMessage());
+        }
+
+        $this->assertSame([null, false], [DB::scalar("select column_default from information_schema.columns where table_name = 'jobs' and column_name = 'legacy_id'"), DB::scalar("select count(*) > 0 from pg_attribute where attrelid = 'jobs'::regclass and attname = 'legacy_uuid'")]);
+    }
+
     #[Test]
     public function it_refuses_a_constraint_that_holds_the_name_of_the_check_it_adds(): void
     {

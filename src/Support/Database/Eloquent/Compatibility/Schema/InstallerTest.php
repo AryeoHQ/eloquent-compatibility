@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -296,6 +297,32 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_an_inbound_foreign_key_that_was_not_valid_before_install_not_valid_through_recompile_and_uninstall(): void
+    {
+        DB::statement('create table listing_notes (listing_id integer)');
+        $foreignKey = fn () => (array) DB::selectOne("select pg_get_constraintdef(oid) as definition, convalidated from pg_constraint where conname = 'listing_notes_listing_id_foreign'");
+
+        try {
+            DB::insert('insert into listing_notes (listing_id) values (1), (99)');
+            DB::statement('alter table listing_notes add constraint listing_notes_listing_id_foreign foreign key (listing_id) references listings (id) not valid');
+            Compatibility::install(Listing::class);
+            $installed = $foreignKey();
+            Compatibility::recompile(Listing::class);
+            $recompiled = $foreignKey();
+            Compatibility::uninstall(Listing::class);
+            $uninstalled = $foreignKey();
+        } finally {
+            DB::statement('drop table listing_notes');
+        }
+
+        $this->assertSame([
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES jobs(legacy_id) NOT VALID', 'convalidated' => false],
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES jobs(legacy_id) NOT VALID', 'convalidated' => false],
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES listings(id) NOT VALID', 'convalidated' => false],
+        ], [$installed, $recompiled, $uninstalled]);
+    }
+
+    #[Test]
     public function it_validates_on_recompile_each_foreign_key_install_left_not_valid(): void
     {
         Compatibility::install(Listing::class);
@@ -525,6 +552,36 @@ final class InstallerTest extends TestCase
         $this->assertSame('v', $this->kind('listings'));
     }
 
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function unfinishedPreparations(): array
+    {
+        return [
+            'a nullable identifier' => ['alter table jobs alter column legacy_id drop not null', 'jobs.legacy_id is not yet NOT NULL with a unique index of its own'],
+            'an identifier without its unique index' => ['alter table jobs drop constraint jobs_legacy_uuid_unique', 'jobs.legacy_uuid is not yet NOT NULL with a unique index of its own'],
+            'no at-most-one index' => ['drop index places_listings_at_most_one', 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
+            'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
+        ];
+    }
+
+    #[DataProvider('unfinishedPreparations')]
+    #[Test]
+    public function it_refuses_to_install_over_a_preparation_that_has_not_finished_even_with_no_inbound_foreign_key(string $unfinished, string $what): void
+    {
+        DB::statement('drop table listing_photos, listing_shares');
+        DB::statement($unfinished);
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
     #[Test]
     public function it_reads_the_catalog_under_locks_that_keep_the_legacy_shape_until_install_commits(): void
     {
@@ -602,6 +659,42 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame(['55P03', 0, 'v'], $outcome);
+    }
+
+    #[Test]
+    public function it_holds_back_a_write_to_a_related_successor_until_uninstall_commits_the_values_it_copied(): void
+    {
+        Compatibility::install(Listing::class);
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_starts_with($query->sql, 'UPDATE "listings" SET')) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function (): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->update("update places set street = '9 Moved St' where job_id = (select id from jobs where legacy_id = 1)");
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::uninstall(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $this->assertSame(
+            ['55P03', '1 Oak St', '1 Oak St'],
+            [$concurrent, DB::scalar('select street from listings where id = 1'), DB::scalar('select street from places where job_id = (select id from jobs where legacy_id = 1)')],
+        );
     }
 
     /**
@@ -687,6 +780,61 @@ final class InstallerTest extends TestCase
         Compatibility::install($model::class);
 
         $this->assertSame([[1], [2, 3]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
+    }
+
+    /**
+     * @return array<string, array{string, string, Closure(Builder<Job>): mixed, bool}>
+     */
+    public static function hideBindings(): array
+    {
+        return [
+            'a backslash in a string, with standard_conforming_strings off' => ['alter table jobs add column note text', "update jobs set note = 'C:\\new' where legacy_id = 3", static fn (Builder $jobs) => $jobs->where('note', 'C:\\new'), true],
+            'a backslash before a quote, with standard_conforming_strings off' => ['alter table jobs add column note text', "update jobs set note = 'it\\''s' where legacy_id = 3", static fn (Builder $jobs) => $jobs->where('note', "it\\'s"), true],
+            'an integer against a boolean column' => ['alter table jobs add column archived boolean not null default false', 'update jobs set archived = true where legacy_id = 3', static fn (Builder $jobs) => $jobs->where('archived', 1), false],
+            'a boolean against an integer column' => ['alter table jobs add column rank integer not null default 0', 'update jobs set rank = 1 where legacy_id = 3', static fn (Builder $jobs) => $jobs->where('rank', true), false],
+        ];
+    }
+
+    /**
+     * @param  Closure(Builder<Job>): mixed  $hide
+     */
+    #[DataProvider('hideBindings')]
+    #[Test]
+    public function it_hides_the_rows_eloquent_matches_with_each_binding_as_postgresql_types_it(string $column, string $row, Closure $hide, bool $escapesOff): void
+    {
+        DB::statement($column);
+        DB::update($row);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public static null|Closure $hide = null;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.')))
+                    ->hide(self::$hide ?? fn (Builder $jobs) => $jobs, because: 'A marked job is internal.');
+            }
+        };
+        $model::$hide = $hide;
+        $hidden = array_map(intval(...), Job::query()->withTrashed()->where($hide)->pluck('legacy_id')->all());
+
+        try {
+            DB::statement('set standard_conforming_strings = '.($escapesOff ? 'off' : 'on'));
+            Compatibility::install($model::class);
+        } finally {
+            DB::statement('set standard_conforming_strings = on');
+        }
+
+        $this->assertSame([[3], [1, 2]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
     }
 
     #[Test]

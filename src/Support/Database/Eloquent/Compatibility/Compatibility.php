@@ -16,7 +16,6 @@ use Support\Database\Eloquent\Compatibility\Definition\Branch;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
-use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -322,10 +321,8 @@ final class Compatibility
         }
 
         $connection = self::connection($map);
-        $tables = array_values(array_unique(array_filter([$map->table, $map->retainedTable, $map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], is_string(...))));
-
         try {
-            (new Installer($connection))->compileAndRun($tables, fn () => $statements($map, $connection));
+            (new Installer($connection))->compileAndRun($map->tables(), fn () => $statements($map, $connection));
         } finally {
             LegacyBuilder::forgetViews();
         }

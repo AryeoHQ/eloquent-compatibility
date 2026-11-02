@@ -126,6 +126,14 @@ final readonly class ResolvedMap
     }
 
     /**
+     * @return list<string>
+     */
+    public function tables(): array
+    {
+        return array_values(array_unique(array_filter([$this->table, $this->retainedTable, $this->primary->table, ...array_map(fn (Related $related) => $related->table, $this->related)], is_string(...))));
+    }
+
+    /**
      * @param  list<string>  $columns
      * @return list<string>
      */
