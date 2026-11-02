@@ -212,6 +212,18 @@ final readonly class ResolvedMap
                 }
             }
         }
+
+        foreach (array_keys($declaredIn) as $name) {
+            $served = [];
+
+            foreach ($branches as $successor => $branch) {
+                $served[$branch->attributes[$name]->isExternal() ? 'external' : 'sql'] ??= $successor;
+            }
+
+            if (count($served) > 1) {
+                throw $this->invalid("attribute '{$name}' is external() in the ".class_basename($served['external']).' branch and served from SQL in the '.class_basename($served['sql']).' branch, and every branch of the view serves one set of columns; give it external() in every branch or in none');
+            }
+        }
     }
 
     /**

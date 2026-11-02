@@ -49,6 +49,18 @@ final readonly class MassWriter
     }
 
     /**
+     * @param  array<array-key, mixed>  $amounts
+     */
+    public static function refuseIdentifierAmounts(ResolvedMap $map, array $amounts): void
+    {
+        foreach (array_keys(self::named($amounts)) as $name) {
+            if (array_key_exists($name, $map->identifiers)) {
+                throw CompatibilityWriteRefused::unsupported($map->model, "an increment of its identifier {$name}", 'An increment computes the new '.$name.' in SQL, and a record of '.implode(' or ', array_map(fn (ResolvedMap $branch) => class_basename($branch->primary->model), $map->branches)).' must claim its '.$name.' across both successors and move its retained values before it takes one.');
+            }
+        }
+    }
+
+    /**
      * @template TResult
      *
      * @param  Closure(): TResult  $write
@@ -318,6 +330,8 @@ final readonly class MassWriter
             self::refuseRaw($this->map, $name, $value);
         }
 
+        self::refuseIdentifierAmounts($this->map, $mappedAmounts);
+
         return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $amounts, $mapped, $retained, $mappedAmounts, $retainedAmounts): int {
             $this->refuseMoves($selected, $values, $amounts);
             $identities = array_intersect_key(self::named($mapped), $this->map->identifiers);
@@ -388,6 +402,7 @@ final readonly class MassWriter
                     ->pluck($primary->table.'.'.$primary->key);
 
                 if ($locked->isNotEmpty()) {
+                    (new self($branch, $this->connection))->lockDependents($locked->all());
                     $holding[] = $branch;
                 }
             }
@@ -413,10 +428,25 @@ final readonly class MassWriter
         $key = (new $this->map->model)->getKeyName();
         $values = self::named($values);
         $amounts = self::named($amounts);
+        $grammar = $this->connection->getQueryGrammar();
+        $rows = $this->connection->table($this->map->table)->select($this->map->table.'.*')->whereIn($key, $selected)->orderBy($key);
+        $expressions = array_keys(array_filter($values, fn (mixed $value) => $value instanceof Expression));
 
-        foreach ($this->connection->table($this->map->table)->whereIn($key, $selected)->orderBy($key)->cursor() as $row) {
+        foreach ($expressions as $index => $name) {
+            $value = $values[$name];
+            $rows->selectRaw('('.($value instanceof Expression ? $value->getValue($grammar) : '').') as '.$grammar->wrap('compatibility_value_'.$index));
+        }
+
+        foreach ($rows->cursor() as $row) {
             $before = (array) $row;
-            $after = array_replace($before, $values);
+            $evaluated = [];
+
+            foreach ($expressions as $index => $name) {
+                $evaluated[$name] = $before['compatibility_value_'.$index] ?? null;
+                unset($before['compatibility_value_'.$index]);
+            }
+
+            $after = array_replace($before, $values, $evaluated);
 
             foreach ($amounts as $name => $amount) {
                 $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;

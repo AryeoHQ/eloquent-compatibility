@@ -131,6 +131,7 @@ final readonly class Preparer
         $shared = SqlFragments::identifier(Identifier::SHARED_SEQUENCE);
 
         return "DO \$compatibility\$\nDECLARE\n  legacy_sequence text := pg_get_serial_sequence(".SqlFragments::literal(SqlFragments::identifier($table)).', '.SqlFragments::literal($column).");\n  legacy_next bigint := 1;\n  shared_next bigint;\n  target bigint;\nBEGIN\n"
+            ."  EXECUTE format('ALTER SEQUENCE %s INCREMENT BY %s', ".SqlFragments::literal($shared).', (SELECT increment_by FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = '.SqlFragments::literal(Identifier::SHARED_SEQUENCE)."));\n"
             ."  IF legacy_sequence IS NOT NULL THEN\n"
             ."    EXECUTE format('SELECT {$next} FROM %s', legacy_sequence) INTO legacy_next;\n"
             ."  END IF;\n"

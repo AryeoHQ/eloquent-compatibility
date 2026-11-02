@@ -76,26 +76,22 @@ final class Compatibility
 
     public static function prepare(string $model): void
     {
-        $map = self::of($model)->resolve();
-
-        foreach ($map->branches === [] ? [$map] : $map->branches as $served) {
-            self::execute($served, Statements::prepare(...));
-        }
+        self::run($model, Statements::prepare(...));
     }
 
     public static function install(string $model): void
     {
-        self::run($model, 'install', Statements::install(...));
+        self::run($model, Statements::install(...));
     }
 
     public static function recompile(string $model): void
     {
-        self::run($model, 'recompile', Statements::recompile(...));
+        self::run($model, Statements::recompile(...));
     }
 
     public static function uninstall(string $model): void
     {
-        self::run($model, 'uninstall', Statements::uninstall(...));
+        self::run($model, Statements::uninstall(...));
     }
 
     /**
@@ -280,22 +276,9 @@ final class Compatibility
     /**
      * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
      */
-    private static function run(string $model, string $operation, Closure $statements): void
+    private static function run(string $model, Closure $statements): void
     {
         $map = self::of($model)->resolve();
-
-        if ($map->branches !== []) {
-            throw InvalidCompatibilityMap::cannot($map->table, $operation, 'it serves '.$map->table.' from '.implode(' and ', array_map(class_basename(...), array_keys($map->branches))).", and {$operation}() serves a map from one successor only");
-        }
-
-        self::execute($map, $statements);
-    }
-
-    /**
-     * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
-     */
-    private static function execute(ResolvedMap $map, Closure $statements): void
-    {
         $connection = (new $map->model)->getConnection();
 
         try {

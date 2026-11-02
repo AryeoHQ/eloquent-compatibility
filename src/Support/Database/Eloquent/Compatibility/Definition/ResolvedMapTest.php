@@ -222,6 +222,14 @@ final class ResolvedMapTest extends TestCase
                 ->as(Link::class, fn (Successor $link) => $link),
             "attribute 'original_file_name' is readable in the File branch and not in the Link branch; give it from(), external() or fixed() there",
         ];
+        yield 'an attribute external in one branch only' => [
+            fn (Compatibility $video) => self::identified($video)
+                ->discriminatedBy('legacy_type')
+                ->servedFrom(fn (Video $video): string => File::class)
+                ->as(File::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
+                ->as(Link::class, fn (Successor $link) => $link->attribute('original_file_name', fn (Attribute $attribute) => $attribute->external(fn (Video $video) => null, fn (Video $video, mixed $value) => null))),
+            "attribute 'original_file_name' is external() in the Link branch and served from SQL in the File branch, and every branch of the view serves one set of columns; give it external() in every branch or in none",
+        ];
         yield 'two branches over one table' => [
             fn (Compatibility $video) => self::identified($video)
                 ->discriminatedBy('legacy_type')

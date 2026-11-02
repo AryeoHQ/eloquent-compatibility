@@ -24,11 +24,15 @@ final readonly class Statements
 
     public static function prepare(ResolvedMap $map, ConnectionInterface $connection): self
     {
-        return (new Preparer(new ColumnCatalog($connection)))->statements($map);
+        $preparer = new Preparer(new ColumnCatalog($connection));
+        $prepared = array_map($preparer->statements(...), $map->branches === [] ? [$map] : array_values($map->branches));
+
+        return new self('prepare', array_merge(...array_map(fn (self $statements) => $statements->transaction, $prepared)), array_merge(...array_map(fn (self $statements) => $statements->afterwards, $prepared)));
     }
 
     public static function install(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'install');
         $columnCatalog = new ColumnCatalog($connection);
         $view = (new ViewCompiler($columnCatalog, $connection))->create($map);
 
@@ -152,6 +156,8 @@ final readonly class Statements
 
     public static function recompile(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'recompile');
+
         if (self::kind($connection, $map->table) !== 'v') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so recompile() has nothing to replace; install() creates it");
         }
@@ -188,6 +194,8 @@ final readonly class Statements
 
     public static function uninstall(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'uninstall');
+
         if (self::kind($connection, $map->table) !== 'v') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so uninstall() has nothing to reverse");
         }
@@ -284,6 +292,13 @@ final readonly class Statements
     public function all(): array
     {
         return [...$this->transaction, ...$this->afterwards];
+    }
+
+    private static function refuseBranches(ResolvedMap $map, string $operation): void
+    {
+        if ($map->branches !== []) {
+            throw InvalidCompatibilityMap::cannot($map->table, $operation, 'it serves '.$map->table.' from '.implode(' and ', array_map(class_basename(...), array_keys($map->branches))).", and {$operation}() serves a map from one successor only");
+        }
     }
 
     private static function refuseMissingPrimaries(ResolvedMap $map, string $key): string

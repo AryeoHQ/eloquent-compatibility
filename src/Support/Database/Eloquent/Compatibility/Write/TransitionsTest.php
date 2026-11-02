@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -74,6 +75,24 @@ final class TransitionsTest extends TestCase
         Event::assertDispatchedTimes(EnteredClosed::class, 1);
         Event::assertDispatchedTimes(EnteringLive::class, 1);
         Event::assertDispatchedTimes(EnteredLive::class, 1);
+    }
+
+    #[Test]
+    public function it_saves_the_successor_once_with_the_legacy_timestamp_when_the_trigger_saves_in_a_later_second(): void
+    {
+        Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);
+        Date::setTestNow('2026-06-07 10:00:00');
+        $held = [];
+        Event::listen('eloquent.updating: '.Job::class, function (Job $job) use (&$held): void {
+            $held[] = [$job->getDirty()['lifecycle_status'] ?? null, Applying::holds($job)];
+            Date::setTestNow('2026-06-07 10:00:01');
+        });
+
+        $listing = Listing::query()->findOrFail(1);
+        $listing->update(['status' => ListingStatus::Sold]);
+
+        $this->assertSame([['closed', true]], $held);
+        $this->assertSame(['2026-06-07 10:00:00', '2026-06-07 10:00:00'], [$listing->updated_at?->format('Y-m-d H:i:s'), Listing::query()->findOrFail(1)->updated_at?->format('Y-m-d H:i:s')]);
     }
 
     #[Test]
