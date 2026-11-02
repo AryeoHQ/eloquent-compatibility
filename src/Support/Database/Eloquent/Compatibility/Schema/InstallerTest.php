@@ -205,6 +205,28 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_the_legacy_table_owner_reading_the_view_when_another_role_installs_it(): void
+    {
+        $role = 'compatibility_owner_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("alter table listings owner to {$role}");
+            DB::statement("alter table jobs owner to {$role}");
+
+            Compatibility::install(Listing::class);
+            DB::statement("set role {$role}");
+
+            $this->assertSame([3, true], [DB::scalar('select count(*) from listings'), DB::scalar("select has_table_privilege('listings', 'SELECT WITH GRANT OPTION')")]);
+        } finally {
+            DB::statement('reset role');
+            DB::statement("reassign owned by {$role} to current_user");
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
     public function it_grants_each_view_column_every_privilege_the_legacy_column_granted(): void
     {
         $role = 'compatibility_column_reader_'.getmypid();

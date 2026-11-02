@@ -19,8 +19,8 @@ final class MultipliedByTest extends TestCase
     {
         $conversion = new MultipliedBy(1000);
 
-        $this->assertSame('("job_sites"."area_km2" * 1000)', $conversion->read('"job_sites"."area_km2"'));
-        $this->assertSame(2000, DB::scalar('select '.$conversion->read('CAST(? AS integer)'), [2]));
+        $this->assertSame('("job_sites"."area_km2" * CAST(1000 AS numeric))', $conversion->read('"job_sites"."area_km2"'));
+        $this->assertSame('2000', DB::scalar('select '.$conversion->read('CAST(? AS integer)'), [2]));
     }
 
     #[Test]
@@ -41,7 +41,7 @@ final class MultipliedByTest extends TestCase
     {
         $conversion = new MultipliedBy(1000);
 
-        $this->assertSame($legacy, DB::scalar('select '.$conversion->read('CAST(? AS integer)'), [$conversion->write($legacy)]));
+        $this->assertSame((string) $legacy, DB::scalar('select '.$conversion->read('CAST(? AS integer)'), [$conversion->write($legacy)]));
     }
 
     #[Test]

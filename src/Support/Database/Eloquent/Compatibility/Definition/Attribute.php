@@ -261,7 +261,7 @@ final class Attribute
         $types = $this->types($stored);
 
         foreach ($this->conversions() as $at => $conversion) {
-            if ($conversion instanceof AsType && SqlFragments::isZoned($types[$at]) && ! SqlFragments::isZoned($conversion->type)) {
+            if ($conversion instanceof AsType && SqlFragments::isZoned($types[$at]) && SqlFragments::isNaive($conversion->type)) {
                 $sql = SqlFragments::inApplicationZone($sql);
             }
 

@@ -24,9 +24,10 @@ final readonly class Mapping implements Conversion
     public function read(string $stored): string
     {
         $cases = [];
+        $text = $this->type(null) === 'text';
 
         foreach ($this->values as $storedValue => $legacyValue) {
-            $cases[] = 'WHEN '.SqlFragments::literal((string) $storedValue).' THEN '.(new Fixed($legacyValue))->read('');
+            $cases[] = 'WHEN '.SqlFragments::literal((string) $storedValue).' THEN '.($text ? SqlFragments::literal((string) $legacyValue) : (new Fixed($legacyValue))->read(''));
         }
 
         return '(CASE CAST('.$stored.' AS text) '.implode(' ', $cases).' END)';
@@ -43,7 +44,7 @@ final readonly class Mapping implements Conversion
 
     public function filter(string $operator, mixed $value, null|string $type = null): null|array
     {
-        if (! in_array($operator, ['=', '!=', '<>'], true) || $value === null) {
+        if (! in_array($operator, ['=', '!=', '<>'], true) || $value === null || ! $this->comparesKeysAsText($type)) {
             return null;
         }
 
@@ -85,6 +86,15 @@ final readonly class Mapping implements Conversion
         }
 
         return true;
+    }
+
+    private function comparesKeysAsText(null|string $type): bool
+    {
+        if (SqlFragments::isInteger($type)) {
+            return array_filter(array_keys($this->values), is_string(...)) === [];
+        }
+
+        return $type !== null && preg_match('/^(text|character varying(\(\d+\))?)$/', $type) === 1;
     }
 
     private static function typed(int|string $stored, null|string $type): int|string

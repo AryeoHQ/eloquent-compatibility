@@ -70,13 +70,13 @@ final class MappingTest extends TestCase
     #[TestWith(['=', null, null])]
     public function it_filters_equality_by_the_stored_value_and_inequality_by_the_other_mapped_values(string $operator, null|string $value, null|array $filter): void
     {
-        $this->assertSame($filter, $this->statuses()->filter($operator, $value));
+        $this->assertSame($filter, $this->statuses()->filter($operator, $value, 'character varying(255)'));
     }
 
     #[Test]
     public function it_filters_by_a_legacy_enum_case(): void
     {
-        $this->assertSame(['=', 'closed'], $this->statuses()->filter('=', ListingStatus::Sold));
+        $this->assertSame(['=', 'closed'], $this->statuses()->filter('=', ListingStatus::Sold, 'text'));
     }
 
     #[Test]

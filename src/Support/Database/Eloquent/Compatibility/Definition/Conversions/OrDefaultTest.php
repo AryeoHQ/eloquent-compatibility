@@ -51,13 +51,13 @@ final class OrDefaultTest extends TestCase
     #[TestWith(['!=', null, ['all', null]])]
     public function it_filters_equality_with_a_value_other_than_the_default_and_any_inequality(string $operator, null|string $value, null|array $filter): void
     {
-        $this->assertSame($filter, (new OrDefault('Unknown'))->filter($operator, $value));
+        $this->assertSame($filter, (new OrDefault('Unknown'))->filter($operator, $value, 'text'));
     }
 
     #[Test]
     public function it_treats_a_number_written_as_text_as_the_default_it_equals(): void
     {
-        $this->assertNull((new OrDefault(0))->filter('=', '0'));
+        $this->assertNull((new OrDefault(0))->filter('=', '0', 'integer'));
     }
 
     #[Test]
