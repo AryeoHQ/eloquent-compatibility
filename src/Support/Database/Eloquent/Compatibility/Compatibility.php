@@ -281,10 +281,14 @@ final class Compatibility
     {
         $legacy = new $map->model;
         $connection = $legacy->getConnection();
-        $successors = [$map->primary->model => [(new $map->primary->model)->getConnectionName(), 'the successor '.class_basename($map->primary->model)]];
+        $successors = [];
 
-        foreach ($map->related as $related) {
-            $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
+        foreach ($map->branches === [] ? [$map] : $map->branches as $branch) {
+            $successors[$branch->primary->model] = [(new $branch->primary->model)->getConnectionName(), 'the successor '.class_basename($branch->primary->model)];
+
+            foreach ($branch->related as $related) {
+                $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
+            }
         }
 
         foreach ($successors as [$name, $successor]) {

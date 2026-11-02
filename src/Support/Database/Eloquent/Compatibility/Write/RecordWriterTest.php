@@ -6,10 +6,12 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Events\NullDispatcher;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresMethod;
@@ -21,7 +23,9 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\AliasedPlace;
 use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -198,6 +202,153 @@ final class RecordWriterTest extends TestCase
 
         $this->assertSame([['created', 'BIRCH HOUSE'], ['saved', 'BIRCH HOUSE']], $seen);
         $this->assertSame(['BIRCH HOUSE', false], [$listing->title, $listing->isDirty()]);
+    }
+
+    #[Test]
+    public function it_gives_the_legacy_record_the_values_its_successors_stored_when_the_write_changes_its_identifier(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+        $updated = Listing::query()->create(['title' => 'Pine House', 'company_id' => ListingTables::COMPANY]);
+        $incremented = Listing::query()->create(['title' => 'Elm House', 'company_id' => ListingTables::COMPANY]);
+        $seen = [];
+
+        foreach (['updated', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
+                $seen[] = [$event, $listing->id, $listing->title];
+            });
+        }
+
+        $updated->update(['id' => 99, 'title' => 'Pine Lodge']);
+        $incremented->increment('id', 95, ['title' => 'Elm Lodge']);
+
+        $this->assertSame([
+            ['updated', 99, 'PINE LODGE'],
+            ['saved', 99, 'PINE LODGE'],
+            ['updated', 100, 'ELM LODGE'],
+        ], $seen);
+        $this->assertSame([[99, 'PINE LODGE', false], [100, 'ELM LODGE', false]], [
+            [$updated->id, $updated->title, $updated->isDirty()],
+            [$incremented->id, $incremented->title, $incremented->isDirty('id')],
+        ]);
+        $this->assertSame([99 => 'PINE LODGE', 100 => 'ELM LODGE'], Listing::query()->whereIn('id', [99, 100])->orderBy('id')->pluck('title', 'id')->all());
+    }
+
+    /**
+     * @return iterable<string, array{string, Closure(Listing): mixed}>
+     */
+    public static function quietWrites(): iterable
+    {
+        yield 'a quiet save' => ['saving', function (Listing $listing): mixed {
+            $listing->title = 'Oak Manor';
+
+            return $listing->saveQuietly();
+        }];
+        yield 'a quiet soft delete' => ['deleting', fn (Listing $listing): mixed => $listing->deleteQuietly()];
+        yield 'a quiet force delete' => ['deleting', fn (Listing $listing): mixed => $listing->forceDeleteQuietly()];
+    }
+
+    /**
+     * @param  Closure(Listing): mixed  $write
+     */
+    #[DataProvider('quietWrites')]
+    #[Test]
+    public function it_runs_the_successor_listeners_of_a_quiet_legacy_write_and_keeps_the_legacy_events_quiet(string $event, Closure $write): void
+    {
+        $before = $this->snapshot();
+        $fired = [];
+        Event::listen('eloquent.*: '.Listing::class, function (string $name) use (&$fired): void {
+            $fired[] = $name;
+        });
+        Event::listen("eloquent.{$event}: ".Job::class, fn () => false);
+        $listing = Listing::query()->findOrFail(1);
+        $fired = [];
+
+        $refusal = $this->refusal(fn () => $write($listing));
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame([], $fired);
+        $this->assertSame($before, $this->snapshot());
+        $this->assertNotInstanceOf(NullDispatcher::class, Model::getEventDispatcher());
+    }
+
+    /**
+     * @return iterable<string, array{bool, Closure(Model): mixed}>
+     */
+    public static function writesThroughAnotherConnectionName(): iterable
+    {
+        $update = fn (Model $listing): mixed => $listing->newQuery()->findOrFail(1)->update(['street' => '2 Oak St', 'latitude' => 1.5]);
+
+        yield 'an update' => [false, $update];
+        yield 'an update under a guard' => [true, $update];
+        yield 'an insert' => [false, fn (Model $listing): mixed => $listing->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'latitude' => 2.5])];
+    }
+
+    /**
+     * @param  Closure(Model): mixed  $write
+     */
+    #[DataProvider('writesThroughAnotherConnectionName')]
+    #[Test]
+    public function it_writes_a_related_model_that_names_another_connection_to_the_same_database_inside_the_write_transaction(bool $guarded, Closure $write): void
+    {
+        config(['database.connections.'.AliasedPlace::CONNECTION => [...(array) config('database.connections.'.DB::getDefaultConnection()), 'database' => DB::connection()->getDatabaseName()]]);
+        DB::connection(AliasedPlace::CONNECTION)->statement("set lock_timeout = '2s'");
+        $listing = $guarded ? $this->guardedAliasedListing() : $this->aliasedListing();
+        $before = $this->snapshot();
+        Event::listen('eloquent.saving: '.JobSite::class, fn () => false);
+
+        $refusal = $this->refusal(fn () => $write($listing));
+
+        $this->assertStringEndsWith(' cannot take this write, because a listener of JobSite refused its save. Why: The write stores its values through JobSite, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of JobSite.', $refusal->getMessage());
+        $this->assertSame($before, $this->snapshot());
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): Listing}>
+     */
+    public static function deletesOfATrashedSuccessor(): iterable
+    {
+        yield 'an already-trashed record' => [fn (): Listing => Listing::withTrashed()->findOrFail(2)];
+        yield 'a stale record whose successor a concurrent writer trashed' => [function (): Listing {
+            $listing = Listing::query()->findOrFail(1);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->delete();
+
+            return $listing;
+        }];
+    }
+
+    /**
+     * @param  Closure(): Listing  $record
+     */
+    #[DataProvider('deletesOfATrashedSuccessor')]
+    #[Test]
+    public function it_runs_the_successor_delete_and_its_veto_when_the_legacy_record_deletes_a_trashed_successor(Closure $record): void
+    {
+        $listing = $record();
+        $before = $this->snapshot();
+        /** @var Collection<int, string> $fired */
+        $fired = new Collection;
+        Event::listen('eloquent.*: '.Job::class, function (string $name) use ($fired): void {
+            $fired->push(Str::before(Str::after($name, 'eloquent.'), ':'));
+        });
+        Event::listen('eloquent.deleting: '.Job::class, function () use ($fired): bool {
+            $fired->push('vetoed');
+
+            return false;
+        });
+
+        $refusal = $this->refusal(fn () => $listing->delete());
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame(['retrieved', 'vetoed'], $fired->all());
+        $this->assertSame($before, $this->snapshot());
+
+        Event::forget('eloquent.deleting: '.Job::class);
+
+        $this->assertTrue($listing->delete());
+        $this->assertSame(['retrieved', 'deleting', 'trashed', 'deleted'], $fired->slice(2)->values()->all());
+        $this->assertSame($listing->deleted_at?->toDateTimeString(), Job::withTrashed()->where('legacy_id', $listing->id)->firstOrFail()->deleted_at?->toDateTimeString());
     }
 
     #[Test]
@@ -521,6 +672,59 @@ final class RecordWriterTest extends TestCase
         Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Job', false]], $held);
+    }
+
+    private function aliasedListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return RecordWriterTest::aliasedMap($listing);
+            }
+        };
+    }
+
+    private function guardedAliasedListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return RecordWriterTest::aliasedMap($listing)->guard('never', fn () => false, because: 'It reads every related row.', instead: 'Nothing.');
+            }
+        };
+    }
+
+    public static function aliasedMap(Compatibility $listing): Compatibility
+    {
+        return $listing
+            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->retainedIn('listings_retained', key: 'job_id')
+            ->servedFrom(Job::class, fn (Successor $job) => $job
+                ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                ->related(fn (Job $job) => $job->hasOne(AliasedPlace::class), fn (Successor $place) => $place
+                    ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                    ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')))
+                ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
+                    ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))));
     }
 
     private function lockConcurrently(string $sql): string

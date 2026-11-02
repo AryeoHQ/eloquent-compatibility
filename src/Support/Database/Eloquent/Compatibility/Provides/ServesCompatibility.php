@@ -139,6 +139,14 @@ trait ServesCompatibility
     }
 
     /**
+     * @return null|bool
+     */
+    public function delete()
+    {
+        return LegacyBuilder::deleting($this, fn () => parent::delete());
+    }
+
+    /**
      * @param  Builder<static>  $query
      * @return Builder<static>
      */

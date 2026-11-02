@@ -80,7 +80,8 @@ final readonly class Preparer
             $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
             $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
             $foreignChecks[] = $this->refuseForeignCheck($map, $filledName, (string) $identifier->column());
-            $foreignChecks[] = $identifier->isUuid() ? '' : $this->refuseUnusableSequence($map, (string) $identifier->column(), $default);
+            $foreignChecks[] = $identifier->isUuid() ? '' : $this->refuseUnusableSequence($map, $map->primary->table, (string) $identifier->column(), $default);
+            $foreignChecks[] = $sharesSequence ? $this->refuseUnusableSequence($map, $map->table, $name, $default) : '';
             $fills[] = $successorColumn.' = COALESCE('.$successorColumn.', '.$default.')';
             $missing[] = $successorColumn.' IS NULL';
             $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
@@ -168,18 +169,18 @@ final readonly class Preparer
             ."  END IF;\n";
     }
 
-    private function refuseUnusableSequence(ResolvedMap $map, string $column, string $default): string
+    private function refuseUnusableSequence(ResolvedMap $map, string $table, string $column, string $default): string
     {
         $sequence = (string) preg_replace('/^(?:pg_catalog\.)?nextval\((.+)\)$/s', '$1', $default);
-        $primary = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($map->primary->table)).')';
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')';
         $grantee = "CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee";
-        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$map->primary->table}.{$column} draws from ")
-            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(', and ').' || found || '.SqlFragments::literal(" can insert into {$map->primary->table} without USAGE on it. Grant USAGE ON SEQUENCE ")
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$table}.{$column} draws from ")
+            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(', and ').' || found || '.SqlFragments::literal(" can insert into {$table} without USAGE on it. Grant USAGE ON SEQUENCE ")
             ." || CAST({$sequence} AS text) || ".SqlFragments::literal(' to each of them, then prepare again.');
 
         return "  SELECT string_agg(inserter, ', ' ORDER BY inserter) INTO found FROM (\n"
-            ."    SELECT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = {$primary} AND granted.privilege_type = 'INSERT'\n"
-            ."    UNION SELECT {$grantee} FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = {$primary} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'\n"
+            ."    SELECT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = {$relation} AND granted.privilege_type = 'INSERT'\n"
+            ."    UNION SELECT {$grantee} FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = {$relation} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'\n"
             ."  ) AS inserters WHERE NOT has_sequence_privilege(CAST(CASE WHEN grantee = 0 THEN 'public' ELSE pg_get_userbyid(grantee) END AS name), CAST({$sequence} AS oid), 'USAGE, UPDATE');\n"
             ."  IF found IS NOT NULL THEN\n"
             ."    RAISE EXCEPTION '%', {$refusal};\n"

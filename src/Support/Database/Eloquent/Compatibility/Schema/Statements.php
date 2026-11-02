@@ -37,7 +37,8 @@ final readonly class Statements
     {
         self::refuseBranches($map, 'install');
         $columnCatalog = new ColumnCatalog($connection);
-        $view = (new ViewCompiler($columnCatalog, $connection))->create($map);
+        $owned = self::ownedConstants($connection, $map);
+        $view = (new ViewCompiler($columnCatalog, $connection))->create($map, $owned);
 
         if (self::kind($connection, $map->table) !== 'r') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a plain table, so install() cannot serve it through a view; recompile() replaces an installed view");
@@ -52,7 +53,7 @@ final readonly class Statements
         $retainedKey = (string) $map->retainedKey;
         $primary = SqlFragments::identifier($map->primary->table);
         $primaryKey = SqlFragments::identifier($map->primary->key);
-        $legacy = $columnCatalog->of($map->table);
+        $legacy = array_diff_key($columnCatalog->of($map->table), array_flip($owned));
         $key = (new $map->model)->getKeyName();
 
         $external = array_values(array_filter($map->externals(), fn (string $name) => array_key_exists($name, $legacy)));
@@ -132,6 +133,7 @@ final readonly class Statements
         usort($mapped, fn (string $first, string $second) => $legacy[$second]->alwaysGenerated <=> $legacy[$first]->alwaysGenerated);
         $defaults = array_filter($legacy, fn (Column $column, string $name) => $column->default !== null && ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH);
         $hidden = self::reportHidden($map, $key);
+        [$readGrants, $grant] = self::grants($map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH)));
 
         return new self('install', [
             "LOCK TABLE {$legacyTable}, {$primary} IN SHARE ROW EXCLUSIVE MODE",
@@ -144,13 +146,14 @@ final readonly class Statements
             ...array_column($constants, 0),
             ...$repoints,
             ...$sequences,
+            $readGrants,
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
             "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, array_column($constants, 1), $external)),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
-            ...self::grants($connection, $map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH))),
+            $grant,
             ...$check,
         ], [
             ...$validations,
@@ -167,6 +170,11 @@ final readonly class Statements
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so recompile() has nothing to replace; install() creates it");
         }
 
+        if ($map->membership !== null) {
+            self::refuseSharedAlias($connection, $map, $map->membership);
+        }
+
+        self::refuseChangedMembership($connection, $map);
         $view = (new ViewCompiler(new ColumnCatalog($connection), $connection))->replace($map);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $identifiers = array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers));
@@ -224,6 +232,7 @@ final readonly class Statements
         $membership = $map->membership;
         $statements = [
             "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            ...($membership === null ? [] : [self::refuseReclassified($map, $membership, $key)]),
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
             "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE "
@@ -237,6 +246,7 @@ final readonly class Statements
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
                 ."\nWHERE {$primary}.{$primaryKey} = {$legacyTable}.{$retainedKey}",
         ];
+        $filled = count($statements) - 1;
 
         $restoredDefaults = [...array_map(fn (Column $column) => (string) $column->default, $defaults), ...array_filter(array_map(fn (array $column) => $column['default'], $external), is_string(...))];
 
@@ -294,7 +304,7 @@ final readonly class Statements
             $statements[] = "ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint());
         }
 
-        return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [5 => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
+        return new self('uninstall', $statements, [...$repointed, ...$validations], $external === [] ? [] : [$filled => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
     }
 
     /**
@@ -369,7 +379,75 @@ final readonly class Statements
 
     private static function refuseSharedAlias(ConnectionInterface $connection, ResolvedMap $map, Membership $membership): void
     {
-        $claim = ['table' => $membership->table, 'column' => $membership->column, 'alias' => $membership->alias];
+        $claim = self::claim($membership);
+
+        foreach (self::installed($connection) as $name => $captured) {
+            if ($name !== ViewCompiler::retainedTable($map) && ($captured['membership'] ?? null) === $claim) {
+                throw InvalidCompatibilityMap::because($map->table, "the installed map retained in {$name} already serves the {$membership->table} rows whose {$membership->column} is '{$membership->alias}', and two installed maps cannot share a morph alias");
+            }
+        }
+    }
+
+    private static function refuseChangedMembership(ConnectionInterface $connection, ResolvedMap $map): void
+    {
+        $retainedTable = ViewCompiler::retainedTable($map);
+        $captured = self::installed($connection)[$retainedTable] ?? null;
+        $recorded = is_array($captured['membership'] ?? null) ? $captured['membership'] : null;
+        $claim = $map->membership === null ? null : self::claim($map->membership);
+
+        if ($captured === null || $recorded === $claim) {
+            return;
+        }
+
+        $describe = fn (null|array $membership): string => $membership === null ? 'every row of its successor' : 'the '.$membership['table'].' rows whose '.$membership['column']." is '".$membership['alias']."'";
+
+        throw InvalidCompatibilityMap::because($map->table, 'install() recorded that it serves '.$describe($recorded).', and the map now serves '.$describe($claim)."; recompile() cannot move the generated columns of repointed foreign keys or the record in {$retainedTable}, so uninstall() and install() the map to change it");
+    }
+
+    private static function refuseReclassified(ResolvedMap $map, Membership $membership, string $key): string
+    {
+        $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
+        $primary = SqlFragments::identifier($map->primary->table);
+        $legacyColumn = (string) $map->identifiers[$key]->column();
+        $legacyKey = "{$primary}.".SqlFragments::identifier($legacyColumn);
+        $reclassified = "FROM {$retainedTable} JOIN {$primary} ON {$primary}.".SqlFragments::identifier($map->primary->key)." = {$retainedTable}.".SqlFragments::identifier((string) $map->retainedKey)
+            ." WHERE {$primary}.".SqlFragments::identifier($membership->column).' IS DISTINCT FROM '.SqlFragments::literal($membership->alias);
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot uninstall: ")
+            .' || reclassified || '.SqlFragments::literal(' '.ViewCompiler::retainedTable($map)." rows belong to {$map->primary->table} rows whose {$membership->column} is no longer '{$membership->alias}'; the first are {$legacyColumn} ")
+            .' || first_keys || '.SqlFragments::literal(". Restore their {$membership->column}, or delete their ".ViewCompiler::retainedTable($map).' rows, before uninstall().');
+
+        return "DO \$compatibility\$\nDECLARE\n  reclassified bigint;\n  first_keys text;\nBEGIN\n"
+            ."  SELECT count(*) INTO reclassified {$reclassified};\n"
+            ."  IF reclassified > 0 THEN\n"
+            ."    SELECT string_agg(CAST(reclassified_key AS text), ', ' ORDER BY reclassified_key) INTO first_keys FROM (SELECT {$legacyKey} {$reclassified} ORDER BY {$legacyKey} LIMIT 5) AS first_reclassified (reclassified_key);\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\nEND\n\$compatibility\$";
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function ownedConstants(ConnectionInterface $connection, ResolvedMap $map): array
+    {
+        $owned = [];
+
+        foreach (self::installed($connection) as $captured) {
+            foreach (self::pairs($captured['constants'] ?? null) as [$table, $constant]) {
+                if ($table === SqlFragments::identifier($map->table)) {
+                    $owned[] = $constant;
+                }
+            }
+        }
+
+        return array_values(array_unique($owned));
+    }
+
+    /**
+     * @return array<string, array<array-key, mixed>>
+     */
+    private static function installed(ConnectionInterface $connection): array
+    {
+        $installed = [];
 
         foreach ($connection->select(
             "select relation.relname as name, obj_description(relation.oid, 'pg_class') as comment
@@ -381,10 +459,20 @@ final readonly class Statements
         ) as $row) {
             $captured = json_decode((string) $row->comment, true);
 
-            if ((string) $row->name !== ViewCompiler::retainedTable($map) && is_array($captured) && ($captured['membership'] ?? null) === $claim) {
-                throw InvalidCompatibilityMap::because($map->table, "the installed map retained in {$row->name} already serves the {$membership->table} rows whose {$membership->column} is '{$membership->alias}', and two installed maps cannot share a morph alias");
+            if (is_array($captured)) {
+                $installed[(string) $row->name] = $captured;
             }
         }
+
+        return $installed;
+    }
+
+    /**
+     * @return array{table: string, column: string, alias: string}
+     */
+    private static function claim(Membership $membership): array
+    {
+        return ['table' => $membership->table, 'column' => $membership->column, 'alias' => $membership->alias];
     }
 
     /**
@@ -477,7 +565,7 @@ final readonly class Statements
             'moved' => $moved,
             ...($map->membership === null ? [] : [
                 'constants' => $constants,
-                'membership' => ['table' => $map->membership->table, 'column' => $map->membership->column, 'alias' => $map->membership->alias],
+                'membership' => self::claim($map->membership),
             ]),
             ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => ['type' => $legacy[$name]->type, 'default' => $legacy[$name]->default], $external))]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -579,37 +667,37 @@ final readonly class Statements
 
     /**
      * @param  list<string>  $columns
-     * @return list<string>
+     * @return array{string, string}
      */
-    private static function grants(ConnectionInterface $connection, string $table, string $view, array $columns): array
+    private static function grants(string $table, string $view, array $columns): array
     {
-        $rows = $connection->select(
-            "select case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
-                    string_agg(granted.privilege_type, ', ' order by granted.privilege_type) as privileges,
-                    granted.is_grantable or granted.grantee = relation.relowner as grantable
-             from pg_class relation
-             cross join lateral aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) as granted
-             where relation.oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and granted.grantee <> (select oid from pg_roles where rolname = current_user)
-             group by granted.grantee, granted.is_grantable, relation.relowner
-             order by 1, 3",
-            [SqlFragments::identifier($table)],
-        );
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')';
+        $on = SqlFragments::literal(' ON '.$view.' TO ');
+        $grantee = "CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END";
+        $installer = '(SELECT oid FROM pg_roles WHERE rolname = current_user)';
 
-        $columnRows = $connection->select(
-            "select string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' order by attribute.attnum, granted.privilege_type) as privileges,
-                    case when granted.grantee = 0 then 'PUBLIC' else quote_ident(pg_get_userbyid(granted.grantee)) end as grantee,
-                    granted.is_grantable as grantable
-             from pg_attribute attribute
-             cross join lateral aclexplode(attribute.attacl) as granted
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped
-               and granted.grantee <> (select oid from pg_roles where rolname = current_user)
-               and attribute.attname in (select jsonb_array_elements_text(cast(? as jsonb)))
-             group by granted.grantee, granted.is_grantable
-             order by 2, 3",
-            [SqlFragments::identifier($table), json_encode($columns, JSON_THROW_ON_ERROR)],
-        );
-
-        return array_values(array_map(fn (object $row) => 'GRANT '.$row->privileges.' ON '.$view.' TO '.$row->grantee.($row->grantable === true ? ' WITH GRANT OPTION' : ''), [...$rows, ...$columnRows]));
+        return [
+            "SELECT set_config('compatibility.grants', coalesce(json_agg(grants.statement ORDER BY grants.position, grants.statement)::text, '[]'), true)\n"
+                ."FROM (\n"
+                ."  SELECT 1 AS position, 'GRANT ' || string_agg(granted.privilege_type, ', ' ORDER BY granted.privilege_type) || {$on} || {$grantee} || CASE WHEN granted.is_grantable OR granted.grantee = relation.relowner THEN ' WITH GRANT OPTION' ELSE '' END AS statement\n"
+                ."  FROM pg_class relation\n"
+                ."  CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted\n"
+                ."  WHERE relation.oid = {$relation} AND granted.grantee <> {$installer}\n"
+                ."  GROUP BY granted.grantee, granted.is_grantable, relation.relowner\n"
+                ."  UNION ALL\n"
+                ."  SELECT 2, 'GRANT ' || string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' ORDER BY attribute.attnum, granted.privilege_type) || {$on} || {$grantee} || CASE WHEN granted.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END\n"
+                ."  FROM pg_attribute attribute\n"
+                ."  CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted\n"
+                ."  WHERE attribute.attrelid = {$relation} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.grantee <> {$installer}\n"
+                .'    AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('.SqlFragments::literal(json_encode($columns, JSON_THROW_ON_ERROR)).' AS jsonb)))'."\n"
+                ."  GROUP BY granted.grantee, granted.is_grantable\n"
+                .') AS grants',
+            "DO \$compatibility\$\nDECLARE\n  granted text;\nBEGIN\n"
+                ."  FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP\n"
+                ."    EXECUTE granted;\n"
+                ."  END LOOP;\n"
+                ."END\n\$compatibility\$",
+        ];
     }
 
     /**

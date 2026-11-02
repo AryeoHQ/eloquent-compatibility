@@ -45,6 +45,9 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $inserts = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $deletes = null;
+
     /** @var array<string, true> */
     private static array $tables = [];
 
@@ -80,9 +83,27 @@ final class LegacyBuilder extends Builder
         return $inserting;
     }
 
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $delete
+     * @return TResult
+     */
+    public static function deleting(Model $model, Closure $delete): mixed
+    {
+        $deletes = self::$deletes ??= new WeakMap;
+        $deletes[$model] = true;
+
+        try {
+            return $delete();
+        } finally {
+            $deletes->offsetUnset($model);
+        }
+    }
+
     public static function serves(Model $model): bool
     {
-        return $model->getConnection()->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
+        return $model->getConnection()->scalar('select relkind::text from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($model->getTable())], false) === 'v';
     }
 
     /**
@@ -179,7 +200,7 @@ final class LegacyBuilder extends Builder
     {
         $model = $this->ownWrite();
 
-        return $model === null ? parent::update($values) : $this->writer()->update($model, $values);
+        return $model === null ? parent::update($values) : $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false);
     }
 
     public function delete(): mixed
@@ -729,7 +750,7 @@ final class LegacyBuilder extends Builder
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true))) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true) && ! in_array($attribute, $this->nondeterministic($this->map()->table), true))) {
             return [$type, null];
         }
 
@@ -800,13 +821,18 @@ final class LegacyBuilder extends Builder
      */
     private function incrementOwn(Model $model, array $amounts, array $extra): int
     {
+        $named = [];
         $values = [];
+
+        foreach ($amounts as $name => $amount) {
+            $named[Str::afterLast((string) $name, '.')] = $amount;
+        }
 
         foreach ($this->addUpdatedAtColumn($extra) as $name => $value) {
             $values[Str::afterLast((string) $name, '.')] = $value;
         }
 
-        return $this->writer()->increment($model, $amounts, $values);
+        return $this->writer()->increment($model, $named, $values);
     }
 
     private function ownWrite(): null|Model

@@ -189,6 +189,87 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_or_schema_before_reading_the_database(): void
+    {
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'link_previews';
+        };
+        $legacies = [
+            new class extends Model implements Contracts\Compatible
+            {
+                protected $table = 'videos';
+
+                public function getMorphClass()
+                {
+                    return 'video';
+                }
+
+                public static function compatibility(Compatibility $video): Compatibility
+                {
+                    return $video
+                        ->discriminatedBy('legacy_type')
+                        ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? CompatibilityTest::$reporting : File::class)
+                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                        ->as(CompatibilityTest::$reporting, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                }
+            },
+            new class extends Model implements Contracts\Compatible
+            {
+                protected $table = 'videos';
+
+                public function getMorphClass()
+                {
+                    return 'video';
+                }
+
+                public static function compatibility(Compatibility $video): Compatibility
+                {
+                    return $video
+                        ->discriminatedBy('legacy_type')
+                        ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                        ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                        ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                        ->as(Link::class, fn (Successor $link) => $link
+                            ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
+                            ->related(fn (Link $link) => $link->hasOne(CompatibilityTest::$reporting, 'link_id'), fn (Successor $preview) => $preview));
+                }
+            },
+        ];
+        self::$reporting = $reporting::class;
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([['database' => 'compatibility_reporting'], ['search_path' => 'reporting']] as $elsewhere) {
+            DB::purge('compatibility_reporting');
+            config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), ...$elsewhere]]);
+
+            foreach ($legacies as $legacy) {
+                try {
+                    Compatibility::prepare($legacy::class);
+                } catch (InvalidCompatibilityMap $refusal) {
+                    $refusals[] = $refusal->getMessage();
+                }
+            }
+        }
+
+        DB::purge('compatibility_reporting');
+        $another = ' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of ';
+        $oneDatabase = '; the view and its filters read every successor through the connection of ';
+        $this->assertSame(array_merge(...array_fill(0, 2, [
+            "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
+            "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
+        ])), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
     public function it_refuses_a_related_successor_that_reads_another_schema_or_a_connection_nobody_configured(): void
     {
         config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'search_path' => 'reporting']]);
