@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -23,6 +24,8 @@ use Tests\Fixtures\Support\Listings\Lifecycle\EnteredLive;
 use Tests\Fixtures\Support\Listings\Lifecycle\EnteringClosed;
 use Tests\Fixtures\Support\Listings\Lifecycle\EnteringLive;
 use Tests\Fixtures\Support\Listings\Lifecycle\LaunchedJob;
+use Tests\Fixtures\Support\Listings\Lifecycle\StagedJob;
+use Tests\Fixtures\Support\Listings\LifecycleStage;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -213,6 +216,50 @@ final class TransitionsTest extends TestCase
 
         $this->assertSame([$listing::class.'::$status cannot take a write', 'has no state-machine cast.'], [$refusal->refused, substr($refusal->because, -strlen('has no state-machine cast.'))]);
         $this->assertSame($before, $this->snapshot());
+    }
+
+    #[Test]
+    public function it_runs_the_trigger_of_an_integer_backed_state_machine_and_refuses_a_move_it_does_not_declare(): void
+    {
+        DB::statement('create table stages (id serial primary key, stage integer not null default 1)');
+        DB::statement('create table staged_jobs (id uuid primary key default gen_random_uuid(), stage integer not null default 1)');
+        DB::table('stages')->insert([['stage' => 1], ['stage' => 1]]);
+        $staged = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'stages';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $stage): Compatibility
+            {
+                return $stage
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('stages_retained', key: 'staged_job_id')
+                    ->servedFrom(StagedJob::class, fn (Successor $job) => $job
+                        ->attribute('stage', fn (Attribute $attribute) => $attribute->from('stage')->transitions()));
+            }
+        };
+
+        try {
+            Compatibility::prepare($staged::class);
+            DB::statement('insert into staged_jobs (legacy_id, stage) select id, stage from stages');
+            Compatibility::install($staged::class);
+
+            $staged->newQuery()->findOrFail(1)->update(['stage' => LifecycleStage::Live]);
+            $refusal = $this->refusal(fn () => $staged->newQuery()->findOrFail(1)->update(['stage' => LifecycleStage::Drafting]));
+            $stages = DB::table('staged_jobs')->orderBy('legacy_id')->pluck('stage')->all();
+        } finally {
+            DB::statement('drop view if exists stages');
+            DB::statement('drop table if exists stages, stages_retained, staged_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([2, 1], $stages);
+        $this->assertSame($staged::class.' record 1 cannot change $stage from \'2\' to \'1\'. Why: LifecycleStage declares no transition from \'2\' to \'1\', so no trigger can make the change. Instead: Change stage only along a transition LifecycleStage declares.', $refusal->getMessage());
     }
 
     #[Test]

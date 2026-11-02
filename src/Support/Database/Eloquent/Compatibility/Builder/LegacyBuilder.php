@@ -46,9 +46,6 @@ final class LegacyBuilder extends Builder
     /** @var array<string, true> */
     private static array $tables = [];
 
-    /** @var array<string, true> */
-    private static array $writtenTables = [];
-
     private int $negations = 0;
 
     private null|Model $writeOf = null;
@@ -60,7 +57,6 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         self::$tables = [];
-        self::$writtenTables = [];
     }
 
     public static function insertOf(Model $model): void
@@ -80,20 +76,7 @@ final class LegacyBuilder extends Builder
 
     public static function serves(Model $model): bool
     {
-        $connection = $model->getConnection();
-        $relation = $connection->getName().'.'.$model->getTable();
-
-        if (array_key_exists($relation, self::$writtenTables)) {
-            return false;
-        }
-
-        $view = $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
-
-        if (! $view) {
-            self::$writtenTables[$relation] = true;
-        }
-
-        return $view;
+        return $model->getConnection()->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($model->getTable())], false) === 'v';
     }
 
     /**

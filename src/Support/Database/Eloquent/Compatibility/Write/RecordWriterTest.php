@@ -100,6 +100,36 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_gives_the_legacy_record_the_values_its_successors_stored_before_its_own_events_run(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+        $seen = [];
+
+        foreach (['created', 'updated', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
+                $seen[] = [$event, $listing->title, $listing->getOriginal('title'), $listing->getChanges()['title'] ?? null];
+            });
+        }
+
+        $updated = Listing::query()->findOrFail(1);
+        $updated->update(['title' => 'Oak Manor']);
+        $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([
+            ['updated', 'OAK MANOR', 'Oak House', 'OAK MANOR'],
+            ['saved', 'OAK MANOR', 'Oak House', 'OAK MANOR'],
+            ['created', 'BIRCH HOUSE', null, null],
+            ['saved', 'BIRCH HOUSE', null, null],
+        ], $seen);
+        $this->assertSame([['OAK MANOR', 'OAK MANOR', false], ['BIRCH HOUSE', 'BIRCH HOUSE', false]], [
+            [$updated->title, $updated->getOriginal('title'), $updated->isDirty()],
+            [$created->title, $created->getOriginal('title'), $created->isDirty()],
+        ]);
+    }
+
+    #[Test]
     public function it_keeps_the_timestamps_a_legacy_write_sets_when_it_soft_deletes(): void
     {
         $this->freezeSecond();

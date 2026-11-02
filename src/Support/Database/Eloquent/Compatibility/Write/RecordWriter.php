@@ -41,6 +41,7 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             (new RetainedRows($this->map, $this->connection))->upsert(self::keyOf($primary), $retained);
+            $this->readBack($legacy, $key, array_keys($values));
 
             return $key;
         });
@@ -68,6 +69,7 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
+            $this->readBack($legacy, $key, array_keys($values));
 
             return 1;
         });
@@ -98,6 +100,7 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $stored[$this->map->primary->table] ?? []);
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
+            $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
 
             return 1;
         });
@@ -293,6 +296,22 @@ final readonly class RecordWriter
         $row = (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->selectRaw(implode(', ', $selects))->first();
 
         return array_combine(array_keys($expressions), array_values($row));
+    }
+
+    /**
+     * @param  list<int|string>  $names
+     */
+    private function readBack(Model $legacy, int|string $key, array $names): void
+    {
+        if ($names === []) {
+            return;
+        }
+
+        $row = (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->first(array_map(fn (int|string $name) => (string) $name, $names));
+
+        if ($row !== []) {
+            $legacy->setRawAttributes(array_replace($legacy->getAttributes(), $row));
+        }
     }
 
     /**

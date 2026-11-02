@@ -35,8 +35,8 @@ final readonly class Transitions
             return;
         }
 
-        $from = $current === null ? null : $machine::tryFrom($current);
-        $to = $target === null ? null : $machine::tryFrom($target);
+        $from = self::state($machine, $current);
+        $to = self::state($machine, $target);
         $transitions = $from instanceof StateMachineable && $to !== null ? $from->transitions()->filter(fn (Transition $transition) => $transition->to === $to)->values()->all() : [];
 
         if ($transitions === []) {
@@ -104,6 +104,20 @@ final readonly class Transitions
         $expression = (new ColumnCatalog($this->connection))->of($successor->getTable())[$column]->default ?? null;
 
         return $expression === null ? null : self::stored($this->connection->scalar('select ('.$expression.')::text'));
+    }
+
+    /**
+     * @param  class-string<StateMachineable&BackedEnum>  $machine
+     */
+    private static function state(string $machine, null|string $stored): null|(StateMachineable&BackedEnum)
+    {
+        foreach ($machine::cases() as $case) {
+            if ($stored !== null && self::stored($case) === $stored) {
+                return $case;
+            }
+        }
+
+        return null;
     }
 
     private static function stored(mixed $value): null|string

@@ -187,6 +187,7 @@ final class LegacyBuilderWriteTest extends TestCase
             [1, 'select places for update'],
             [1, 'update jobs'],
             [1, 'update places'],
+            [1, 'select listings'],
         ], $statements);
     }
 
@@ -214,6 +215,7 @@ final class LegacyBuilderWriteTest extends TestCase
             'select job_sites for update',
             'insert job_sites',
             'insert listings_retained',
+            'select listings',
         ], $statements);
     }
 
@@ -239,6 +241,22 @@ final class LegacyBuilderWriteTest extends TestCase
             [1, '2026-01-01 08:00:00', '2026-06-07 10:00:00', null],
             [3, '2026-01-04 08:00:00', '2026-06-07 10:00:00', null],
         ], array_map(fn (int $id) => [$id, ...array_map(fn (mixed $at) => $at instanceof DateTimeInterface ? $at->format('Y-m-d H:i:s') : $at, $this->served($id, ['created_at', 'updated_at', 'deleted_at']))], [$created->id, 1, 3]));
+    }
+
+    #[Test]
+    public function it_stores_a_naive_timestamp_a_mass_write_names_so_the_view_reads_it_back_whatever_the_session_time_zone(): void
+    {
+        $this->install();
+        DB::statement("set time zone 'Asia/Tokyo'");
+
+        Listing::query()->whereKey(1)->toBase()->update(['updated_at' => '2026-06-07 08:09:10']);
+        Listing::query()->whereKey(3)->update(['created_at' => '2026-06-07 08:09:10', 'updated_at' => '2026-06-07 08:09:10']);
+
+        $this->assertSame('Asia/Tokyo', DB::scalar("select current_setting('TimeZone')"));
+        $this->assertSame([
+            [1, '2026-01-01 10:00:00', '2026-06-07 08:09:10'],
+            [3, '2026-06-07 08:09:10', '2026-06-07 08:09:10'],
+        ], array_map(fn (int $id) => [$id, ...array_map(fn (mixed $at) => $at instanceof DateTimeInterface ? $at->format('Y-m-d H:i:s') : $at, $this->served($id, ['created_at', 'updated_at']))], [1, 3]));
     }
 
     #[Test]
@@ -274,6 +292,29 @@ final class LegacyBuilderWriteTest extends TestCase
 
         $this->assertSame([0, 4], [$read, $created->getKey()]);
         $this->assertSame('Birch House', $this->job(4)->name);
+    }
+
+    #[Test]
+    public function it_routes_a_write_by_the_relation_the_current_schema_holds_after_the_connection_switches_schemas(): void
+    {
+        $this->install();
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.listings (id serial primary key, title text, company_id uuid, created_at timestamp, updated_at timestamp, deleted_at timestamp)');
+
+        try {
+            DB::statement('set search_path to compatibility_tenant');
+            $native = Listing::query()->create(['title' => 'Tenant House', 'company_id' => ListingTables::COMPANY]);
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            $served = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+            $updated = Listing::query()->whereKey(1)->toBase()->update(['title' => 'Oak Manor']);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([1, 4, 1], [$native->getKey(), $served->getKey(), $updated]);
+        $this->assertSame(['Birch House', 'Oak Manor'], [$this->job(4)->name, $this->job(1)->name]);
     }
 
     private function install(): void

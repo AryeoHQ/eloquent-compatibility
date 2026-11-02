@@ -150,7 +150,7 @@ final class LegacyBuilderMassTest extends TestCase
 
         $listing->increment('price');
 
-        $this->assertSame([[1, "select set_config('TimeZone', ?, true)"], [1, 'select jobs for update'], [1, 'select listings'], [1, 'update jobs']], $statements);
+        $this->assertSame([[1, "select set_config('TimeZone', ?, true)"], [1, 'select jobs for update'], [1, 'select listings'], [1, 'update jobs'], [1, 'select listings']], $statements);
     }
 
     #[Test]
