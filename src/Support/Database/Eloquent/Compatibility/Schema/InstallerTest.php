@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use LogicException;
 use Pdo\Pgsql;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -203,6 +204,34 @@ final class InstallerTest extends TestCase
             $this->assertSame(3, DB::scalar('select count(*) from listings'));
         } finally {
             DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+    }
+
+    #[Test]
+    public function it_grants_the_view_no_privilege_the_installer_s_default_privileges_add_and_the_legacy_table_did_not_grant(): void
+    {
+        $role = 'compatibility_denied_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("alter default privileges in schema public grant select, insert on tables to {$role}");
+            DB::statement('alter default privileges in schema public grant select on tables to public');
+
+            Compatibility::install(Listing::class);
+
+            $this->assertSame(
+                [false, false, false, true],
+                [
+                    DB::scalar("select has_table_privilege(?, 'listings', 'SELECT')", [$role]),
+                    DB::scalar("select has_table_privilege(?, 'listings', 'INSERT')", [$role]),
+                    DB::scalar("select exists (select from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC')"),
+                    DB::scalar("select has_table_privilege('listings', 'SELECT WITH GRANT OPTION')"),
+                ],
+            );
+        } finally {
+            DB::statement('alter default privileges in schema public revoke select on tables from public');
             DB::statement("drop owned by {$role}");
             DB::statement("drop role {$role}");
         }
@@ -664,7 +693,7 @@ final class InstallerTest extends TestCase
         $concurrent = null;
 
         DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
-            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_starts_with($query->sql, 'UPDATE "listings" SET')) {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_starts_with($query->sql, 'UPDATE "listings" AS "listings_retained" SET')) {
                 return;
             }
 
@@ -830,6 +859,108 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame([[3], [1, 2]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
+    }
+
+    #[Test]
+    public function it_serves_and_restores_each_mapped_column_in_the_collation_the_legacy_column_declares(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+
+        try {
+            DB::statement('alter table listings alter column title type varchar(255) collate compatibility_case_insensitive, alter column street type varchar(255) collate "C"');
+            DB::statement('alter table places alter column street type varchar(255) collate compatibility_case_insensitive');
+            $collations = fn () => DB::table('pg_attribute')->join('pg_collation', 'pg_collation.oid', '=', 'pg_attribute.attcollation')
+                ->whereRaw("attrelid = 'listings'::regclass")->whereIn('attname', ['title', 'street', 'city'])->orderBy('attname')->pluck('collname', 'attname')->all();
+            $behaviour = fn () => [
+                array_map(intval(...), DB::table('listings')->where('title', 'OAK HOUSE')->pluck('id')->all()),
+                array_map(intval(...), DB::table('listings')->where('street', '1 OAK ST')->pluck('id')->all()),
+            ];
+            $before = [$collations(), $behaviour()];
+
+            Compatibility::install(Listing::class);
+            $installed = [$collations(), $behaviour()];
+            Compatibility::recompile(Listing::class);
+            $recompiled = [$collations(), $behaviour()];
+            Compatibility::uninstall(Listing::class);
+
+            $this->assertSame(
+                array_fill(0, 4, [['city' => 'default', 'street' => 'C', 'title' => 'compatibility_case_insensitive'], [[1], []]]),
+                [$before, $installed, $recompiled, [$collations(), $behaviour()]],
+            );
+        } finally {
+            ListingTables::drop();
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    #[Test]
+    public function it_serves_and_restores_a_raw_wall_clock_read_of_a_column_the_retained_table_keeps(): void
+    {
+        DB::statement('alter table listings add column listed_wall timestamp(0), add column listed_before timestamp(0)');
+        DB::update("update listings set listed_wall = '2026-01-01 10:00:00', listed_before = '2026-01-01 10:00:00' where id = 1");
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
+                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."listed_before"')->readOnly(because: 'The legacy table keeps the first listing time.')));
+            }
+        };
+        $read = fn () => DB::table('listings')->orderBy('id')->pluck('listed_wall', 'id')->map(fn (mixed $value) => $value === null ? null : (string) $value)->all();
+
+        Compatibility::install($model::class);
+        $served = [$this->kind('listings'), $read()];
+        Compatibility::recompile($model::class);
+        $recompiled = $read();
+        Compatibility::uninstall($model::class);
+
+        $this->assertSame(
+            [['v', [1 => '2026-01-01 10:00:00', 2 => null, 3 => null]], [1 => '2026-01-01 10:00:00', 2 => null, 3 => null], ['r', [1 => '2026-01-01 10:00:00', 2 => null, 3 => null]]],
+            [$served, $recompiled, [$this->kind('listings'), $read()]],
+        );
+    }
+
+    #[Test]
+    public function it_refuses_a_raw_hide_condition_whose_string_literal_holds_a_backslash_and_installs_nothing(): void
+    {
+        DB::statement('alter table jobs add column note text');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing)
+                    ->hide(fn (Builder $jobs) => $jobs->whereRaw("note = 'it\\'s?' or name = ?", ['Elm Cottage']), because: 'A noted job is internal.');
+            }
+        };
+        $refusals = [];
+
+        foreach (['off', 'on'] as $setting) {
+            try {
+                DB::statement("set standard_conforming_strings = {$setting}");
+                Compatibility::install($model::class);
+            } catch (InvalidArgumentException $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } finally {
+                DB::statement('set standard_conforming_strings = on');
+            }
+        }
+
+        $this->assertSame(array_fill(0, 2, "The SQL [note = 'it\\'s?' or name = ?] has a backslash in the string literal 'it\\', and PostgreSQL reads that backslash as an escape only while standard_conforming_strings is off; write the string as E'…' so that it reads the same under either setting."), $refusals);
+        $this->assertSame('r', $this->kind('listings'));
     }
 
     #[Test]

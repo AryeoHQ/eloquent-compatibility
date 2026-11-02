@@ -164,16 +164,17 @@ final readonly class Statements
         $defaults = array_filter(array_intersect_key($shape, array_flip($columns)), fn (Column $column) => $column->default !== null);
         $repointed = [];
         $locked = implode(', ', array_values(array_unique([$primary, ...array_map(fn ($related) => SqlFragments::identifier($related->table), $map->related)])));
+        $collations = ViewCompiler::collations($connection, $map->table);
 
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
             "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
-            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns)),
-            "UPDATE {$legacyTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
+            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type.(($collations[$column]['declared'] ?? false) ? ' COLLATE '.$collations[$column]['name'] : ''), $columns)),
+            "UPDATE {$legacyTable} AS {$retainedTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
-                ."\nWHERE {$primary}.{$primaryKey} = {$legacyTable}.{$retainedKey}",
+                ."\nWHERE {$primary}.{$primaryKey} = {$retainedTable}.{$retainedKey}",
         ];
 
         if ($defaults !== []) {
@@ -482,7 +483,10 @@ final readonly class Statements
                 .'    AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('.SqlFragments::literal(json_encode($columns, JSON_THROW_ON_ERROR)).' AS jsonb)))'."\n"
                 ."  GROUP BY granted.grantee, granted.is_grantable\n"
                 .') AS grants',
-            "DO \$compatibility\$\nDECLARE\n  granted text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  granted text;\n  inherited text;\nBEGIN\n"
+                ."  FOR inherited IN SELECT DISTINCT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(relation.relacl) AS granted WHERE relation.oid = {$relation} AND granted.grantee <> relation.relowner LOOP\n"
+                .'    EXECUTE '.SqlFragments::literal('REVOKE ALL ON '.$view.' FROM ')." || inherited;\n"
+                ."  END LOOP;\n"
                 ."  FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP\n"
                 ."    EXECUTE granted;\n"
                 ."  END LOOP;\n"
