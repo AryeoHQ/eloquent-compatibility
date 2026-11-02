@@ -237,6 +237,46 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_between_columns_filter_that_names_the_attribute_as_a_bound_and_runs_a_between_filter_whose_value_spells_it(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->whereBetweenColumns('file_name', ['file_name', 'mime_type'])->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->whereNotBetweenColumns('file_name', ['photos.mime_type', 'file_name'])->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->where('id', 1)->orWhereBetweenColumns('file_name', ['mime_type', 'file_name'])->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereBetweenColumns('file_name', ['file_name', 'mime_type'])->get(),
+            fn () => Photo::query()->toBase()->where(fn (QueryBuilder $query) => $query->whereNotBetweenColumns('file_name', ['mime_type', 'file_name']))->count(),
+            fn () => Video::query()->whereBetweenColumns('original_file_name', ['original_file_name', 'mime_type'])->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->whereBetween('file_name', ['mime_type', 'z'])->count(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereNotBetween('file_name', ['mime_type', 'z'])->count(),
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = $result instanceof Collection ? 'ran' : $result;
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = fn (string $model) => $model.'::$mime_type cannot take where. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Video::class),
+            2,
+            1,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
     public function it_reads_the_legacy_column_and_calls_nothing_before_install(): void
     {
         FileTables::create();
@@ -431,6 +471,26 @@ final class ExternalAttributesTest extends TestCase
         });
 
         $this->assertSame(['image/png', 'image/png', null], $read);
+    }
+
+    #[Test]
+    public function it_resolves_every_record_a_streamed_read_takes_from_the_write_connection_through_the_write_connection(): void
+    {
+        $read = $this->onReplica(function (string $replicated): array {
+            $mimeTypes = fn (iterable $photos): array => array_map(fn (Model $photo) => $photo->getAttribute('mime_type'), [...$photos]);
+
+            return [
+                $mimeTypes($replicated::query()->useWritePdo()->orderBy('id')->cursor()), // @phpstan-ignore staticMethod.dynamicCall
+                $mimeTypes($replicated::onWriteConnection()->orderBy('id')->cursor()),
+                $mimeTypes($replicated::query()->useWritePdo()->lazy(2)), // @phpstan-ignore staticMethod.dynamicCall
+                $mimeTypes($replicated::query()->useWritePdo()->lazyById(2)), // @phpstan-ignore staticMethod.dynamicCall
+                $mimeTypes($replicated::query()->orderBy('id')->cursor()),
+            ];
+        });
+
+        $written = ['image/jpeg', 'image/jpeg', 'image/png'];
+
+        $this->assertSame([$written, $written, $written, $written, [null, null, null]], $read);
     }
 
     #[Test]

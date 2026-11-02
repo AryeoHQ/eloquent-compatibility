@@ -338,4 +338,56 @@ final class ExternalAttributesTest extends TestCase
             [$read, $seen, $video->mime_type, array_intersect_key($video->toArray(), ['mime_type' => true]), $video->isDirty(), $video->wasChanged('mime_type')],
         );
     }
+
+    #[Test]
+    public function it_reads_a_value_left_unread_through_a_move_from_the_write_connection(): void
+    {
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.files as table public.files');
+        DB::statement('create table compatibility_replica.links as table public.links');
+        DB::statement('create view compatibility_replica.photos as select * from public.photos');
+        DB::statement('create view compatibility_replica.videos as select * from public.videos');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
+
+        try {
+            $videos = Video::on('compatibility_replicated')->whereKey([1, 3])->orderBy('id')->get();
+
+            $videos[0]->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+
+            $read = [$videos[1]->mime_type, $videos[0]->mime_type];
+            $replica = Video::on('compatibility_replicated')->whereKey([1, 3])->orderBy('id')->get()->map(fn (Video $video) => $video->mime_type)->all();
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame(['video/quicktime', null], $read);
+        $this->assertSame(['video/mp4', 'video/quicktime'], $replica);
+    }
+
+    #[Test]
+    public function it_reads_a_value_left_unread_by_the_legacy_id_the_write_gives_its_record(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        Photo::updated(function (Photo $photo) use (&$seen): void {
+            $seen[] = $photo->mime_type;
+        });
+        $photo = Photo::query()->findOrFail(2);
+        $updated = Video::query()->findOrFail(3);
+        $incremented = Video::query()->findOrFail(1);
+
+        $photo->update(['id' => 20]);
+        $updated->update(['id' => 30]);
+        $incremented->increment('views', 1, ['id' => 10]);
+
+        $this->assertSame(['image/jpeg', 'video/quicktime', 'video/mp4'], $seen);
+        $this->assertSame(
+            [[20, 'image/jpeg', 'image/jpeg'], [30, 'video/quicktime', 'video/quicktime'], [10, 'video/mp4', 'video/mp4']],
+            array_map(fn (Model $model) => [$model->getKey(), $model->getAttribute('mime_type'), $model->getOriginal('mime_type')], [$photo, $updated, $incremented]),
+        );
+        $this->assertSame([false, false, false], [$photo->wasChanged('mime_type'), $updated->wasChanged('mime_type'), $incremented->wasChanged('mime_type')]);
+    }
 }

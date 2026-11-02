@@ -100,7 +100,9 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, array_keys($values));
-            $this->readBackExternal($legacy, self::keyAfter($legacy, $key, $values), array_keys($external));
+            $after = self::keyAfter($legacy, $key, $values);
+            $this->readBackExternal($legacy, $after, array_keys($external));
+            self::rebind($legacy, $key, $after);
 
             return 1;
         });
@@ -137,7 +139,9 @@ final readonly class RecordWriter
             $this->saveEach($legacy, $existing);
             $this->create($legacy, $key, $models, $missing, $stored, $states);
             $this->readBack($legacy, $key, [...array_keys($amounts), ...array_keys($extra)]);
-            $this->readBackExternal($legacy, self::keyAfter($legacy, $key, $extra), array_keys($external));
+            $after = self::keyAfter($legacy, $key, $extra);
+            $this->readBackExternal($legacy, $after, array_keys($external));
+            self::rebind($legacy, $key, $after);
 
             return 1;
         });
@@ -199,6 +203,7 @@ final readonly class RecordWriter
         (new MassWriter($this->map, $this->connection))->claim($this->allocated($legacy, $target, $stored), $target);
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
         $this->readBackExternal($legacy, $moved, [...array_keys($legacy->getAttributes()), ...array_keys($values)]);
+        ExternalAttributes::refreshed($legacy, $moved);
 
         return 1;
     }
@@ -229,6 +234,13 @@ final readonly class RecordWriter
         $moved = $values[$legacy->getKeyName()] ?? null;
 
         return (is_int($moved) || is_string($moved)) && (string) $moved !== (string) $key ? $moved : $key;
+    }
+
+    private static function rebind(Model $legacy, int|string $key, int|string $after): void
+    {
+        if ($after !== $key) {
+            ExternalAttributes::refreshed($legacy, $after);
+        }
     }
 
     /**

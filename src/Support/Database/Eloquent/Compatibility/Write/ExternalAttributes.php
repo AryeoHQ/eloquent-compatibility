@@ -40,7 +40,7 @@ final class ExternalAttributes
     /**
      * @param  list<WeakReference<Model>>  $models
      */
-    private function __construct(private readonly array $models, private readonly bool $writePdo) {}
+    private function __construct(private readonly array $models, private readonly bool $writePdo, private readonly null|int|string $key = null) {}
 
     /**
      * @param  array<array-key, mixed>  $models
@@ -95,11 +95,11 @@ final class ExternalAttributes
         self::readFrom($legacy, self::$written?->offsetExists($from) ?? false);
     }
 
-    public static function refreshed(Model $legacy): void
+    public static function refreshed(Model $legacy, null|int|string $key = null): void
     {
         if (self::of($legacy::class) !== []) {
             $batches = self::$batches ??= new WeakMap;
-            $batches[$legacy] = new self([WeakReference::create($legacy)], true);
+            $batches[$legacy] = new self([WeakReference::create($legacy)], true, $key);
         }
     }
 
@@ -287,7 +287,7 @@ final class ExternalAttributes
                 continue;
             }
 
-            $key = $model->getRawOriginal($model->getKeyName()) ?? $model->getKey();
+            $key = $this->key ?? $model->getRawOriginal($model->getKeyName()) ?? $model->getKey();
 
             if (is_int($key) || is_string($key)) {
                 $pending[$key][] = $model;

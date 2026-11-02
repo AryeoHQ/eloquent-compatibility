@@ -377,6 +377,10 @@ final class LegacyQueryBuilder extends QueryBuilder
             if (is_array($where['columns'] ?? null)) {
                 $columns = [...$columns, ...array_values($where['columns'])];
             }
+
+            if (($where['type'] ?? null) === 'betweenColumns' && is_array($where['values'] ?? null)) {
+                $columns = [...$columns, ...array_values($where['values'])];
+            }
         }
 
         return $columns;
