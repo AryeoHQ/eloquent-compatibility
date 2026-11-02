@@ -190,7 +190,7 @@ final readonly class RecordWriter
         }
 
         $this->through($target)->split($legacy, $values, $key);
-        $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
+        $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values, $target);
         $moved = $this->rekey($legacy, null, $key, $values);
         $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
@@ -625,7 +625,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $retained
      * @return array<string, mixed>
      */
-    private function guard(Model $legacy, Model $primary, int|string $key, array $values, array $amounts, array $retained): array
+    private function guard(Model $legacy, Model $primary, int|string $key, array $values, array $amounts, array $retained, null|ResolvedMap $target = null): array
     {
         if ($this->map->guards === []) {
             return $retained;
@@ -650,8 +650,9 @@ final readonly class RecordWriter
             }
         }
 
+        $projected = $target === null ? [] : (new MassWriter($target, $this->connection))->served($values, fixed: true) ?? [];
         $after = clone $before;
-        $after->setRawAttributes(array_replace($before->getAttributes(), $values));
+        $after->setRawAttributes(array_replace($before->getAttributes(), $projected, $values));
 
         foreach ($this->map->guards as $guard) {
             if ($guard->refuses($after, $before)) {

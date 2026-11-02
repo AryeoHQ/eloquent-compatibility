@@ -6,6 +6,8 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 
@@ -44,11 +46,18 @@ final readonly class BranchMove
         }
 
         foreach ($to->attributes as $name => $attribute) {
-            if (! $attribute->isExternal() && ($attribute->column() !== null || array_key_exists($name, $values))) {
+            if (! $attribute->isExternal() && (array_key_exists($name, $values) || ($attribute->column() !== null && ! self::readsOnly($attribute)))) {
                 $recreated[$name] = $after[$name] ?? null;
             }
         }
 
         return $recreated + array_intersect_key($values, array_flip($to->legacyOnly(array_keys($values))));
+    }
+
+    private static function readsOnly(Attribute $attribute): bool
+    {
+        $conversion = $attribute->conversions()[0] ?? null;
+
+        return $conversion instanceof ReadAs && $conversion->inverse === null;
     }
 }
