@@ -39,7 +39,7 @@ final readonly class MultipliedBy implements Conversion
             default => null,
         };
 
-        return $operator === null ? null : SqlFragments::bound($operator, $this->write($value), $type);
+        return $operator === null ? null : SqlFragments::bound($operator, $value, 1, $this->factor, $type);
     }
 
     public function order(string $direction): string

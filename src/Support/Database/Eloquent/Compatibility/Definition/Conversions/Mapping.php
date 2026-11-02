@@ -70,6 +70,20 @@ final readonly class Mapping implements Conversion
 
     public function exact(null|string $type, string $served): bool
     {
+        $integers = ['smallint' => 32767, 'integer' => 2147483647, 'bigint' => PHP_INT_MAX];
+        $length = preg_match('/^character varying(\((\d+)\))?$/', $served, $match) === 1 ? (int) ($match[2] ?? PHP_INT_MAX) : ($served === 'text' ? PHP_INT_MAX : null);
+
+        foreach ($this->values as $value) {
+            $characters = is_int($value) ? false : preg_match_all('/./su', $value);
+            $kept = is_int($value)
+                ? array_key_exists($served, $integers) && abs($value) <= $integers[$served]
+                : $length !== null && $characters !== false && $characters <= $length;
+
+            if (! $kept) {
+                return false;
+            }
+        }
+
         return true;
     }
 

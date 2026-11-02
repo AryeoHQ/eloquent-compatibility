@@ -28,9 +28,13 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function insert(array $values): bool
     {
+        if ($values === []) {
+            return parent::insert($values);
+        }
+
         $legacy = $this->served();
 
-        if ($legacy === null || $values === []) {
+        if ($legacy === null) {
             return parent::insert($values);
         }
 
@@ -59,9 +63,13 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function insertOrIgnore(array $values): int
     {
+        if ($values === []) {
+            return parent::insertOrIgnore($values);
+        }
+
         $legacy = $this->served();
 
-        if ($legacy === null || $values === []) {
+        if ($legacy === null) {
             return parent::insertOrIgnore($values);
         }
 
@@ -84,9 +92,13 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function insertOrIgnoreReturning(array $values, array $returning = ['*'], array|string|null $uniqueBy = null): Collection
     {
+        if ($values === []) {
+            return parent::insertOrIgnoreReturning($values, $returning, $uniqueBy);
+        }
+
         $legacy = $this->served();
 
-        if ($legacy === null || $values === []) {
+        if ($legacy === null) {
             return parent::insertOrIgnoreReturning($values, $returning, $uniqueBy);
         }
 

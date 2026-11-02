@@ -178,6 +178,7 @@ final class LegacyBuilderWriteTest extends TestCase
         $listing->save();
 
         $this->assertSame([
+            [0, "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)"],
             [1, 'select jobs for update'],
             [1, 'select listings'],
             [1, 'insert listings_retained'],

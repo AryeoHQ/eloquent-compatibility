@@ -39,7 +39,7 @@ final readonly class DividedBy implements Conversion
             default => null,
         };
 
-        return $operator === null ? null : SqlFragments::bound($operator, $this->write($value), $type);
+        return $operator === null ? null : SqlFragments::bound($operator, $value, $this->divisor, 1, $type);
     }
 
     public function order(string $direction): string

@@ -194,6 +194,16 @@ final class ViewCompilerTest extends TestCase
             $required,
             'listings.listed_at defaults to now(), which is not immutable, so the view would serve a new value on each read of a jobs row without a listings_retained row',
         ];
+        yield 'a legacy-only column whose domain default is not immutable' => [
+            function () use ($prepare): void {
+                $prepare();
+                DB::statement('drop domain if exists compatibility_stamp cascade');
+                DB::statement('create domain compatibility_stamp as timestamp default now()');
+                DB::statement('alter table listings add column listed_at compatibility_stamp');
+            },
+            $required,
+            'listings.listed_at defaults to now(), which is not immutable, so the view would serve a new value on each read of a jobs row without a listings_retained row',
+        ];
     }
 
     /**

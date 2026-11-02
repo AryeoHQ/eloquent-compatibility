@@ -34,6 +34,10 @@ final readonly class Statements
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a plain table, so install() cannot serve it through a view; recompile() replaces an installed view");
         }
 
+        if ($connection->scalar("select relrowsecurity or relforcerowsecurity from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($map->table)]) === true) {
+            throw InvalidCompatibilityMap::because($map->table, "{$map->table} enables row-level security, and the view would read its successors with its owner's privileges and serve rows a policy hides");
+        }
+
         $legacyTable = SqlFragments::identifier($map->table);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $retainedKey = (string) $map->retainedKey;
@@ -42,12 +46,19 @@ final readonly class Statements
         $legacy = $columnCatalog->of($map->table);
         $key = (new $map->model)->getKeyName();
 
+        foreach ($map->attributes as $name => $attribute) {
+            if ($attribute->isExternal() && array_key_exists($name, $legacy)) {
+                throw InvalidCompatibilityMap::because($map->table, "attribute '{$name}' is external(), and this release neither reads nor restores an external attribute, so install() would drop {$map->table}.{$name} and its values");
+            }
+        }
+
         if (array_key_exists($retainedKey, $legacy)) {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$retainedKey}, which install() adds as the key of the retained table");
         }
 
         $repoints = [];
         $validations = [];
+        $moved = [];
 
         foreach (self::foreignKeysTo($connection, $map->table) as $foreignKey) {
             if (array_key_exists($foreignKey->referencedColumn, $map->attributes)) {
@@ -57,6 +68,7 @@ final readonly class Statements
             if (array_key_exists($foreignKey->referencedColumn, $map->identifiers)) {
                 $repoints[] = self::repoint($map, $foreignKey, $foreignKey->qualifiedTable, $map->primary->table, (string) $map->identifiers[$foreignKey->referencedColumn]->column());
                 $validations[] = self::validate($foreignKey->qualifiedTable === $legacyTable ? $retainedTable : $foreignKey->qualifiedTable, $foreignKey->name);
+                $moved[] = [$foreignKey->qualifiedTable === $legacyTable ? $retainedTable : $foreignKey->qualifiedTable, $foreignKey->name];
             }
         }
 
@@ -78,7 +90,7 @@ final readonly class Statements
         $hidden = self::reportHidden($map, $key);
 
         return new self('install', [
-            "LOCK TABLE {$legacyTable} IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE {$legacyTable}, {$primary} IN SHARE ROW EXCLUSIVE MODE",
             self::refuseMissingPrimaries($map, $key),
             ...($hidden === null ? [] : [$hidden]),
             "ALTER TABLE {$legacyTable} ADD COLUMN ".SqlFragments::identifier($retainedKey).' '.$columnCatalog->of($map->primary->table)[$map->primary->key]->type,
@@ -88,7 +100,7 @@ final readonly class Statements
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
-            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped)),
+            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved)),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
             ...self::grants($connection, $map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH))),
@@ -142,6 +154,7 @@ final readonly class Statements
         $repointed = [];
 
         $statements = [
+            "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
             "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
@@ -186,7 +199,7 @@ final readonly class Statements
         }
 
         foreach (self::foreignKeysTo($connection, $map->primary->table) as $foreignKey) {
-            if (array_key_exists($foreignKey->referencedColumn, $identifiers)) {
+            if (array_key_exists($foreignKey->referencedColumn, $identifiers) && ($captured === null || in_array([$foreignKey->qualifiedTable, $foreignKey->name], $captured['moved'], true))) {
                 $on = $foreignKey->qualifiedTable === $retainedTable ? $legacyTable : $foreignKey->qualifiedTable;
                 $statements[] = self::repoint($map, $foreignKey, $on, $map->table, $identifiers[$foreignKey->referencedColumn]);
                 $repointed[] = self::validate($on, $foreignKey->name);
@@ -257,8 +270,9 @@ final readonly class Statements
     /**
      * @param  array<string, Column>  $legacy
      * @param  list<string>  $mapped
+     * @param  list<array{string, string}>  $moved
      */
-    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped): string
+    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved): string
     {
         $table = SqlFragments::identifier($map->table);
         $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
@@ -307,11 +321,12 @@ final readonly class Statements
             'generated' => $generated,
             'constraints' => array_values($constraints),
             'indexes' => array_values($indexes),
+            'moved' => $moved,
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>}
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -338,17 +353,26 @@ final readonly class Statements
             }
         }
 
+        $moved = [];
+
+        foreach (is_array($captured['moved'] ?? null) ? $captured['moved'] : [] as $foreignKey) {
+            if (is_array($foreignKey) && is_string($foreignKey[0] ?? null) && is_string($foreignKey[1] ?? null)) {
+                $moved[] = [$foreignKey[0], $foreignKey[1]];
+            }
+        }
+
         return [
             'comment' => is_string($captured['comment'] ?? null) ? $captured['comment'] : null,
             'notNull' => array_values(array_filter(is_array($captured['notNull'] ?? null) ? $captured['notNull'] : [], is_string(...))),
             'generated' => $generated,
             'constraints' => $constraints,
             'indexes' => array_values(array_filter(is_array($captured['indexes'] ?? null) ? $captured['indexes'] : [], is_string(...))),
+            'moved' => $moved,
         ];
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */
