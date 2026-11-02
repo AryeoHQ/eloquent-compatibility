@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Closure;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -12,6 +15,7 @@ use Illuminate\Support\Facades\DB;
 use LogicException;
 use Pdo\Pgsql;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
@@ -26,6 +30,7 @@ use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\LegacyFile;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
@@ -309,6 +314,32 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_an_inbound_foreign_key_that_was_not_valid_before_install_not_valid_through_recompile_and_uninstall(): void
+    {
+        DB::statement('create table listing_notes (listing_id integer)');
+        $foreignKey = fn () => (array) DB::selectOne("select pg_get_constraintdef(oid) as definition, convalidated from pg_constraint where conname = 'listing_notes_listing_id_foreign'");
+
+        try {
+            DB::insert('insert into listing_notes (listing_id) values (1), (99)');
+            DB::statement('alter table listing_notes add constraint listing_notes_listing_id_foreign foreign key (listing_id) references listings (id) not valid');
+            Compatibility::install(Listing::class);
+            $installed = $foreignKey();
+            Compatibility::recompile(Listing::class);
+            $recompiled = $foreignKey();
+            Compatibility::uninstall(Listing::class);
+            $uninstalled = $foreignKey();
+        } finally {
+            DB::statement('drop table listing_notes');
+        }
+
+        $this->assertSame([
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES jobs(legacy_id) NOT VALID', 'convalidated' => false],
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES jobs(legacy_id) NOT VALID', 'convalidated' => false],
+            ['definition' => 'FOREIGN KEY (listing_id) REFERENCES listings(id) NOT VALID', 'convalidated' => false],
+        ], [$installed, $recompiled, $uninstalled]);
+    }
+
+    #[Test]
     public function it_validates_on_recompile_each_foreign_key_install_left_not_valid(): void
     {
         Compatibility::install(Listing::class);
@@ -497,6 +528,67 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_install_while_the_read_returns_a_boolean_for_a_legacy_value_that_is_not_that_boolean(): void
+    {
+        $this->prepareFiles();
+        DB::table('photos')->where('id', 3)->update(['mime_type' => 'false']);
+        $truthful = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->when(fn (Builder $files) => $files->where('mime_type', 'like', 'image/%'))
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => $file->getAttribute('legacy_id') === 1 ? 'image/jpeg' : true])->all(),
+                            write: fn (File $file, mixed $value) => null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+
+        try {
+            Compatibility::install($truthful::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_generated_legacy_column(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photos drop column mime_type');
+        DB::statement("alter table photos add column mime_type varchar(255) generated always as ('image/' || 'jpeg') stored");
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 's'], [$this->kind('photos'), DB::scalar("select attgenerated::text from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'")]);
+    }
+
+    #[Test]
     public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
     {
         $this->prepareFiles();
@@ -601,6 +693,298 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('v', $this->kind('listings'));
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function unfinishedPreparations(): array
+    {
+        return [
+            'a nullable identifier' => ['alter table jobs alter column legacy_id drop not null', 'jobs.legacy_id is not yet NOT NULL with a unique index of its own'],
+            'an identifier without its unique index' => ['alter table jobs drop constraint jobs_legacy_uuid_unique', 'jobs.legacy_uuid is not yet NOT NULL with a unique index of its own'],
+            'no at-most-one index' => ['drop index places_listings_at_most_one', 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
+            'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
+        ];
+    }
+
+    #[DataProvider('unfinishedPreparations')]
+    #[Test]
+    public function it_refuses_to_install_over_a_preparation_that_has_not_finished_even_with_no_inbound_foreign_key(string $unfinished, string $what): void
+    {
+        DB::statement('drop table listing_photos, listing_shares');
+        DB::statement($unfinished);
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_reads_the_catalog_under_locks_that_keep_the_legacy_shape_until_install_commits(): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'format_type(table_column.atttypid')) {
+                return;
+            }
+
+            $concurrent = 'added';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function (): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement('alter table listings add column notes text');
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $this->assertSame(['55P03', false, false], [$concurrent, ...array_map(fn (string $relation) => DB::scalar('select count(*) > 0 from pg_attribute where attrelid = cast(? as regclass) and attname = ?', [$relation, 'notes']), ['listings', 'listings_retained'])]);
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function concurrentChanges(): array
+    {
+        return [
+            'a column' => ['alter table listings add column notes text', "select count(*) from pg_attribute where attname = 'notes' and attrelid in (to_regclass('listings'), to_regclass('listings_retained'))"],
+            'an index' => ['create index listings_city_index on listings (city)', "select count(*) from pg_class where relname = 'listings_city_index'"],
+            'a foreign key to the legacy table' => ['create table listing_notes (listing_id bigint references listings (id))', "select count(*) from pg_class where relname = 'listing_notes'"],
+        ];
+    }
+
+    #[DataProvider('concurrentChanges')]
+    #[Test]
+    public function it_holds_back_a_concurrent_change_to_a_table_it_read_until_install_commits(string $change, string $exists): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+        $locked = false;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent, &$locked, $change): void {
+            if ($query->connectionName === 'compatibility_concurrent') {
+                return;
+            }
+
+            $locked = $locked || str_ends_with($query->sql, ' IN SHARE UPDATE EXCLUSIVE MODE');
+
+            if ($concurrent !== null || ! $locked || ! str_contains($query->sql, 'obj_description(')) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function () use ($change): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement($change);
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+            $outcome = [$concurrent, (int) DB::scalar($exists), DB::scalar("select relkind::text from pg_class where oid = to_regclass('listings')")];
+        } finally {
+            DB::purge('compatibility_concurrent');
+            DB::statement('drop table if exists listing_notes');
+        }
+
+        $this->assertSame(['55P03', 0, 'v'], $outcome);
+    }
+
+    #[Test]
+    public function it_holds_back_a_write_to_a_related_successor_until_uninstall_commits_the_values_it_copied(): void
+    {
+        Compatibility::install(Listing::class);
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_starts_with($query->sql, 'UPDATE "listings" SET')) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function (): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->update("update places set street = '9 Moved St' where job_id = (select id from jobs where legacy_id = 1)");
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::uninstall(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $this->assertSame(
+            ['55P03', '1 Oak St', '1 Oak St'],
+            [$concurrent, DB::scalar('select street from listings where id = 1'), DB::scalar('select street from places where job_id = (select id from jobs where legacy_id = 1)')],
+        );
+    }
+
+    /**
+     * @return array<string, array{null|string, string, bool, bool}>
+     */
+    public static function concurrentPrivilegeChanges(): array
+    {
+        return [
+            'a grant' => [null, 'grant select on listings to %s', true, true],
+            'a revoke' => ['grant select on listings to %s', 'revoke select on listings from %s', false, false],
+            'a column grant' => [null, 'grant select (title) on listings to %s', false, true],
+        ];
+    }
+
+    #[DataProvider('concurrentPrivilegeChanges')]
+    #[Test]
+    public function it_serves_through_the_view_a_privilege_change_that_commits_after_install_compiles(null|string $before, string $change, bool $table, bool $column): void
+    {
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $role = 'compatibility_grantee_'.getmypid();
+        $concurrent = null;
+        DB::statement("create role {$role}");
+
+        DB::listen(function (QueryExecuted $query) use (&$concurrent, $change, $role): void {
+            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'IN SHARE ROW EXCLUSIVE MODE')) {
+                return;
+            }
+
+            $concurrent = 'committed';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function () use ($change, $role): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement(sprintf($change, $role));
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            if ($before !== null) {
+                DB::statement(sprintf($before, $role));
+            }
+
+            Compatibility::install(Listing::class);
+            $outcome = [$concurrent, DB::scalar("select has_table_privilege(?, 'listings', 'SELECT')", [$role]), DB::scalar("select has_column_privilege(?, 'listings', 'title', 'SELECT')", [$role])];
+        } finally {
+            DB::purge('compatibility_concurrent');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(['committed', $table, $column], $outcome);
+    }
+
+    #[Test]
+    public function it_hides_the_rows_eloquent_matches_with_a_float_binding_as_pdo_sends_it(): void
+    {
+        DB::statement('alter table jobs add column score double precision');
+        DB::update('update jobs set score = 0.01 where legacy_id = 1');
+        DB::update('update jobs set score = 0.009999999999999998 where legacy_id = 3');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.')))
+                    ->hide(fn (Builder $jobs) => $jobs->where('score', 0.009999999999999998), because: 'A scored job is internal.');
+            }
+        };
+        $hidden = array_map(intval(...), Job::query()->withTrashed()->where('score', 0.009999999999999998)->pluck('legacy_id')->all());
+
+        Compatibility::install($model::class);
+
+        $this->assertSame([[1], [2, 3]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
+    }
+
+    /**
+     * @return array<string, array{string, string, Closure(Builder<Job>): mixed, bool}>
+     */
+    public static function hideBindings(): array
+    {
+        return [
+            'a backslash in a string, with standard_conforming_strings off' => ['alter table jobs add column note text', "update jobs set note = 'C:\\new' where legacy_id = 3", static fn (Builder $jobs) => $jobs->where('note', 'C:\\new'), true],
+            'a backslash before a quote, with standard_conforming_strings off' => ['alter table jobs add column note text', "update jobs set note = 'it\\''s' where legacy_id = 3", static fn (Builder $jobs) => $jobs->where('note', "it\\'s"), true],
+            'an integer against a boolean column' => ['alter table jobs add column archived boolean not null default false', 'update jobs set archived = true where legacy_id = 3', static fn (Builder $jobs) => $jobs->where('archived', 1), false],
+            'a boolean against an integer column' => ['alter table jobs add column rank integer not null default 0', 'update jobs set rank = 1 where legacy_id = 3', static fn (Builder $jobs) => $jobs->where('rank', true), false],
+        ];
+    }
+
+    /**
+     * @param  Closure(Builder<Job>): mixed  $hide
+     */
+    #[DataProvider('hideBindings')]
+    #[Test]
+    public function it_hides_the_rows_eloquent_matches_with_each_binding_as_postgresql_types_it(string $column, string $row, Closure $hide, bool $escapesOff): void
+    {
+        DB::statement($column);
+        DB::update($row);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public static null|Closure $hide = null;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.')))
+                    ->hide(self::$hide ?? fn (Builder $jobs) => $jobs, because: 'A marked job is internal.');
+            }
+        };
+        $model::$hide = $hide;
+        $hidden = array_map(intval(...), Job::query()->withTrashed()->where($hide)->pluck('legacy_id')->all());
+
+        try {
+            DB::statement('set standard_conforming_strings = '.($escapesOff ? 'off' : 'on'));
+            Compatibility::install($model::class);
+        } finally {
+            DB::statement('set standard_conforming_strings = on');
+        }
+
+        $this->assertSame([[3], [1, 2]], [$hidden, array_map(intval(...), DB::table('listings')->orderBy('id')->pluck('id')->all())]);
     }
 
     #[Test]
@@ -723,6 +1107,42 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('r', $this->kind('floorplans'));
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_an_installed_map_onto_the_morph_alias_another_installed_map_claims(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        Compatibility::install(LegacyFile::class);
+        $view = DB::scalar("select pg_get_viewdef('legacy_files'::regclass)");
+        $impostor = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'legacy_files';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $legacyFile): Compatibility
+            {
+                return LegacyFile::compatibility($legacyFile);
+            }
+        };
+
+        try {
+            Compatibility::recompile($impostor::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(InvalidCompatibilityMap::because('legacy_files', "the installed map retained in photos_retained already serves the files rows whose legacy_type is 'photo', and two installed maps cannot share a morph alias")->getMessage(), $refusal);
+        $this->assertSame($view, DB::scalar("select pg_get_viewdef('legacy_files'::regclass)"));
+        $this->assertSame([], DB::table('legacy_files')->whereIn('file_name', DB::table('photos')->select('file_name'))->pluck('file_name')->all());
     }
 
     #[Test]
@@ -1177,6 +1597,164 @@ final class InstallerTest extends TestCase
             'listings_retained_pkey' => 'PRIMARY KEY (job_id)',
         ], array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass and contype <> 'n' order by conname"), 'definition', 'conname'));
         $this->assertSame(0, DB::scalar('select count(*) from listings_retained left join jobs on jobs.id = listings_retained.job_id where jobs.id is null'));
+    }
+
+    #[Test]
+    public function it_refuses_to_uninstall_while_a_retained_row_belongs_to_a_successor_row_another_morph_alias_now_claims(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        $pine = Photo::query()->create(['file_name' => 'pine.jpg', 'mime_type' => 'image/jpeg', 'caption' => 'Pine']);
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', $pine->id)->update(['legacy_type' => 'legacy_file']);
+
+        try {
+            Compatibility::uninstall(Photo::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'photos' cannot uninstall: 1 photos_retained rows belong to files rows whose legacy_type is no longer 'photo'; the first are legacy_id {$pine->id}. Restore their legacy_type, or delete their photos_retained rows, before uninstall().", $refusal);
+        $this->assertSame('v', $this->kind('photos'));
+
+        DB::table('files')->where('legacy_type', 'legacy_file')->where('legacy_id', $pine->id)->update(['legacy_type' => 'photo']);
+        Compatibility::uninstall(Photo::class);
+
+        $this->assertSame([[1, 'Front'], [2, null], [3, 'Elm'], [$pine->id, 'Pine']], array_map(fn (object $row) => [(int) $row->id, $row->caption], DB::select('select id, caption from photos order by id')));
+    }
+
+    #[Test]
+    public function it_installs_and_uninstalls_two_maps_whose_legacy_tables_reference_each_other_in_either_order(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table floorplans add column photo_id integer references photos (id)');
+        DB::statement('alter table photos add column floorplan_id integer references floorplans (id)');
+        DB::update('update floorplans set photo_id = 1 where id = 1');
+        DB::update('update photos set floorplan_id = 1 where id = 2');
+        $foreignKeys = fn () => array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where contype = 'f' and conrelid in (to_regclass('photos'), to_regclass('photos_retained'), to_regclass('floorplans'), to_regclass('floorplans_retained')) order by conname"), 'definition', 'conname');
+        $before = [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id'), $foreignKeys()];
+
+        foreach ([[Photo::class, FloorPlan::class], [FloorPlan::class, Photo::class]] as $order) {
+            foreach ($order as $model) {
+                Compatibility::install($model);
+            }
+
+            $served = [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id')];
+            $codes = [];
+
+            foreach ([
+                fn () => FloorPlan::query()->findOrFail(2)->update(['photo_id' => 999]),
+                fn () => Photo::query()->findOrFail(3)->update(['floorplan_id' => 999]),
+            ] as $write) {
+                try {
+                    $write();
+                    $codes[] = 'stored';
+                } catch (QueryException $exception) {
+                    $codes[] = $exception->getCode();
+                }
+            }
+
+            foreach (array_reverse($order) as $model) {
+                Compatibility::uninstall($model);
+            }
+
+            $this->assertEquals([array_map(fn (object $row) => (object) array_diff_key((array) $row, ['mime_type' => true]), $before[0]), $before[1]], $served);
+            $this->assertSame(['23503', '23503'], $codes);
+            $this->assertEquals($before, [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id'), $foreignKeys()]);
+        }
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_an_installed_map_onto_a_morph_alias_install_did_not_record(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        $view = DB::scalar("select pg_get_viewdef('photos'::regclass)");
+        $renamed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'image';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return Photo::compatibility($photo);
+            }
+        };
+
+        try {
+            Compatibility::recompile($renamed::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(InvalidCompatibilityMap::because('photos', "install() recorded that it serves the files rows whose legacy_type is 'photo', and the map now serves the files rows whose legacy_type is 'image'; recompile() cannot move the generated columns of repointed foreign keys or the record in photos_retained, so uninstall() and install() the map to change it")->getMessage(), $refusal);
+        $this->assertSame($view, DB::scalar("select pg_get_viewdef('photos'::regclass)"));
+        $this->assertSame([1, 2, 3], Photo::query()->orderBy('id')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_compiles_an_install_from_a_watermark_only_once_it_holds_the_lock_that_keeps_the_legacy_shape(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $locked = false;
+        $concurrent = null;
+
+        DB::listen(function (QueryExecuted $query) use (&$locked, &$concurrent): void {
+            if ($query->connectionName === 'compatibility_concurrent') {
+                return;
+            }
+
+            $locked = $locked || str_ends_with($query->sql, ' IN SHARE UPDATE EXCLUSIVE MODE');
+
+            if (! $locked || $concurrent !== null || ! str_contains($query->sql, 'format_type(table_column.atttypid')) {
+                return;
+            }
+
+            $concurrent = 'added';
+
+            try {
+                DB::connection('compatibility_concurrent')->transaction(function (): void {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+                    DB::connection('compatibility_concurrent')->statement('alter table listings add column notes text');
+                });
+            } catch (QueryException $exception) {
+                $concurrent = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $this->assertSame(['55P03', 'v', false], [$concurrent, $this->kind('listings'), DB::scalar("select count(*) > 0 from pg_attribute where attrelid = 'listings_retained'::regclass and attname = 'notes'")]);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_from_a_watermark_over_a_preparation_that_has_not_finished_and_drops_the_retained_key_it_filled(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::statement('drop table listing_photos, listing_shares');
+        DB::statement('alter table jobs alter column legacy_id drop not null');
+
+        try {
+            Compatibility::install(Listing::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' cannot install: jobs.legacy_id is not yet NOT NULL with a unique index of its own, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $refusal);
+        $this->assertSame(['r', false], [$this->kind('listings'), DB::scalar("select count(*) > 0 from pg_attribute where attrelid = 'listings'::regclass and attname = 'job_id' and not attisdropped")]);
     }
 
     private function prepareMedia(): void

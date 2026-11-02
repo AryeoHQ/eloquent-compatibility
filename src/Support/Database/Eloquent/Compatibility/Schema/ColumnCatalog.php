@@ -14,10 +14,13 @@ final class ColumnCatalog
     /** @var array<string, bool> */
     private array $equatable = [];
 
+    /** @var array<string, string> */
+    private array $baseTypes = [];
+
     /**
      * @param  array<string, list<string>>  $hidden
      */
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, private readonly array $hidden = []) {}
+    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, private readonly bool $throughSearchPath = false, private readonly array $hidden = []) {}
 
     /**
      * @return array<string, Column>
@@ -79,7 +82,7 @@ final class ColumnCatalog
                         (array_agg(format_type(declared.typbasetype, declared.typtypmod) order by domain_chain.depth desc))[1] as base_type
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = \'d\'
              ) column_domain
-             where table_column.attrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and table_column.attnum > 0 and not table_column.attisdropped
+             where table_column.attrelid = '.($this->throughSearchPath ? 'to_regclass(?)' : "to_regclass(quote_ident(current_schema()) || '.' || ?)").' and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
             [SqlFragments::identifier($table)],
         );
@@ -122,6 +125,32 @@ final class ColumnCatalog
              )",
             [SqlFragments::identifier($table), $column],
         ) === true;
+    }
+
+    public function baseType(null|string $type): null|string
+    {
+        if ($type === null) {
+            return null;
+        }
+
+        return $this->baseTypes[$type] ??= (function () use ($type): string {
+            $base = $this->connection->scalar(
+                "with recursive domain_chain(type, depth) as (
+                     select to_regtype(?)::oid, 0
+                     union all
+                     select declared.typbasetype, domain_chain.depth + 1
+                     from domain_chain join pg_type declared on declared.oid = domain_chain.type
+                     where declared.typtype = 'd'
+                 )
+                 select format_type(declared.typbasetype, declared.typtypmod)
+                 from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = 'd'
+                 order by domain_chain.depth desc
+                 limit 1",
+                [$type],
+            );
+
+            return is_string($base) ? $base : $type;
+        })();
     }
 
     public function equatable(string $type): bool

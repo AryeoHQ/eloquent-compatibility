@@ -17,9 +17,12 @@ final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
-    public function create(ResolvedMap $map): string
+    /**
+     * @param  list<string>  $omitted
+     */
+    public function create(ResolvedMap $map, array $omitted = []): string
     {
-        $legacy = $this->columnCatalog->of($map->table);
+        $legacy = array_diff_key($this->columnCatalog->of($map->table), array_flip($omitted));
 
         return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
     }
@@ -52,7 +55,7 @@ final readonly class ViewCompiler
                 $table = $map->owners[$name]->table;
                 $column = $attribute->column();
                 $stored = $column === null ? null : $this->baseType($table, $column);
-                $reads[$name] = [$attribute->read($table, $stored), $attribute->type($stored), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
+                $reads[$name] = [$attribute->read($table, $stored, $this->columnCatalog->baseType(...)), $this->columnCatalog->baseType($attribute->type($stored)), ($attribute->conversions()[0] ?? null) instanceof ReadAs];
             }
         }
 
@@ -219,7 +222,7 @@ final readonly class ViewCompiler
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, self::laterals($map))),
         );
 
-        return is_string($type) ? $type : null;
+        return is_string($type) ? $this->columnCatalog->baseType($type) : null;
     }
 
     /**
@@ -301,7 +304,7 @@ final readonly class ViewCompiler
                     throw InvalidCompatibilityMap::because($map->table, "attribute '{$name}' reads {$table}.{$column} in the time zone {$conversion->zone}, and AT TIME ZONE reads a wall clock only from a timestamp with time zone, not from ".($type ?? 'the type the conversions before inTimeZone() give'));
                 }
 
-                $type = $conversion instanceof AsType ? $conversion->type : null;
+                $type = $conversion instanceof AsType ? $this->columnCatalog->baseType($conversion->type) : null;
             }
         }
     }
@@ -344,7 +347,7 @@ final readonly class ViewCompiler
                 throw InvalidCompatibilityMap::because($map->table, "a hide() scope compiles to no plain condition on {$map->primary->table}; it takes where clauses only, because \"{$hide->because}\" becomes the view's filter");
             }
 
-            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), SqlFragments::formatDates(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
+            $conditions[] = SqlFragments::bind(Str::after($where, 'where '), SqlFragments::asSent(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
         }
 
         return $conditions;

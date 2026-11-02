@@ -21,6 +21,7 @@ use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\TestCase;
@@ -82,6 +83,52 @@ final class ExternalAttributesTest extends TestCase
         $this->assertEquals(new FileMetadata('image/avif'), FakeMediaLibrary::bound()->stored($asset));
         $this->assertSame(['image/avif', false], [$photo->mime_type, $photo->isDirty()]);
         $this->assertSame(['image/jpeg', 'image/avif', 'image/png'], Photo::query()->orderBy('id')->get()->map(fn (Photo $photo) => $photo->mime_type)->all());
+    }
+
+    #[Test]
+    public function it_serves_the_value_the_external_system_keeps_after_a_write_it_normalizes(): void
+    {
+        $normalizing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType === null ? null : strtolower($mimeType)))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        $seen = [];
+        $normalizing::saved(function (Model $photo) use (&$seen): void {
+            $seen[] = $photo->getAttribute('mime_type');
+        });
+
+        $created = $normalizing::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'IMAGE/WEBP', 'caption' => 'Birch']);
+        $updated = $normalizing::query()->findOrFail(2);
+        $updated->update(['mime_type' => 'IMAGE/AVIF']);
+
+        $this->assertSame(['image/webp', 'image/avif'], $seen);
+        $this->assertSame(['image/webp', 'image/avif'], [$created->getAttribute('mime_type'), $updated->getAttribute('mime_type')]);
+        $this->assertSame(['image/webp', 'image/avif'], [$created->getOriginal('mime_type'), $updated->getOriginal('mime_type')]);
     }
 
     #[Test]
@@ -245,6 +292,37 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_serves_the_value_a_write_stores_to_a_record_whose_legacy_id_the_same_write_changes(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        Photo::updated(function (Photo $photo) use (&$seen): void {
+            $seen[] = $photo->mime_type;
+        });
+        $updated = Video::query()->findOrFail(1);
+        $incremented = Video::query()->findOrFail(3);
+        $photo = Photo::query()->findOrFail(2);
+
+        $updated->update(['id' => 10, 'mime_type' => 'video/webm']);
+        $incremented->increment('views', 1, ['id' => 30, 'mime_type' => 'video/x-msvideo']);
+        $photo->update(['id' => 20, 'mime_type' => 'image/avif']);
+
+        $this->assertSame(['video/webm', 'video/x-msvideo', 'image/avif'], $seen);
+        $this->assertSame(
+            [[10, 'video/webm'], [30, 'video/x-msvideo'], [20, 'image/avif']],
+            array_map(fn (Model $model) => [$model->getKey(), $model->getAttribute('mime_type')], [$updated, $incremented, $photo]),
+        );
+        $this->assertSame(['video/webm', 'image/avif'], [$updated->getOriginal('mime_type'), $photo->getOriginal('mime_type')]);
+        $this->assertSame(
+            [[2, null], [10, 'video/webm'], [30, 'video/x-msvideo']],
+            Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->mime_type])->all(),
+        );
+        $this->assertSame('image/avif', Photo::query()->findOrFail(20)->mime_type);
+    }
+
+    #[Test]
     public function it_serves_the_value_the_new_branch_holds_to_a_record_that_read_the_attribute_before_its_move(): void
     {
         $seen = [];
@@ -260,5 +338,186 @@ final class ExternalAttributesTest extends TestCase
             ['video/mp4', [null], null, ['mime_type' => null], false, true],
             [$read, $seen, $video->mime_type, array_intersect_key($video->toArray(), ['mime_type' => true]), $video->isDirty(), $video->wasChanged('mime_type')],
         );
+    }
+
+    #[Test]
+    public function it_reads_a_value_left_unread_through_a_move_from_the_write_connection(): void
+    {
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.files as table public.files');
+        DB::statement('create table compatibility_replica.links as table public.links');
+        DB::statement('create view compatibility_replica.photos as select * from public.photos');
+        DB::statement('create view compatibility_replica.videos as select * from public.videos');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
+
+        try {
+            $videos = Video::on('compatibility_replicated')->whereKey([1, 3])->orderBy('id')->get();
+
+            $videos[0]->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+
+            $read = [$videos[1]->mime_type, $videos[0]->mime_type];
+            $replica = Video::on('compatibility_replicated')->whereKey([1, 3])->orderBy('id')->get()->map(fn (Video $video) => $video->mime_type)->all();
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame(['video/quicktime', null], $read);
+        $this->assertSame(['video/mp4', 'video/quicktime'], $replica);
+    }
+
+    #[Test]
+    public function it_reads_a_value_left_unread_by_the_legacy_id_the_write_gives_its_record(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        Photo::updated(function (Photo $photo) use (&$seen): void {
+            $seen[] = $photo->mime_type;
+        });
+        $photo = Photo::query()->findOrFail(2);
+        $updated = Video::query()->findOrFail(3);
+        $incremented = Video::query()->findOrFail(1);
+
+        $photo->update(['id' => 20]);
+        $updated->update(['id' => 30]);
+        $incremented->increment('views', 1, ['id' => 10]);
+
+        $this->assertSame(['image/jpeg', 'video/quicktime', 'video/mp4'], $seen);
+        $this->assertSame(
+            [[20, 'image/jpeg', 'image/jpeg'], [30, 'video/quicktime', 'video/quicktime'], [10, 'video/mp4', 'video/mp4']],
+            array_map(fn (Model $model) => [$model->getKey(), $model->getAttribute('mime_type'), $model->getOriginal('mime_type')], [$photo, $updated, $incremented]),
+        );
+        $this->assertSame([false, false, false], [$photo->wasChanged('mime_type'), $updated->wasChanged('mime_type'), $incremented->wasChanged('mime_type')]);
+    }
+
+    #[Test]
+    public function it_reads_a_value_the_successor_generates_for_a_new_record_from_the_write_connection(): void
+    {
+        $generating = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->mime_type = (string) $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        File::creating(function (File $file): void {
+            $file->mime_type ??= 'image/'.pathinfo($file->filename, PATHINFO_EXTENSION);
+        });
+        $seen = [];
+        $generating::saved(function (Model $photo) use (&$seen): void {
+            if ($photo->getAttribute('file_name') === 'listened.png') {
+                $seen[] = $photo->getAttribute('mime_type');
+            }
+        });
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.files as table public.files');
+        DB::statement('create view compatibility_replica.photos as select * from public.photos');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
+
+        try {
+            $listened = $generating::on('compatibility_replicated')->create(['file_name' => 'listened.png', 'caption' => 'Listened']);
+            $read = $generating::on('compatibility_replicated')->create(['file_name' => 'read.webp', 'caption' => 'Read']);
+            $named = $generating::on('compatibility_replicated')->create(['file_name' => 'named.jpg', 'mime_type' => 'image/avif', 'caption' => 'Named']);
+
+            $values = [$listened->getAttribute('mime_type'), $read->getAttribute('mime_type'), $named->getAttribute('mime_type')];
+            $replica = $generating::on('compatibility_replicated')->whereKey([$listened->getKey(), $read->getKey()])->orderBy('id')->get()->map(fn (Model $photo) => $photo->getAttribute('mime_type'))->all();
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame(['image/png'], $seen);
+        $this->assertSame(['image/png', 'image/webp', 'image/avif'], $values);
+        $this->assertSame([null, null], $replica);
+    }
+
+    #[Test]
+    public function it_serves_the_value_a_move_stores_to_a_record_whose_new_legacy_id_the_database_normalizes(): void
+    {
+        $seen = [];
+        Video::updated(function (Video $video) use (&$seen): void {
+            $seen[] = $video->mime_type;
+        });
+        $video = Video::query()->findOrFail(2);
+
+        $video->update(['id' => '010', 'youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'mime_type' => 'video/webm']);
+
+        $this->assertSame(['video/webm'], $seen);
+        $this->assertSame([10, 'video/webm', 'video/webm'], [$video->getKey(), $video->mime_type, $video->getOriginal('mime_type')]);
+        $this->assertSame('video/webm', Video::query()->findOrFail(10)->mime_type);
+    }
+
+    #[Test]
+    public function it_reads_a_value_left_unread_through_a_move_by_the_legacy_id_the_database_normalizes(): void
+    {
+        $generating = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->mime_type = (string) $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+        File::creating(function (File $file): void {
+            $file->mime_type ??= 'video/'.pathinfo($file->filename, PATHINFO_EXTENSION);
+        });
+        $video = $generating::query()->findOrFail(2);
+
+        $video->update(['id' => '020', 'youtube_embed_url' => null, 'original_file_name' => 'oak.mp4']);
+
+        $this->assertSame([20, 'video/mp4'], [$video->getKey(), $video->getAttribute('mime_type')]);
+        $this->assertSame('video/mp4', $generating::query()->findOrFail(20)->getAttribute('mime_type'));
     }
 }

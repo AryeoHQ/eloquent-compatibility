@@ -121,7 +121,14 @@ final class RelatedTest extends TestCase
         yield 'a unique index over another table' => [fn (Job $job) => $job->hasOne(Place::class)->where('jobs.name', 'Oak'), fn (Successor $place) => $place->atMostOne('One.'), 'atMostOne() on the related() relation from Job to Place compiles its conditions into a unique index on places, and jobs.name is not a column of places'];
         yield 'a parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('city', $job->name), $none, "a related() relation closure on Job reads its attribute name, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
         yield 'a cast parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('street', $job->getAttribute('lifecycle_status')), $none, "a related() relation closure on Job reads its attribute lifecycle_status, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
+        yield 'a raw original parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('city', $job->getRawOriginal('company_id')), $none, "a related() relation closure on Job reads its attribute company_id, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
+        yield 'an original parent attribute' => [fn (Job $job) => $job->hasOne(Place::class)->where('city', $job->getOriginal('name')), $none, "a related() relation closure on Job reads its original attributes, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
         yield 'the parent key' => [fn (Job $job) => $job->hasOne(Place::class)->where('parent_id', $job->getKey()), $none, "a related() relation closure on Job reads its attribute id, and the view compiles one relation for every Job, so a condition cannot follow each row's value"];
+        yield 'a default model' => [fn (Job $job) => $job->hasOne(Place::class)->withDefault(['street' => 'Unknown']), $none, 'the related() relation from Job to Place returns a default model when no row exists, and the view serves NULL for each attribute of a missing row'];
+        yield 'a default model built by a closure' => [fn (Job $job) => $job->hasOne(Place::class)->withDefault(fn (Place $place) => $place->forceFill(['street' => 'Unknown'])), $none, 'the related() relation from Job to Place returns a default model when no row exists, and the view serves NULL for each attribute of a missing row'];
+        yield 'a default belongs to' => [fn (Job $job) => $job->belongsTo(Place::class, 'merged_into_job_id')->withDefault(), $none, 'the related() relation from Job to Place returns a default model when no row exists, and the view serves NULL for each attribute of a missing row'];
+        yield 'an ungrouped or' => [fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle')->orWhere('street', 'Main'), $none, 'the related() relation from Job to Place joins a condition with or outside a group, and Eloquent then reads rows of every Job; group the conditions in a nested where()'];
+        yield 'an or as the first condition' => [fn (Job $job) => $job->hasOne(Place::class)->orWhereNull('parent_id'), $none, 'the related() relation from Job to Place joins a condition with or outside a group, and Eloquent then reads rows of every Job; group the conditions in a nested where()'];
         yield 'a unique index over a column comparison' => [fn (Job $job) => $job->hasOne(Place::class)->whereColumn('street', 'city'), fn (Successor $place) => $place->atMostOne('One.'), 'atMostOne() on the related() relation from Job to Place compiles its conditions into a unique index, and a Column condition is not a plain column predicate'];
     }
 
@@ -155,6 +162,14 @@ final class RelatedTest extends TestCase
             Model::preventAccessingMissingAttributes(false);
             Model::handleMissingAttributeViolationUsing(null);
         }
+    }
+
+    #[Test]
+    public function it_compiles_an_or_that_a_nested_where_groups(): void
+    {
+        $related = Related::compile('listings', Job::class, fn (Job $job) => $job->hasOne(Place::class)->where(fn (Builder $places) => $places->where('city', 'Seattle')->orWhere('street', 'Main')), fn (Successor $place) => $place);
+
+        $this->assertSame(['("city" = ? or "street" = ?)', ['Seattle', 'Main']], [$related->conditions, $related->bindings]);
     }
 
     #[Test]

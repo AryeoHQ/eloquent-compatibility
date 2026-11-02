@@ -17,7 +17,7 @@ final readonly class BranchMove
      * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $values
      */
-    public function run(Model $legacy, Model $old, ResolvedMap $to, array $before, array $values): void
+    public function run(Model $legacy, Model $old, ResolvedMap $to, array $before, array $values): int|string
     {
         if (Applying::run($legacy, $old, fn () => $old->forceDelete()) === false) {
             throw CompatibilityWriteRefused::bySuccessorListener($legacy::class, $old);
@@ -25,7 +25,8 @@ final readonly class BranchMove
 
         $recreated = self::recreated($to, $before, $values);
         (new MassWriter($this->map, $this->connection))->claim($recreated, $to);
-        (new RecordWriter($to, $this->connection, $this->map->externals()))->insert($legacy, $recreated);
+
+        return (new RecordWriter($to, $this->connection, $this->map->externals()))->insert($legacy, $recreated);
     }
 
     /**

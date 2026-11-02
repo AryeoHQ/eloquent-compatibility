@@ -96,6 +96,26 @@ final class TransitionsTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_the_backdated_timestamp_of_a_write_that_changes_the_state_and_another_attribute_and_fires_each_save(): void
+    {
+        Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);
+        Date::setTestNow('2026-06-07 10:00:00');
+        $saves = [];
+        Event::listen('eloquent.updating: '.Job::class, function (Job $job) use (&$saves): void {
+            $saves[] = [$job->getDirty()['lifecycle_status'] ?? null, $job->getDirty()['name'] ?? null];
+        });
+
+        $listing = Listing::query()->findOrFail(1);
+        $listing->update(['status' => ListingStatus::Sold, 'title' => 'Oak Manor', 'updated_at' => '2026-03-04 05:06:07']);
+
+        $this->assertSame([['closed', null], [null, 'Oak Manor']], $saves);
+        $this->assertSame(
+            ['2026-03-04 05:06:07', '2026-03-04 05:06:07', '2026-03-04 05:06:07'],
+            [$listing->updated_at?->format('Y-m-d H:i:s'), Listing::query()->findOrFail(1)->updated_at?->format('Y-m-d H:i:s'), Job::query()->where('legacy_id', 1)->firstOrFail()->updated_at?->format('Y-m-d H:i:s')],
+        );
+    }
+
+    #[Test]
     public function it_runs_no_trigger_for_a_write_that_leaves_the_state_where_it_is(): void
     {
         Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);
@@ -326,6 +346,25 @@ final class TransitionsTest extends TestCase
 
         $this->assertSame('live', DB::table('jobs')->where('legacy_id', $launched->getKey())->value('lifecycle_status'));
         $this->assertSame($listing::class.' cannot insert a record whose $status stores \'drafting\'. Why: A new LaunchedJob starts in its initial state \'live\' on lifecycle_status, and an insert runs no transition. Instead: Insert the record with the status that stores \'live\', then change it in a second write.', $refusal->getMessage());
+    }
+
+    #[Test]
+    public function it_takes_the_initial_state_from_the_column_default_when_a_later_schema_on_the_search_path_holds_the_successor(): void
+    {
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.invoices (id serial primary key)');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $schema = DB::scalar('select current_schema()');
+            $listing = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Draft]);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame(['compatibility_tenant', 'drafting'], [$schema, DB::table('jobs')->where('legacy_id', $listing->id)->value('lifecycle_status')]);
     }
 
     #[Test]

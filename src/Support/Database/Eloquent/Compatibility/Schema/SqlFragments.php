@@ -18,6 +18,8 @@ final class SqlFragments
 
     private const array FLOATS = ['double precision', 'real', 'float4', 'float8'];
 
+    private const array RANGES = ['smallint' => [-32768, 32767], 'int2' => [-32768, 32767], 'integer' => [-2147483648, 2147483647], 'int' => [-2147483648, 2147483647], 'int4' => [-2147483648, 2147483647]];
+
     public static function isInteger(null|string $type): bool
     {
         return in_array($type, self::INTEGERS, true);
@@ -71,6 +73,17 @@ final class SqlFragments
      * @return null|array{string, mixed}
      */
     public static function bound(string $operator, mixed $value, int|float $multiplier, int|float $divisor, null|string $type): null|array
+    {
+        $bound = self::unranged($operator, $value, $multiplier, $divisor, $type);
+        [$low, $high] = self::RANGES[(string) $type] ?? [PHP_INT_MIN, PHP_INT_MAX];
+
+        return $bound !== null && is_int($bound[1]) && ($bound[1] < $low || $bound[1] > $high) ? null : $bound;
+    }
+
+    /**
+     * @return null|array{string, mixed}
+     */
+    private static function unranged(string $operator, mixed $value, int|float $multiplier, int|float $divisor, null|string $type): null|array
     {
         if ($value === null) {
             return [$operator, null];
@@ -229,6 +242,10 @@ final class SqlFragments
 
     public static function literal(string $value): string
     {
+        if (str_contains($value, '\\')) {
+            return "E'".str_replace(['\\', "'"], ['\\\\', "''"], $value)."'";
+        }
+
         return "'".str_replace("'", "''", $value)."'";
     }
 
@@ -243,10 +260,8 @@ final class SqlFragments
 
         return match (true) {
             $value === null => 'NULL',
-            is_bool($value) => $value ? 'true' : 'false',
-            is_int($value) => (string) $value,
-            is_float($value) => var_export($value, true),
-            is_string($value) => self::literal($value),
+            is_bool($value) => self::literal($value ? '1' : '0'),
+            is_int($value), is_float($value), is_string($value) => self::literal((string) $value),
             default => throw new InvalidArgumentException(get_debug_type($value).' has no SQL literal.'),
         };
     }
@@ -291,9 +306,13 @@ final class SqlFragments
      * @param  list<mixed>  $bindings
      * @return list<mixed>
      */
-    public static function formatDates(array $bindings, string $format): array
+    public static function asSent(array $bindings, string $dateFormat): array
     {
-        return array_map(fn (mixed $binding) => $binding instanceof DateTimeInterface ? $binding->format($format) : $binding, $bindings);
+        return array_map(fn (mixed $binding) => match (true) {
+            $binding instanceof DateTimeInterface => $binding->format($dateFormat),
+            is_float($binding) => (string) $binding,
+            default => $binding,
+        }, $bindings);
     }
 
     private static function quoted(string $sql, int $at): int

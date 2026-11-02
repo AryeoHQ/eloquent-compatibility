@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -22,6 +23,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
+use Tests\Fixtures\Support\Listings\ConfiguredJob;
+use Tests\Fixtures\Support\Listings\DefaultedPlace;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -128,6 +131,68 @@ final class MassWriterTest extends TestCase
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
         $this->assertSame(2, DB::table('places')->where('street', '7 Ash St')->count());
         $this->assertSame(['7 Ash St', 3.5], [Listing::withTrashed()->findOrFail(2)->street, Listing::withTrashed()->findOrFail(2)->latitude]);
+    }
+
+    #[Test]
+    public function it_writes_each_value_as_its_column_type_when_a_later_schema_on_the_search_path_holds_the_tables(): void
+    {
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.invoices (id serial primary key)');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $schema = DB::scalar('select current_schema()');
+            $updated = Listing::withTrashed()->whereKey([1, 2])->update(['latitude' => 3.5, 'featured' => false]);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $this->assertSame(['compatibility_tenant', 2], [$schema, $updated]);
+        $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
+        $this->assertSame([false, false], DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('featured')->all());
+        $this->assertSame([[3.5, false], [3.5, false]], Listing::withTrashed()->whereKey([1, 2])->orderBy('id')->get()->map(fn (Listing $listing) => [$listing->latitude, $listing->featured])->all());
+    }
+
+    #[Test]
+    public function it_creates_a_missing_dependent_with_the_attribute_defaults_of_its_model_as_a_record_write_does(): void
+    {
+        $defaulted = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(fn (Job $job) => $job->hasOne(DefaultedPlace::class), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))));
+            }
+        };
+        DB::table('jobs')->insert([['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Lodge', 'company_id' => ListingTables::COMPANY]]);
+        $legacyId = fn (string $name): int => (int) Job::query()->where('name', $name)->value('legacy_id');
+        $places = fn (int $legacyId): array => DB::table('places')->join('jobs', 'jobs.id', '=', 'places.job_id')->where('jobs.legacy_id', $legacyId)->get(['places.street', 'places.city', 'places.created_at'])->map(fn (object $place) => [$place->street, $place->city, $place->created_at !== null])->all();
+
+        $defaulted->newQuery()->whereKey(2)->update(['city' => 'Tacoma']);
+        $defaulted->newQuery()->whereKey($legacyId('Birch Lodge'))->update(['street' => '9 Birch St']);
+        $defaulted->newQuery()->findOrFail($legacyId('Cedar Lodge'))->update(['street' => '9 Cedar St']);
+
+        $this->assertSame([['Unknown St', 'Tacoma', true]], $places(2));
+        $this->assertSame([['9 Birch St', 'Unknown', true]], $places($legacyId('Birch Lodge')));
+        $this->assertSame([['9 Cedar St', 'Unknown', true]], $places($legacyId('Cedar Lodge')));
     }
 
     #[Test]
@@ -299,6 +364,161 @@ final class MassWriterTest extends TestCase
         $this->assertSame([42, 7, 10], Listing::withTrashed()->orderBy('id')->pluck('views')->all());
         $this->assertSame(['MLS-Z', 'MLS-Z', 'MLS-Z'], Listing::withTrashed()->orderBy('id')->pluck('mls_number')->all());
         $this->assertSame([47.1062, null, -122.8321], Listing::withTrashed()->orderBy('id')->pluck('latitude')->all());
+    }
+
+    #[Test]
+    public function it_reads_a_raw_expression_for_a_legacy_only_column_by_the_alias_the_write_reads_the_legacy_table_by(): void
+    {
+        $updated = Listing::query()->withoutGlobalScopes()->toBase()->from('listings as legacy')->where('legacy.id', 1)->update(['mls_number' => DB::raw('legacy.title')]);
+        $aliased = Listing::query()->withoutGlobalScopes();
+        $aliased->getQuery()->from('listings AS legacy');
+        $eloquent = $aliased->where('legacy.id', 2)->update(['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
+        $incremented = Listing::query()->withoutGlobalScopes()->getQuery()->from('listings as legacy')->where('legacy.id', 3)->incrementEach(['views' => 2], ['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
+        $retained = fn (int $legacyId): array => array_values((array) DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->where('jobs.legacy_id', $legacyId)->first(['mls_number', 'views']));
+
+        $this->assertSame([1, 1, 1], [$updated, $eloquent, $incremented]);
+        $this->assertSame([['Oak House', 5], ['Pine Flat-5', 5], ['Elm Cottage-5', 7]], [$retained(1), $retained(2), $retained(3)]);
+    }
+
+    #[Test]
+    public function it_writes_a_json_path_into_the_column_that_owns_it_for_a_mapped_a_related_and_a_legacy_only_column(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'settings' => '{"color": "red", "enabled": false}', 'preferences' => '{"theme": "light"}', 'options' => '{"a": 1}'],
+            ['name' => 'Pine', 'settings' => '{"color": "blue"}', 'preferences' => '{"theme": "light", "font": "serif"}', 'options' => null],
+            ['name' => 'Elm', 'settings' => null, 'preferences' => null, 'options' => null],
+        ]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
+                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
+                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('settings', fn (Attribute $attribute) => $attribute->from('settings'))
+                        ->related(fn (ConfiguredJob $job) => $job->site(), fn (Successor $site) => $site
+                            ->attribute('options', fn (Attribute $attribute) => $attribute->from('options'))));
+            }
+        };
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name, settings) select id, name, settings from settings_holders');
+            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.legacy_id = settings_holders.id where settings_holders.options is not null');
+            Compatibility::install($holder::class);
+
+            $updated = [
+                $holder->newQuery()->whereKey([1, 3])->update(['settings->enabled' => true, 'preferences->theme' => 'dark', 'options->b' => 2]),
+                $holder->newQuery()->whereKey(2)->toBase()->update(['settings_holders.settings->size' => ['width' => 3], 'preferences->font' => 'mono']),
+            ];
+            $rows = DB::table('settings_holders')->orderBy('id')->get(['settings', 'preferences', 'options'])->map(fn (object $row) => array_map(fn (mixed $json) => json_decode((string) $json, true), array_values((array) $row)))->all();
+            $sites = DB::table('configured_sites')->count();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_sites, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([2, 1], $updated);
+        $this->assertSame([
+            [['color' => 'red', 'enabled' => true], ['theme' => 'dark'], ['a' => 1, 'b' => 2]],
+            [['size' => ['width' => 3], 'color' => 'blue'], ['font' => 'mono', 'theme' => 'light'], null],
+            [null, null, null],
+        ], $rows);
+        $this->assertSame(1, $sites);
+    }
+
+    #[Test]
+    public function it_evaluates_the_json_paths_and_expressions_of_one_mass_write_against_the_values_before_the_write_as_a_native_update_does(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, label text)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
+            ['name' => 'Pine', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
+        ]);
+        DB::statement('create table settings_natives as select * from settings_holders');
+        $writes = [
+            1 => ['preferences->theme' => 'dark', 'label' => DB::raw("preferences->>'theme'")],
+            2 => ['preferences->font' => DB::raw('to_jsonb(label)'), 'label' => 'mono'],
+        ];
+        $rows = fn (string $table): array => DB::table($table)->orderBy('id')->get(['preferences', 'label'])->map(fn (object $row) => [json_decode((string) $row->preferences, true), $row->label])->all();
+        $holder = $this->jsonHolder();
+
+        try {
+            foreach ($writes as $id => $values) {
+                DB::table('settings_natives')->where('id', $id)->update($values);
+            }
+
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
+            Compatibility::install($holder::class);
+
+            $updated = array_map(fn (int $id) => $holder->newQuery()->whereKey($id)->update($writes[$id]), array_keys($writes));
+            $served = $rows('settings_holders');
+            $native = $rows('settings_natives');
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([1, 1], $updated);
+        $this->assertSame([[['theme' => 'dark'], 'light'], [['font' => 'serif', 'theme' => 'light'], 'mono']], $native);
+        $this->assertSame($native, $served);
+    }
+
+    #[Test]
+    public function it_writes_a_json_path_into_the_served_default_of_a_legacy_only_column_for_a_record_without_a_retained_row(): void
+    {
+        DB::statement("create table settings_holders (id serial primary key, name text not null, preferences jsonb not null default '{}'::jsonb, notes jsonb)");
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
+        $holder = $this->jsonHolder();
+        $rows = fn (): array => DB::table('settings_holders')->orderBy('id')->get(['id', 'preferences', 'notes'])->map(fn (object $row) => [$row->id, json_decode((string) $row->preferences, true), json_decode((string) $row->notes, true)])->all();
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
+            Compatibility::install($holder::class);
+            DB::table('configured_jobs')->insert(['legacy_id' => 10, 'name' => 'Ash']);
+
+            $before = $rows();
+            $updated = $holder->newQuery()->whereKey([1, 10])->update(['preferences->theme' => 'dark', 'notes->seen' => true]);
+            $after = $rows();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([[1, ['theme' => 'light'], null], [10, [], null]], $before);
+        $this->assertSame(2, $updated);
+        $this->assertSame([[1, ['theme' => 'dark'], null], [10, ['theme' => 'dark'], null]], $after);
+    }
+
+    #[Test]
+    public function it_refuses_a_json_path_write_into_an_attribute_whose_conversions_read_the_whole_value(): void
+    {
+        $before = DB::table('jobs')->orderBy('legacy_id')->get()->all();
+
+        $refusal = $this->refusal(fn () => Listing::query()->whereKey(1)->update(['price->amount' => 5]));
+
+        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its conversions read the whole stored value, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
+        $this->assertEquals($before, DB::table('jobs')->orderBy('legacy_id')->get()->all());
     }
 
     #[Test]
@@ -532,6 +752,29 @@ final class MassWriterTest extends TestCase
         }
 
         $this->fail('The write was not refused.');
+    }
+
+    private function jsonHolder(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
+                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
+                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
     }
 
     private function sited(): Model

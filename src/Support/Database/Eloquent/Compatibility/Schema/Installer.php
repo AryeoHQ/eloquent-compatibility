@@ -29,24 +29,38 @@ final readonly class Installer
 
     public function run(Statements $statements): void
     {
-        $this->refuseTransaction($statements);
-
-        $this->connection->transaction(fn () => $this->apply($statements));
-
-        foreach ($statements->afterwards as $statement) {
-            $this->connection->unprepared($statement);
-        }
+        $this->compileAndRun([], fn () => $statements);
     }
 
     /**
-     * @param  Closure(): Statements  $statements
+     * @param  list<string>  $tables
+     * @param  Closure(): Statements  $compile
      */
-    public function install(ResolvedMap $map, Closure $statements): void
+    public function compileAndRun(array $tables, Closure $compile): void
     {
+        $outside = $this->connection->transactionLevel() === 0;
+
+        $statements = $this->connection->transaction(function () use ($tables, $compile, $outside): Statements {
+            $this->lockSchema($tables);
+            $statements = $this->compile($compile, $outside);
+            $this->apply($statements);
+
+            return $statements;
+        });
+
+        $this->runAfterwards($statements);
+    }
+
+    /**
+     * @param  Closure(): Statements  $compile
+     */
+    public function install(ResolvedMap $map, Closure $compile): void
+    {
+        $outside = $this->connection->transactionLevel() === 0;
         $backfiller = new Backfiller($map, $this->connection);
         $watermark = $backfiller->remembered();
 
-        if ($watermark !== null && $this->connection->transactionLevel() > 0) {
+        if ($watermark !== null && ! $outside) {
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
@@ -63,10 +77,9 @@ final readonly class Installer
                 }
             }
 
-            $install = $statements();
-            $this->refuseTransaction($install);
-
-            $this->locked(function () use ($map, $backfiller, $watermark, $install): void {
+            $install = $this->locked(function () use ($map, $backfiller, $watermark, $compile, $outside): Statements {
+                $this->lockSchema($map->tables());
+                $install = $this->compile($compile, $outside);
                 $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
 
                 if ($watermark !== null) {
@@ -75,13 +88,12 @@ final readonly class Installer
 
                 $this->apply($install);
                 $backfiller->forget();
+
+                return $install;
             });
 
             $retaining = false;
-
-            foreach ($install->afterwards as $statement) {
-                $this->connection->unprepared($statement);
-            }
+            $this->runAfterwards($install);
         } catch (Throwable $exception) {
             if ($retaining) {
                 $this->unretain($map);
@@ -119,9 +131,7 @@ final readonly class Installer
             }
         });
 
-        foreach ($retain->afterwards as $statement) {
-            $this->connection->unprepared($statement);
-        }
+        $this->runAfterwards($retain);
     }
 
     private function unretain(ResolvedMap $map): void
@@ -136,24 +146,55 @@ final readonly class Installer
     }
 
     /**
-     * @param  Closure(): void  $locked
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $locked
+     * @return TResult
      */
-    private function locked(Closure $locked): void
+    private function locked(Closure $locked): mixed
     {
         for ($attempt = 0; ; $attempt++) {
             try {
-                $this->connection->transaction(function () use ($locked): void {
+                return $this->connection->transaction(function () use ($locked): mixed {
                     $this->connection->statement("SET LOCAL lock_timeout = '".self::LOCK_TIMEOUT."'");
-                    $locked();
-                });
 
-                return;
+                    return $locked();
+                });
             } catch (QueryException $exception) {
                 if (! in_array($exception->getCode(), self::RETRIED_STATES, true) || $attempt === self::RETRIES) {
                     throw $exception;
                 }
             }
         }
+    }
+
+    /**
+     * @param  list<string>  $tables
+     */
+    private function lockSchema(array $tables): void
+    {
+        $locked = array_values(array_filter(array_map(
+            fn (string $table) => $this->connection->scalar("select cast(to_regclass(quote_ident(current_schema()) || '.' || ?) as text)", [SqlFragments::identifier($table)]),
+            $tables,
+        ), is_string(...)));
+
+        if ($locked !== []) {
+            $this->connection->unprepared('LOCK TABLE '.implode(', ', $locked).' IN SHARE UPDATE EXCLUSIVE MODE');
+        }
+    }
+
+    /**
+     * @param  Closure(): Statements  $compile
+     */
+    private function compile(Closure $compile, bool $outside): Statements
+    {
+        $statements = $compile();
+
+        if ($statements->afterwards !== [] && ! $outside) {
+            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($statements->afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
+        }
+
+        return $statements;
     }
 
     private function apply(Statements $statements): void
@@ -167,10 +208,10 @@ final readonly class Installer
         }
     }
 
-    private function refuseTransaction(Statements $statements): void
+    private function runAfterwards(Statements $statements): void
     {
-        if ($statements->afterwards !== [] && $this->connection->transactionLevel() > 0) {
-            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($statements->afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
+        foreach ($statements->afterwards as $statement) {
+            $this->connection->unprepared($statement);
         }
     }
 }

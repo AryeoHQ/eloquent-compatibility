@@ -4,12 +4,20 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
@@ -22,6 +30,9 @@ use Tests\TestCase;
 #[CoversClass(CompileSql::class)]
 final class CompileSqlTest extends TestCase
 {
+    /** @var class-string<Model> */
+    public static string $successor = Model::class;
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -46,7 +57,8 @@ final class CompileSqlTest extends TestCase
     #[Test]
     public function it_prints_the_statements_install_runs_and_runs_none_of_them(): void
     {
-        $statements = Statements::install(Compatibility::of(Listing::class)->resolve(), DB::connection());
+        $map = Compatibility::of(Listing::class)->resolve();
+        $statements = Statements::install($map, DB::connection());
 
         $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class]));
         $printed = explode("\n", Artisan::output(), 4);
@@ -55,7 +67,7 @@ final class CompileSqlTest extends TestCase
         $this->assertMatchesRegularExpression('/^-- Read from database testing\w*, schema public \(search path .+\), on PostgreSQL \d+\.\d+/', $printed[1]);
         $this->assertMatchesRegularExpression('/^-- Compiled at \d{4}-\d{2}-\d{2}T/', $printed[2]);
         $this->assertSame(
-            "\nBEGIN;\n\n".implode("\n;\n\n", $statements->transaction)."\n;\n\nCOMMIT;\n\n-- After the transaction commits, outside any transaction\n\n".implode("\n;\n\n", $statements->afterwards)."\n;\n",
+            "\nBEGIN;\n\n".implode("\n;\n\n", [...Statements::guard($map, DB::connection(), 'install'), ...$statements->transaction])."\n;\n\nCOMMIT;\n\n-- After the transaction commits, outside any transaction\n\n".implode("\n;\n\n", $statements->afterwards)."\n;\n",
             $printed[3],
         );
         $this->assertStringContainsString("ALTER TABLE \"listing_photos\"\n  DROP CONSTRAINT \"listing_photos_listing_id_foreign\",\n  ADD CONSTRAINT \"listing_photos_listing_id_foreign\" FOREIGN KEY (\"listing_id\") REFERENCES \"jobs\" (\"legacy_id\") ON DELETE CASCADE NOT VALID\n;", $printed[3]);
@@ -71,7 +83,8 @@ final class CompileSqlTest extends TestCase
         $printed = explode("\n", Artisan::output(), 4);
 
         $this->assertSame('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=recompile: the statements Compatibility::recompile() runs for listings', $printed[0]);
-        $this->assertSame("\nBEGIN;\n\n".Statements::recompile(Compatibility::of(Listing::class)->resolve(), DB::connection())->transaction[0]."\n;\n\nCOMMIT;\n", $printed[3]);
+        $map = Compatibility::of(Listing::class)->resolve();
+        $this->assertSame("\nBEGIN;\n\n".implode("\n;\n\n", [...Statements::guard($map, DB::connection(), 'recompile'), Statements::recompile($map, DB::connection())->transaction[0]])."\n;\n\nCOMMIT;\n", $printed[3]);
     }
 
     #[Test]
@@ -85,6 +98,75 @@ final class CompileSqlTest extends TestCase
         );
     }
 
+    /**
+     * @return array<string, array{null|string, string}>
+     */
+    public static function schemaChanges(): array
+    {
+        return [
+            'no change' => [null, 'v'],
+            'a column added to the legacy table' => ['alter table listings add column notes text', 'r'],
+            'an index added on a mapped column' => ['create index listings_city_index on listings (city)', 'r'],
+            'a foreign key added to the legacy table' => ['create table listing_notes (listing_id integer references listings (id))', 'r'],
+        ];
+    }
+
+    #[DataProvider('schemaChanges')]
+    #[Test]
+    public function it_runs_a_printed_install_only_while_the_schema_it_read_is_unchanged(null|string $change, string $kind): void
+    {
+        $file = (string) tempnam(sys_get_temp_dir(), 'compatibility');
+        $refusal = null;
+
+        try {
+            Artisan::call('compatibility:sql', ['model' => Listing::class, '--output' => $file]);
+
+            if ($change !== null) {
+                DB::statement($change);
+            }
+
+            try {
+                DB::unprepared((string) file_get_contents($file));
+            } catch (QueryException $exception) {
+                DB::unprepared('ROLLBACK');
+                $refusal = $exception->getMessage();
+            }
+
+            $outcome = [DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"), $refusal === null ? null : str_contains($refusal, "Compatibility map 'listings' cannot install: listings, listings_retained, jobs, places or job_sites changed after compatibility:sql read them. Print the statements again.")];
+        } finally {
+            unlink($file);
+            DB::statement('drop table if exists listing_notes');
+        }
+
+        $this->assertSame([$kind, $change === null ? null : true], $outcome);
+    }
+
+    #[Test]
+    public function it_runs_a_printed_recompile_of_a_map_over_two_successors_only_while_neither_successor_changed(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        FileTables::installMedia();
+        $file = (string) tempnam(sys_get_temp_dir(), 'compatibility');
+        $refusal = null;
+
+        try {
+            Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile', '--output' => $file]);
+            DB::statement('alter table links add column notes text');
+
+            try {
+                DB::unprepared((string) file_get_contents($file));
+            } catch (QueryException $exception) {
+                DB::unprepared('ROLLBACK');
+                $refusal = $exception->getMessage();
+            }
+        } finally {
+            unlink($file);
+        }
+
+        $this->assertStringContainsString("Compatibility map 'videos' cannot recompile: videos, videos_retained, files or links changed after compatibility:sql read them. Print the statements again.", (string) $refusal);
+    }
+
     #[Test]
     public function it_writes_the_statements_to_a_file(): void
     {
@@ -92,7 +174,7 @@ final class CompileSqlTest extends TestCase
 
         try {
             $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class, '--for' => 'prepare', '--output' => $file]));
-            $this->assertStringContainsString("Wrote 17 statements to {$file}.", Artisan::output());
+            $this->assertStringContainsString("Wrote 19 statements to {$file}.", Artisan::output());
             $this->assertStringStartsWith('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=prepare:', (string) file_get_contents((string) $file));
         } finally {
             unlink((string) $file);
@@ -134,12 +216,94 @@ final class CompileSqlTest extends TestCase
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
 
+        $file = sys_get_temp_dir().'/compatibility-photos-'.getmypid().'.sql';
+
+        $this->artisan('compatibility:sql', ['model' => Photo::class, '--output' => $file])
+            ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
+            ->assertFailed();
+        $this->assertFileDoesNotExist($file);
+
         Compatibility::install(Photo::class);
 
         $this->artisan('compatibility:sql', ['model' => Photo::class, '--for' => 'uninstall'])
             ->expectsOutputToContain('Compatibility::uninstall() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::uninstall() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
+    }
+
+    #[Test]
+    public function it_leaves_the_connection_reading_from_its_replica_once_it_prints_or_refuses(): void
+    {
+        DB::statement('create schema compatibility_replica');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => []]]);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_replicated';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            $exits = [Artisan::call('compatibility:sql', ['model' => $model::class]), Artisan::call('compatibility:sql', ['model' => $model::class, '--for' => 'uninstall'])];
+            $schema = DB::connection('compatibility_replicated')->scalar('select current_schema()');
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame([[0, 1], 'compatibility_replica'], [$exits, $schema]);
+    }
+
+    #[Test]
+    public function it_prints_a_map_whose_successor_names_another_connection_to_the_same_database_and_refuses_one_to_another(): void
+    {
+        config([
+            'database.connections.compatibility_alias' => config('database.connections.pgsql'),
+            'database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'database' => 'compatibility_reporting'],
+        ]);
+        $successors = [
+            new class extends Model
+            {
+                protected $connection = 'compatibility_alias';
+
+                protected $table = 'jobs';
+            },
+            new class extends Model
+            {
+                protected $connection = 'compatibility_reporting';
+
+                protected $table = 'jobs';
+            },
+        ];
+        $legacy = new class extends Model implements Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(CompileSqlTest::$successor, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+        $exits = [];
+
+        foreach ($successors as $successor) {
+            self::$successor = $successor::class;
+            $exits[] = Artisan::call('compatibility:sql', ['model' => $legacy::class]);
+        }
+
+        $this->assertSame([0, 1], $exits);
+        $this->assertSame("Compatibility map 'listings' is declared wrongly: the successor ".class_basename($successors[1]).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).", so a map reads one database.\n", Artisan::output());
     }
 
     /**

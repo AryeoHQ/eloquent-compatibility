@@ -101,6 +101,41 @@ final class ServedModelsTest extends TestCase
     }
 
     #[Test]
+    public function it_discovers_an_application_model_that_inherits_serving_from_a_registry_package_and_no_model_of_that_package(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $serves = '\\Support\\Database\\Eloquent\\Compatibility\\Provides\\ServesCompatibility';
+        $compatible = 'implements \\Support\\Database\\Eloquent\\Compatibility\\Contracts\\Compatible';
+        $map = 'public static function compatibility(\\Support\\Database\\Eloquent\\Compatibility\\Compatibility $compatibility): \\Support\\Database\\Eloquent\\Compatibility\\Compatibility { return $compatibility; }';
+        $classmap = [
+            "Acme\\Base\\Record{$suffix}" => $this->source("{$vendor}/acme/base/src/Record{$suffix}.php", "namespace Acme\\Base; abstract class Record{$suffix} extends \\Illuminate\\Database\\Eloquent\\Model {$compatible} { use {$serves}; {$map} }"),
+            "Acme\\Base\\Serves{$suffix}" => $this->source("{$vendor}/acme/base/src/Serves{$suffix}.php", "namespace Acme\\Base; trait Serves{$suffix} { use {$serves}; }"),
+            "Acme\\Base\\Shipped{$suffix}" => $this->source("{$vendor}/acme/base/src/Shipped{$suffix}.php", "namespace Acme\\Base; final class Shipped{$suffix} extends Record{$suffix} {}"),
+            "App\\Models\\Inherited{$suffix}" => $this->source("{$this->bootstrap}/app/Models/Inherited{$suffix}.php", "namespace App\\Models; use Acme\\Base\\Record{$suffix}; final class Inherited{$suffix} extends Record{$suffix} {}"),
+            "App\\Models\\Traited{$suffix}" => $this->source("{$this->bootstrap}/app/Models/Traited{$suffix}.php", "namespace App\\Models; use Acme\\Base\\Serves{$suffix}; final class Traited{$suffix} extends \\Illuminate\\Database\\Eloquent\\Model {$compatible} { use Serves{$suffix}; {$map} }"),
+        ];
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+        file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => [
+            ['name' => 'acme/base', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/base.zip'], 'install-path' => '../acme/base', 'require' => ['aryeo/eloquent-compatibility' => '^1.0']],
+        ]], JSON_THROW_ON_ERROR));
+        $loader = new ClassLoader($vendor);
+        $loader->addClassMap($classmap);
+        $loader->register();
+
+        try {
+            $served = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertSame(
+            [true, true, false],
+            [in_array("App\\Models\\Inherited{$suffix}", $served, true), in_array("App\\Models\\Traited{$suffix}", $served, true), in_array("Acme\\Base\\Shipped{$suffix}", $served, true)],
+        );
+    }
+
+    #[Test]
     public function it_scans_on_every_boot_in_testing_and_ignores_a_cache(): void
     {
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return [];');
@@ -141,6 +176,14 @@ final class ServedModelsTest extends TestCase
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return '.var_export([Photo::class, 'Tests\Fixtures\Support\Files\RemovedPhoto'], true).';');
 
         $this->assertSame([Photo::class], $this->app->make(ServedModels::class)->all());
+    }
+
+    private function source(string $file, string $code): string
+    {
+        (new Filesystem)->ensureDirectoryExists(dirname($file));
+        file_put_contents($file, "<?php\n\n{$code}\n");
+
+        return $file;
     }
 
     private function package(string $directory, string $namespace, string $class): string

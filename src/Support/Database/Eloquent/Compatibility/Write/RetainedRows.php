@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
@@ -34,7 +35,7 @@ final readonly class RetainedRows
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    public function upsertAll(QueryBuilder $keys, array $values, array $amounts): void
+    public function upsertAll(QueryBuilder $keys, array $values, array $amounts, null|string $alias = null): void
     {
         if ($values === [] && $amounts === []) {
             return;
@@ -44,18 +45,31 @@ final readonly class RetainedRows
         $table = SqlFragments::identifier($retained);
         $primary = SqlFragments::identifier($this->map->primary->table);
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
-        $legacy = SqlFragments::identifier($this->map->table);
-        $catalog = new ColumnCatalog($this->connection);
+        $alias ??= $this->map->table;
+        $legacy = SqlFragments::identifier($alias);
+        $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
+        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $query = $this->connection->table($retained);
         $grammar = $query->getGrammar();
+        $columns = [];
         $selects = [];
         $updates = [];
         $bindings = [];
         $joined = $amounts !== [];
 
-        foreach ($values as $column => $value) {
+        foreach ($values as $key => $value) {
+            $column = Str::before($key, '->');
             $wrapped = SqlFragments::identifier($column);
+            $columns[] = $wrapped;
             $updates[] = $wrapped.' = excluded.'.$wrapped;
+
+            if ($column !== $key) {
+                $selects[] = Str::after($grammar->compileUpdate($query, [$key => $value]), ' set '.$grammar->wrap($column).' = ');
+                $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [$key => $value])];
+                $joined = true;
+
+                continue;
+            }
 
             if ($value instanceof Expression) {
                 $selects[] = (string) $value->getValue($grammar);
@@ -70,6 +84,7 @@ final readonly class RetainedRows
 
         foreach ($amounts as $column => $amount) {
             $wrapped = SqlFragments::identifier($column);
+            $columns[] = $wrapped;
             $selects[] = $legacy.'.'.$wrapped.' + '.$amount;
             $updates[] = $wrapped.' = '.$table.'.'.$wrapped.' + '.$amount;
         }
@@ -80,12 +95,12 @@ final readonly class RetainedRows
         $keyed = $primaryKey.' IN ('.$keys->toSql().')';
         $member = $this->map->membership === null ? '' : ' AND '.$this->map->membership->of($this->map->primary->table);
         $source = $joined
-            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.$member.'), '.implode(', ', $selects).' FROM '.$legacy.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
+            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.$member.'), '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
             : implode(', ', [$primaryKey, ...$selects]).' FROM '.$primary.' WHERE '.$keyed;
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
 
         $this->connection->affectingStatement(
-            'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
+            'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...$columns]).')'
                 .' SELECT '.$source
                 .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
             [...$query->cleanBindings($bindings), ...$keys->getBindings()],

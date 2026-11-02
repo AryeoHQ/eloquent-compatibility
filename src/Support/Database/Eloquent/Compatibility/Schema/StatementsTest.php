@@ -48,7 +48,22 @@ final class StatementsTest extends TestCase
             DECLARE
               duplicated bigint;
               first_keys text;
+              zone text := current_setting('TimeZone');
+              west text;
+              east text;
             BEGIN
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'places', current_schema(), 'places');
+              PERFORM set_config('TimeZone', 'Etc/GMT+12', true);
+              CREATE INDEX compatibility_west ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              PERFORM set_config('TimeZone', 'Etc/GMT-14', true);
+              CREATE INDEX compatibility_east ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              PERFORM set_config('TimeZone', zone, true);
+              SELECT pg_get_expr(indpred, indrelid) INTO west FROM pg_index WHERE indexrelid = 'pg_temp.compatibility_west'::regclass;
+              SELECT pg_get_expr(indpred, indrelid) INTO east FROM pg_index WHERE indexrelid = 'pg_temp.compatibility_east'::regclass;
+              DROP TABLE pg_temp."places";
+              IF west IS DISTINCT FROM east THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: atMostOne() on the relation from Job to Place has a condition whose instant follows the session time zone, and the index and the view would each read it in the time zone of their own session. Compare a timestamp with time zone with a value that names its offset.';
+              END IF;
               SELECT count(*) INTO duplicated FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1) AS duplicates;
               IF duplicated > 0 THEN
                 SELECT string_agg(CAST(duplicate AS text), ', ' ORDER BY duplicate) INTO first_keys FROM (SELECT "job_id" FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL AND "job_id" IS NOT NULL GROUP BY "job_id" HAVING count(*) > 1 ORDER BY "job_id" LIMIT 5) AS first_duplicates (duplicate);
@@ -70,6 +85,13 @@ final class StatementsTest extends TestCase
               SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_id_filled';
               IF found NOT IN ('CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_id') || ' IS NOT NULL))' || ' NOT VALID') THEN
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_id_filled already exists on jobs and is not the check prepare() adds. Drop or rename it, then prepare again.';
+              END IF;
+              SELECT string_agg(inserter, ', ' ORDER BY inserter) INTO found FROM (
+                SELECT CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND granted.privilege_type = 'INSERT'
+                UNION SELECT CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'
+              ) AS inserters WHERE NOT has_sequence_privilege(CAST(CASE WHEN grantee = 0 THEN 'public' ELSE pg_get_userbyid(grantee) END AS name), CAST('listings_id_seq'::regclass AS oid), 'USAGE, UPDATE');
+              IF found IS NOT NULL THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs.legacy_id draws from ' || CAST('listings_id_seq'::regclass AS text) || ', and ' || found || ' can insert into jobs without USAGE on it. Grant USAGE ON SEQUENCE ' || CAST('listings_id_seq'::regclass AS text) || ' to each of them, then prepare again.';
               END IF;
               SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND conname = 'jobs_legacy_uuid_filled';
               IF found NOT IN ('CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))', 'CHECK ((' || quote_ident('legacy_uuid') || ' IS NOT NULL))' || ' NOT VALID') THEN
@@ -133,10 +155,6 @@ final class StatementsTest extends TestCase
               IF existing IS NULL THEN
                 RETURN;
               END IF;
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
-                DROP INDEX "jobs_legacy_id_unique";
-                RETURN;
-              END IF;
               EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'jobs', current_schema(), 'jobs');
               CREATE UNIQUE INDEX "jobs_legacy_id_unique" ON "jobs" ("legacy_id");
               SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."jobs"'::regclass;
@@ -144,6 +162,9 @@ final class StatementsTest extends TestCase
               DROP TABLE pg_temp."jobs";
               IF found IS DISTINCT FROM expected THEN
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_id_unique already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
+                EXECUTE format('DROP INDEX %s', existing);
               END IF;
             END
             $compatibility$
@@ -168,10 +189,6 @@ final class StatementsTest extends TestCase
               IF existing IS NULL THEN
                 RETURN;
               END IF;
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
-                DROP INDEX "jobs_legacy_uuid_unique";
-                RETURN;
-              END IF;
               EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'jobs', current_schema(), 'jobs');
               CREATE UNIQUE INDEX "jobs_legacy_uuid_unique" ON "jobs" ("legacy_uuid");
               SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."jobs"'::regclass;
@@ -179,6 +196,9 @@ final class StatementsTest extends TestCase
               DROP TABLE pg_temp."jobs";
               IF found IS DISTINCT FROM expected THEN
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: jobs_legacy_uuid_unique already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
+                EXECUTE format('DROP INDEX %s', existing);
               END IF;
             END
             $compatibility$
@@ -203,10 +223,6 @@ final class StatementsTest extends TestCase
               IF existing IS NULL THEN
                 RETURN;
               END IF;
-              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
-                DROP INDEX "places_listings_at_most_one";
-                RETURN;
-              END IF;
               EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'places', current_schema(), 'places');
               CREATE UNIQUE INDEX "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
               SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."places"'::regclass;
@@ -214,6 +230,9 @@ final class StatementsTest extends TestCase
               DROP TABLE pg_temp."places";
               IF found IS DISTINCT FROM expected THEN
                 RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: places_listings_at_most_one already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.';
+              END IF;
+              IF EXISTS (SELECT FROM pg_index WHERE indexrelid = existing AND NOT indisvalid) THEN
+                EXECUTE format('DROP INDEX %s', existing);
               END IF;
             END
             $compatibility$
@@ -243,6 +262,46 @@ final class StatementsTest extends TestCase
 
         $this->assertSame([
             'LOCK TABLE "listings", "jobs" IN SHARE ROW EXCLUSIVE MODE',
+            <<<'SQL'
+            DO $compatibility$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT FROM pg_attribute attribute
+                JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate
+                  AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum
+                WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND attribute.attname = 'legacy_id' AND attribute.attnotnull
+              ) THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot install: jobs.legacy_id is not yet NOT NULL with a unique index of its own, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.';
+              END IF;
+              IF NOT EXISTS (
+                SELECT FROM pg_attribute attribute
+                JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate
+                  AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum
+                WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."jobs"') AND attribute.attname = 'legacy_uuid' AND attribute.attnotnull
+              ) THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot install: jobs.legacy_uuid is not yet NOT NULL with a unique index of its own, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.';
+              END IF;
+            END
+            $compatibility$
+            SQL,
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              existing regclass := to_regclass(quote_ident(current_schema()) || '."places_listings_at_most_one"');
+              expected text;
+              found text;
+            BEGIN
+              EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', 'places', current_schema(), 'places');
+              CREATE UNIQUE INDEX "places_listings_at_most_one" ON "places" ("job_id") WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO expected FROM pg_index WHERE indrelid = 'pg_temp."places"'::regclass;
+              SELECT substr(pg_get_indexdef(indexrelid), strpos(pg_get_indexdef(indexrelid), ' USING ')) INTO found FROM pg_index WHERE indexrelid = existing AND indisunique AND indisvalid AND indrelid = to_regclass(quote_ident(current_schema()) || '."places"');
+              DROP TABLE pg_temp."places";
+              IF found IS DISTINCT FROM expected THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot install: places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.';
+              END IF;
+            END
+            $compatibility$
+            SQL,
             <<<'SQL'
             DO $compatibility$
             DECLARE
@@ -285,6 +344,23 @@ final class StatementsTest extends TestCase
             SQL,
             'ALTER SEQUENCE public.listings_id_seq OWNED BY "jobs"."legacy_id"',
             <<<'SQL'
+            SELECT set_config('compatibility.grants', coalesce(json_agg(grants.statement ORDER BY grants.position, grants.statement)::text, '[]'), true)
+            FROM (
+              SELECT 1 AS position, 'GRANT ' || string_agg(granted.privilege_type, ', ' ORDER BY granted.privilege_type) || ' ON "listings" TO ' || CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END || CASE WHEN granted.is_grantable OR granted.grantee = relation.relowner THEN ' WITH GRANT OPTION' ELSE '' END AS statement
+              FROM pg_class relation
+              CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted
+              WHERE relation.oid = to_regclass(quote_ident(current_schema()) || '."listings"') AND granted.grantee <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+              GROUP BY granted.grantee, granted.is_grantable, relation.relowner
+              UNION ALL
+              SELECT 2, 'GRANT ' || string_agg(granted.privilege_type || ' (' || quote_ident(attribute.attname) || ')', ', ' ORDER BY attribute.attnum, granted.privilege_type) || ' ON "listings" TO ' || CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END || CASE WHEN granted.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+              FROM pg_attribute attribute
+              CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted
+              WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '."listings"') AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.grantee <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('["id","uuid","title","company_id","price","status","street","city","latitude","mls_number","featured","created_at","updated_at","deleted_at"]' AS jsonb)))
+              GROUP BY granted.grantee, granted.is_grantable
+            ) AS grants
+            SQL,
+            <<<'SQL'
             ALTER TABLE "listings"
               DROP COLUMN "id",
               DROP COLUMN "uuid",
@@ -305,12 +381,23 @@ final class StatementsTest extends TestCase
               ADD CONSTRAINT "listings_retained_pkey" PRIMARY KEY ("job_id"),
               ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID
             SQL,
-            'COMMENT ON TABLE "listings_retained" IS \'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":["CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)"],"moved":[["\\"listing_photos\\"","listing_photos_listing_id_foreign"],["\\"listing_shares\\"","listing_shares_listing_uuid_foreign"]]}\'',
+            'COMMENT ON TABLE "listings_retained" IS E\'{"captured":"compatibility install","comment":null,"notNull":["id","uuid","title","company_id","status"],"generated":[],"constraints":[],"indexes":["CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)"],"moved":[["\\\\"listing_photos\\\\"","listing_photos_listing_id_foreign"],["\\\\"listing_shares\\\\"","listing_shares_listing_uuid_foreign"]],"notValid":[]}\'',
             $view,
             'ALTER VIEW "listings" ALTER COLUMN "id" SET DEFAULT nextval(\'listings_id_seq\'::regclass)',
             'ALTER VIEW "listings" ALTER COLUMN "uuid" SET DEFAULT gen_random_uuid()',
             'ALTER VIEW "listings" ALTER COLUMN "status" SET DEFAULT \'Draft\'::character varying',
             'ALTER VIEW "listings" ALTER COLUMN "featured" SET DEFAULT false',
+            <<<'SQL'
+            DO $compatibility$
+            DECLARE
+              granted text;
+            BEGIN
+              FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP
+                EXECUTE granted;
+              END LOOP;
+            END
+            $compatibility$
+            SQL,
         ], $statements->transaction);
         $this->assertSame([
             'ALTER TABLE "listing_photos" VALIDATE CONSTRAINT "listing_photos_listing_id_foreign"',
@@ -324,7 +411,7 @@ final class StatementsTest extends TestCase
     {
         Compatibility::prepare(Listing::class);
 
-        $parity = Statements::install($this->map(), DB::connection())->transaction[1];
+        $parity = Statements::install($this->map(), DB::connection())->transaction[3];
 
         $this->assertStringContainsString('WHERE NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND "jobs"."legacy_uuid" IS NOT DISTINCT FROM "listings"."uuid")', $parity);
     }
@@ -345,12 +432,12 @@ final class StatementsTest extends TestCase
     }
 
     #[Test]
-    public function it_locks_the_primary_successor_against_writes_before_uninstall_copies_it(): void
+    public function it_locks_the_primary_and_related_successors_against_writes_before_uninstall_copies_them(): void
     {
         Compatibility::prepare(Listing::class);
         Compatibility::install(Listing::class);
 
-        $this->assertSame('LOCK TABLE "jobs" IN SHARE ROW EXCLUSIVE MODE', Statements::uninstall($this->map(), DB::connection())->transaction[0]);
+        $this->assertSame('LOCK TABLE "jobs", "places", "job_sites" IN SHARE ROW EXCLUSIVE MODE', Statements::uninstall($this->map(), DB::connection())->transaction[0]);
     }
 
     #[Test]
@@ -371,7 +458,7 @@ final class StatementsTest extends TestCase
         $statements = Statements::uninstall($this->map(), DB::connection());
 
         $this->assertSame([
-            'LOCK TABLE "jobs" IN SHARE ROW EXCLUSIVE MODE',
+            'LOCK TABLE "jobs", "places", "job_sites" IN SHARE ROW EXCLUSIVE MODE',
             'DROP VIEW "listings"',
             'ALTER TABLE "listings_retained" RENAME TO "listings"',
             'INSERT INTO "listings" ("job_id") SELECT "jobs"."id" FROM "jobs" WHERE NOT EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" = "jobs"."id")',

@@ -45,9 +45,12 @@ final class CompileSql extends Command
 
         try {
             $map = Compatibility::of($model)->resolve();
-            $connection = (new $map->model)->getConnection();
-            $connection->useWriteConnectionWhenReading();
-            $statements = $statementsFor($map, $connection);
+            $connection = Compatibility::connection($map);
+            [$guard, $statements, $server] = $connection->transaction(fn () => [
+                Statements::guard($map, $connection, $for),
+                $statementsFor($map, $connection),
+                (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version"),
+            ]);
         } catch (InvalidCompatibilityMap $exception) {
             return $this->refuse($exception->getMessage());
         }
@@ -58,14 +61,13 @@ final class CompileSql extends Command
             return $this->refuse("Compatibility::{$for}() reads the external() ".(count($externals) === 1 ? 'attribute ' : 'attributes ').implode(', ', $externals)." of {$map->table} through PHP between its statements, and no printed SQL runs that step. Run Compatibility::{$for}() instead.");
         }
 
-        $server = (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version");
         $header = array_map(fn (string $line) => str_replace(["\r", "\n"], ['\\r', '\\n'], $line), [
             "-- compatibility:sql {$model} --for={$for}: the statements Compatibility::{$for}() runs for {$map->table}",
             "-- Read from database {$server['database']}, schema {$server['schema']} (search path {$server['search_path']}), on PostgreSQL {$server['version']}",
             '-- Compiled at '.Date::now()->toIso8601String(),
         ]);
         $terminate = fn (string $statement) => $statement."\n;";
-        $sql = implode("\n", $header)."\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, $statements->transaction))."\n\nCOMMIT;\n";
+        $sql = implode("\n", $header)."\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, [...$guard, ...$statements->transaction]))."\n\nCOMMIT;\n";
 
         if ($statements->afterwards !== []) {
             $sql .= "\n-- After the transaction commits, outside any transaction\n\n".implode("\n\n", array_map($terminate, $statements->afterwards))."\n";
@@ -81,7 +83,7 @@ final class CompileSql extends Command
             return $this->refuse("Could not write the statements to {$file}.");
         }
 
-        $count = count($statements->all());
+        $count = count($guard) + count($statements->all());
         $this->components->info("Wrote {$count} ".($count === 1 ? 'statement' : 'statements')." to {$file}.");
 
         return self::SUCCESS;

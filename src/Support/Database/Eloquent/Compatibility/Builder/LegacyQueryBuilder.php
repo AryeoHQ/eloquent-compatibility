@@ -163,7 +163,7 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function update(array $values): int
     {
-        return $this->route(fn (): int => parent::update($values), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $values));
+        return $this->route(fn (): int => parent::update($values), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $values, alias: $this->alias($legacy)));
     }
 
     /**
@@ -172,7 +172,7 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function incrementEach(array $columns, array $extra = []): int
     {
-        return $this->route(fn (): int => parent::incrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1)));
+        return $this->route(fn (): int => parent::incrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, 1), $this->alias($legacy)));
     }
 
     /**
@@ -181,7 +181,7 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function decrementEach(array $columns, array $extra = []): int
     {
-        return $this->route(fn (): int => parent::decrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1)));
+        return $this->route(fn (): int => parent::decrementEach($columns, $extra), fn (Model $legacy): int => $this->massWriter($legacy)->update($this->keys($legacy), $extra, self::amounts($columns, -1), $this->alias($legacy)));
     }
 
     /**
@@ -191,7 +191,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         return $this->route(fn (): int => parent::delete($id), function (Model $legacy) use ($id): int {
             if ($id !== null) {
-                $this->where($this->from.'.id', '=', $id);
+                $this->where($this->alias($legacy).'.id', '=', $id);
             }
 
             return $this->massWriter($legacy)->delete($this->keys($legacy));
@@ -295,19 +295,20 @@ final class LegacyQueryBuilder extends QueryBuilder
         $keys = $this->cloneWithout($limited ? ['columns', 'aggregate', 'lock'] : ['columns', 'aggregate', 'lock', 'orders'])
             ->cloneWithoutBindings($limited ? ['select'] : ['select', 'order']);
 
-        return $keys->select($legacy->qualifyColumn($legacy->getKeyName()));
+        return $keys->select($this->alias($legacy).'.'.$legacy->getKeyName());
     }
 
     private function refuseExternal(): void
     {
         $legacy = $this->legacy;
+        $alias = $legacy === null ? null : $this->alias($legacy);
 
-        if ($legacy === null || $this->from !== $legacy->getTable()) {
+        if ($legacy === null || $alias === null) {
             return;
         }
 
         $externals = ExternalAttributes::of($legacy::class);
-        $reading = $externals === [] ? null : $this->reading($legacy->getTable(), $externals);
+        $reading = $externals === [] ? null : $this->reading($alias, $externals);
 
         if ($reading !== null && LegacyBuilder::serves($legacy)) {
             throw LegacyBuilder::refuseExternal($legacy::class, ...$reading);
@@ -324,8 +325,8 @@ final class LegacyQueryBuilder extends QueryBuilder
             ...($this->aggregate === null ? [] : [[$this->aggregate['function'].'()', $this->aggregate['columns'] ?? []]]),
             ['select', $this->columns ?? []],
             ['groupBy', $this->groups ?? []],
-            ['having', array_column($this->havings ?? [], 'column')],
-            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], $this->orders ?? []),
+            ['having', self::havingColumns($this->havings ?? [])],
+            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], [...($this->orders ?? []), ...($this->unionOrders ?? [])]),
             ['where', self::whereColumns($this->wheres)],
         ];
 
@@ -366,6 +367,33 @@ final class LegacyQueryBuilder extends QueryBuilder
             if (is_array($where['columns'] ?? null)) {
                 $columns = [...$columns, ...array_values($where['columns'])];
             }
+
+            if (($where['type'] ?? null) === 'betweenColumns' && is_array($where['values'] ?? null)) {
+                $columns = [...$columns, ...array_values($where['values'])];
+            }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $havings
+     * @return list<mixed>
+     */
+    private static function havingColumns(array $havings): array
+    {
+        $columns = [];
+
+        foreach ($havings as $having) {
+            if (! is_array($having)) {
+                continue;
+            }
+
+            if (($having['type'] ?? null) === 'Nested' && ($having['query'] ?? null) instanceof QueryBuilder) {
+                $columns = [...$columns, ...self::havingColumns($having['query']->havings ?? [])];
+            }
+
+            $columns[] = $having['column'] ?? null;
         }
 
         return $columns;
@@ -393,11 +421,18 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->legacy;
 
-        if ($legacy === null || $this->native || $this->from !== $legacy->getTable()) {
+        if ($legacy === null || $this->native || $this->alias($legacy) === null) {
             return $native();
         }
 
         return ServedTable::write($legacy, $native, fn (): mixed => $translated($legacy));
+    }
+
+    private function alias(Model $legacy): null|string
+    {
+        $segments = is_string($this->from) ? preg_split('/\s+as\s+/i', trim($this->from)) : false;
+
+        return is_array($segments) && count($segments) <= 2 && $segments[0] === $legacy->getTable() ? end($segments) : null;
     }
 
     private function writer(Model $legacy): RecordWriter

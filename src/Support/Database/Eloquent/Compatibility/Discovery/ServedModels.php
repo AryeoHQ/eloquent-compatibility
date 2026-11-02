@@ -14,6 +14,8 @@ use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
 final class ServedModels
 {
+    private const string PACKAGE = 'aryeo/eloquent-compatibility';
+
     /** @var null|list<class-string<Model&Compatible>> */
     private null|array $models = null;
 
@@ -81,7 +83,7 @@ final class ServedModels
         while ($mentions !== null) {
             $inherited = [];
 
-            foreach ($files as $class => $file) {
+            foreach ($files as $class => [$file, $listed]) {
                 if (array_key_exists($class, $checked) || preg_match($mentions, (string) file_get_contents($file)) !== 1) {
                     continue;
                 }
@@ -104,7 +106,7 @@ final class ServedModels
                     $inherited[] = '\bextends\s+\\\\?(?:\w+\\\\)*'.preg_quote($reflection->getShortName(), '/').'\b|\b'.preg_quote($reflection->getShortName(), '/').'\s+as\s+\w';
                 }
 
-                if (! $reflection->isAbstract() && is_subclass_of($class, Model::class) && is_subclass_of($class, Compatible::class)) {
+                if ($listed && ! $reflection->isAbstract() && is_subclass_of($class, Model::class) && is_subclass_of($class, Compatible::class)) {
                     $models[] = $class;
                 }
             }
@@ -118,7 +120,7 @@ final class ServedModels
     }
 
     /**
-     * @return array<string, string>
+     * @return array<string, array{string, bool}>
      */
     private function classmap(): array
     {
@@ -127,7 +129,7 @@ final class ServedModels
         foreach (ClassLoader::getRegisteredLoaders() as $vendor => $loader) {
             $real = realpath($vendor);
             $vendor = ($real === false ? $vendor : $real).DIRECTORY_SEPARATOR;
-            $packages = $this->pathPackages($vendor);
+            [$paths, $dependents] = $this->packages($vendor);
 
             foreach ($loader->getClassMap() as $class => $file) {
                 $real = realpath($file);
@@ -137,9 +139,12 @@ final class ServedModels
                 }
 
                 $vendored = str_starts_with($file, $vendor) || str_starts_with($real, $vendor);
+                $within = fn (array $packages): bool => array_filter($packages, fn (string $package) => str_starts_with($real, $package)) !== [];
 
-                if (! $vendored || array_filter($packages, fn (string $package) => str_starts_with($real, $package)) !== []) {
-                    $files[$class] ??= $real;
+                if (! $vendored || $within($paths)) {
+                    $files[$class] ??= [$real, true];
+                } elseif ($within($dependents)) {
+                    $files[$class] ??= [$real, false];
                 }
             }
         }
@@ -148,30 +153,47 @@ final class ServedModels
     }
 
     /**
-     * @return list<string>
+     * @return array{list<string>, list<string>}
      */
-    private function pathPackages(string $vendor): array
+    private function packages(string $vendor): array
     {
         $installed = "{$vendor}composer/installed.json";
 
         if (! $this->files->isFile($installed)) {
-            return [];
+            return [[], []];
         }
 
         $decoded = json_decode($this->files->get($installed), true);
-        $packages = is_array($decoded) ? $decoded['packages'] ?? $decoded : [];
+        $packages = array_filter(is_array($decoded) ? $decoded['packages'] ?? $decoded : [], fn (mixed $package) => is_array($package) && is_string($package['name'] ?? null));
+        $depends = [self::PACKAGE => true];
+
+        do {
+            $grown = false;
+
+            foreach ($packages as $package) {
+                if (! array_key_exists($package['name'], $depends) && array_intersect_key(is_array($package['require'] ?? null) ? $package['require'] : [], $depends) !== []) {
+                    $depends[$package['name']] = $grown = true;
+                }
+            }
+        } while ($grown);
+
         $paths = [];
+        $dependents = [];
 
-        foreach (is_array($packages) ? $packages : [] as $package) {
-            $path = is_array($package) && ($package['dist']['type'] ?? null) === 'path' && is_string($package['install-path'] ?? null)
-                ? realpath("{$vendor}composer/{$package['install-path']}")
-                : false;
+        foreach ($packages as $package) {
+            $path = is_string($package['install-path'] ?? null) ? realpath("{$vendor}composer/{$package['install-path']}") : false;
 
-            if ($path !== false) {
+            if ($path === false) {
+                continue;
+            }
+
+            if (($package['dist']['type'] ?? null) === 'path') {
                 $paths[] = $path.DIRECTORY_SEPARATOR;
+            } elseif ($package['name'] !== self::PACKAGE && array_key_exists($package['name'], $depends)) {
+                $dependents[] = $path.DIRECTORY_SEPARATOR;
             }
         }
 
-        return $paths;
+        return [$paths, $dependents];
     }
 }

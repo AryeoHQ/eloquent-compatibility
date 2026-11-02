@@ -228,6 +228,55 @@ final class PreparerTest extends TestCase
         }
     }
 
+    /**
+     * @return iterable<string, array{list<string>, string, string}>
+     */
+    public static function foreignInvalidIndexes(): iterable
+    {
+        yield 'on another table' => [['create table job_notes (job_id uuid)', 'create unique index jobs_legacy_uuid_unique on job_notes (job_id)'], 'jobs_legacy_uuid_unique', 'CREATE UNIQUE INDEX jobs_legacy_uuid_unique ON public.job_notes USING btree (job_id)'];
+        yield 'on the table, over another definition' => [['create unique index places_listings_at_most_one on places (job_id)'], 'places_listings_at_most_one', 'CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id)'];
+    }
+
+    /**
+     * @param  list<string>  $create
+     */
+    #[DataProvider('foreignInvalidIndexes')]
+    #[Test]
+    public function it_refuses_and_keeps_an_invalid_index_that_holds_the_name_of_an_index_it_builds_but_not_its_table_or_definition(array $create, string $name, string $definition): void
+    {
+        foreach ($create as $statement) {
+            DB::statement($statement);
+        }
+
+        DB::update('update pg_index set indisvalid = false where indexrelid = cast(? as regclass)', [$name]);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: {$name} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.", $exception->getMessage());
+            $this->assertSame([$definition, false], [DB::scalar('select pg_get_indexdef(to_regclass(?))', [$name]), DB::scalar('select indisvalid from pg_index where indexrelid = to_regclass(?)', [$name])]);
+        } finally {
+            DB::statement('drop table if exists job_notes');
+        }
+    }
+
+    #[Test]
+    public function it_refuses_an_identifier_column_the_successor_already_has_with_another_type_and_changes_nothing(): void
+    {
+        DB::statement('alter table jobs add column legacy_id bigint');
+        DB::insert("insert into jobs (name, company_id, legacy_id) values ('Birch Barn', ?, 2147483648)", [ListingTables::COMPANY]);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'listings' is declared wrongly: jobs already has a column legacy_id of type bigint, and identifier 'id' needs integer, the type of listings.id; change or drop jobs.legacy_id, then prepare again.", $exception->getMessage());
+        }
+
+        $this->assertSame([null, false], [DB::scalar("select column_default from information_schema.columns where table_name = 'jobs' and column_name = 'legacy_id'"), DB::scalar("select count(*) > 0 from pg_attribute where attrelid = 'jobs'::regclass and attname = 'legacy_uuid'")]);
+    }
+
     #[Test]
     public function it_refuses_a_constraint_that_holds_the_name_of_the_check_it_adds(): void
     {
@@ -465,17 +514,159 @@ final class PreparerTest extends TestCase
     #[Test]
     public function it_builds_an_at_most_one_index_whose_condition_binds_a_date(): void
     {
+        DB::statement('alter table places add column moved_in_at timestamp(0) without time zone');
+        $map = (new Compatibility(Listing::class))
+            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->servedFrom(Job::class, fn (Successor $job) => $job
+                ->related(fn (Job $job) => $job->hasOne(Place::class)->where('moved_in_at', '>=', new DateTimeImmutable('2026-01-01')), fn (Successor $place) => $place->atMostOne(because: 'One current address.')))
+            ->resolve();
+
+        (new Installer(DB::connection()))->run(Statements::prepare($map, DB::connection()));
+
+        $this->assertSame(
+            "CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id) WHERE ((moved_in_at >= '2026-01-01 00:00:00'::timestamp without time zone) AND (deleted_at IS NULL))",
+            DB::scalar("select indexdef from pg_indexes where indexname = 'places_listings_at_most_one'"),
+        );
+    }
+
+    #[Test]
+    public function it_refuses_an_at_most_one_condition_whose_instant_follows_the_session_time_zone(): void
+    {
         $map = (new Compatibility(Listing::class))
             ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
             ->servedFrom(Job::class, fn (Successor $job) => $job
                 ->related(fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', new DateTimeImmutable('2026-01-01')), fn (Successor $place) => $place->atMostOne(because: 'One current address.')))
             ->resolve();
 
+        try {
+            (new Installer(DB::connection()))->run(Statements::prepare($map, DB::connection()));
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'listings' cannot prepare: atMostOne() on the relation from Job to Place has a condition whose instant follows the session time zone, and the index and the view would each read it in the time zone of their own session. Compare a timestamp with time zone with a value that names its offset.", null],
+            [$refusal, DB::scalar("select indexdef from pg_indexes where indexname = 'places_listings_at_most_one'")],
+        );
+    }
+
+    #[Test]
+    public function it_builds_an_at_most_one_index_whose_condition_names_the_offset_of_its_instant(): void
+    {
+        $map = (new Compatibility(Listing::class))
+            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+            ->servedFrom(Job::class, fn (Successor $job) => $job
+                ->related(fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', '2026-01-01 00:00:00+09'), fn (Successor $place) => $place->atMostOne(because: 'One current address.')))
+            ->resolve();
+
         (new Installer(DB::connection()))->run(Statements::prepare($map, DB::connection()));
 
         $this->assertSame(
-            "CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id) WHERE ((created_at >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (deleted_at IS NULL))",
+            "CREATE UNIQUE INDEX places_listings_at_most_one ON public.places USING btree (job_id) WHERE ((created_at >= '2025-12-31 15:00:00+00'::timestamp with time zone) AND (deleted_at IS NULL))",
             DB::scalar("select indexdef from pg_indexes where indexname = 'places_listings_at_most_one'"),
+        );
+    }
+
+    #[Test]
+    public function it_refuses_to_share_the_legacy_sequence_with_a_successor_writer_that_cannot_draw_from_it(): void
+    {
+        $role = 'compatibility_job_writer_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant insert on jobs to {$role}");
+
+            try {
+                Compatibility::prepare(Listing::class);
+                $refusal = 'no refusal';
+            } catch (QueryException $exception) {
+                $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+
+            $columns = DB::scalar("select count(*) from pg_attribute where attrelid = 'jobs'::regclass and attname = 'legacy_id'");
+            DB::statement("grant usage on sequence listings_id_seq to {$role}");
+            Compatibility::prepare(Listing::class);
+            DB::statement("set role {$role}");
+            DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY]);
+            DB::statement('reset role');
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'listings' cannot prepare: jobs.legacy_id draws from listings_id_seq, and {$role} can insert into jobs without USAGE on it. Grant USAGE ON SEQUENCE listings_id_seq to each of them, then prepare again.", 0, 1],
+            [$refusal, $columns, DB::table('jobs')->where('name', 'Birch Barn')->whereNotNull('legacy_id')->count()],
+        );
+    }
+
+    #[Test]
+    public function it_refuses_to_move_a_legacy_identifier_onto_the_shared_sequence_while_a_legacy_writer_cannot_draw_from_it(): void
+    {
+        FileTables::create();
+        $role = 'compatibility_photo_writer_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant insert on photos to {$role}");
+            DB::statement("grant usage on sequence photos_id_seq to {$role}");
+
+            try {
+                Compatibility::prepare(Photo::class);
+                $refusal = 'no refusal';
+            } catch (QueryException $exception) {
+                $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+
+            $default = (new ColumnCatalog(DB::connection()))->of('photos')['id']->default;
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+            DB::statement('create sequence compatibility_legacy_id_seq');
+            DB::statement("grant usage on sequence compatibility_legacy_id_seq to {$role}");
+            Compatibility::prepare(Photo::class);
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch-back.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'photos' cannot prepare: photos.id draws from compatibility_legacy_id_seq, and {$role} can insert into photos without USAGE on it. Grant USAGE ON SEQUENCE compatibility_legacy_id_seq to each of them, then prepare again.", "nextval('photos_id_seq'::regclass)"],
+            [$refusal, $default],
+        );
+        $this->assertSame(['birch.jpg', 'birch-back.jpg'], DB::table('photos')->orderBy('id')->pluck('file_name')->all());
+    }
+
+    #[Test]
+    public function it_reads_the_sequence_grant_to_public_for_a_successor_that_public_can_insert_into(): void
+    {
+        try {
+            DB::statement('grant insert on jobs to public');
+
+            try {
+                Compatibility::prepare(Listing::class);
+                $refusal = 'no refusal';
+            } catch (QueryException $exception) {
+                $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+
+            DB::statement('grant usage on sequence listings_id_seq to public');
+            Compatibility::prepare(Listing::class);
+            $columns = DB::scalar("select count(*) from pg_attribute where attrelid = 'jobs'::regclass and attname = 'legacy_id'");
+        } finally {
+            DB::statement('revoke insert on jobs from public');
+            DB::statement('revoke usage on sequence listings_id_seq from public');
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'listings' cannot prepare: jobs.legacy_id draws from listings_id_seq, and PUBLIC can insert into jobs without USAGE on it. Grant USAGE ON SEQUENCE listings_id_seq to each of them, then prepare again.", 1],
+            [$refusal, $columns],
         );
     }
 

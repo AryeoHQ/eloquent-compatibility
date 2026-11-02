@@ -307,7 +307,10 @@ final class Attribute
         return $this;
     }
 
-    public function read(string $table, null|string $stored = null): string
+    /**
+     * @param  null|(Closure(null|string): (null|string))  $baseType
+     */
+    public function read(string $table, null|string $stored = null, null|Closure $baseType = null): string
     {
         if ($this->external !== null) {
             throw new LogicException("Attribute '{$this->name}' is external, so no SQL reads it.");
@@ -315,9 +318,10 @@ final class Attribute
 
         $sql = $this->column === null ? 'NULL' : SqlFragments::identifier($table).'.'.SqlFragments::identifier($this->column);
         $types = $this->types($stored);
+        $baseType ??= fn (null|string $type) => $type;
 
         foreach ($this->conversions() as $at => $conversion) {
-            if ($conversion instanceof AsType && SqlFragments::isZoned($types[$at]) && SqlFragments::isNaive($conversion->type)) {
+            if ($conversion instanceof AsType && SqlFragments::isZoned($baseType($types[$at])) && SqlFragments::isNaive($baseType($conversion->type))) {
                 $sql = SqlFragments::inApplicationZone($sql);
             }
 

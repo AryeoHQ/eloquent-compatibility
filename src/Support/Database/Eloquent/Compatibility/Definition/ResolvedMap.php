@@ -146,6 +146,16 @@ final readonly class ResolvedMap
     }
 
     /**
+     * @return list<string>
+     */
+    public function tables(): array
+    {
+        $successors = array_map(fn (self $served) => [$served->primary->table, ...array_map(fn (Related $related) => $related->table, $served->related)], $this->branches === [] ? [$this] : array_values($this->branches));
+
+        return array_values(array_unique(array_filter([$this->table, $this->retainedTable, ...array_merge(...$successors)], is_string(...))));
+    }
+
+    /**
      * @param  list<string>  $columns
      * @return list<string>
      */
