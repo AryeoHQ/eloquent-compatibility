@@ -513,6 +513,47 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_move_a_legacy_identifier_onto_the_shared_sequence_while_a_legacy_writer_cannot_draw_from_it(): void
+    {
+        FileTables::create();
+        $role = 'compatibility_photo_writer_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant insert on photos to {$role}");
+            DB::statement("grant usage on sequence photos_id_seq to {$role}");
+
+            try {
+                Compatibility::prepare(Photo::class);
+                $refusal = 'no refusal';
+            } catch (QueryException $exception) {
+                $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+
+            $default = (new ColumnCatalog(DB::connection()))->of('photos')['id']->default;
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+            DB::statement('create sequence compatibility_legacy_id_seq');
+            DB::statement("grant usage on sequence compatibility_legacy_id_seq to {$role}");
+            Compatibility::prepare(Photo::class);
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch-back.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'photos' cannot prepare: photos.id draws from compatibility_legacy_id_seq, and {$role} can insert into photos without USAGE on it. Grant USAGE ON SEQUENCE compatibility_legacy_id_seq to each of them, then prepare again.", "nextval('photos_id_seq'::regclass)"],
+            [$refusal, $default],
+        );
+        $this->assertSame(['birch.jpg', 'birch-back.jpg'], DB::table('photos')->orderBy('id')->pluck('file_name')->all());
+    }
+
+    #[Test]
     public function it_refuses_an_index_name_longer_than_postgresql_keeps(): void
     {
         $legacy = new class extends Model

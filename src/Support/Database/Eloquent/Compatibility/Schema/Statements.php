@@ -162,6 +162,10 @@ final readonly class Statements
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so recompile() has nothing to replace; install() creates it");
         }
 
+        if ($map->membership !== null) {
+            self::refuseSharedAlias($connection, $map, $map->membership);
+        }
+
         $view = (new ViewCompiler(new ColumnCatalog($connection), $connection))->replace($map);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $identifiers = array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers));

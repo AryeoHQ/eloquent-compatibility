@@ -33,6 +33,7 @@ final readonly class RecordWriter
             $writer = new MassWriter($this->map, $this->connection);
 
             return $writer->transaction(function () use ($writer, $legacy, $values): int|string {
+                $values = $this->evaluateRetained($legacy, null, $values);
                 $branch = $this->map->branchFor(self::probe($legacy, $values));
                 $writer->claim($values, $branch);
                 $key = $this->through($branch)->insert($legacy, $values);
@@ -173,11 +174,7 @@ final readonly class RecordWriter
         if ($target === $current) {
             (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($values, $this->map->identifiers), $current);
             $updated = $this->through($current)->update($legacy, $values);
-            $moved = $this->rekey($legacy, $key, $values);
-
-            if ($moved !== $key) {
-                $this->readBack($legacy, $moved, array_keys($values));
-            }
+            $this->settle($legacy, $current, $primary, $key, $values, array_keys($values));
 
             return $updated;
         }
@@ -186,7 +183,7 @@ final readonly class RecordWriter
         $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
         $moved = $this->rekey($legacy, $key, $values);
         $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
-        (new MassWriter($this->map, $this->connection))->claim($this->allocated($legacy, $target, $stored), $target);
+        $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
         $this->readBack($legacy, $moved, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
 
         return 1;
@@ -214,7 +211,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $values
      * @return array<string, mixed>
      */
-    private function evaluateRetained(Model $legacy, int|string $key, array $values): array
+    private function evaluateRetained(Model $legacy, null|int|string $key, array $values): array
     {
         $retained = array_diff_key($values, $this->map->identifiers, $this->map->attributes);
 
@@ -244,16 +241,16 @@ final readonly class RecordWriter
         $this->refuseRaw($extra);
         MassWriter::refuseIdentifierAmounts($this->map, $amounts);
         $key = self::keyOf($legacy);
-        [$current] = $this->holding($legacy, $key);
+        [$current, $primary] = $this->holding($legacy, $key);
 
-        if ($current === null) {
+        if ($current === null || $primary === null) {
             return 0;
         }
 
         $extra = $this->evaluateRetained($legacy, $key, $extra);
         $after = array_replace($this->before($legacy, $key), $extra);
 
-        foreach ($amounts as $name => $amount) {
+        foreach (array_diff_key($amounts, $extra) as $name => $amount) {
             $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
         }
 
@@ -265,11 +262,7 @@ final readonly class RecordWriter
 
         (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
         $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
-        $moved = $this->rekey($legacy, $key, $extra);
-
-        if ($moved !== $key) {
-            $this->readBack($legacy, $moved, [...array_keys($amounts), ...array_keys($extra)]);
-        }
+        $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
 
         return $incremented;
     }
@@ -323,15 +316,54 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  array<string, mixed>  $values
+     * @param  list<int|string>  $names
+     */
+    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): void
+    {
+        $this->confirm($legacy, $branch, $key, $values, $this->identifiersWhere($branch, $branch->primary->key, self::keyOf($primary)));
+        $moved = $this->rekey($legacy, $key, $values);
+
+        if ($moved !== $key) {
+            $this->readBack($legacy, $moved, $names);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  array<string, mixed>  $stored
+     */
+    private function confirm(Model $legacy, ResolvedMap $branch, int|string $key, array $values, array $stored): void
+    {
+        (new MassWriter($this->map, $this->connection))->claim($stored, $branch);
+        $written = $values[$legacy->getKeyName()] ?? $key;
+        $kept = $stored[$legacy->getKeyName()] ?? null;
+
+        if ((is_int($written) || is_string($written)) && (is_int($kept) || is_string($kept)) && (string) $written === (string) $kept) {
+            return;
+        }
+
+        throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that changes the id of record '.$key, class_basename($branch->primary->model).' stored id '.(is_scalar($kept) ? (string) $kept : 'none').' where the write gives '.(is_scalar($written) ? (string) $written : '').', and the retained values and the instance follow the id the write gives.');
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function allocated(Model $legacy, ResolvedMap $branch, int|string $key): array
+    {
+        return $this->identifiersWhere($branch, (string) $branch->identifiers[$legacy->getKeyName()]->column(), $key);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function identifiersWhere(ResolvedMap $branch, string $column, int|string $value): array
     {
         $table = $branch->primary->table;
         $columns = array_map(fn (Identifier $identifier) => (string) $identifier->column(), $branch->identifiers);
         $row = (array) $this->connection->table($table)
             ->where($table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
-            ->where($table.'.'.$columns[$legacy->getKeyName()], $key)
+            ->where($table.'.'.$column, $value)
             ->first(array_values($columns));
 
         return array_map(fn (string $column) => $row[$column] ?? null, $columns);
@@ -514,7 +546,7 @@ final readonly class RecordWriter
      * @param  array<string, Expression>  $expressions
      * @return array<string, mixed>
      */
-    private function evaluate(Model $legacy, int|string $key, array $expressions): array
+    private function evaluate(Model $legacy, null|int|string $key, array $expressions): array
     {
         if ($expressions === []) {
             return [];
@@ -527,7 +559,9 @@ final readonly class RecordWriter
             $selects[] = '('.$expression->getValue($grammar).') as '.$grammar->wrap('value_'.$index);
         }
 
-        $row = (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->selectRaw(implode(', ', $selects))->first();
+        $row = $key === null
+            ? (array) $this->connection->selectOne('select '.implode(', ', $selects))
+            : (array) $this->connection->table($legacy->getTable())->where($legacy->getKeyName(), $key)->selectRaw(implode(', ', $selects))->first();
 
         return array_combine(array_keys($expressions), array_values($row));
     }

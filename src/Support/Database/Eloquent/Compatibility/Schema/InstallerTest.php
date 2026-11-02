@@ -22,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\LegacyFile;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -706,6 +707,42 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('r', $this->kind('floorplans'));
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_an_installed_map_onto_the_morph_alias_another_installed_map_claims(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        Compatibility::install(LegacyFile::class);
+        $view = DB::scalar("select pg_get_viewdef('legacy_files'::regclass)");
+        $impostor = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'legacy_files';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $legacyFile): Compatibility
+            {
+                return LegacyFile::compatibility($legacyFile);
+            }
+        };
+
+        try {
+            Compatibility::recompile($impostor::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(InvalidCompatibilityMap::because('legacy_files', "the installed map retained in photos_retained already serves the files rows whose legacy_type is 'photo', and two installed maps cannot share a morph alias")->getMessage(), $refusal);
+        $this->assertSame($view, DB::scalar("select pg_get_viewdef('legacy_files'::regclass)"));
+        $this->assertSame([], DB::table('legacy_files')->whereIn('file_name', DB::table('photos')->select('file_name'))->pluck('file_name')->all());
     }
 
     #[Test]

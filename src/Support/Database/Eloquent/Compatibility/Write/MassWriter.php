@@ -494,7 +494,7 @@ final readonly class MassWriter
 
             $after = array_replace($before, $values, $evaluated);
 
-            foreach ($amounts as $name => $amount) {
+            foreach (array_diff_key($amounts, $values) as $name => $amount) {
                 $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
             }
 
