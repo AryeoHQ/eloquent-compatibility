@@ -12,6 +12,7 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
@@ -58,6 +59,14 @@ final class ServesCompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_boot_a_named_served_model_that_discovery_did_not_find(): void
+    {
+        $this->expectExceptionObject(UndiscoveredServedModel::named(Unmapped::class));
+
+        new Unmapped;
+    }
+
+    #[Test]
     public function it_reads_identical_values_through_eloquent_and_through_raw_sql_once_installed(): void
     {
         $eloquent = fn () => Listing::withTrashed()->orderBy('id')->get()->map(fn (Listing $listing) => $listing->getAttributes())->all();
@@ -97,5 +106,15 @@ final class ServesCompatibilityTest extends TestCase
 
         $this->assertSame([4, [[4, 'Birch Hall', false], [5, 'Ash', true]], 0], [$native, $tableRows, $nativeJobs]);
         $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('jobs', 'legacy_id', 'name')]);
+    }
+}
+
+final class Unmapped extends Model implements Compatible
+{
+    use ServesCompatibility;
+
+    public static function compatibility(Compatibility $compatibility): Compatibility
+    {
+        return $compatibility;
     }
 }

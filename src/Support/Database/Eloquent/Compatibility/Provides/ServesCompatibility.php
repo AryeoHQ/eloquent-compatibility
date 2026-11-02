@@ -4,12 +4,16 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Provides;
 
+use Illuminate\Container\Container;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use ReflectionClass;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyQueryBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
+use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
 /**
@@ -19,6 +23,17 @@ use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
  */
 trait ServesCompatibility
 {
+    public static function bootServesCompatibility(): void
+    {
+        if ((new ReflectionClass(static::class))->isAnonymous()) {
+            return;
+        }
+
+        if (! Container::getInstance()->make(ServedModels::class)->contains(static::class)) {
+            throw UndiscoveredServedModel::named(static::class);
+        }
+    }
+
     /**
      * @param  QueryBuilder  $query
      * @return LegacyBuilder<$this>
