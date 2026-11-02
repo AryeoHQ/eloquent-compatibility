@@ -150,7 +150,13 @@ final readonly class ResolvedMap
      */
     public function tables(): array
     {
-        return array_values(array_unique(array_filter([$this->table, $this->retainedTable, $this->primary->table, ...array_map(fn (Related $related) => $related->table, $this->related)], is_string(...))));
+        return array_values(array_unique(array_filter([
+            $this->table,
+            $this->retainedTable,
+            $this->primary->table,
+            ...array_map(fn (Related $related) => $related->table, $this->related),
+            ...array_merge([], ...array_map(fn (self $branch) => $branch->tables(), array_values($this->branches))),
+        ], is_string(...))));
     }
 
     /**

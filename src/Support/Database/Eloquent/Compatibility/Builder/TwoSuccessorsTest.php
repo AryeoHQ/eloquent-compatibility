@@ -1028,6 +1028,126 @@ final class TwoSuccessorsTest extends TestCase
         $this->assertSame(['2048.000', 5], [Video::query()->findOrFail(1)->size_kb, Video::query()->findOrFail(1)->views]);
     }
 
+    #[Test]
+    public function it_writes_a_value_that_another_branch_cannot_cast_to_the_branch_the_selector_chooses(): void
+    {
+        $video = $this->numberedVideo();
+        DB::table('files')->where('legacy_type', 'video')->update(['size_bytes' => null]);
+        DB::statement((new ViewCompiler(new ColumnCatalog(DB::connection()), DB::connection()))->replace(Compatibility::of($video::class)->resolve()));
+        LegacyBuilder::forgetViews();
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->create(['youtube_embed_url' => 'https://youtu.be/pine', 'title' => 'Pine']),
+            fn () => $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => 'https://youtu.be/elm']),
+            fn () => $video->newQuery()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/ash']),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (QueryException $exception) {
+                $outcomes[] = $exception->getCode();
+            }
+        }
+
+        $pine = (int) $video->newQuery()->where('title', 'Pine')->value('id');
+
+        $this->assertSame(['stored', 'stored', 'stored'], $outcomes);
+        $this->assertSame([['links', 1], ['links', 2], ['links', $pine]], $this->holders([1, 2, $pine]));
+        $this->assertSame(['https://youtu.be/ash', 'https://youtu.be/elm', 'https://youtu.be/pine'], $video->newQuery()->whereKey([1, 2, $pine])->orderBy('id')->pluck('youtube_embed_url')->all());
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_of_a_record_update_from_the_fixed_values_each_branch_serves_for_the_attributes_the_write_omits(): void
+    {
+        $video = $this->unnamedLinkVideo();
+
+        $this->assertTrue($video->newQuery()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour']));
+        $this->assertSame([['links', 1]], $this->holders([1]));
+        $this->assertSame([null, null, null, 'https://youtu.be/tour', 'Tour'], array_values($video->newQuery()->findOrFail(1)->only(['original_file_name', 'mime_type', 'size_kb', 'youtube_embed_url', 'title'])));
+        $this->assertSame(0, DB::table('files')->where('legacy_type', 'video')->where('legacy_id', 1)->count());
+    }
+
+    private function numberedVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('size_bytes')))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+    }
+
+    private function unnamedLinkVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('original_file_name') === null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+    }
+
     private function sizedVideo(): Model
     {
         return new class extends Model implements Compatible

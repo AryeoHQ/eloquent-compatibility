@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Definition;
 
 use Closure;
+use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -113,6 +114,29 @@ final class MembershipTest extends TestCase
         DB::table('files')->insert(['filename' => 'blank.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => null, 'size_bytes' => null]);
 
         $this->assertSame(1, DB::table('files')->where('filename', 'blank.jpg')->count());
+    }
+
+    #[Test]
+    public function it_compiles_a_when_that_compares_a_timestamp_with_a_date_object(): void
+    {
+        $map = self::photos(fn (Successor $file) => $file
+            ->when(fn (Builder $files) => $files->where('created_at', '>=', new DateTimeImmutable('2026-01-01')))
+            ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+            ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type')))->resolve();
+        Compatibility::prepare(Photo::class);
+        FileTables::backfill();
+        (new Installer(DB::connection()))->run(Statements::install($map, DB::connection()));
+
+        try {
+            DB::table('files')->insert(['filename' => 'old.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => 'photo', 'created_at' => '2025-12-31 10:00:00']);
+            $this->fail('The row was stored.');
+        } catch (QueryException $exception) {
+            $this->assertSame(['23514', true], [$exception->getCode(), str_contains($exception->getMessage(), 'files_photos_membership')]);
+        }
+
+        DB::table('files')->insert(['filename' => 'new.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => 'photo', 'created_at' => '2026-03-01 10:00:00']);
+
+        $this->assertSame(1, DB::table('files')->where('filename', 'new.jpg')->count());
     }
 
     #[Test]

@@ -79,7 +79,7 @@ final readonly class RetainedRows
             }
 
             $selects[] = 'CAST(? AS '.($catalog->type($retained, $column) ?? 'text').')';
-            $bindings[] = $value;
+            $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [$key => $value])];
         }
 
         foreach ($amounts as $column => $amount) {
