@@ -18,6 +18,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -139,6 +140,44 @@ final class ViewCompilerTest extends TestCase
             FROM (SELECT * FROM "files" WHERE "files"."legacy_type" = 'photo') AS "files"
             LEFT JOIN "photos_retained" ON "photos_retained"."file_id" = "files"."id"
             SQL, $this->viewCompiler()->create(Compatibility::of(Photo::class)->resolve()));
+    }
+
+    #[Test]
+    public function it_unions_one_select_per_successor_and_keys_the_retained_table_by_the_legacy_identifier(): void
+    {
+        FileTables::create();
+        Compatibility::prepare(Video::class);
+
+        $this->assertSame(<<<'SQL'
+            CREATE VIEW "videos" AS
+            SELECT
+              CAST("files"."legacy_id" AS integer) AS "id",
+              CAST("files"."legacy_uuid" AS uuid) AS "uuid",
+              CAST("files"."filename" AS character varying(255)) AS "original_file_name",
+              CAST("files"."mime_type" AS character varying(255)) AS "mime_type",
+              CAST((CAST("files"."size_bytes" AS numeric) / 1000) AS numeric(12,3)) AS "size_kb",
+              CAST(NULL AS character varying(255)) AS "youtube_embed_url",
+              CAST("videos_retained"."title" AS character varying(255)) AS "title",
+              CAST(CASE WHEN "videos_retained"."id" IS NULL THEN 0 ELSE "videos_retained"."views" END AS integer) AS "views",
+              CAST(("files"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "created_at",
+              CAST(("files"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "updated_at"
+            FROM (SELECT * FROM "files" WHERE "files"."legacy_type" = 'video') AS "files"
+            LEFT JOIN "videos_retained" ON "videos_retained"."id" = "files"."legacy_id"
+            UNION ALL
+            SELECT
+              CAST("links"."legacy_id" AS integer) AS "id",
+              CAST("links"."legacy_uuid" AS uuid) AS "uuid",
+              CAST(NULL AS character varying(255)) AS "original_file_name",
+              CAST(NULL AS character varying(255)) AS "mime_type",
+              CAST(NULL AS numeric(12,3)) AS "size_kb",
+              CAST("links"."url" AS character varying(255)) AS "youtube_embed_url",
+              CAST("videos_retained"."title" AS character varying(255)) AS "title",
+              CAST(CASE WHEN "videos_retained"."id" IS NULL THEN 0 ELSE "videos_retained"."views" END AS integer) AS "views",
+              CAST(("links"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "created_at",
+              CAST(("links"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "updated_at"
+            FROM (SELECT * FROM "links" WHERE "links"."legacy_type" = 'video') AS "links"
+            LEFT JOIN "videos_retained" ON "videos_retained"."id" = "links"."legacy_id"
+            SQL, $this->viewCompiler()->create(Compatibility::of(Video::class)->resolve()));
     }
 
     #[Test]

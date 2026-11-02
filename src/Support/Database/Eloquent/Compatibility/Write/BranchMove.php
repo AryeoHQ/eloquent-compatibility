@@ -1,0 +1,51 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility\Write;
+
+use Illuminate\Database\Connection;
+use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+
+final readonly class BranchMove
+{
+    public function __construct(private Connection $connection) {}
+
+    /**
+     * @param  array<string, mixed>  $before
+     * @param  array<string, mixed>  $values
+     */
+    public function run(Model $legacy, Model $old, ResolvedMap $to, array $before, array $values): void
+    {
+        if (Applying::run($legacy, $old, fn () => $old->forceDelete()) === false) {
+            throw CompatibilityWriteRefused::bySuccessorListener($legacy::class, $old);
+        }
+
+        (new RecordWriter($to, $this->connection))->insert($legacy, self::recreated($to, $before, $values));
+    }
+
+    /**
+     * @param  array<string, mixed>  $before
+     * @param  array<string, mixed>  $values
+     * @return array<string, mixed>
+     */
+    private static function recreated(ResolvedMap $to, array $before, array $values): array
+    {
+        $after = array_replace($before, $values);
+        $recreated = [];
+
+        foreach (array_keys($to->identifiers) as $name) {
+            $recreated[$name] = $after[$name] ?? null;
+        }
+
+        foreach ($to->attributes as $name => $attribute) {
+            if (! $attribute->isExternal() && ($attribute->column() !== null || array_key_exists($name, $values))) {
+                $recreated[$name] = $after[$name] ?? null;
+            }
+        }
+
+        return $recreated + array_intersect_key($values, array_flip($to->legacyOnly(array_keys($values))));
+    }
+}

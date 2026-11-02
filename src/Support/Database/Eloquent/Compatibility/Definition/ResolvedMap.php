@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Definition;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use LogicException;
 use ReflectionFunction;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -27,12 +28,18 @@ final readonly class ResolvedMap
 
     public null|Membership $membership;
 
+    public null|Closure $selector;
+
+    /** @var array<class-string<Model>, ResolvedMap> */
+    public array $branches;
+
     /**
      * @param  class-string<Model>  $model
      * @param  array<string, Identifier>  $identifiers
      * @param  list<Hide>  $hides
      * @param  array<string, Guard>  $guards
      * @param  array<class-string, string>  $withoutForwarding
+     * @param  array<class-string<Model>, Branch>  $branches
      */
     public function __construct(
         public string $model,
@@ -46,7 +53,19 @@ final readonly class ResolvedMap
         public array $guards,
         public array $withoutForwarding,
         null|string $discriminator = null,
+        null|Closure $selector = null,
+        array $branches = [],
+        public bool $branch = false,
     ) {
+        if ($selector !== null || $branches !== []) {
+            $this->resolveBranches($retainedKey, $timestamps, $discriminator, $selector, $branches);
+
+            return;
+        }
+
+        $this->selector = null;
+        $this->branches = [];
+
         if ($primary === null) {
             throw $this->invalid('it says no servedFrom(), so it names no successor');
         }
@@ -94,6 +113,18 @@ final readonly class ResolvedMap
         }
     }
 
+    public function branchFor(Model $legacy): self
+    {
+        $selector = $this->selector ?? throw new LogicException("Compatibility map '{$this->table}' serves one successor, so it has no branch to choose.");
+        $successor = $selector($legacy);
+
+        if (is_string($successor) && array_key_exists($successor, $this->branches)) {
+            return $this->branches[$successor];
+        }
+
+        throw $this->invalid('the servedFrom() selector returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and as() declares only '.implode(' and ', array_keys($this->branches)));
+    }
+
     /**
      * @param  list<string>  $columns
      * @return list<string>
@@ -101,6 +132,86 @@ final readonly class ResolvedMap
     public function legacyOnly(array $columns): array
     {
         return array_values(array_filter($columns, fn (string $column) => ! array_key_exists($column, $this->identifiers) && ! array_key_exists($column, $this->attributes)));
+    }
+
+    /**
+     * @param  array<class-string<Model>, Branch>  $branches
+     */
+    private function resolveBranches(null|string $retainedKey, bool $timestamps, null|string $discriminator, null|Closure $selector, array $branches): void
+    {
+        if ($selector === null) {
+            throw $this->invalid('as() declares a successor for the servedFrom() selector, and the map says no servedFrom() selector');
+        }
+
+        if ($branches === []) {
+            throw $this->invalid('servedFrom() takes a selector, and no as() declares a successor for it to choose');
+        }
+
+        $names = implode(' and ', array_map(class_basename(...), array_keys($branches)));
+
+        if ($discriminator === null) {
+            throw $this->invalid("servedFrom() chooses between {$names}, and they share one morph identity on one identifier sequence only through discriminatedBy()");
+        }
+
+        $resolved = [];
+        $tables = [];
+
+        foreach ($branches as $successor => $branch) {
+            $table = $branch->successor->table;
+
+            if (array_key_exists($table, $tables)) {
+                throw $this->invalid('as('.class_basename($successor).") reads the table {$table}, which as(".class_basename($tables[$table]).') already reads');
+            }
+
+            $tables[$table] = $successor;
+            $resolved[$successor] = new self(
+                $this->model,
+                $this->table,
+                $this->identifiers,
+                $this->retainedTable,
+                $retainedKey ?? (new $this->model)->getKeyName(),
+                $timestamps,
+                $branch->successor,
+                $this->hides,
+                $this->guards,
+                $this->withoutForwarding,
+                $discriminator,
+                branch: true,
+            );
+        }
+
+        $this->refuseUnreadable($resolved);
+        $first = reset($resolved);
+        $this->primary = $first->primary;
+        $this->retainedKey = $first->retainedKey;
+        $this->related = $first->related;
+        $this->attributes = $first->attributes;
+        $this->owners = $first->owners;
+        $this->membership = $first->membership;
+        $this->selector = $selector;
+        $this->branches = $resolved;
+    }
+
+    /**
+     * @param  array<class-string<Model>, ResolvedMap>  $branches
+     */
+    private function refuseUnreadable(array $branches): void
+    {
+        $declaredIn = [];
+
+        foreach ($branches as $successor => $branch) {
+            foreach (array_keys($branch->attributes) as $name) {
+                $declaredIn[$name] ??= $successor;
+            }
+        }
+
+        foreach ($branches as $successor => $branch) {
+            foreach ($declaredIn as $name => $declared) {
+                if (! array_key_exists($name, $branch->attributes)) {
+                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' branch and not in the '.class_basename($successor).' branch; give it from(), external() or fixed() there');
+                }
+            }
+        }
     }
 
     /**

@@ -12,7 +12,9 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -153,6 +155,108 @@ final class ResolvedMapTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_a_two_successor_map_into_one_map_per_successor_that_share_its_identity(): void
+    {
+        $map = Compatibility::of(Video::class)->resolve();
+        $branches = array_map(fn (ResolvedMap $branch) => [
+            $branch->primary->table,
+            $branch->branch,
+            $branch->retainedKey,
+            $branch->membership?->alias,
+            array_map(fn (Identifier $identifier) => $identifier->column(), $branch->identifiers),
+            array_map(fn (Attribute $attribute) => $attribute->column(), $branch->attributes),
+        ], $map->branches);
+
+        $this->assertSame([File::class, Link::class], array_keys($map->branches));
+        $this->assertSame([
+            File::class => ['files', true, 'id', 'video', ['id' => 'legacy_id', 'uuid' => 'legacy_uuid'], ['original_file_name' => 'filename', 'mime_type' => 'mime_type', 'size_kb' => 'size_bytes', 'youtube_embed_url' => null, 'created_at' => 'created_at', 'updated_at' => 'updated_at']],
+            Link::class => ['links', true, 'id', 'video', ['id' => 'legacy_id', 'uuid' => 'legacy_uuid'], ['original_file_name' => null, 'mime_type' => null, 'size_kb' => null, 'youtube_embed_url' => 'url', 'created_at' => 'created_at', 'updated_at' => 'updated_at']],
+        ], $branches);
+        $this->assertSame([false, 'videos_retained', 'id'], [$map->branch, $map->retainedTable, $map->retainedKey]);
+    }
+
+    #[Test]
+    public function it_chooses_the_branch_the_selector_returns_for_a_legacy_record(): void
+    {
+        $map = Compatibility::of(Video::class)->resolve();
+
+        $this->assertSame(
+            [$map->branches[Link::class], $map->branches[File::class]],
+            [$map->branchFor(new Video(['youtube_embed_url' => 'https://youtu.be/oak'])), $map->branchFor(new Video(['original_file_name' => 'tour.mp4']))],
+        );
+    }
+
+    #[Test]
+    public function it_refuses_a_selector_that_returns_a_successor_no_branch_declares(): void
+    {
+        $map = self::branched(new Compatibility(Video::class), fn (Video $video): string => Photo::class)->resolve();
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', 'the servedFrom() selector returns '.Photo::class.', and as() declares only '.File::class.' and '.Link::class));
+
+        $map->branchFor(new Video);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Compatibility): mixed, string}>
+     */
+    public static function invalidBranchedMaps(): iterable
+    {
+        $other = new class extends Model
+        {
+            protected $table = 'files';
+        };
+        $untimed = new class extends Model
+        {
+            public $timestamps = false;
+
+            protected $table = 'untimed_links';
+        };
+
+        yield 'a selector without a successor' => [fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(fn (Video $video): string => File::class), 'servedFrom() takes a selector, and no as() declares a successor for it to choose'];
+        yield 'branches without a discriminator' => [fn (Compatibility $video) => self::branched(self::identified($video)->retainedIn('videos_retained'), fn (Video $video): string => File::class, discriminated: false), 'servedFrom() chooses between File and Link, and they share one morph identity on one identifier sequence only through discriminatedBy()'];
+        yield 'an attribute one branch cannot read' => [
+            fn (Compatibility $video) => self::identified($video)
+                ->discriminatedBy('legacy_type')
+                ->servedFrom(fn (Video $video): string => File::class)
+                ->as(File::class, fn (Successor $file) => $file->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')))
+                ->as(Link::class, fn (Successor $link) => $link),
+            "attribute 'original_file_name' is readable in the File branch and not in the Link branch; give it from(), external() or fixed() there",
+        ];
+        yield 'two branches over one table' => [
+            fn (Compatibility $video) => self::identified($video)
+                ->discriminatedBy('legacy_type')
+                ->servedFrom(fn (Video $video): string => File::class)
+                ->as(File::class, fn (Successor $file) => $file)
+                ->as($other::class, fn (Successor $file) => $file),
+            'as('.class_basename($other::class).') reads the table files, which as(File) already reads',
+        ];
+        yield 'a branch timestamps cannot read' => [
+            fn (Compatibility $video) => self::identified($video)
+                ->discriminatedBy('legacy_type')
+                ->timestamps()
+                ->servedFrom(fn (Video $video): string => File::class)
+                ->as(File::class, fn (Successor $file) => $file)
+                ->as($untimed::class, fn (Successor $link) => $link),
+            'timestamps() reads the timestamps of '.class_basename($untimed).', which uses none',
+        ];
+    }
+
+    /**
+     * @param  Closure(Compatibility): mixed  $declare
+     */
+    #[DataProvider('invalidBranchedMaps')]
+    #[Test]
+    public function it_refuses_an_invalid_two_successor_map_and_names_it(Closure $declare, string $problem): void
+    {
+        $video = new Compatibility(Video::class);
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('videos', $problem));
+
+        $declare($video);
+        $video->resolve();
+    }
+
+    #[Test]
     public function it_refuses_timestamps_for_a_legacy_model_without_them(): void
     {
         $untimed = new class extends Model
@@ -204,6 +308,17 @@ final class ResolvedMapTest extends TestCase
         return $listing
             ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
             ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'));
+    }
+
+    /**
+     * @param  Closure(Video): string  $selector
+     */
+    private static function branched(Compatibility $video, Closure $selector, bool $discriminated = true): Compatibility
+    {
+        return ($discriminated ? self::identified($video)->discriminatedBy('legacy_type') : $video)
+            ->servedFrom($selector)
+            ->as(File::class, fn (Successor $file) => $file->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+            ->as(Link::class, fn (Successor $link) => $link->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
     }
 
     private static function titled(Successor $job): Successor

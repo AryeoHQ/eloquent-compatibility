@@ -27,6 +27,8 @@ final readonly class MassWriter
 {
     private const string PINNED = 'pg_temp.compatibility_pinned';
 
+    private const string SELECTED = 'pg_temp.compatibility_selected';
+
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     public static function refuseRaw(ResolvedMap $map, string $name, mixed $value): void
@@ -49,6 +51,10 @@ final readonly class MassWriter
      */
     public function update(QueryBuilder $keys, array $values, array $amounts = []): int
     {
+        if ($this->map->branches !== []) {
+            return $this->updateBranches($keys, $values, $amounts);
+        }
+
         [$stored, $retained] = $this->split($values);
         [$added, $retainedAmounts] = $this->amounts($amounts, null);
 
@@ -77,6 +83,22 @@ final readonly class MassWriter
 
     public function delete(QueryBuilder $keys): int
     {
+        if ($this->map->branches !== []) {
+            return $this->acrossBranches($keys, function (QueryBuilder $selected): int {
+                $deleted = 0;
+
+                foreach ($this->map->branches as $branch) {
+                    $deleted += (new self($branch, $this->connection))->delete($selected);
+                }
+
+                if ($this->map->retainedTable !== null) {
+                    $this->connection->table($this->map->retainedTable)->whereIn((string) $this->map->retainedKey, $selected)->delete();
+                }
+
+                return $deleted;
+            });
+        }
+
         $primary = $this->map->primary;
 
         $query = $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$this->legacyColumn(), $keys);
@@ -125,6 +147,193 @@ final readonly class MassWriter
         }
 
         return [$added, $retained];
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  array<string, float|int>  $amounts
+     */
+    public function retainByIdentity(QueryBuilder $keys, array $values, array $amounts): void
+    {
+        if ($values === [] && $amounts === []) {
+            return;
+        }
+
+        $retained = ViewCompiler::retainedTable($this->map);
+        $table = SqlFragments::identifier($retained);
+        $legacy = SqlFragments::identifier($this->map->table);
+        $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
+        $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
+        $catalog = new ColumnCatalog($this->connection);
+        $grammar = $this->connection->getQueryGrammar();
+        $selects = [];
+        $updates = [];
+        $bindings = [];
+        $joined = $amounts !== [];
+
+        foreach ($values as $column => $value) {
+            $wrapped = SqlFragments::identifier($column);
+            $updates[] = $wrapped.' = excluded.'.$wrapped;
+
+            if ($value instanceof Expression) {
+                $selects[] = (string) $value->getValue($grammar);
+                $joined = true;
+
+                continue;
+            }
+
+            $selects[] = 'CAST(? AS '.($catalog->type($retained, $column) ?? 'text').')';
+            $bindings[] = $value;
+        }
+
+        foreach ($amounts as $column => $amount) {
+            $wrapped = SqlFragments::identifier($column);
+            $selects[] = $legacy.'.'.$wrapped.' + '.$amount;
+            $updates[] = $wrapped.' = '.$table.'.'.$wrapped.' + '.$amount;
+        }
+
+        $source = $joined
+            ? implode(', ', [$legacyKey, ...$selects]).' FROM '.$legacy.' WHERE '.$legacyKey.' IN ('.$keys->toSql().')'
+            : implode(', ', ['selected.key', ...$selects]).' FROM ('.$keys->toSql().') AS selected (key)';
+
+        $this->connection->affectingStatement(
+            'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
+                .' SELECT '.$source
+                .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
+            [...$bindings, ...$keys->getBindings()],
+        );
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @param  array<array-key, float|int|numeric-string>  $amounts
+     */
+    private function updateBranches(QueryBuilder $keys, array $values, array $amounts): int
+    {
+        [$mapped, $retained] = $this->byOwner($values);
+        [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
+
+        return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $amounts, $mapped, $retained, $mappedAmounts, $retainedAmounts): int {
+            $this->refuseMoves($selected, $values, $amounts);
+            $updated = 0;
+
+            foreach ($holding as $branch) {
+                $updated += (new self($branch, $this->connection))->update($selected, $mapped, $mappedAmounts);
+            }
+
+            $this->retainByIdentity($selected, self::named($retained), array_map(fn (float|int|string $amount) => $amount + 0, array_diff_key(self::named($retainedAmounts), self::named($retained))));
+
+            return $updated;
+        });
+    }
+
+    /**
+     * @param  Closure(QueryBuilder, list<ResolvedMap>): int  $write
+     */
+    private function acrossBranches(QueryBuilder $keys, Closure $write): int
+    {
+        return $this->connection->transaction(function () use ($keys, $write): int {
+            $grammar = $this->connection->getQueryGrammar();
+            $key = (new $this->map->model)->getKeyName();
+            $selected = $this->connection->table(self::SELECTED)->select('key');
+            $holding = [];
+
+            $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
+
+            foreach ($this->map->branches as $branch) {
+                $primary = $branch->primary;
+                $locked = $this->connection->table($primary->table)
+                    ->where($primary->table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
+                    ->whereIn($primary->table.'.'.(string) $branch->identifiers[$key]->column(), $selected)
+                    ->orderBy($primary->table.'.'.$primary->key)
+                    ->lockForUpdate()
+                    ->pluck($primary->table.'.'.$primary->key);
+
+                if ($locked->isNotEmpty()) {
+                    $holding[] = $branch;
+                }
+            }
+
+            $this->connection->table(self::SELECTED)->whereNotIn('key', $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']))->delete();
+            $written = $write($selected, $holding);
+            $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::SELECTED));
+
+            return $written;
+        });
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @param  array<array-key, float|int|numeric-string>  $amounts
+     */
+    private function refuseMoves(QueryBuilder $selected, array $values, array $amounts): void
+    {
+        if ($values === [] && $amounts === []) {
+            return;
+        }
+
+        $key = (new $this->map->model)->getKeyName();
+        $values = self::named($values);
+        $amounts = self::named($amounts);
+
+        foreach ($this->connection->table($this->map->table)->whereIn($key, $selected)->orderBy($key)->cursor() as $row) {
+            $before = (array) $row;
+            $after = array_replace($before, $values);
+
+            foreach ($amounts as $name => $amount) {
+                $after[$name] = is_numeric($after[$name] ?? null) ? $after[$name] + $amount : $after[$name] ?? null;
+            }
+
+            $from = $this->map->branchFor((new $this->map->model)->setRawAttributes($before));
+            $to = $this->map->branchFor((new $this->map->model)->setRawAttributes($after));
+
+            if ($from !== $to) {
+                $record = $before[$key] ?? null;
+
+                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what servedFrom() chooses', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename($from->primary->model).' to '.class_basename($to->primary->model).', and a move deletes and recreates each record through its successor models, one at a time.');
+            }
+        }
+    }
+
+    /**
+     * @template TValue
+     *
+     * @param  array<array-key, TValue>  $values
+     * @return array{array<array-key, TValue>, array<array-key, TValue>}
+     */
+    private function byOwner(array $values): array
+    {
+        $mapped = [];
+        $retained = [];
+
+        foreach ($values as $name => $value) {
+            $attribute = Str::afterLast((string) $name, '.');
+
+            if (array_key_exists($attribute, $this->map->identifiers) || array_key_exists($attribute, $this->map->attributes)) {
+                $mapped[$name] = $value;
+            } else {
+                $retained[$name] = $value;
+            }
+        }
+
+        return [$mapped, $retained];
+    }
+
+    /**
+     * @template TValue
+     *
+     * @param  array<array-key, TValue>  $values
+     * @return array<string, TValue>
+     */
+    private static function named(array $values): array
+    {
+        $named = [];
+
+        foreach ($values as $name => $value) {
+            $named[Str::afterLast((string) $name, '.')] = $value;
+        }
+
+        return $named;
     }
 
     /**

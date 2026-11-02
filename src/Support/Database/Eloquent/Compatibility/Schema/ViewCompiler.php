@@ -21,7 +21,7 @@ final readonly class ViewCompiler
     {
         $legacy = $this->columnCatalog->of($map->table);
 
-        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $legacy, $map->table, $legacy);
+        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
     }
 
     public function replace(ResolvedMap $map): string
@@ -29,7 +29,7 @@ final readonly class ViewCompiler
         $shape = $this->columnCatalog->of($map->table);
         $retained = $this->columnCatalog->of(self::retainedTable($map));
 
-        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $shape, self::retainedTable($map), $retained);
+        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $shape, self::retainedTable($map), $retained);
     }
 
     /**
@@ -139,6 +139,15 @@ final readonly class ViewCompiler
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
      */
+    private function union(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    {
+        return implode("\nUNION ALL\n", array_map(fn (ResolvedMap $served) => $this->select($served, $shape, $defaultsOn, $retained), $map->branches === [] ? [$map] : array_values($map->branches)));
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @param  array<string, Column>  $retained
+     */
     private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
     {
         $served = $this->served($map, $shape);
@@ -181,10 +190,11 @@ final readonly class ViewCompiler
         }
 
         $primary = SqlFragments::identifier($map->primary->table);
+        $retainedBy = $map->branch ? (string) $map->identifiers[(new $map->model)->getKeyName()]->column() : $map->primary->key;
 
         return "SELECT\n  ".implode(",\n  ", $columns)
             ."\nFROM ".self::primary($map)
-            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($map->primary->key)
+            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($retainedBy)
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
     }
 

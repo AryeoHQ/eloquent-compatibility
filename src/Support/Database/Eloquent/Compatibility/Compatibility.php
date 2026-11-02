@@ -9,6 +9,7 @@ use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Branch;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
@@ -37,6 +38,11 @@ final class Compatibility
     private null|string $discriminator = null;
 
     private null|Successor $primary = null;
+
+    private null|Closure $selector = null;
+
+    /** @var array<class-string<Model>, Branch> */
+    private array $branches = [];
 
     /** @var list<Hide> */
     private array $hides = [];
@@ -70,22 +76,26 @@ final class Compatibility
 
     public static function prepare(string $model): void
     {
-        self::run($model, Statements::prepare(...));
+        $map = self::of($model)->resolve();
+
+        foreach ($map->branches === [] ? [$map] : $map->branches as $served) {
+            self::execute($served, Statements::prepare(...));
+        }
     }
 
     public static function install(string $model): void
     {
-        self::run($model, Statements::install(...));
+        self::run($model, 'install', Statements::install(...));
     }
 
     public static function recompile(string $model): void
     {
-        self::run($model, Statements::recompile(...));
+        self::run($model, 'recompile', Statements::recompile(...));
     }
 
     public static function uninstall(string $model): void
     {
-        self::run($model, Statements::uninstall(...));
+        self::run($model, 'uninstall', Statements::uninstall(...));
     }
 
     /**
@@ -145,12 +155,27 @@ final class Compatibility
     }
 
     /**
-     * @param  Closure(Successor): mixed  $definition
+     * @param  null|Closure(Successor): mixed  $definition
      */
-    public function servedFrom(string $successor, Closure $definition): self
+    public function servedFrom(string|Closure $successor, null|Closure $definition = null): self
     {
-        if ($this->primary !== null) {
+        if ($this->primary !== null || $this->selector !== null) {
             throw $this->invalid('servedFrom() is declared twice');
+        }
+
+        if ($successor instanceof Closure) {
+            if ($definition !== null) {
+                throw $this->invalid('servedFrom() takes a selector closure alone; declare each successor it chooses with as()');
+            }
+
+            ResolvedMap::refuseCaptures($this->map, 'the servedFrom() selector', $successor);
+            $this->selector = $successor;
+
+            return $this;
+        }
+
+        if ($definition === null) {
+            throw $this->invalid("servedFrom() names {$successor} without a closure over it");
         }
 
         if (! is_subclass_of($successor, Model::class)) {
@@ -161,6 +186,25 @@ final class Compatibility
 
         $this->primary = new Successor($this->map, $successor);
         $definition($this->primary);
+
+        return $this;
+    }
+
+    /**
+     * @param  Closure(Successor): mixed  $definition
+     */
+    public function as(string $successor, Closure $definition): self
+    {
+        if ($this->selector === null) {
+            throw $this->invalid('as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it');
+        }
+
+        if (array_key_exists($successor, $this->branches)) {
+            throw $this->invalid("as({$successor}) is declared twice");
+        }
+
+        $branch = Branch::declare($this->map, $successor, $definition);
+        $this->branches[$branch->model] = $branch;
 
         return $this;
     }
@@ -228,15 +272,30 @@ final class Compatibility
             $this->guards,
             $this->withoutForwarding,
             $this->discriminator,
+            $this->selector,
+            $this->branches,
         );
     }
 
     /**
      * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
      */
-    private static function run(string $model, Closure $statements): void
+    private static function run(string $model, string $operation, Closure $statements): void
     {
         $map = self::of($model)->resolve();
+
+        if ($map->branches !== []) {
+            throw InvalidCompatibilityMap::cannot($map->table, $operation, 'it serves '.$map->table.' from '.implode(' and ', array_map(class_basename(...), array_keys($map->branches))).", and {$operation}() serves a map from one successor only");
+        }
+
+        self::execute($map, $statements);
+    }
+
+    /**
+     * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
+     */
+    private static function execute(ResolvedMap $map, Closure $statements): void
+    {
         $connection = (new $map->model)->getConnection();
 
         try {

@@ -18,7 +18,9 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\LegacyFile;
+use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -56,6 +58,44 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_a_map_over_two_successors_without_a_database_connection(): void
+    {
+        foreach (array_keys(DB::getConnections()) as $connection) {
+            DB::purge($connection);
+        }
+
+        $map = Compatibility::of(Video::class)->resolve();
+
+        $this->assertSame([], DB::getConnections());
+        $this->assertSame([[File::class, Link::class], ['original_file_name', 'mime_type', 'size_kb', 'youtube_embed_url', 'created_at', 'updated_at']], [array_keys($map->branches), array_keys($map->attributes)]);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_recompile_or_uninstall_a_map_over_two_successors_before_reading_the_database(): void
+    {
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach (['install' => Compatibility::install(...), 'recompile' => Compatibility::recompile(...), 'uninstall' => Compatibility::uninstall(...)] as $operation) {
+            try {
+                $operation(Video::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame([
+            "Compatibility map 'videos' cannot install: it serves videos from File and Link, and install() serves a map from one successor only.",
+            "Compatibility map 'videos' cannot recompile: it serves videos from File and Link, and recompile() serves a map from one successor only.",
+            "Compatibility map 'videos' cannot uninstall: it serves videos from File and Link, and uninstall() serves a map from one successor only.",
+        ], $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
     public function it_resolves_a_map_built_directly_for_a_model(): void
     {
         $map = (new Compatibility(Listing::class))
@@ -71,7 +111,7 @@ final class CompatibilityTest extends TestCase
     {
         $package = fn (string $name) => str_starts_with($name, 'Support\\Database\\Eloquent\\Compatibility\\');
 
-        foreach ([Job::class, Place::class, JobSite::class, File::class] as $successor) {
+        foreach ([Job::class, Place::class, JobSite::class, File::class, Link::class] as $successor) {
             $this->assertSame([], array_values(array_filter([...class_implements($successor), ...class_uses_recursive($successor)], $package)), $successor);
         }
     }
@@ -128,6 +168,12 @@ final class CompatibilityTest extends TestCase
         yield 'a discriminator in another table' => [fn (Compatibility $listing) => $listing->discriminatedBy('jobs.legacy_type'), "discriminatedBy() names 'jobs.legacy_type', which names no column of the primary successor's own table"];
         yield 'a successor twice' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(Job::class, $successor), 'servedFrom() is declared twice'];
         yield 'a successor that is no model' => [fn (Compatibility $listing) => $listing->servedFrom(SyncListingToMls::class, $successor), 'servedFrom() names '.SyncListingToMls::class.', which is not an Eloquent model'];
+        yield 'a selector with a definition' => [fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => Job::class, $successor), 'servedFrom() takes a selector closure alone; declare each successor it chooses with as()'];
+        yield 'a successor without a closure' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class), 'servedFrom() names '.Job::class.' without a closure over it'];
+        yield 'a selector after a successor' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->servedFrom(fn (Listing $listing): string => Job::class), 'servedFrom() is declared twice'];
+        yield 'a branch without a selector' => [fn (Compatibility $listing) => $listing->as(Job::class, $successor), 'as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it'];
+        yield 'a branch after a successor' => [fn (Compatibility $listing) => $listing->servedFrom(Job::class, $successor)->as(Place::class, $successor), 'as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it'];
+        yield 'a branch twice' => [fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => Job::class)->as(Job::class, $successor)->as(Job::class, $successor), 'as('.Job::class.') is declared twice'];
         yield 'a hide rule without a reason' => [fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs, because: ''), 'hide() gives no reason; it takes the reason the legacy model never shows these records'];
         yield 'a guard without a remedy' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, because: 'Frozen.', instead: ' '), "guard 'frozen' needs a name, a reason and what to do instead"];
         yield 'a guard twice' => [fn (Compatibility $listing) => $listing->guard('frozen', fn (Model $after, Model $before) => false, 'Frozen.', 'Wait.')->guard('frozen', fn (Model $after, Model $before) => true, 'Frozen.', 'Wait.'), "guard 'frozen' is declared twice"];
@@ -157,6 +203,7 @@ final class CompatibilityTest extends TestCase
         foreach ([
             fn (Compatibility $listing) => $listing->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from($merged)),
             fn (Compatibility $listing) => $listing->servedFrom(Job::class, fn (Successor $job) => $job->attribute($merged, fn (Attribute $attribute) => $attribute)),
+            fn (Compatibility $listing) => $listing->servedFrom(fn (Listing $listing): string => $listing->getAttribute($merged) === null ? Job::class : Place::class),
             fn (Compatibility $listing) => $listing->hide(fn (Builder $jobs) => $jobs->whereNotNull($merged), because: 'Merged.'),
             fn (Compatibility $listing) => $listing->guard('merged', fn (Model $after, Model $before) => $after->getAttribute($merged) !== null, because: 'Merged.', instead: 'Unmerge.'),
         ] as $declare) {
@@ -170,6 +217,7 @@ final class CompatibilityTest extends TestCase
         $this->assertSame([
             "Compatibility map 'listings' is declared wrongly: the closure of identifier 'id' captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: the servedFrom() closure captures \$merged, and a map reads nothing but its own arguments.",
+            "Compatibility map 'listings' is declared wrongly: the servedFrom() selector captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: a hide() scope captures \$merged, and a map reads nothing but its own arguments.",
             "Compatibility map 'listings' is declared wrongly: guard 'merged' captures \$merged, and a map reads nothing but its own arguments.",
         ], $refusals);

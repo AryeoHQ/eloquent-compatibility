@@ -10,6 +10,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final class FileTables
 {
@@ -55,6 +57,31 @@ final class FileTables
             $table->timestamps();
         });
 
+        Schema::create('links', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('url');
+            $table->timestampsTz();
+        });
+
+        Schema::create('videos', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
+            $table->string('original_file_name')->nullable();
+            $table->string('mime_type')->nullable();
+            $table->decimal('size_kb', 12, 3)->nullable();
+            $table->string('youtube_embed_url')->nullable();
+            $table->string('title')->nullable();
+            $table->integer('views')->default(0);
+            $table->timestamps();
+        });
+
+        Schema::create('interactive_content', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
+            $table->string('url');
+            $table->timestamps();
+        });
+
         Schema::create('photo_comments', function (Blueprint $table): void {
             $table->increments('id');
             $table->integer('photo_id');
@@ -91,6 +118,50 @@ final class FileTables
         DB::table('photo_shares')->insert([['photo_uuid' => DB::table('photos')->where('id', 1)->value('uuid')], ['photo_uuid' => null]]);
     }
 
+    public static function seedMedia(): void
+    {
+        DB::table('videos')->insert([
+            ['original_file_name' => 'tour.mp4', 'mime_type' => 'video/mp4', 'size_kb' => 2048, 'youtube_embed_url' => null, 'title' => 'Tour', 'views' => 5, 'created_at' => '2026-02-01 10:00:00', 'updated_at' => '2026-02-01 10:00:00'],
+            ['original_file_name' => null, 'mime_type' => null, 'size_kb' => null, 'youtube_embed_url' => 'https://youtu.be/oak', 'title' => 'Oak walkthrough', 'views' => 2, 'created_at' => '2026-02-02 10:00:00', 'updated_at' => '2026-02-02 10:00:00'],
+            ['original_file_name' => 'drone.mov', 'mime_type' => 'video/quicktime', 'size_kb' => 512, 'youtube_embed_url' => null, 'title' => null, 'views' => 0, 'created_at' => '2026-02-03 10:00:00', 'updated_at' => '2026-02-03 10:00:00'],
+        ]);
+
+        DB::table('interactive_content')->insert([
+            ['url' => 'https://tour.example/oak', 'created_at' => '2026-02-04 10:00:00', 'updated_at' => '2026-02-04 10:00:00'],
+            ['url' => 'https://tour.example/elm', 'created_at' => '2026-02-05 10:00:00', 'updated_at' => '2026-02-05 10:00:00'],
+        ]);
+    }
+
+    public static function backfillMedia(): void
+    {
+        DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select 'video', id, uuid, original_file_name, mime_type, round(size_kb * 1000), created_at, updated_at from videos where youtube_embed_url is null");
+        DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'video', id, uuid, youtube_embed_url, created_at, updated_at from videos where youtube_embed_url is not null");
+        DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'interactive_content', id, uuid, url, created_at, updated_at from interactive_content");
+    }
+
+    public static function installMedia(): void
+    {
+        Compatibility::prepare(Video::class);
+        Compatibility::prepare(InteractiveContent::class);
+        self::backfillMedia();
+        Compatibility::install(InteractiveContent::class);
+
+        $connection = DB::connection();
+        $catalog = new ColumnCatalog($connection);
+        $map = Compatibility::of(Video::class)->resolve();
+        $view = (new ViewCompiler($catalog, $connection))->create($map);
+        $legacy = array_keys($catalog->of('videos'));
+        $served = array_values(array_diff($legacy, $map->legacyOnly($legacy), [(string) $map->retainedKey]));
+
+        DB::transaction(function () use ($view, $served): void {
+            DB::statement('alter table videos '.implode(', ', array_map(fn (string $column) => "drop column {$column}", $served)));
+            DB::statement('alter table videos rename to videos_retained');
+            DB::statement($view);
+        });
+
+        LegacyBuilder::forgetViews();
+    }
+
     public static function backfill(): void
     {
         foreach (['photo' => ['photos', 'round(size_kb * 1000)'], 'floorplan' => ['floorplans', 'null'], 'legacy_file' => ['legacy_files', 'null']] as $type => [$table, $size]) {
@@ -115,13 +186,13 @@ final class FileTables
     {
         DB::statement('drop table if exists photo_comments, photo_shares cascade');
 
-        foreach (['photos', 'floorplans', 'legacy_files'] as $view) {
+        foreach (['photos', 'floorplans', 'legacy_files', 'videos', 'interactive_content'] as $view) {
             if (Schema::hasView($view)) {
                 DB::statement("drop view {$view}");
             }
         }
 
-        DB::statement('drop table if exists photos, photos_retained, floorplans, floorplans_retained, legacy_files, legacy_files_retained, files cascade');
+        DB::statement('drop table if exists photos, photos_retained, floorplans, floorplans_retained, legacy_files, legacy_files_retained, videos, videos_retained, interactive_content, interactive_content_retained, files, links cascade');
         DB::statement('drop sequence if exists compatibility_legacy_id_seq');
         LegacyBuilder::forgetViews();
     }

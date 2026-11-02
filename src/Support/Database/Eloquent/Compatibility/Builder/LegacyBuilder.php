@@ -551,6 +551,12 @@ final class LegacyBuilder extends Builder
             }
         }
 
+        if ($map->branches !== []) {
+            $onView();
+
+            return $this;
+        }
+
         $owner = $map->owners[$attribute]->table;
         $key = $this->model->getKeyName();
         $negated = $this->negations % 2 === 1;
