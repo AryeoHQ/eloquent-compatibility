@@ -442,6 +442,75 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_evaluates_the_json_paths_and_expressions_of_one_mass_write_against_the_values_before_the_write_as_a_native_update_does(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, label text)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
+            ['name' => 'Pine', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
+        ]);
+        DB::statement('create table settings_natives as select * from settings_holders');
+        $writes = [
+            1 => ['preferences->theme' => 'dark', 'label' => DB::raw("preferences->>'theme'")],
+            2 => ['preferences->font' => DB::raw('to_jsonb(label)'), 'label' => 'mono'],
+        ];
+        $rows = fn (string $table): array => DB::table($table)->orderBy('id')->get(['preferences', 'label'])->map(fn (object $row) => [json_decode((string) $row->preferences, true), $row->label])->all();
+        $holder = $this->jsonHolder();
+
+        try {
+            foreach ($writes as $id => $values) {
+                DB::table('settings_natives')->where('id', $id)->update($values);
+            }
+
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
+            Compatibility::install($holder::class);
+
+            $updated = array_map(fn (int $id) => $holder->newQuery()->whereKey($id)->update($writes[$id]), array_keys($writes));
+            $served = $rows('settings_holders');
+            $native = $rows('settings_natives');
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([1, 1], $updated);
+        $this->assertSame([[['theme' => 'dark'], 'light'], [['font' => 'serif', 'theme' => 'light'], 'mono']], $native);
+        $this->assertSame($native, $served);
+    }
+
+    #[Test]
+    public function it_writes_a_json_path_into_the_served_default_of_a_legacy_only_column_for_a_record_without_a_retained_row(): void
+    {
+        DB::statement("create table settings_holders (id serial primary key, name text not null, preferences jsonb not null default '{}'::jsonb, notes jsonb)");
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
+        $holder = $this->jsonHolder();
+        $rows = fn (): array => DB::table('settings_holders')->orderBy('id')->get(['id', 'preferences', 'notes'])->map(fn (object $row) => [$row->id, json_decode((string) $row->preferences, true), json_decode((string) $row->notes, true)])->all();
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
+            Compatibility::install($holder::class);
+            DB::table('configured_jobs')->insert(['legacy_id' => 10, 'name' => 'Ash']);
+
+            $before = $rows();
+            $updated = $holder->newQuery()->whereKey([1, 10])->update(['preferences->theme' => 'dark', 'notes->seen' => true]);
+            $after = $rows();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([[1, ['theme' => 'light'], null], [10, [], null]], $before);
+        $this->assertSame(2, $updated);
+        $this->assertSame([[1, ['theme' => 'dark'], null], [10, ['theme' => 'dark'], null]], $after);
+    }
+
+    #[Test]
     public function it_refuses_a_json_path_write_into_an_attribute_whose_conversions_read_the_whole_value(): void
     {
         $before = DB::table('jobs')->orderBy('legacy_id')->get()->all();
@@ -683,6 +752,29 @@ final class MassWriterTest extends TestCase
         }
 
         $this->fail('The write was not refused.');
+    }
+
+    private function jsonHolder(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
+                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
+                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
     }
 
     private function sited(): Model
