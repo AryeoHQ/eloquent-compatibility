@@ -34,6 +34,8 @@ final readonly class RecordWriter
      */
     public function insert(Model $legacy, array $values): int|string
     {
+        Applying::unidentified($legacy);
+
         if ($this->map->branches !== []) {
             $this->refuseRaw($values);
             $writer = new MassWriter($this->map, $this->connection);
