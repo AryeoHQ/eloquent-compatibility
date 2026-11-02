@@ -30,7 +30,7 @@ final readonly class MassWriter
 
     private const string SELECTED = 'pg_temp.compatibility_selected';
 
-    private const string MISSING = 'pg_temp.compatibility_missing';
+    private const string REACHED = 'pg_temp.compatibility_reached';
 
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
@@ -87,6 +87,13 @@ final readonly class MassWriter
 
             if ($pinned > 0) {
                 $primary = $this->map->primary;
+                $related = array_values($this->map->related);
+                $reached = array_filter($related, fn (Related $related) => $this->withAmounts($stored[$related->table] ?? [], $added[$related->table] ?? []) !== []) !== [];
+
+                if ($reached) {
+                    $this->capture();
+                }
+
                 (new RetainedRows($this->map, $this->connection))->upsertAll($this->pinned(), $retained, array_diff_key($retainedAmounts, $retained));
                 $values = $this->withAmounts($stored[$primary->table] ?? [], $added[$primary->table] ?? []);
 
@@ -94,8 +101,12 @@ final readonly class MassWriter
                     $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$primary->key, $this->pinned())->update($values);
                 }
 
-                foreach ($this->map->related as $related) {
-                    $this->updateRelated($related, $stored[$related->table] ?? [], $added[$related->table] ?? []);
+                foreach ($related as $index => $table) {
+                    $this->updateRelated($table, $index, $stored[$table->table] ?? [], $added[$table->table] ?? []);
+                }
+
+                if ($reached) {
+                    $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::REACHED));
                 }
             }
 
@@ -190,7 +201,8 @@ final readonly class MassWriter
         $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
         $catalog = new ColumnCatalog($this->connection);
-        $grammar = $this->connection->getQueryGrammar();
+        $query = $this->connection->table($retained);
+        $grammar = $query->getGrammar();
         $selects = [];
         $updates = [];
         $bindings = [];
@@ -225,8 +237,72 @@ final readonly class MassWriter
             'INSERT INTO '.$table.' ('.implode(', ', [$retainedKey, ...array_map(fn (string $column) => SqlFragments::identifier($column), [...array_keys($values), ...array_keys($amounts)])]).')'
                 .' SELECT '.$source
                 .' ON CONFLICT ('.$retainedKey.') DO UPDATE SET '.implode(', ', $updates),
-            [...$bindings, ...$keys->getBindings()],
+            [...$query->cleanBindings($bindings), ...$keys->getBindings()],
         );
+    }
+
+    /**
+     * @param  array<string, mixed>  $identities
+     */
+    public function claim(array $identities, null|ResolvedMap $holder = null, null|int|string $except = null): void
+    {
+        $claimed = [];
+
+        foreach ($this->map->identifiers as $name => $identifier) {
+            $value = $identities[$name] ?? null;
+
+            if ($value !== null) {
+                self::refuseRaw($this->map, $name, $value);
+                $this->lockIdentity($name, $value);
+                $claimed[$name] = $value;
+            }
+        }
+
+        $key = (new $this->map->model)->getKeyName();
+
+        foreach ($this->map->branches as $branch) {
+            if ($branch === $holder) {
+                continue;
+            }
+
+            $table = $branch->primary->table;
+
+            foreach ($claimed as $name => $value) {
+                $taken = $this->connection->table($table)
+                    ->where($table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
+                    ->where($table.'.'.(string) $branch->identifiers[$name]->column(), $value);
+
+                if ($except !== null) {
+                    $taken->where($table.'.'.(string) $branch->identifiers[$key]->column(), '<>', $except);
+                }
+
+                if ($taken->exists()) {
+                    $this->duplicate(class_basename($this->map->model)." {$name} ".(is_scalar($value) ? (string) $value : '')." is already taken in {$table}, and a ".class_basename($this->map->model)." {$name} is unique across ".implode(' and ', array_map(fn (ResolvedMap $branch) => $branch->primary->table, $this->map->branches)).'.');
+                }
+            }
+        }
+    }
+
+    public function lockIdentity(string $name, mixed $value): void
+    {
+        $this->connection->select('select pg_advisory_xact_lock(hashtextextended(CAST(? AS text) || CAST(CAST(? AS '.$this->identityType($name).') AS text), 0))', [$this->identityLock($name), $value]);
+    }
+
+    private function identityLock(string $name): string
+    {
+        return ($this->map->membership->alias ?? $this->map->table).':'.$name.':';
+    }
+
+    private function identityType(string $name): string
+    {
+        return $this->map->identifiers[$name]->isUuid() ? 'uuid' : 'bigint';
+    }
+
+    private function duplicate(string $message): never
+    {
+        $this->connection->unprepared("DO \$compatibility\$\nBEGIN\n  RAISE EXCEPTION USING ERRCODE = 'unique_violation', MESSAGE = ".SqlFragments::literal($message).";\nEND\n\$compatibility\$");
+
+        throw new LogicException($message);
     }
 
     /**
@@ -238,18 +314,51 @@ final readonly class MassWriter
         [$mapped, $retained] = $this->byOwner($values);
         [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
 
+        foreach (self::named($mapped) as $name => $value) {
+            self::refuseRaw($this->map, $name, $value);
+        }
+
         return $this->acrossBranches($keys, function (QueryBuilder $selected, array $holding) use ($values, $amounts, $mapped, $retained, $mappedAmounts, $retainedAmounts): int {
             $this->refuseMoves($selected, $values, $amounts);
+            $identities = array_intersect_key(self::named($mapped), $this->map->identifiers);
+
+            if ($identities !== []) {
+                $this->claimAcross($selected, $identities);
+            }
+
+            $this->retainByIdentity($selected, self::named($retained), array_map(fn (float|int|string $amount) => $amount + 0, array_diff_key(self::named($retainedAmounts), self::named($retained))));
             $updated = 0;
 
             foreach ($holding as $branch) {
                 $updated += (new self($branch, $this->connection))->update($selected, $mapped, $mappedAmounts);
             }
 
-            $this->retainByIdentity($selected, self::named($retained), array_map(fn (float|int|string $amount) => $amount + 0, array_diff_key(self::named($retainedAmounts), self::named($retained))));
+            $key = (new $this->map->model)->getKeyName();
+
+            if (array_key_exists($key, $identities) && $this->map->retainedTable !== null) {
+                $this->connection->table($this->map->retainedTable)->whereIn((string) $this->map->retainedKey, $selected)->update([(string) $this->map->retainedKey => $identities[$key]]);
+            }
 
             return $updated;
         });
+    }
+
+    /**
+     * @param  array<string, mixed>  $identities
+     */
+    private function claimAcross(QueryBuilder $selected, array $identities): void
+    {
+        $records = (clone $selected)->count();
+
+        if ($records > 1) {
+            $this->duplicate('A mass write gives '.$records.' '.class_basename($this->map->model).' records one '.implode(' and one ', array_keys($identities)).', and each is unique.');
+        }
+
+        $current = (clone $selected)->value('key');
+
+        if ($records === 1 && (is_int($current) || is_string($current))) {
+            $this->claim($identities, null, $current);
+        }
     }
 
     /**
@@ -264,6 +373,10 @@ final readonly class MassWriter
             $holding = [];
 
             $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
+            $this->connection->table(self::SELECTED)
+                ->selectRaw('pg_advisory_xact_lock(hashtextextended(CAST(? AS text) || CAST(CAST('.$grammar->wrap('key').' AS '.$this->identityType($key).') AS text), 0))', [$this->identityLock($key)])
+                ->orderBy('key')
+                ->get();
 
             foreach ($this->map->branches as $branch) {
                 $primary = $branch->primary;
@@ -432,7 +545,7 @@ final readonly class MassWriter
 
         $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::PINNED).' ON COMMIT DROP AS SELECT '.$grammar->wrap($key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
         $locked = $this->connection->table(self::PINNED)->insertUsing(['key'], $this->members($this->connection->table($primary->table))->select($key)->whereIn($legacy, $keys)->orderBy($key)->lockForUpdate());
-        $this->lockDependents();
+        $this->lockDependents($this->pinned());
         $filter = $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']);
         $moved = $this->connection->table(self::PINNED.' as pinned')->whereNotExists(fn (QueryBuilder $matching) => $this->members($matching->from($primary->table))->whereColumn($key, 'pinned.key')->whereIn($legacy, $filter))->delete();
 
@@ -446,20 +559,28 @@ final readonly class MassWriter
         return $membership === null ? $query : $query->where($membership->table.'.'.$membership->column, $membership->alias);
     }
 
-    private function lockDependents(): void
+    public function lockDependentsOf(int|string $key): void
+    {
+        $this->lockDependents([$key]);
+    }
+
+    /**
+     * @param  QueryBuilder|list<int|string>  $keys
+     */
+    private function lockDependents(QueryBuilder|array $keys): void
     {
         $retained = $this->map->retainedTable;
 
         if ($retained !== null) {
             $primary = $this->map->primary;
             $retainedKey = $retained.'.'.$this->map->retainedKey;
-            $owners = $this->map->branch ? $this->connection->table($primary->table)->select($primary->table.'.'.$this->legacyColumn())->whereIn($primary->table.'.'.$primary->key, $this->pinned()) : $this->pinned();
+            $owners = $this->map->branch ? $this->connection->table($primary->table)->select($primary->table.'.'.$this->legacyColumn())->whereIn($primary->table.'.'.$primary->key, $keys) : $keys;
             $this->lock($this->connection->table($retained)->select($retainedKey)->whereIn($retainedKey, $owners)->orderBy($retainedKey));
         }
 
         foreach ($this->map->related as $related) {
             $key = $related->table.'.'.$related->successor->key;
-            $this->lock($this->connection->table($related->table)->select($key)->whereIn($key, $this->reach($related)->whereNotNull($key)->select($key))->orderBy($key));
+            $this->lock($this->connection->table($related->table)->select($key)->whereIn($key, $this->reach($related, $keys)->whereNotNull($key)->select($key))->orderBy($key));
         }
     }
 
@@ -473,11 +594,43 @@ final readonly class MassWriter
         return $this->connection->table(self::PINNED)->select('key');
     }
 
+    private function capture(): void
+    {
+        $primary = $this->map->primary;
+        $grammar = $this->connection->getQueryGrammar();
+        $columns = [];
+
+        foreach (array_values($this->map->related) as $index => $related) {
+            $columns[self::target($index)] = $grammar->wrap($related->table.'.'.$related->successor->key);
+            $columns[self::parentOf($index)] = self::parent($related);
+        }
+
+        $selects = implode(', ', array_map(fn (string $expression, string $name) => $expression.' AS '.$grammar->wrap($name), $columns, array_keys($columns)));
+        $reached = SqlFragments::identifier($primary->table).' '.implode(' ', ViewCompiler::laterals($this->map));
+        $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::REACHED).' ON COMMIT DROP AS SELECT '.$selects.' FROM '.$reached.' WITH NO DATA');
+        $this->connection->table(self::REACHED)->insertUsing(array_keys($columns), $this->connection->query()->fromRaw($reached)->selectRaw($selects)->whereIn($primary->table.'.'.$primary->key, $this->pinned()));
+    }
+
+    private function reached(): QueryBuilder
+    {
+        return $this->connection->table(self::REACHED);
+    }
+
+    private static function target(int $index): string
+    {
+        return 'target_'.$index;
+    }
+
+    private static function parentOf(int $index): string
+    {
+        return 'parent_'.$index;
+    }
+
     /**
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    private function updateRelated(Related $related, array $values, array $amounts): void
+    private function updateRelated(Related $related, int $index, array $values, array $amounts): void
     {
         $changes = $this->withAmounts($values, $amounts);
 
@@ -486,47 +639,39 @@ final readonly class MassWriter
         }
 
         $catalog = new ColumnCatalog($this->connection);
-        $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $values, $catalog);
+        $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $values, $catalog);
         $key = $related->table.'.'.$related->successor->key;
-        $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reach($related)->whereNotNull($key)->select($key))->update($changes);
+        $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reached()->whereNotNull(self::target($index))->select(self::target($index)))->update($changes);
 
         if ($creates) {
-            $this->createMissing($related, $values, $catalog);
+            $this->createMissing($related, $index, $values, $catalog);
         }
     }
 
     /**
      * @param  array<string, mixed>  $values
      */
-    private function pinMissing(Related $related, array $values, ColumnCatalog $catalog): bool
+    private function pinMissing(Related $related, int $index, array $values, ColumnCatalog $catalog): bool
     {
-        $missing = self::missing($related);
-        $parent = self::parent($related);
         $written = array_keys(array_filter($related->successor->attributes(), fn ($attribute) => array_key_exists((string) $attribute->column(), $values)));
 
-        if ($related->belongsTo && $this->reach($related)->whereRaw($missing)->exists()) {
+        if ($related->belongsTo && $this->reached()->whereNull(self::target($index))->exists()) {
             throw CompatibilityWriteRefused::noRelatedRow($this->map->model, $written, $related->table, $related->parentTable);
         }
 
-        if ($related->parentTable !== $this->map->primary->table && $this->reach($related)->whereRaw($missing)->whereRaw($parent.' IS NULL')->exists()) {
+        if ($related->parentTable !== $this->map->primary->table && $this->reached()->whereNull(self::target($index))->whereNull(self::parentOf($index))->exists()) {
             throw CompatibilityWriteRefused::noParentRow($this->map->model, $written, $related->table, $related->parentTable);
         }
 
         $key = $catalog->of($related->table)[$related->successor->key] ?? null;
-        $lacking = $this->reach($related)->whereRaw($missing)->whereNotNull(new RawExpression($parent));
 
         if ($key !== null && $key->default === null && ! $key->generated) {
-            if ($lacking->exists()) {
+            if ($this->reached()->whereNull(self::target($index))->whereNotNull(self::parentOf($index))->exists()) {
                 throw CompatibilityWriteRefused::noKeyDefault($this->map->model, $written, $related->table, $related->successor->key);
             }
 
             return false;
         }
-
-        $primary = $this->map->primary;
-        $grammar = $this->connection->getQueryGrammar();
-        $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::MISSING).' ON COMMIT DROP AS SELECT '.$grammar->wrap($primary->table.'.'.$primary->key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
-        $this->connection->table(self::MISSING)->insertUsing(['key'], $lacking->select($primary->table.'.'.$primary->key));
 
         return true;
     }
@@ -534,10 +679,11 @@ final readonly class MassWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function createMissing(Related $related, array $values, ColumnCatalog $catalog): void
+    private function createMissing(Related $related, int $index, array $values, ColumnCatalog $catalog): void
     {
         $model = $this->successor($related->model);
-        $parent = self::parent($related);
+        $grammar = $this->connection->getQueryGrammar();
+        $parent = $grammar->wrap(self::parentOf($index));
         $row = [$related->relatedKey => new RawExpression($parent), ...$related->attributes, ...$values];
 
         if ($model->usesTimestamps()) {
@@ -566,15 +712,28 @@ final readonly class MassWriter
             $bindings[] = $value;
         }
 
-        $primary = $this->map->primary;
-        $source = $this->reach($related)->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereIn($primary->table.'.'.$primary->key, $this->connection->table(self::MISSING)->select('key'))->whereRaw(self::missing($related));
+        $source = $this->reached()->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereNull(self::target($index))->whereNotNull(self::parentOf($index));
         $model->newModelQuery()->insertUsing(array_map(fn (int|string $column) => (string) $column, array_keys($row)), $source);
-        $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::MISSING));
+        $this->adopt($related, $index);
     }
 
-    private static function missing(Related $related): string
+    private function adopt(Related $created, int $index): void
     {
-        return SqlFragments::identifier($related->table).'.'.SqlFragments::identifier($related->relatedKey).' IS NULL';
+        $grammar = $this->connection->getQueryGrammar();
+        $table = SqlFragments::identifier($created->table);
+
+        foreach (array_values($this->map->related) as $child => $related) {
+            if ($related->parentTable !== $created->table) {
+                continue;
+            }
+
+            $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::parentOf($child)).' = '.$table.'.'.SqlFragments::identifier($related->parentKey).' FROM '.$table.' WHERE '.implode(' AND ', [
+                'reached.'.$grammar->wrap(self::target($index)).' IS NULL',
+                'reached.'.$grammar->wrap(self::parentOf($child)).' IS NULL',
+                $table.'.'.SqlFragments::identifier($created->relatedKey).' = reached.'.$grammar->wrap(self::parentOf($index)),
+                ...ViewCompiler::conditions($created, false),
+            ]));
+        }
     }
 
     private static function parent(Related $related): string
@@ -582,11 +741,14 @@ final readonly class MassWriter
         return SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
     }
 
-    private function reach(Related $related): QueryBuilder
+    /**
+     * @param  null|QueryBuilder|list<int|string>  $keys
+     */
+    private function reach(Related $related, null|QueryBuilder|array $keys = null): QueryBuilder
     {
         $primary = $this->map->primary;
 
-        return $this->connection->query()->fromRaw(SqlFragments::identifier($primary->table).' '.implode(' ', ViewCompiler::laterals($this->map, $related->table)))->whereIn($primary->table.'.'.$primary->key, $this->pinned());
+        return $this->connection->query()->fromRaw(SqlFragments::identifier($primary->table).' '.implode(' ', ViewCompiler::laterals($this->map, $related->table)))->whereIn($primary->table.'.'.$primary->key, $keys ?? $this->pinned());
     }
 
     /**

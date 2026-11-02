@@ -264,7 +264,7 @@ final class PreparerTest extends TestCase
             array_intersect_key((new ColumnCatalog(DB::connection()))->of('files'), ['legacy_type' => true, 'legacy_id' => true, 'legacy_uuid' => true]),
         );
         $this->assertSame(
-            ['files_legacy_type_legacy_id_unique' => 'UNIQUE (legacy_type, legacy_id)', 'files_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'],
+            ['files_legacy_type_legacy_id_unique' => 'UNIQUE (legacy_type, legacy_id)', 'files_legacy_type_legacy_uuid_unique' => 'UNIQUE (legacy_type, legacy_uuid)', 'files_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'],
             array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'files'::regclass and contype = 'u' order by conname"), 'definition', 'conname'),
         );
         $this->assertSame(
@@ -288,6 +288,25 @@ final class PreparerTest extends TestCase
 
         $this->assertEquals((object) ['legacy_type' => null, 'legacy_id' => 4], DB::selectOne("select legacy_type, legacy_id from files where filename = 'orphan.bin'"));
         $this->assertSame([5, 6, 7], [$photo, $floorPlan, DB::scalar("select legacy_id from files where filename = 'birch-extra.jpg'")]);
+    }
+
+    #[Test]
+    public function it_leaves_the_shared_sequence_unwritten_when_it_already_leads_every_legacy_id(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+
+        foreach (FileTables::MODELS as $model) {
+            Compatibility::prepare($model);
+        }
+
+        FileTables::backfill();
+        DB::select("select setval('compatibility_legacy_id_seq', 100)");
+
+        Compatibility::prepare(FloorPlan::class);
+        Compatibility::install(Photo::class);
+
+        $this->assertEquals((object) ['last_value' => 100, 'is_called' => true], DB::selectOne('select last_value, is_called from compatibility_legacy_id_seq'));
     }
 
     #[Test]

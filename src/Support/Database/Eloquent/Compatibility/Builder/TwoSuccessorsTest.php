@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -16,6 +18,7 @@ use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\TestCase;
 
 #[CoversClass(LegacyBuilder::class)]
@@ -209,6 +212,146 @@ final class TwoSuccessorsTest extends TestCase
     {
         $this->assertSame([2], Video::query()->whereNull('size_kb')->pluck('id')->all());
         $this->assertSame([1], Video::query()->where('size_kb', '>', 1000)->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_refuses_an_explicit_identifier_the_other_successor_already_holds_as_a_native_table_refuses_a_duplicate_key(): void
+    {
+        $embedUuid = Video::query()->findOrFail(2)->uuid;
+        $codes = [];
+
+        foreach ([
+            fn () => Video::query()->create(['id' => 1, 'youtube_embed_url' => 'https://youtu.be/dup']),
+            fn () => Video::query()->create(['id' => 2, 'original_file_name' => 'dup.mp4', 'mime_type' => 'video/mp4']),
+            fn () => Video::query()->create(['uuid' => strtoupper($embedUuid), 'original_file_name' => 'dup.mp4', 'mime_type' => 'video/mp4']),
+        ] as $insert) {
+            try {
+                $insert();
+                $codes[] = 'stored';
+            } catch (UniqueConstraintViolationException $exception) {
+                $codes[] = $exception->getCode();
+            }
+        }
+
+        $ignored = [
+            Video::query()->toBase()->insertOrIgnore(['id' => 3, 'youtube_embed_url' => 'https://youtu.be/dup']),
+            Video::query()->toBase()->insertOrIgnore(['id' => 40, 'youtube_embed_url' => 'https://youtu.be/fresh']),
+        ];
+
+        $this->assertSame(['23505', '23505', '23505'], $codes);
+        $this->assertSame([0, 1], $ignored);
+        $this->assertSame([1, 2, 3, 40], Video::query()->orderBy('id')->pluck('id')->all());
+        $this->assertSame([['files', 1], ['links', 2], ['files', 3], ['links', 40]], $this->holders([1, 2, 3, 40]));
+    }
+
+    #[Test]
+    public function it_stores_the_backing_value_of_an_enum_a_branched_mass_write_gives_a_legacy_only_column(): void
+    {
+        Video::query()->whereIn('id', [1, 2])->update(['title' => ListingStatus::Sold]);
+        Video::query()->whereKey(3)->toBase()->update(['title' => ListingStatus::Draft]);
+
+        $this->assertSame(['Sold', 'Sold', 'Draft'], Video::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_returns_the_column_an_insert_get_id_names_for_a_record_either_successor_stores(): void
+    {
+        $uuid = Video::query()->toBase()->insertGetId(['youtube_embed_url' => 'https://youtu.be/cedar', 'title' => 'Cedar'], 'uuid');
+        $id = Video::query()->toBase()->insertGetId(['original_file_name' => 'cedar.mp4', 'mime_type' => 'video/mp4'], 'id');
+
+        $this->assertSame(['Cedar', 'cedar.mp4'], [Video::query()->where('uuid', $uuid)->value('title'), Video::query()->whereKey($id)->value('original_file_name')]);
+        $this->assertIsString($uuid);
+        $this->assertIsInt($id);
+    }
+
+    #[Test]
+    public function it_reads_a_retained_expression_of_a_mass_update_against_the_record_before_the_update(): void
+    {
+        Video::query()->whereKey(1)->update(['original_file_name' => 'new.mp4', 'title' => DB::raw('original_file_name')]);
+
+        $this->assertSame(['new.mp4', 'tour.mp4'], [Video::query()->findOrFail(1)->original_file_name, Video::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
+    public function it_keeps_the_retained_values_of_a_record_whose_legacy_id_a_write_changes(): void
+    {
+        Video::query()->findOrFail(1)->update(['id' => 10]);
+        Video::query()->whereKey(2)->update(['id' => 20]);
+        $moved = Video::query()->findOrFail(3);
+        $moved->update(['id' => 30, 'youtube_embed_url' => 'https://youtu.be/drone']);
+
+        $this->assertSame(
+            [[10, 'Tour', 5], [20, 'Oak walkthrough', 2], [30, null, 0]],
+            Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->title, $video->views])->all(),
+        );
+        $this->assertSame([10, 20, 30], DB::table('videos_retained')->orderBy('id')->pluck('id')->all());
+        $this->assertSame([['files', 10], ['links', 20], ['links', 30]], $this->holders([10, 20, 30]));
+        $this->assertSame([30, 'https://youtu.be/drone'], [$moved->id, $moved->youtube_embed_url]);
+    }
+
+    #[Test]
+    public function it_refuses_a_legacy_id_change_to_an_id_another_record_holds_in_either_successor(): void
+    {
+        $codes = [];
+
+        foreach ([
+            fn () => Video::query()->findOrFail(1)->update(['id' => 2]),
+            fn () => Video::query()->whereKey(3)->update(['id' => 2]),
+            fn () => Video::query()->whereIn('id', [1, 2])->update(['id' => 50]),
+        ] as $write) {
+            try {
+                $write();
+                $codes[] = 'stored';
+            } catch (UniqueConstraintViolationException $exception) {
+                $codes[] = $exception->getCode();
+            }
+        }
+
+        $this->assertSame(['23505', '23505', '23505'], $codes);
+        $this->assertSame([['files', 1], ['links', 2], ['files', 3]], $this->holders([1, 2, 3, 50]));
+        $this->assertSame([1, 2, 3], DB::table('videos_retained')->orderBy('id')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_raw_expression_for_a_successor_attribute_before_it_chooses_a_branch(): void
+    {
+        $messages = [];
+
+        foreach ([
+            fn () => Video::query()->findOrFail(1)->update(['youtube_embed_url' => DB::raw("'https://youtu.be/raw'")]),
+            fn () => Video::query()->findOrFail(3)->increment('views', 1, ['youtube_embed_url' => DB::raw("'https://youtu.be/raw'")]),
+            fn () => Video::query()->whereKey(1)->update(['youtube_embed_url' => DB::raw("'https://youtu.be/raw'")]),
+        ] as $write) {
+            try {
+                $write();
+                $messages[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $messages[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame(array_fill(0, 3, Video::class.'::$youtube_embed_url cannot take a raw expression'), $messages);
+        $this->assertSame([['files', 1], ['files', 3]], $this->holders([1, 3]));
+        $this->assertSame([5, 0], Video::query()->whereIn('id', [1, 3])->orderBy('id')->pluck('views')->all());
+    }
+
+    #[Test]
+    public function it_stores_each_timestamp_of_a_branched_write_in_the_application_time_zone_whatever_the_session_time_zone(): void
+    {
+        DB::statement("set time zone 'America/Denver'");
+        Date::setTestNow('2026-06-07 10:00:00');
+
+        Video::query()->whereIn('id', [1, 2])->update(['title' => 'Featured']);
+        Video::query()->findOrFail(2)->update(['title' => 'Oak tour']);
+        Video::query()->findOrFail(3)->update(['youtube_embed_url' => 'https://youtu.be/drone']);
+        $session = DB::scalar("select current_setting('TimeZone')");
+        DB::statement("set time zone 'UTC'");
+
+        $this->assertSame('America/Denver', $session);
+        $this->assertSame(
+            [[1, '2026-06-07 10:00:00'], [2, '2026-06-07 10:00:00'], [3, '2026-06-07 10:00:00']],
+            Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->updated_at?->format('Y-m-d H:i:s')])->all(),
+        );
     }
 
     /**

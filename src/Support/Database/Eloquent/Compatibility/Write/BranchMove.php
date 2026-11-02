@@ -11,7 +11,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 
 final readonly class BranchMove
 {
-    public function __construct(private Connection $connection) {}
+    public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     /**
      * @param  array<string, mixed>  $before
@@ -23,7 +23,9 @@ final readonly class BranchMove
             throw CompatibilityWriteRefused::bySuccessorListener($legacy::class, $old);
         }
 
-        (new RecordWriter($to, $this->connection))->insert($legacy, self::recreated($to, $before, $values));
+        $recreated = self::recreated($to, $before, $values);
+        (new MassWriter($this->map, $this->connection))->claim($recreated, $to);
+        (new RecordWriter($to, $this->connection))->insert($legacy, $recreated);
     }
 
     /**

@@ -33,7 +33,7 @@ final readonly class Membership
     {
         $condition = $this->condition();
 
-        return $condition === null ? null : SqlFragments::identifier($this->column).' IS DISTINCT FROM '.SqlFragments::literal($this->alias).' OR ('.$condition.')';
+        return $condition === null ? null : SqlFragments::identifier($this->column).' IS DISTINCT FROM '.SqlFragments::literal($this->alias).' OR COALESCE(('.$condition.'), false)';
     }
 
     public function constraint(): string

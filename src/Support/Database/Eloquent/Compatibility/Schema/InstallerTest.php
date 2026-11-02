@@ -554,16 +554,46 @@ final class InstallerTest extends TestCase
 
         $this->assertSame([
             'photo_comments_photo_id_foreign' => 'FOREIGN KEY (photo_legacy_type, photo_id) REFERENCES files(legacy_type, legacy_id) ON DELETE CASCADE',
-            'photo_shares_photo_uuid_foreign' => 'FOREIGN KEY (photo_uuid) REFERENCES files(legacy_uuid) ON DELETE SET NULL',
+            'photo_shares_photo_uuid_foreign' => 'FOREIGN KEY (photo_legacy_type, photo_uuid) REFERENCES files(legacy_type, legacy_uuid) ON DELETE CASCADE',
         ], $installed[0]);
         $this->assertEquals((object) ['generated' => 's', 'expression' => "'photo'::text"], $installed[1]);
         $this->assertSame([
             'photo_comments_photo_id_foreign' => 'FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE',
-            'photo_shares_photo_uuid_foreign' => 'FOREIGN KEY (photo_uuid) REFERENCES photos(uuid) ON DELETE SET NULL',
+            'photo_shares_photo_uuid_foreign' => 'FOREIGN KEY (photo_uuid) REFERENCES photos(uuid) ON DELETE CASCADE',
         ], $before[0]);
         $this->assertSame($before[0], $this->photoForeignKeys());
-        $this->assertSame([], DB::select("select attname from pg_attribute where attrelid = 'photo_comments'::regclass and attname = 'photo_legacy_type' and not attisdropped"));
+        $this->assertSame([], DB::select("select attrelid::regclass::text from pg_attribute where attrelid in ('photo_comments'::regclass, 'photo_shares'::regclass) and attname = 'photo_legacy_type' and not attisdropped"));
         $this->assertEquals($before[1], DB::select('select id, uuid, file_name, mime_type, caption, views, size_kb, created_at, updated_at from photos order by id'));
+    }
+
+    #[Test]
+    public function it_refuses_an_inbound_uuid_reference_to_the_row_of_another_legacy_model_on_the_same_successor(): void
+    {
+        $this->prepareFiles();
+        Compatibility::install(Photo::class);
+        $floorPlan = DB::table('files')->where('legacy_type', 'floorplan')->where('legacy_id', 1)->value('legacy_uuid');
+
+        try {
+            DB::table('photo_shares')->insert(['photo_uuid' => $floorPlan]);
+            $this->fail('The reference to a floor plan was stored.');
+        } catch (QueryException $exception) {
+            $this->assertSame('23503', $exception->getCode());
+        }
+
+        DB::table('photo_shares')->insert(['photo_uuid' => Photo::query()->findOrFail(2)->uuid]);
+
+        $this->assertSame(3, DB::table('photo_shares')->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_composite_repoint_of_a_uuid_foreign_key_that_sets_its_column_to_null(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photo_shares drop constraint photo_shares_photo_uuid_foreign, add constraint photo_shares_photo_uuid_foreign foreign key (photo_uuid) references photos (uuid) on delete set null');
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('photos', 'the foreign key photo_shares_photo_uuid_foreign on photo_shares takes ON DELETE SET NULL, and install() repoints it onto (legacy_type, legacy_uuid) through the generated column photo_legacy_type, which no referential action may change'));
+
+        Compatibility::install(Photo::class);
     }
 
     #[Test]

@@ -12,6 +12,7 @@ use Illuminate\Database\Query\Processors\Processor;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
+use LogicException;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
@@ -55,7 +56,18 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->served();
 
-        return $legacy === null ? parent::insertGetId($values, $sequence) : $this->writer($legacy)->insert($legacy->newInstance(), $values);
+        if ($legacy === null) {
+            return parent::insertGetId($values, $sequence);
+        }
+
+        $returning = $sequence === null || $sequence === '' ? $legacy->getKeyName() : $sequence;
+
+        return $legacy->getConnection()->transaction(function () use ($legacy, $values, $returning): int|string {
+            $key = $this->writer($legacy)->insert($legacy->newInstance(), $values);
+            $id = $returning === $legacy->getKeyName() ? $key : $this->newQuery()->from($legacy->getTable())->where($legacy->getKeyName(), $key)->value($returning);
+
+            return is_numeric($id) ? (int) $id : (is_string($id) ? $id : throw new LogicException("{$legacy->getTable()}.{$returning} read back no value for the new ".class_basename($legacy).'.'));
+        });
     }
 
     /**

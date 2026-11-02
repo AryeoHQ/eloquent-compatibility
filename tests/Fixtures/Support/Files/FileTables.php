@@ -92,7 +92,7 @@ final class FileTables
         Schema::create('photo_shares', function (Blueprint $table): void {
             $table->increments('id');
             $table->uuid('photo_uuid')->nullable();
-            $table->foreign('photo_uuid')->references('uuid')->on('photos')->nullOnDelete();
+            $table->foreign('photo_uuid')->references('uuid')->on('photos')->cascadeOnDelete();
         });
     }
 

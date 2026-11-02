@@ -79,7 +79,7 @@ final readonly class Statements
                 $installed = $foreignKey->qualifiedTable === $legacyTable ? $retainedTable : $foreignKey->qualifiedTable;
                 $composite = null;
 
-                if ($membership !== null && $identifier->isInteger()) {
+                if ($membership !== null) {
                     $constant = SqlFragments::objectName($map->table, $membership->alias.'_'.$membership->column);
                     $type = $columnCatalog->type($map->primary->table, $membership->column) ?? 'text';
                     $composite = [$constant, $membership->column];
@@ -115,7 +115,7 @@ final readonly class Statements
             }
         }
 
-        [$refuseOutsiders, $check, $validateCheck] = $membership === null ? [[], [], []] : self::membershipCheck($map, $membership);
+        [$refuseOutsiders, $check, $validateCheck] = $membership === null ? [[], [], []] : self::membershipCheck($map, $membership, 'install');
 
         $retainedPrimaryKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey'));
         $retainedForeignKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'));
@@ -169,7 +169,21 @@ final readonly class Statements
             }
         }
 
-        return new self('recompile', [$view], $validations);
+        $membership = $map->membership;
+
+        if ($membership === null) {
+            return new self('recompile', [$view], $validations);
+        }
+
+        $primary = SqlFragments::identifier($map->primary->table);
+        [$refuseOutsiders, $check, $validateCheck] = self::membershipCheck($map, $membership, 'recompile');
+
+        return new self('recompile', [
+            "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            ...$refuseOutsiders,
+            $view,
+            ...($check === [] ? ["ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint())] : $check),
+        ], [...$validations, ...$validateCheck]);
     }
 
     public static function uninstall(ResolvedMap $map, ConnectionInterface $connection): self
@@ -350,7 +364,7 @@ final readonly class Statements
     /**
      * @return array{list<string>, list<string>, list<string>}
      */
-    private static function membershipCheck(ResolvedMap $map, Membership $membership): array
+    private static function membershipCheck(ResolvedMap $map, Membership $membership, string $operation): array
     {
         $check = $membership->check();
 
@@ -362,9 +376,9 @@ final readonly class Statements
         $primaryKey = SqlFragments::identifier($map->primary->key);
         $constraint = SqlFragments::identifier($membership->constraint());
         $outside = "FROM {$primary} WHERE NOT ({$check})";
-        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot install: ")
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot {$operation}: ")
             .' || outside || '.SqlFragments::literal(" {$map->primary->table} rows carry {$membership->column} '{$membership->alias}' and fail its when(); the first are {$map->primary->key} ")
-            .' || first_keys || '.SqlFragments::literal(". Correct their {$membership->column} before install().");
+            .' || first_keys || '.SqlFragments::literal(". Correct their {$membership->column} before {$operation}().");
 
         return [
             ["DO \$compatibility\$\nDECLARE\n  outside bigint;\n  first_keys text;\nBEGIN\n"

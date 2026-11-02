@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -156,6 +157,23 @@ final class BranchMoveTest extends TestCase
         }
 
         $this->assertUnmoved();
+    }
+
+    #[Test]
+    public function it_gives_the_legacy_record_the_values_the_new_successor_stored_before_its_own_events_run(): void
+    {
+        File::saving(function (File $file): void {
+            $file->filename = strtoupper($file->filename);
+        });
+        $seen = [];
+        Event::listen('eloquent.updated: '.Video::class, function (Video $video) use (&$seen): void {
+            $seen[] = $video->original_file_name;
+        });
+        $video = Video::query()->findOrFail(2);
+
+        $video->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'mime_type' => 'video/mp4']);
+
+        $this->assertSame([['OAK.MP4'], 'OAK.MP4', 'OAK.MP4'], [$seen, $video->original_file_name, Video::query()->findOrFail(2)->original_file_name]);
     }
 
     #[Test]

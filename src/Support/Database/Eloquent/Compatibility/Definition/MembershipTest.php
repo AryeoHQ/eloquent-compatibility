@@ -13,7 +13,10 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileTables;
@@ -85,6 +88,105 @@ final class MembershipTest extends TestCase
             array_column(DB::select("select conname, convalidated from pg_constraint where conrelid = 'files'::regclass and contype = 'c' and conname like '%membership' order by conname"), 'convalidated', 'conname'),
         );
         $this->assertSame(['lease-plan.pdf'], FloorPlan::query()->where('mime_type', 'application/pdf')->where('file_name', 'like', 'lease%')->pluck('file_name')->all());
+    }
+
+    #[Test]
+    public function it_refuses_the_alias_on_a_row_whose_when_reads_a_null(): void
+    {
+        $map = self::photos(fn (Successor $file) => $file
+            ->when(fn (Builder $files) => $files->where('size_bytes', '>', 0))
+            ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+            ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type')))->resolve();
+        Compatibility::prepare(Photo::class);
+        FileTables::backfill();
+        (new Installer(DB::connection()))->run(Statements::install($map, DB::connection()));
+
+        try {
+            DB::table('files')->insert(['filename' => 'blank.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => 'photo', 'size_bytes' => null]);
+            $this->fail('The row was stored.');
+        } catch (QueryException $exception) {
+            $this->assertSame(['23514', true], [$exception->getCode(), str_contains($exception->getMessage(), 'files_photos_membership')]);
+        }
+
+        DB::table('files')->insert(['filename' => 'blank.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => null, 'size_bytes' => null]);
+
+        $this->assertSame(1, DB::table('files')->where('filename', 'blank.jpg')->count());
+    }
+
+    #[Test]
+    public function it_recompiles_the_check_to_the_when_the_map_now_declares(): void
+    {
+        FileTables::install();
+        $widened = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->when(fn (Builder $files) => $files->where('mime_type', 'like', 'image/%')->orWhere('mime_type', 'application/pdf'))
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        $narrowed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->when(fn (Builder $files) => $files->where('mime_type', 'image/jpeg'))
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+
+        Compatibility::recompile($widened::class);
+        $widened::query()->create(['file_name' => 'lease.pdf', 'mime_type' => 'application/pdf']);
+
+        try {
+            Compatibility::recompile($narrowed::class);
+            $this->fail('recompile() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'photos' cannot recompile: 2 files rows carry legacy_type 'photo' and fail its when(); the first are id ", $exception->getMessage());
+        }
+
+        $this->assertSame(['elm.png', 'lease.pdf', 'oak-back.jpg', 'oak-front.jpg'], Photo::query()->orderBy('file_name')->pluck('file_name')->all());
+        $this->assertSame(
+            [true, true],
+            [str_contains((string) DB::scalar("select pg_get_constraintdef(oid) from pg_constraint where conname = 'files_photos_membership'"), 'application/pdf'), DB::scalar("select convalidated from pg_constraint where conname = 'files_photos_membership'")],
+        );
     }
 
     #[Test]

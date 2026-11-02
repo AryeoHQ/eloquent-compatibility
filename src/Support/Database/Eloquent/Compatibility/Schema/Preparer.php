@@ -86,6 +86,10 @@ final readonly class Preparer
             $notNull[] = ['ALTER COLUMN '.$successorColumn.' SET NOT NULL', 'DROP CONSTRAINT '.$filled];
             $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, $unique, '('.($sharesSequence ? $discriminator.', ' : '').$successorColumn.')', true)];
 
+            if ($membership !== null && ! $sharesSequence) {
+                $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, SqlFragments::objectName($map->table, $map->primary->table.'_'.$membership->column.'_'.$identifier->column().'_unique'), '('.SqlFragments::identifier($membership->column).', '.$successorColumn.')', true)];
+            }
+
             if ($sharesSequence) {
                 $shared[] = 'ALTER TABLE '.SqlFragments::identifier($map->table).' ALTER COLUMN '.SqlFragments::identifier($name).' SET DEFAULT '.$default;
                 $shared[] = self::advance($map->table, $name);
@@ -126,12 +130,15 @@ final readonly class Preparer
         $next = 'CASE WHEN is_called THEN last_value + 1 ELSE last_value END';
         $shared = SqlFragments::identifier(Identifier::SHARED_SEQUENCE);
 
-        return "DO \$compatibility\$\nDECLARE\n  legacy_sequence text := pg_get_serial_sequence(".SqlFragments::literal(SqlFragments::identifier($table)).', '.SqlFragments::literal($column).");\n  legacy_next bigint := 1;\n  shared_next bigint;\nBEGIN\n"
+        return "DO \$compatibility\$\nDECLARE\n  legacy_sequence text := pg_get_serial_sequence(".SqlFragments::literal(SqlFragments::identifier($table)).', '.SqlFragments::literal($column).");\n  legacy_next bigint := 1;\n  shared_next bigint;\n  target bigint;\nBEGIN\n"
             ."  IF legacy_sequence IS NOT NULL THEN\n"
             ."    EXECUTE format('SELECT {$next} FROM %s', legacy_sequence) INTO legacy_next;\n"
             ."  END IF;\n"
             ."  SELECT {$next} INTO shared_next FROM {$shared};\n"
-            .'  PERFORM setval('.SqlFragments::literal($shared).', greatest(shared_next, legacy_next, (SELECT coalesce(max('.SqlFragments::identifier($column).'), 0) + 1 FROM '.SqlFragments::identifier($table).")), false);\n"
+            .'  target := greatest(legacy_next, (SELECT coalesce(max('.SqlFragments::identifier($column).'), 0) + 1 FROM '.SqlFragments::identifier($table)."));\n"
+            ."  IF target > shared_next THEN\n"
+            .'    PERFORM setval('.SqlFragments::literal($shared).", target, false);\n"
+            ."  END IF;\n"
             ."END\n\$compatibility\$";
     }
 
