@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use DateTimeImmutable;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -89,6 +90,19 @@ final class BackfillTest extends TestCase
             ->assertFailed();
 
         $this->assertSame(0, DB::scalar('select count(*) from jobs'));
+    }
+
+    #[Test]
+    public function it_refuses_a_since_later_than_the_watermark_the_last_backfill_remembers(): void
+    {
+        Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+        $remembered = substr(explode("\n", trim(Artisan::output()))[2], 11);
+        $later = (new DateTimeImmutable($remembered))->modify('+1 hour')->format('Y-m-d\TH:i:s\Z');
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class, '--since' => $later])
+            ->expectsOutputToContain("--since takes a watermark no later than {$remembered}, which the last backfill of listings remembers, not {$later}; a later one skips the legacy rows updated in between.")
+            ->doesntExpectOutputToContain('Watermark:')
+            ->assertFailed();
     }
 
     #[Test]

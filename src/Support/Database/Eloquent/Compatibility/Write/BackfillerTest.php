@@ -218,18 +218,23 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
-    public function it_keeps_the_comment_of_the_legacy_table_beside_its_watermark_and_uninstall_restores_it(): void
+    public function it_keeps_the_comment_of_the_legacy_table_beside_its_watermark_and_uninstall_restores_both(): void
     {
         DB::statement("comment on table listings is 'Listings shown on the site'");
 
         $this->backfiller(Listing::class)->run();
         $remembered = json_decode((string) DB::scalar("select obj_description('listings'::regclass, 'pg_class')"), true);
         Compatibility::install(Listing::class);
+        $uninstalledAt = (string) DB::scalar("select to_char(now() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')");
         Compatibility::uninstall(Listing::class);
+        $restored = json_decode((string) DB::scalar("select obj_description('listings'::regclass, 'pg_class')"), true);
 
         $this->assertSame(['backfilled', 'comment', 'key', 'updatedAt'], array_keys((array) $remembered));
         $this->assertSame(['compatibility backfill', 'Listings shown on the site', 3], [$remembered['backfilled'] ?? null, $remembered['comment'] ?? null, $remembered['key'] ?? null]);
-        $this->assertSame('Listings shown on the site', DB::scalar("select obj_description('listings'::regclass, 'pg_class')"));
+        $this->assertSame(['backfilled', 'comment', 'key', 'updatedAt'], array_keys((array) $restored));
+        $this->assertSame(['compatibility backfill', 'Listings shown on the site', 3], [$restored['backfilled'] ?? null, $restored['comment'] ?? null, $restored['key'] ?? null]);
+        $this->assertGreaterThanOrEqual($uninstalledAt, $restored['updatedAt'] ?? null);
+        $this->assertSame('Listings shown on the site', Backfiller::comment(DB::connection(), 'listings'));
     }
 
     #[Test]
@@ -320,6 +325,63 @@ final class BackfillerTest extends TestCase
         Compatibility::uninstall(Video::class);
 
         $this->assertSame(array_map($this->sorted(...), $seeded), array_map($this->sorted(...), $this->rows('select * from videos order by id')));
+    }
+
+    #[Test]
+    public function it_writes_a_json_column_postgresql_cannot_compare_for_equality_and_changes_nothing_when_it_runs_again(): void
+    {
+        DB::statement('alter table listings add column details json');
+        DB::statement('alter table jobs add column details json');
+        DB::update('update listings set details = ? where id = 1', ['{"rooms": 3}']);
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->attribute('details', fn (Attribute $attribute) => $attribute->from('details')));
+            }
+        };
+
+        $first = $this->backfiller($listing::class)->run();
+        $again = $this->backfiller($listing::class)->run();
+
+        $this->assertSame([3, 0], [$first['changed'], $again['changed']]);
+        $this->assertSame(['{"rooms": 3}', null, null], array_column($this->rows('select cast(details as text) as details from jobs order by legacy_id'), 'details'));
+    }
+
+    #[Test]
+    public function it_refuses_a_watermark_while_pg_stat_activity_hides_the_transactions_of_other_sessions(): void
+    {
+        $role = 'compatibility_hidden_'.DB::connection()->getDatabaseName();
+        DB::statement('create role '.$role);
+        config(['database.connections.hidden' => config('database.connections.'.DB::getDefaultConnection())]);
+        $hidden = DB::connection('hidden');
+        $failure = null;
+
+        try {
+            $hidden->statement('set role '.$role);
+            (new Backfiller(Compatibility::of(Listing::class)->resolve(), $hidden))->run();
+        } catch (InvalidCompatibilityMap $exception) {
+            $failure = $exception->getMessage();
+        } finally {
+            DB::disconnect('hidden');
+            DB::statement('drop role '.$role);
+        }
+
+        $this->assertIsString($failure);
+        $this->assertStringStartsWith("Compatibility map 'listings' cannot backfill: pg_stat_activity hides from {$role} whether ", $failure);
+        $this->assertStringEndsWith("Grant pg_read_all_stats to {$role}, then backfill again.", $failure);
+        $this->assertSame(0, DB::scalar('select count(*) from jobs'));
     }
 
     private function seattleListing(bool $withAttributes): Model

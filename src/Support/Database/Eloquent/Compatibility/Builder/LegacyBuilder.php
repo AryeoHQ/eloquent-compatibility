@@ -50,9 +50,6 @@ final class LegacyBuilder extends Builder
 
     private null|Model $writeOf = null;
 
-    /** @var null|array{schema: string, view: bool, readable: bool} */
-    private null|array $relation = null;
-
     public static function forgetViews(): void
     {
         self::$catalogs = [];
@@ -244,7 +241,6 @@ final class LegacyBuilder extends Builder
 
             if ($nested instanceof self) {
                 $nested->negations = $this->negations + (self::negates($boolean) ? 1 : 0);
-                $nested->relation = $this->relation;
             }
 
             $column($nested);
@@ -811,7 +807,7 @@ final class LegacyBuilder extends Builder
     {
         $map = $this->map();
 
-        return $this->relation ??= ServedTable::reading($this->model, [$map->primary->table, ...array_map(fn (Related $related) => $related->table, array_values($map->related))]);
+        return ServedTable::reading($this->model, [$map->primary->table, ...array_map(fn (Related $related) => $related->table, array_values($map->related))]);
     }
 
     private function map(): ResolvedMap

@@ -809,7 +809,7 @@ final class InstallerTest extends TestCase
             Compatibility::install(Listing::class);
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $exception) {
-            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still changed 1100 successor rows, and install() takes the lock only once a pass changes fewer than 1000. Run php artisan compatibility:backfill ".Listing::class.' --since=', $exception->getMessage());
+            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still read 1100 legacy rows and changed 1100 successor rows, and install() takes the lock only once a pass reads and changes fewer than 1000 rows each. Run php artisan compatibility:backfill ".Listing::class.' --since=', $exception->getMessage());
         }
 
         $this->assertSame([5, 'r'], [$passes, $this->kind('listings')]);
@@ -854,10 +854,19 @@ final class InstallerTest extends TestCase
             .' echo json_encode($writes);');
         usleep(300000);
         $locked = null;
-        DB::listen(function (QueryExecuted $query) use (&$locked): void {
+        $retaining = [];
+        DB::listen(function (QueryExecuted $query) use (&$locked, &$retaining): void {
             if ($locked === null && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
                 $locked = microtime(true);
                 usleep(500000);
+            }
+
+            if (str_starts_with($query->sql, 'ALTER TABLE "listings" ADD COLUMN IF NOT EXISTS "job_id"')) {
+                $retaining = [microtime(true) - $query->time / 1000, microtime(true)];
+            }
+
+            if (str_starts_with($query->sql, 'COMMENT ON COLUMN "listings"."job_id"')) {
+                $retaining[1] = microtime(true) + 0.05;
             }
         });
 
@@ -877,7 +886,8 @@ final class InstallerTest extends TestCase
 
         ksort($last);
         $this->assertNotEmpty(array_filter($written, fn (array $write) => $write[1] < $locked));
-        $this->assertLessThan(0.3, max(array_map(fn (array $write) => $write[1] - $write[0], $written)));
+        $this->assertCount(2, $retaining);
+        $this->assertSame([], array_values(array_filter($written, fn (array $write) => $write[1] - $write[0] >= 0.3 && ($write[0] > $retaining[1] || $write[1] < $retaining[0]))));
         $this->assertIsArray($blocked);
         $this->assertSame([null, '55000'], [$blocked[2], $blocked[3]]);
         $this->assertGreaterThanOrEqual($locked - 0.05, $blocked[0]);
@@ -900,6 +910,7 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame('r', $this->kind('listings'));
+        $this->assertSame(0, DB::scalar("select count(*) from pg_attribute where attrelid = 'listings'::regclass and attname = 'job_id' and not attisdropped"));
     }
 
     #[Test]
@@ -985,6 +996,144 @@ final class InstallerTest extends TestCase
         Compatibility::install($video::class);
     }
 
+    #[Test]
+    public function it_refuses_to_install_a_map_over_two_successors_while_a_legacy_row_sits_in_the_successor_its_selector_does_not_choose(): void
+    {
+        $this->prepareMedia();
+        DB::insert("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type) select 'video', id, uuid, 'oak.mp4', 'video/mp4' from videos where id = 2");
+        DB::delete("delete from links where legacy_type = 'video' and legacy_id = 2");
+
+        try {
+            Compatibility::install(Video::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'videos' cannot install: 1 videos rows sit in a successor their servedFrom() selector does not choose; the first are id 2. Run php artisan compatibility:backfill ".Video::class.', then install().', $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('videos'));
+    }
+
+    #[Test]
+    public function it_retries_the_lock_after_postgresql_ends_its_attempt_to_break_a_deadlock_with_a_legacy_writer(): void
+    {
+        DB::beginTransaction();
+
+        try {
+            DB::statement("set local deadlock_timeout = '10s'");
+            Listing::query()->findOrFail(1);
+            $install = $this->startInAnotherProcess('Illuminate\Support\Facades\DB::listen(function ($query) { if ($query->sql === \'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE\') { usleep(1500000); } });'
+                .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+            $this->awaitHolder('ShareRowExclusiveLock');
+            DB::table('listings')->where('id', 1)->update(['title' => 'Oak Manor']);
+        } finally {
+            DB::commit();
+        }
+
+        $this->assertSame([0, ''], $this->finish($install));
+        $this->assertSame('v', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_catches_up_on_a_reinstall_the_legacy_writes_made_after_an_uninstall(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        Compatibility::install(Listing::class);
+        Compatibility::uninstall(Listing::class);
+        Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_from_a_watermark_while_the_legacy_table_has_no_updated_at_its_model_writes(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+        $this->backfiller($listing::class)->run();
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::cannot('listings', 'install', 'listings has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock'));
+
+        Compatibility::install($listing::class);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_from_a_watermark_that_records_no_legacy_key_while_the_legacy_table_holds_rows(): void
+    {
+        $this->backfiller(Listing::class)->run(since: '2026-01-01T00:00:00Z');
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'listings' cannot install: the watermark of the last backfill records no legacy key it walked, so install() would walk every legacy row while it holds the lock. Run php artisan compatibility:backfill ".Listing::class.' without --since, then install().', $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_refuses_to_take_the_lock_while_its_last_catch_up_pass_still_reads_a_thousand_rows_it_changes_nothing_in(): void
+    {
+        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), localtimestamp(0) from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+        $this->backfiller(Listing::class)->run();
+        $holding = $this->holdConcurrently('select 1', 30);
+        $this->writer()->update("update listings set title = title || '.', updated_at = localtimestamp(0) where title like 'Bulk %'");
+
+        try {
+            Compatibility::install(Listing::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still read 1100 legacy rows and changed 0 successor rows, and install() takes the lock only once a pass reads and changes fewer than 1000 rows each.", $exception->getMessage());
+        }
+
+        $this->assertSame(["locked\n", 'r'], [$holding, $this->kind('listings')]);
+    }
+
+    #[Test]
+    public function it_keeps_legacy_reads_available_while_it_fills_the_retained_key_under_the_lock(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $locked = false;
+        $read = null;
+        DB::listen(function (QueryExecuted $query) use (&$locked, &$read): void {
+            if ($query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $locked = true;
+            }
+
+            if ($locked && $read === null && str_starts_with($query->sql, 'UPDATE "listings" SET "job_id"')) {
+                $read = $this->readConcurrently("set lock_timeout = '1s'; select count(*) from listings");
+            }
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame(['3', 'v'], [$read, $this->kind('listings')]);
+        $this->assertSame([
+            'listings_retained_job_id_foreign' => 'FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE',
+            'listings_retained_pkey' => 'PRIMARY KEY (job_id)',
+        ], array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass and contype <> 'n' order by conname"), 'definition', 'conname'));
+        $this->assertSame(0, DB::scalar('select count(*) from listings_retained left join jobs on jobs.id = listings_retained.job_id where jobs.id is null'));
+    }
+
     private function prepareMedia(): void
     {
         FileTables::create();
@@ -1028,6 +1177,67 @@ final class InstallerTest extends TestCase
         $this->concurrent = [$process, $pipes];
 
         return (string) fgets($pipes[1]);
+    }
+
+    /**
+     * @return array{resource, array<int, resource>}
+     */
+    private function startInAnotherProcess(string $statement): array
+    {
+        $child = 'require '.var_export(dirname(__DIR__, 6).'/vendor/autoload.php', true).';'
+            .' Tests\\TestCase::optimizeClassmap();'
+            .' Orchestra\Testbench\Foundation\Application::create();'
+            .' '.$statement.';'
+            .' Illuminate\Support\Facades\DB::disconnect();';
+        $process = proc_open([PHP_BINARY, '-r', $child], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['APP_ENV' => 'testing', 'DB_DATABASE' => DB::connection()->getDatabaseName()] + getenv());
+
+        if ($process === false) {
+            $this->fail('The other process did not start.');
+        }
+
+        return [$process, $pipes];
+    }
+
+    /**
+     * @param  array{resource, array<int, resource>}  $process
+     * @return array{int, string}
+     */
+    private function finish(array $process): array
+    {
+        [$handle, $pipes] = $process;
+        $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
+
+        return [proc_close($handle), $output];
+    }
+
+    private function awaitHolder(string $mode): void
+    {
+        $deadline = microtime(true) + 10;
+
+        while (DB::scalar("select count(*) from pg_locks where relation = to_regclass('listings') and mode = ? and granted and pid <> pg_backend_pid()", [$mode]) === 0) {
+            if (microtime(true) > $deadline) {
+                $this->fail("No other session took {$mode} on listings.");
+            }
+
+            usleep(20000);
+        }
+    }
+
+    private function readConcurrently(string $sql): string
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $process = proc_open([PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
+            .' try { foreach (explode(";", '.var_export($sql, true).') as $statement) { if (trim($statement) !== "") { $read = $pdo->query($statement)->fetchColumn(); } } echo $read; } catch (PDOException $exception) { echo $exception->getMessage(); }'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($process === false) {
+            $this->fail('The concurrent reader did not start.');
+        }
+
+        $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
+        proc_close($process);
+
+        return $output;
     }
 
     private function concurrentFailure(): string

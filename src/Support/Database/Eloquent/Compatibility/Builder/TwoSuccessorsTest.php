@@ -89,6 +89,17 @@ final class TwoSuccessorsTest extends TestCase
     }
 
     #[Test]
+    public function it_uninstalls_a_map_over_two_successors_after_a_raw_write_deletes_a_row_one_successor_held(): void
+    {
+        DB::delete("delete from links where legacy_type = 'video' and legacy_id = 2");
+
+        Compatibility::uninstall(Video::class);
+
+        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
+        $this->assertSame([1, 3], array_map(intval(...), array_column(DB::select('select id from videos order by id'), 'id')));
+    }
+
+    #[Test]
     public function it_recompiles_the_view_over_both_successors_in_place(): void
     {
         $view = DB::scalar("select oid from pg_class where oid = to_regclass('videos')");

@@ -22,7 +22,7 @@ use Tests\TestCase;
 #[CoversClass(ServedTable::class)]
 final class LegacyBuilderRolloutTest extends TestCase
 {
-    private const string CATALOG = "select cast(oid as bigint) from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and relkind = 'v'";
+    private const string CATALOG = "select cast(oid as bigint) from pg_class where oid = to_regclass(?) and relkind = 'v'";
 
     /** @var list<string> */
     protected $connectionsToTransact = [];
@@ -210,20 +210,17 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{bool, list<string>}>
+     * @return iterable<string, array{bool}>
      */
     public static function transactions(): iterable
     {
-        yield 'outside a transaction' => [false, [self::CATALOG, 'update listings', self::CATALOG]];
-        yield 'inside a transaction' => [true, [self::CATALOG, 'update listings']];
+        yield 'outside a transaction' => [false];
+        yield 'inside a transaction' => [true];
     }
 
-    /**
-     * @param  list<string>  $expected
-     */
     #[DataProvider('transactions')]
     #[Test]
-    public function it_retries_no_native_write_the_catalog_does_not_show_as_a_write_to_the_view(bool $transaction, array $expected): void
+    public function it_writes_through_the_successors_when_the_search_path_reaches_the_installed_view_through_a_later_schema(bool $transaction): void
     {
         $this->install();
         DB::statement('create schema compatibility_empty');
@@ -232,24 +229,84 @@ final class LegacyBuilderRolloutTest extends TestCase
         try {
             DB::select("select set_config('search_path', ?, false)", ['compatibility_empty, '.$searchPath]);
             $this->statements = [];
-            $failure = null;
             $write = fn () => Listing::query()->whereKey(1)->update(['title' => 'Oak Manor']);
-
-            try {
-                $transaction ? DB::transaction($write) : $write();
-            } catch (QueryException $exception) {
-                $failure = $exception;
-            }
-
+            $transaction ? DB::transaction($write) : $write();
             $attempted = $this->statements();
+            $read = fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 1000)->orderBy('id')->pluck('id')->all())];
+            $filtered = $transaction ? DB::transaction($read) : $read();
         } finally {
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             DB::statement('drop schema compatibility_empty');
         }
 
+        $this->assertNotContains('update listings', $attempted);
+        $this->assertSame('Oak Manor', $this->job(1)->name);
+        $this->assertStringContainsString('"jobs"."price_cents" > ?', $filtered[0]);
+        $this->assertSame([1], $filtered[1]);
+    }
+
+    /**
+     * @return iterable<string, array{bool, list<string>}>
+     */
+    public static function failuresOutsideTheView(): iterable
+    {
+        yield 'outside a transaction' => [false, ['insert listings', self::CATALOG]];
+        yield 'inside a transaction' => [true, [self::CATALOG, 'insert listings', self::CATALOG]];
+    }
+
+    /**
+     * @param  list<string>  $expected
+     */
+    #[DataProvider('failuresOutsideTheView')]
+    #[Test]
+    public function it_rethrows_a_native_write_that_fails_as_a_view_write_would_while_the_catalog_shows_a_table(bool $transaction, array $expected): void
+    {
+        $this->prepare();
+        Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
+        DB::statement('create sequence compatibility_unread');
+        $this->statements = [];
+        $failure = null;
+        $write = fn () => Listing::query()->toBase()->insert(['title' => DB::raw("cast(currval('compatibility_unread') as text)"), 'company_id' => ListingTables::COMPANY]);
+
+        try {
+            $transaction ? DB::transaction($write) : $write();
+        } catch (QueryException $exception) {
+            $failure = $exception;
+        } finally {
+            $attempted = $this->statements();
+            DB::statement('drop sequence compatibility_unread');
+        }
+
         $this->assertSame('55000', $failure?->errorInfo[0] ?? null);
         $this->assertSame($expected, $attempted);
-        $this->assertSame('Oak House', $this->job(1)->name);
+        $this->assertSame(3, DB::table('listings')->count());
+    }
+
+    #[Test]
+    public function it_retries_a_native_write_inside_a_transaction_translated_once_an_install_it_waited_for_commits(): void
+    {
+        $this->prepare();
+        $listing = Listing::query()->findOrFail(1);
+        $install = $this->startInAnotherProcess('Illuminate\Support\Facades\DB::listen(function ($query) { if ($query->sql === \'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE\') { usleep(1500000); } });'
+            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->awaitLock('ShareRowExclusiveLock');
+
+        DB::transaction(fn () => $listing->update(['title' => 'Oak Manor']));
+
+        $this->assertSame([0, ''], $this->finish($install));
+        $this->assertSame(['v', 'Oak Manor', 'Oak Manor'], [DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"), $this->job(1)->name, $this->served(1)]);
+    }
+
+    #[Test]
+    public function it_asks_the_catalog_again_for_a_filter_a_builder_adds_after_another_process_uninstalls_the_view(): void
+    {
+        $this->install();
+        $query = Listing::query()->where('price', '>', 100);
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+
+        $query->where('price', '<', 5000);
+
+        $this->assertSame(1, substr_count($query->toBase()->toSql(), '"jobs"."price_cents"'));
     }
 
     private function prepare(): void
@@ -266,6 +323,14 @@ final class LegacyBuilderRolloutTest extends TestCase
 
     private function inAnotherProcess(string $statement): void
     {
+        $this->assertSame([0, ''], $this->finish($this->startInAnotherProcess($statement)));
+    }
+
+    /**
+     * @return array{resource, array<int, resource>}
+     */
+    private function startInAnotherProcess(string $statement): array
+    {
         $child = 'require '.var_export(dirname(__DIR__, 6).'/vendor/autoload.php', true).';'
             .' Tests\\TestCase::optimizeClassmap();'
             .' Orchestra\Testbench\Foundation\Application::create();'
@@ -277,9 +342,32 @@ final class LegacyBuilderRolloutTest extends TestCase
             $this->fail('The other process did not start.');
         }
 
+        return [$process, $pipes];
+    }
+
+    /**
+     * @param  array{resource, array<int, resource>}  $process
+     * @return array{int, string}
+     */
+    private function finish(array $process): array
+    {
+        [$handle, $pipes] = $process;
         $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
 
-        $this->assertSame([0, ''], [proc_close($process), $output]);
+        return [proc_close($handle), $output];
+    }
+
+    private function awaitLock(string $mode): void
+    {
+        $deadline = microtime(true) + 10;
+
+        while (DB::scalar("select count(*) from pg_locks where relation = to_regclass('listings') and mode = ? and granted and pid <> pg_backend_pid()", [$mode]) === 0) {
+            if (microtime(true) > $deadline) {
+                $this->fail("No other session took {$mode} on listings.");
+            }
+
+            usleep(20000);
+        }
     }
 
     /**

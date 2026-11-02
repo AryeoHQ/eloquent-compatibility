@@ -11,6 +11,7 @@ use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Throwable;
 
 final readonly class Installer
 {
@@ -22,7 +23,7 @@ final readonly class Installer
 
     public const string LOCK_TIMEOUT = '5s';
 
-    private const string LOCK_NOT_AVAILABLE = '55P03';
+    private const array RETRIED_STATES = ['55P03', '40P01'];
 
     public function __construct(private ConnectionInterface $connection) {}
 
@@ -49,38 +50,43 @@ final readonly class Installer
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
+        $retaining = false;
+
         try {
             if ($watermark !== null) {
+                $backfiller->refuseUnconvergeable($watermark);
                 $watermark = $this->converge($map, $backfiller, $watermark);
+
+                if ($map->branches === []) {
+                    $retaining = true;
+                    $this->retain(Statements::retain($map, $this->connection));
+                }
             }
 
             $install = $statements();
             $this->refuseTransaction($install);
 
-            for ($attempt = 0; ; $attempt++) {
-                try {
-                    $this->connection->transaction(function () use ($map, $backfiller, $watermark, $install): void {
-                        $this->connection->statement("SET LOCAL lock_timeout = '".self::LOCK_TIMEOUT."'");
-                        $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
+            $this->locked(function () use ($map, $backfiller, $watermark, $install): void {
+                $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
 
-                        if ($watermark !== null) {
-                            $backfiller->catchUp($watermark);
-                        }
-
-                        $this->apply($install);
-                    });
-
-                    break;
-                } catch (QueryException $exception) {
-                    if ($exception->getCode() !== self::LOCK_NOT_AVAILABLE || $attempt === self::RETRIES) {
-                        throw $exception;
-                    }
+                if ($watermark !== null) {
+                    $backfiller->catchUp($watermark);
                 }
-            }
+
+                $this->apply($install);
+            });
+
+            $retaining = false;
 
             foreach ($install->afterwards as $statement) {
                 $this->connection->unprepared($statement);
             }
+        } catch (Throwable $exception) {
+            if ($retaining) {
+                $this->unretain($map);
+            }
+
+            throw $exception;
         } finally {
             if ($watermark !== null) {
                 $backfiller->untrack();
@@ -97,15 +103,60 @@ final readonly class Installer
         $backfiller->track();
 
         for ($pass = 1; ; $pass++) {
-            [$changed, $watermark] = $backfiller->catchUp($watermark);
+            [$changed, $read, $watermark] = $backfiller->catchUp($watermark);
             $backfiller->remember($watermark);
 
-            if ($changed < self::THRESHOLD) {
+            if ($changed < self::THRESHOLD && $read < self::THRESHOLD) {
                 return $watermark;
             }
 
             if ($pass === self::PASSES) {
-                throw InvalidCompatibilityMap::cannot($map->table, 'install', "its catch-up pass {$pass} still changed {$changed} successor rows, and install() takes the lock only once a pass changes fewer than ".self::THRESHOLD.'. Run php artisan compatibility:backfill '.$map->model." --since={$watermark['updatedAt']} again, then install()");
+                throw InvalidCompatibilityMap::cannot($map->table, 'install', "its catch-up pass {$pass} still read {$read} legacy rows and changed {$changed} successor rows, and install() takes the lock only once a pass reads and changes fewer than ".self::THRESHOLD.' rows each. Run php artisan compatibility:backfill '.$map->model." --since={$watermark['updatedAt']} again, then install()");
+            }
+        }
+    }
+
+    private function retain(Statements $retain): void
+    {
+        $this->locked(function () use ($retain): void {
+            foreach ($retain->transaction as $statement) {
+                $this->connection->unprepared($statement);
+            }
+        });
+
+        foreach ($retain->afterwards as $statement) {
+            $this->connection->unprepared($statement);
+        }
+    }
+
+    private function unretain(ResolvedMap $map): void
+    {
+        try {
+            $this->locked(function () use ($map): void {
+                $this->connection->unprepared(Statements::unretain($map));
+            });
+        } catch (Throwable) {
+            return;
+        }
+    }
+
+    /**
+     * @param  Closure(): void  $locked
+     */
+    private function locked(Closure $locked): void
+    {
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                $this->connection->transaction(function () use ($locked): void {
+                    $this->connection->statement("SET LOCAL lock_timeout = '".self::LOCK_TIMEOUT."'");
+                    $locked();
+                });
+
+                return;
+            } catch (QueryException $exception) {
+                if (! in_array($exception->getCode(), self::RETRIED_STATES, true) || $attempt === self::RETRIES) {
+                    throw $exception;
+                }
             }
         }
     }

@@ -92,6 +92,16 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_indexes_the_legacy_updated_at_when_only_a_partial_index_leads_with_it(): void
+    {
+        DB::statement('create index listings_live_updated_at on listings (updated_at) where deleted_at is null');
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(['listings_live_updated_at', 'listings_updated_at_index'], array_column(DB::select("select indexname from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'indexname'));
+    }
+
+    #[Test]
     public function it_indexes_the_legacy_updated_at_once_and_leaves_an_index_that_already_leads_with_it(): void
     {
         Compatibility::prepare(Listing::class);

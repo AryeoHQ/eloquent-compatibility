@@ -65,10 +65,10 @@ final class ServedTable
         }
 
         $row = (array) $connection->selectOne(
-            "select current_schema() as schema,
-                    coalesce((select relkind = 'v' from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)) as successor_table), false) as readable",
-            [SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
+            "select coalesce((select relnamespace::regnamespace::text from pg_class where oid = to_regclass(?)), current_schema()) as schema,
+                    coalesce((select relkind = 'v' from pg_class where oid = to_regclass(?)), false) as view,
+                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table), false) as readable",
+            [SqlFragments::identifier($table), SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
         );
         $relations[$key] = ['schema' => (string) ($row['schema'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
 
@@ -91,16 +91,17 @@ final class ServedTable
     {
         $connection = $model->getConnection();
         $table = $model->getTable();
-        $known = $connection->transactionLevel() === 0 && array_key_exists($table, self::$tables[$connection] ?? []);
+        $nested = $connection->transactionLevel() > 0;
+        $known = ! $nested && array_key_exists($table, self::$tables[$connection] ?? []);
 
         if (! $known && self::ask($connection, $table) !== null) {
             return $translated();
         }
 
         try {
-            return $native();
+            return $nested ? $connection->transaction($native) : $native();
         } catch (QueryException $exception) {
-            if ($connection->transactionLevel() > 0 || ! in_array($exception->errorInfo[0] ?? null, self::VIEW_WRITE_STATES, true) || self::ask($connection, $table) === null) {
+            if (! in_array($exception->errorInfo[0] ?? null, self::VIEW_WRITE_STATES, true) || self::ask($connection, $table) === null) {
                 throw $exception;
             }
         }
@@ -111,7 +112,7 @@ final class ServedTable
     private static function ask(Connection $connection, string $table): null|int
     {
         $view = $connection->scalar(
-            "select cast(oid as bigint) from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and relkind = 'v'",
+            "select cast(oid as bigint) from pg_class where oid = to_regclass(?) and relkind = 'v'",
             [SqlFragments::identifier($table)],
             false,
         );

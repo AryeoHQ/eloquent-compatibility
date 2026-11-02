@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Closure;
 use DateTimeImmutable;
+use DateTimeZone;
 use Exception;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Collection;
@@ -60,7 +61,12 @@ final readonly class Backfiller
     {
         $this->refuseUnwalkable($chunk);
         $previous = $this->remembered();
-        $updatedAt = $this->now();
+
+        if ($since !== null && $previous !== null && new DateTimeImmutable($since) > new DateTimeImmutable($previous['updatedAt'])) {
+            throw new LogicException("--since takes a watermark no later than {$previous['updatedAt']}, which the last backfill of {$this->map->table} remembers, not ".(new DateTimeImmutable($since))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z').'; a later one skips the legacy rows updated in between.');
+        }
+
+        $updatedAt = $this->now('backfill');
         [$read, $changed, $last] = $this->walk($chunk, $since === null ? null : $this->updatedSince(self::watermark($since)), $chunked, false);
         $watermark = ['key' => $since === null ? $last : $previous['key'] ?? null, 'updatedAt' => $updatedAt];
         $this->remember($watermark);
@@ -70,17 +76,84 @@ final readonly class Backfiller
 
     /**
      * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     * @return array{int, array{key: null|int|string, updatedAt: string}}
+     * @return array{int, int, array{key: null|int|string, updatedAt: string}}
      */
     public function catchUp(array $watermark): array
     {
         $this->refuseUnwalkable(self::CHUNK);
-        $updatedAt = $this->now();
+        $updatedAt = $this->now('install');
         $updated = $this->updatedAt() === null ? null : $this->updatedSince($watermark['updatedAt']);
         $scope = $watermark['key'] === null || $updated === null ? null : fn (QueryBuilder $query) => $query->where($this->key, '>', $watermark['key'])->orWhere($updated);
-        [, $changed, $last] = $this->walk(self::CHUNK, $scope, null, true);
+        [$read, $changed, $last] = $this->walk(self::CHUNK, $scope, null, true);
 
-        return [$changed + $this->deleteGone(), ['key' => self::greater($watermark['key'], $last), 'updatedAt' => $updatedAt]];
+        return [$changed + $this->deleteGone(), $read, ['key' => self::greater($watermark['key'], $last), 'updatedAt' => $updatedAt]];
+    }
+
+    /**
+     * @param  array{key: null|int|string, updatedAt: string}  $watermark
+     */
+    public function refuseUnconvergeable(array $watermark): void
+    {
+        if ($this->updatedAt() === null) {
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', "{$this->map->table} has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock");
+        }
+
+        if ($watermark['key'] === null && $this->connection->table($this->map->table)->useWritePdo()->exists()) {
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', 'the watermark of the last backfill records no legacy key it walked, so install() would walk every legacy row while it holds the lock. Run php artisan compatibility:backfill '.$this->map->model.' without --since, then install()');
+        }
+    }
+
+    public function refuseMisplaced(): void
+    {
+        $type = (string) $this->catalog->type($this->map->table, $this->key);
+        $misplaced = [];
+        $last = null;
+
+        do {
+            $query = $this->connection->table($this->map->table)->useWritePdo()->orderBy($this->key)->limit(self::CHUNK);
+
+            if ($last !== null) {
+                $query->where($this->key, '>', $last);
+            }
+
+            $rows = array_map(fn (object $row) => (array) $row, $query->get()->all());
+            $chosen = [];
+
+            foreach ($rows as $row) {
+                $chosen[$this->map->branchFor($this->probe($row))->primary->model][] = self::keyOf($row[$this->key] ?? null);
+            }
+
+            foreach ($chosen as $model => $keys) {
+                $branch = $this->map->branches[$model];
+                $primary = SqlFragments::identifier($branch->primary->table);
+                $misplaced = [...$misplaced, ...array_column($this->connection->select(
+                    "SELECT CAST(chosen.key AS {$type}) AS key FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS chosen (key)"
+                        ." WHERE NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = CAST(chosen.key AS {$type})"
+                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table)).')',
+                    [json_encode($keys, JSON_THROW_ON_ERROR)],
+                    false,
+                ), 'key')];
+            }
+
+            $last = $rows === [] ? $last : self::keyOf(end($rows)[$this->key] ?? null);
+        } while (count($rows) === self::CHUNK);
+
+        if ($misplaced !== []) {
+            sort($misplaced);
+
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', count($misplaced)." {$this->map->table} rows sit in a successor their servedFrom() selector does not choose; the first are {$this->key} ".implode(', ', array_slice($misplaced, 0, 5)).'. Run php artisan compatibility:backfill '.$this->map->model.', then install()');
+        }
+    }
+
+    public static function rememberNow(string $table, null|string $comment, null|int|string $key): string
+    {
+        return "DO \$compatibility\$\nBEGIN\n"
+            ."  EXECUTE format('COMMENT ON TABLE %s IS %L', ".SqlFragments::literal($table).', CAST(json_build_object('
+            .SqlFragments::literal('backfilled').', '.SqlFragments::literal(self::MARKER).', '
+            .SqlFragments::literal('comment').', CAST('.($comment === null ? 'NULL' : SqlFragments::literal($comment)).' AS text), '
+            .SqlFragments::literal('key').', CAST('.SqlFragments::literal(json_encode($key, JSON_THROW_ON_ERROR)).' AS json), '
+            .SqlFragments::literal('updatedAt').", to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) AS text));\n"
+            ."END\n\$compatibility\$";
     }
 
     /**
@@ -319,7 +392,7 @@ final readonly class Backfiller
         $wrapped = array_map(SqlFragments::identifier(...), $changing);
         $target = SqlFragments::identifier(self::TARGET);
         $action = $changing === [] ? 'DO NOTHING' : 'DO UPDATE SET '.implode(', ', array_map(fn (string $column) => "{$column} = excluded.{$column}", [...$wrapped, ...($updated === null ? [] : [SqlFragments::identifier($updated)])]))
-            .' WHERE ('.implode(', ', array_map(fn (string $column) => "{$target}.{$column}", $wrapped)).') IS DISTINCT FROM ('.implode(', ', array_map(fn (string $column) => "excluded.{$column}", $wrapped)).')';
+            .' WHERE '.$this->distinct($changing, $types, $target, 'excluded');
         $rows = [];
 
         foreach ($stored as $values) {
@@ -456,7 +529,7 @@ final readonly class Backfiller
             $changed += $this->connection->affectingStatement(
                 'UPDATE '.SqlFragments::identifier($table)." AS {$target} SET ".implode(', ', [...array_map(fn (string $column) => "{$column} = {$source}.{$column}", $wrapped), ...($updated === null ? [] : [SqlFragments::identifier($updated).' = CAST(? AS '.$types[$updated].')'])])
                     ."\nFROM {$from}"
-                    ."\nWHERE {$target}.{$relatedKey} = {$alias}.{$relatedKey} AND (".implode(', ', array_map(fn (string $column) => "{$target}.{$column}", $wrapped)).') IS DISTINCT FROM ('.implode(', ', array_map(fn (string $column) => "{$source}.{$column}", $wrapped)).')',
+                    ."\nWHERE {$target}.{$relatedKey} = {$alias}.{$relatedKey} AND ".$this->distinct($columns, $types, $target, $source),
                 [...($updated === null ? [] : [$stamp]), ...$bindings],
             );
 
@@ -490,6 +563,17 @@ final readonly class Backfiller
         }
 
         return $changed;
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @param  array<string, string>  $types
+     */
+    private function distinct(array $columns, array $types, string $before, string $after): string
+    {
+        $side = fn (string $alias) => implode(', ', array_map(fn (string $column) => $this->catalog->equatable($types[$column]) ? $alias.'.'.SqlFragments::identifier($column) : 'CAST('.$alias.'.'.SqlFragments::identifier($column).' AS text)', $columns));
+
+        return '('.$side($before).') IS DISTINCT FROM ('.$side($after).')';
     }
 
     private function deleteGone(): int
@@ -640,13 +724,25 @@ final readonly class Backfiller
         return fn (QueryBuilder $query) => $query->whereRaw(SqlFragments::identifier($column).' >= '.$bound, [$watermark]);
     }
 
-    private function now(): string
+    private function now(string $operation): string
     {
-        return (string) $this->connection->scalar(
-            "select to_char(least(now(), (select min(xact_start) from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and pid <> pg_backend_pid())) at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        $now = (array) $this->connection->selectOne(
+            "select to_char(least(now(), min(xact_start) filter (where backend_type = 'client backend')) at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as watermark,
+                    count(*) filter (where state is null and backend_type is null) as hidden,
+                    current_user as role
+             from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()",
             [],
             false,
         );
+        $hidden = (int) ($now['hidden'] ?? 0);
+
+        if ($hidden > 0) {
+            $role = (string) ($now['role'] ?? '');
+
+            throw InvalidCompatibilityMap::cannot($this->map->table, $operation, "pg_stat_activity hides from {$role} whether {$hidden} other sessions of this database hold a transaction open, so no watermark can start before a write they have not committed yet. Grant pg_read_all_stats to {$role}, then {$operation} again");
+        }
+
+        return (string) ($now['watermark'] ?? '');
     }
 
     private function inApplicationZone(): null|string
