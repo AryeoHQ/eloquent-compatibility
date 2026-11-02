@@ -179,7 +179,7 @@ final class LegacyBuilderWriteTest extends TestCase
         $listing->save();
 
         $this->assertSame([
-            [0, "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)"],
+            [0, "select cast(oid as bigint) from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and relkind = 'v'"],
             [1, "select set_config('TimeZone', ?, true)"],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],

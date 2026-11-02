@@ -16,7 +16,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
-use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Write\Applying;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Throwable;
@@ -245,13 +245,9 @@ final class Forwarder
 
     private function read(Model $successor, bool $removes): null|LegacyRecord
     {
-        $view = $successor->getConnection()->scalar(
-            "select cast(oid as bigint) from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?) and relkind = 'v'",
-            [SqlFragments::identifier($this->map->table)],
-            false,
-        );
+        $view = ServedTable::view($successor->getConnection(), $this->map->table);
 
-        if (! is_int($view)) {
+        if ($view === null) {
             return null;
         }
 
