@@ -318,7 +318,7 @@ final readonly class MassWriter
             return;
         }
 
-        $catalog = new ColumnCatalog($this->connection);
+        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $creates = array_filter($values, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $values, $catalog);
         $key = $related->table.'.'.$related->successor->key;
         $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reached()->whereNotNull(self::target($index))->select(self::target($index)))->update($changes);

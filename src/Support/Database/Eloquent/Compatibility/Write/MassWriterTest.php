@@ -131,6 +131,30 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
+    public function it_writes_each_value_as_its_column_type_when_a_later_schema_on_the_search_path_holds_the_tables(): void
+    {
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.invoices (id serial primary key)');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $schema = DB::scalar('select current_schema()');
+            $updated = Listing::withTrashed()->whereKey([1, 2])->update(['latitude' => 3.5, 'featured' => false]);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+
+        $this->assertSame(['compatibility_tenant', 2], [$schema, $updated]);
+        $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
+        $this->assertSame([false, false], DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('featured')->all());
+        $this->assertSame([[3.5, false], [3.5, false]], Listing::withTrashed()->whereKey([1, 2])->orderBy('id')->get()->map(fn (Listing $listing) => [$listing->latitude, $listing->featured])->all());
+    }
+
+    #[Test]
     public function it_creates_no_dependent_for_a_record_whose_dependent_the_write_moves_out_of_its_relation(): void
     {
         $seattle = new class extends Model implements Compatible

@@ -45,7 +45,7 @@ final readonly class RetainedRows
         $primary = SqlFragments::identifier($this->map->primary->table);
         $primaryKey = $primary.'.'.SqlFragments::identifier($this->map->primary->key);
         $legacy = SqlFragments::identifier($this->map->table);
-        $catalog = new ColumnCatalog($this->connection);
+        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $query = $this->connection->table($retained);
         $grammar = $query->getGrammar();
         $selects = [];

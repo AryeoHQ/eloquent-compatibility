@@ -350,7 +350,7 @@ final readonly class RecordWriter
      */
     private function addEach(array $models, array $added, array $stored): void
     {
-        $catalog = new ColumnCatalog($this->connection);
+        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
         $grammar = $this->connection->getQueryGrammar();
         $sums = [];
         $bindings = [];
