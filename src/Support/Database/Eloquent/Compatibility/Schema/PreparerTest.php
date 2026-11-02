@@ -9,6 +9,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
@@ -127,6 +128,67 @@ final class PreparerTest extends TestCase
         $this->assertSame(['jobs_legacy_id_unique' => 'UNIQUE (legacy_id)', 'jobs_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'], array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'jobs'::regclass and contype = 'u' order by conname"), 'definition', 'conname'));
     }
 
+    /**
+     * @return iterable<string, array{string, string, null|string}>
+     */
+    public static function foreignIndexes(): iterable
+    {
+        yield 'an index that is not unique' => ['create index places_listings_at_most_one on places (job_id) where parent_id is null and deleted_at is null', 'places_listings_at_most_one', null];
+        yield 'a unique index over every row' => ['create unique index places_listings_at_most_one on places (job_id)', 'places_listings_at_most_one', null];
+        yield 'a unique index over another column' => ['create unique index jobs_legacy_uuid_unique on jobs (name)', 'jobs_legacy_uuid_unique', null];
+        yield 'a table' => ['create table places_listings_at_most_one (id integer)', 'places_listings_at_most_one', 'drop table if exists places_listings_at_most_one'];
+    }
+
+    #[DataProvider('foreignIndexes')]
+    #[Test]
+    public function it_refuses_an_object_that_holds_the_name_of_an_index_it_builds(string $create, string $name, null|string $drop): void
+    {
+        DB::statement($create);
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: {$name} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.", $exception->getMessage());
+        } finally {
+            if ($drop !== null) {
+                DB::statement($drop);
+            }
+        }
+    }
+
+    #[Test]
+    public function it_lets_the_successor_update_a_row_the_identifier_fill_has_not_reached(): void
+    {
+        DB::table('jobs')->insert(['name' => 'Birch Barn', 'company_id' => ListingTables::COMPANY]);
+        $statements = Statements::prepare(Compatibility::of(Listing::class)->resolve(), DB::connection());
+
+        DB::transaction(function () use ($statements): void {
+            foreach ($statements->transaction as $statement) {
+                DB::unprepared($statement);
+            }
+        });
+        DB::table('jobs')->where('name', 'Birch Barn')->update(['name' => 'Birch Barn, restored']);
+
+        foreach ($statements->afterwards as $statement) {
+            DB::unprepared($statement);
+        }
+
+        $this->assertEquals((object) ['name' => 'Birch Barn, restored', 'legacy_id' => 4, 'has_uuid' => true], DB::selectOne('select name, legacy_id, legacy_uuid is not null as has_uuid from jobs'));
+        $this->assertSame(['legacy_id', 'legacy_uuid'], array_column(DB::select("select attname from pg_attribute where attrelid = 'jobs'::regclass and attname like 'legacy%' and attnotnull order by attname"), 'attname'));
+    }
+
+    #[Test]
+    public function it_builds_an_at_most_one_index_over_rows_whose_key_is_null(): void
+    {
+        DB::statement('alter table places alter column job_id drop not null');
+        DB::table('places')->insert([['job_id' => null, 'street' => 'Lot 1'], ['job_id' => null, 'street' => 'Lot 2']]);
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertTrue(DB::scalar("select indisvalid from pg_index where indexrelid = 'places_listings_at_most_one'::regclass"));
+    }
+
     #[Test]
     public function it_adds_the_identifier_columns_without_rewriting_the_successor_table(): void
     {
@@ -142,7 +204,7 @@ final class PreparerTest extends TestCase
     #[Test]
     public function it_refuses_to_create_an_index_concurrently_inside_a_transaction(): void
     {
-        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 12 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
+        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 13 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
 
         DB::transaction(fn () => Compatibility::prepare(Listing::class));
     }

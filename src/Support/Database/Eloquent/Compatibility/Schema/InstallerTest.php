@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -415,6 +416,83 @@ final class InstallerTest extends TestCase
         $this->expectExceptionObject(new LogicException('Compatibility::install() runs 3 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
 
         DB::transaction(fn () => Compatibility::install(Listing::class));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_map_whose_external_attribute_names_a_legacy_column(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $number) => $number)));
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame(InvalidCompatibilityMap::because('listings', "attribute 'mls_number' is external(), and this release neither reads nor restores an external attribute, so install() would drop listings.mls_number and its values")->getMessage(), $refusal->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+        $this->assertSame(['MLS-1', null, 'MLS-3'], array_column(DB::select('select mls_number from listings order by id'), 'mls_number'));
+    }
+
+    #[Test]
+    public function it_leaves_a_foreign_key_that_install_did_not_move_where_uninstall_finds_it(): void
+    {
+        DB::statement('create table job_notes (id serial primary key, job_legacy_id integer references jobs (legacy_id))');
+
+        try {
+            Compatibility::install(Listing::class);
+            Compatibility::uninstall(Listing::class);
+
+            $this->assertSame('FOREIGN KEY (job_legacy_id) REFERENCES jobs(legacy_id)', DB::scalar("select pg_get_constraintdef(oid) from pg_constraint where conname = 'job_notes_job_legacy_id_fkey'"));
+        } finally {
+            DB::statement('drop table if exists job_notes');
+        }
+    }
+
+    #[Test]
+    public function it_reads_the_catalog_through_the_write_connection_when_the_connection_has_a_replica(): void
+    {
+        DB::statement('create schema compatibility_replica');
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'compatibility_replica'], 'write' => []]]);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_replicated';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
     }
 
     #[Test]

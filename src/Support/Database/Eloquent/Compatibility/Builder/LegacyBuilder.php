@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
-use BackedEnum;
 use Closure;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Support\Arrayable;
@@ -15,6 +14,7 @@ use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -28,23 +28,26 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
  */
 final class LegacyBuilder extends Builder
 {
-    private const array COMPLEMENTS = ['=' => '!=', '!=' => '=', '<>' => '=', '<' => '>=', '>' => '<=', '<=' => '>', '>=' => '<'];
+    private const array COMPLEMENTS = ['=' => '!=', '!=' => '=', '<>' => '=', '<' => '>=', '>' => '<=', '<=' => '>', '>=' => '<', 'unknown' => 'unknown'];
 
     /** @var array<string, ResolvedMap> */
     private static array $maps = [];
 
-    /** @var array<string, bool> */
-    private static array $views = [];
-
     /** @var array<string, ColumnCatalog> */
     private static array $catalogs = [];
 
+    /** @var array<string, true> */
+    private static array $tables = [];
+
     private int $negations = 0;
+
+    /** @var null|array{schema: string, view: bool, readable: bool} */
+    private null|array $relation = null;
 
     public static function forgetViews(): void
     {
-        self::$views = [];
         self::$catalogs = [];
+        self::$tables = [];
     }
 
     /**
@@ -61,6 +64,7 @@ final class LegacyBuilder extends Builder
 
             if ($nested instanceof self) {
                 $nested->negations = $this->negations + (self::negates($boolean) ? 1 : 0);
+                $nested->relation = $this->relation;
             }
 
             $column($nested);
@@ -82,9 +86,10 @@ final class LegacyBuilder extends Builder
         }
 
         $attribute = is_string($column) ? $this->converted($column) : null;
+        $arguments = func_get_args();
 
         if ($attribute === null) {
-            parent::where(...func_get_args());
+            parent::where(...$arguments);
 
             return $this;
         }
@@ -97,7 +102,7 @@ final class LegacyBuilder extends Builder
 
         $operator = strtolower($operator);
 
-        return $this->translate($attribute, self::negates($boolean), $boolean, "where {$operator}", [[$operator, $value]], 'and');
+        return $this->translate($attribute, self::negates($boolean), $boolean, "where {$operator}", [[$operator, $value]], 'and', fn () => parent::where(...$arguments));
     }
 
     /**
@@ -124,7 +129,7 @@ final class LegacyBuilder extends Builder
             throw $this->refuse($attribute, $operation, 'a subquery does not pass through its conversions.');
         }
 
-        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, array_map(fn (mixed $value) => ['=', $value], array_values($values)), 'or');
+        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, array_map(fn (mixed $value) => [$value === null ? 'unknown' : '=', $value], array_values($values)), 'or', fn () => $this->query->whereIn($column, $values, $boolean, $not));
     }
 
     /**
@@ -183,7 +188,7 @@ final class LegacyBuilder extends Builder
 
         [$low, $high] = array_pad(array_slice(Arr::flatten($values), 0, 2), 2, null);
 
-        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, [['>=', $low], ['<=', $high]], 'and');
+        return $this->translate($attribute, $not !== self::negates($boolean), $boolean, $operation, [['>=', $low], ['<=', $high]], 'and', fn () => $this->query->whereBetween($column, $values, $boolean, $not));
     }
 
     /**
@@ -234,7 +239,7 @@ final class LegacyBuilder extends Builder
                 continue;
             }
 
-            $this->translate($attribute, self::negates($boolean), $boolean, $not ? 'whereNotNull' : 'whereNull', [[$not ? '!=' : '=', null]], 'and');
+            $this->translate($attribute, self::negates($boolean), $boolean, $not ? 'whereNotNull' : 'whereNull', [[$not ? '!=' : '=', null]], 'and', fn () => $this->query->whereNull($column, $boolean, $not));
         }
 
         return $this;
@@ -278,17 +283,10 @@ final class LegacyBuilder extends Builder
         $this->query->orderBy($column, $direction);
         $attribute = is_string($column) ? $this->converted($column) : null;
 
-        if ($attribute !== null) {
+        if ($attribute !== null && $this->definition($attribute)->isExternal()) {
             $orders = $this->query->unions ? $this->query->unionOrders : $this->query->orders;
-            $normalized = (string) end($orders)['direction'];
 
-            if ($this->definition($attribute)->isExternal()) {
-                throw $this->refuse($attribute, "orderBy {$normalized}", 'it is stored outside the database, so no SQL reads it.');
-            }
-
-            if ($this->definition($attribute)->order($normalized) === null) {
-                throw $this->refuse($attribute, "orderBy {$normalized}", 'its conversions do not keep the order of the stored values.');
-            }
+            throw $this->refuse($attribute, 'orderBy '.end($orders)['direction'], 'it is stored outside the database, so no SQL reads it.');
         }
 
         return $this;
@@ -375,7 +373,7 @@ final class LegacyBuilder extends Builder
     {
         $attribute = is_string($column) ? $this->attributeOf($column) : null;
 
-        if ($attribute !== null && $this->servesTheView() && $this->definition($attribute)->isExternal()) {
+        if ($attribute !== null && $this->definition($attribute)->isExternal() && $this->relation()['view']) {
             throw $this->refuse($attribute, "{$function}()", 'it is stored outside the database, so no SQL reads it.');
         }
 
@@ -384,9 +382,10 @@ final class LegacyBuilder extends Builder
 
     /**
      * @param  list<array{string, mixed}>  $conditions
+     * @param  Closure(): mixed  $onView
      * @return $this
      */
-    private function translate(string $attribute, bool $not, string $boolean, string $operation, array $conditions, string $combine): self
+    private function translate(string $attribute, bool $not, string $boolean, string $operation, array $conditions, string $combine, Closure $onView): self
     {
         $map = $this->map();
         $definition = $this->definition($attribute);
@@ -406,60 +405,63 @@ final class LegacyBuilder extends Builder
         $negated = $this->negations % 2 === 1;
         $negate = $not !== $negated;
         [$type, $served] = $this->served($attribute, $owner);
+        $stored = $served === null ? $this->stored($attribute, $conditions, $combine, $negate, $type) : [$conditions, $combine, $negate];
 
-        if ($served === null) {
-            [$filters, $combine, $negate] = $this->stored($attribute, $operation, $conditions, $combine, $negate, $type);
-            $column = $owner.'.'.$definition->column();
-        } else {
-            $filters = $conditions;
-            $column = new RawExpression($served);
+        if ($stored === null || ! $this->relation()['readable']) {
+            $onView();
+
+            return $this;
         }
 
-        $stored = $this->query->newQuery()->select($map->primary->table.'.'.$map->identifiers[$key]->column());
+        [$filters, $combine, $negate] = $stored;
+        $column = $served === null ? $owner.'.'.$definition->column() : new RawExpression($served);
+        $successors = $this->query->newQuery()->select($map->primary->table.'.'.$map->identifiers[$key]->column());
 
         if ($owner === $map->primary->table) {
-            $stored->from($owner);
+            $successors->from($owner);
         } else {
-            $stored->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
+            $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
         }
 
-        $stored->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
-        $this->query->whereIn($this->model->qualifyColumn($key), $stored, str_replace(' not', '', $boolean), $negated);
+        $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
+        $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
 
         return $this;
     }
 
     /**
      * @param  list<array{string, mixed}>  $conditions
-     * @return array{list<array{string, mixed}>, string, bool}
+     * @return null|array{list<array{string, mixed}>, string, bool}
      */
-    private function stored(string $attribute, string $operation, array $conditions, string $combine, bool $negate, null|string $type): array
+    private function stored(string $attribute, array $conditions, string $combine, bool $negate, null|string $type): null|array
     {
         if ($negate) {
-            $complements = $this->filters($attribute, $operation, array_map(fn (array $condition) => [self::COMPLEMENTS[$condition[0]] ?? '', $condition[1]], $conditions), $type, false);
+            $complements = $this->filters($attribute, array_map(fn (array $condition) => [self::COMPLEMENTS[$condition[0]] ?? '', $condition[1]], $conditions), $type);
 
             if ($complements !== null) {
                 return [$complements, $combine === 'and' ? 'or' : 'and', false];
             }
         }
 
-        return [(array) $this->filters($attribute, $operation, $conditions, $type, true), $combine, $negate];
+        $filters = $this->filters($attribute, $conditions, $type);
+
+        return $filters === null ? null : [$filters, $combine, $negate];
     }
 
     /**
      * @param  list<array{string, mixed}>  $conditions
      * @return null|list<array{string, mixed}>
      */
-    private function filters(string $attribute, string $operation, array $conditions, null|string $type, bool $refuse): null|array
+    private function filters(string $attribute, array $conditions, null|string $type): null|array
     {
         $filters = [];
 
         foreach ($conditions as [$operator, $value]) {
-            $filter = $operator === '' ? null : $this->definition($attribute)->filter($operator, $value, $type);
-
-            if ($filter === null && $refuse) {
-                throw $this->refuse($attribute, $operation, 'its conversions give no stored value to compare with '.var_export($value instanceof BackedEnum ? $value->value : $value, true).'.');
-            }
+            $filter = match ($operator) {
+                '' => null,
+                'unknown' => ['unknown', null],
+                default => $this->definition($attribute)->filter($operator, $value, $type),
+            };
 
             if ($filter === null) {
                 return null;
@@ -486,6 +488,7 @@ final class LegacyBuilder extends Builder
             match ($operator) {
                 'none' => $query->whereRaw('false', [], $combine),
                 'all' => $query->whereRaw('true', [], $combine),
+                'unknown' => $query->whereRaw('null', [], $combine),
                 'in' => $query->whereIn($column, is_array($value) ? $value : [$value], $combine),
                 default => $query->where($column, $operator, $value, $combine),
             };
@@ -498,7 +501,7 @@ final class LegacyBuilder extends Builder
     private function served(string $attribute, string $owner): array
     {
         $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$connection->getName()] ??= new ColumnCatalog($connection);
+        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
         $definition = $this->definition($attribute);
         $column = $definition->column();
         $type = $column === null ? null : $catalog->type($owner, $column);
@@ -530,14 +533,9 @@ final class LegacyBuilder extends Builder
     private function converted(string $column): null|string
     {
         $attribute = $this->attributeOf($column);
+        $definition = $attribute === null ? null : $this->definition($attribute);
 
-        if ($attribute === null || ! $this->servesTheView()) {
-            return null;
-        }
-
-        $definition = $this->definition($attribute);
-
-        return $definition->isExternal() || $definition->conversions() !== [] ? $attribute : null;
+        return $definition !== null && ($definition->isExternal() || $definition->conversions() !== []) && $this->relation()['view'] ? $attribute : null;
     }
 
     private function attributeOf(string $column): null|string
@@ -553,12 +551,33 @@ final class LegacyBuilder extends Builder
         return $this->map()->attributes[$attribute];
     }
 
-    private function servesTheView(): bool
+    /**
+     * @return array{schema: string, view: bool, readable: bool}
+     */
+    private function relation(): array
     {
         $connection = $this->model->getConnection();
-        $relation = $connection->getName().'.'.$this->model->getTable();
+        $table = $connection->getName().'.'.$this->model->getTable();
 
-        return self::$views[$relation] ??= $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($this->model->getTable())]) === 'v';
+        if ($this->relation !== null || array_key_exists($table, self::$tables)) {
+            return $this->relation ?? ['schema' => '', 'view' => false, 'readable' => true];
+        }
+
+        $map = $this->map();
+        $row = (array) $connection->selectOne(
+            "select current_schema() as schema,
+                    coalesce((select relkind = 'v' from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)), false) as view,
+                    coalesce((select bool_and(coalesce(has_table_privilege(to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)), 'SELECT'), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor), false) as readable",
+            [SqlFragments::identifier($this->model->getTable()), json_encode([$map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], JSON_THROW_ON_ERROR)],
+        );
+
+        $this->relation = ['schema' => (string) ($row['schema'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
+
+        if (! $this->relation['view']) {
+            self::$tables[$table] = true;
+        }
+
+        return $this->relation;
     }
 
     private function map(): ResolvedMap

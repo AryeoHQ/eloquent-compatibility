@@ -51,6 +51,9 @@ final readonly class InTimeZone implements Conversion
 
     public function exact(null|string $type, string $served): bool
     {
-        return SqlFragments::isZoned($type) && SqlFragments::isWallClock($served) && SqlFragments::precision($served) >= SqlFragments::precision((string) $type);
+        $transitions = (new DateTimeZone($this->zone))->getTransitions();
+
+        return SqlFragments::isZoned($type) && SqlFragments::isWallClock($served) && SqlFragments::precision($served) >= SqlFragments::precision((string) $type)
+            && $transitions !== false && count($transitions) <= 1;
     }
 }
