@@ -74,6 +74,7 @@ final readonly class Installer
                 }
 
                 $this->apply($install);
+                $backfiller->forget();
             });
 
             $retaining = false;
@@ -87,10 +88,6 @@ final readonly class Installer
             }
 
             throw $exception;
-        } finally {
-            if ($watermark !== null) {
-                $backfiller->untrack();
-            }
         }
     }
 
@@ -100,8 +97,6 @@ final readonly class Installer
      */
     private function converge(ResolvedMap $map, Backfiller $backfiller, array $watermark): array
     {
-        $backfiller->track();
-
         for ($pass = 1; ; $pass++) {
             [$changed, $read, $watermark] = $backfiller->catchUp($watermark);
             $backfiller->remember($watermark);

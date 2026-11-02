@@ -1047,6 +1047,51 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_deletes_the_job_of_a_listing_hard_deleted_between_the_backfill_and_install(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::delete('delete from listings where id = 3');
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([1, 2], array_column($this->listings(), 'id'));
+        $this->assertSame([1, 2], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+        $this->assertNull(DB::scalar("select to_regclass('listings_backfilled')::text"));
+    }
+
+    #[Test]
+    public function it_keeps_at_install_every_job_no_backfill_wrote_while_it_deletes_the_job_of_a_hard_deleted_listing(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        DB::table('jobs')->insert(['name' => 'Prior job', 'company_id' => ListingTables::COMPANY]);
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        $this->backfiller(Listing::class)->run();
+        DB::table('jobs')->insert(['name' => 'Native job', 'company_id' => ListingTables::COMPANY]);
+        DB::delete('delete from listings where id = 3');
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([[1, 'Oak House'], [2, 'Pine Flat'], [4, 'Prior job'], [5, 'Native job']], array_map(fn (array $row) => [$row['id'], $row['title']], $this->listings()));
+    }
+
+    #[Test]
+    public function it_deletes_on_a_reinstall_the_job_of_a_listing_hard_deleted_after_an_uninstall_and_keeps_a_job_created_since(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        Compatibility::install(Listing::class);
+        Compatibility::uninstall(Listing::class);
+        DB::delete('delete from listings where id = 3');
+        DB::table('jobs')->insert(['name' => 'Native job', 'company_id' => ListingTables::COMPANY]);
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([[1, 'Oak House'], [2, 'Pine Flat'], [4, 'Native job']], array_map(fn (array $row) => [$row['id'], $row['title']], $this->listings()));
+        $this->assertSame([1, 2, 4], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+    }
+
+    #[Test]
     public function it_refuses_to_install_from_a_watermark_while_the_legacy_table_has_no_updated_at_its_model_writes(): void
     {
         $listing = new class extends Model implements Compatible

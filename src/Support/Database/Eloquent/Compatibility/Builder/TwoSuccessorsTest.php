@@ -18,6 +18,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\File;
@@ -97,6 +98,19 @@ final class TwoSuccessorsTest extends TestCase
 
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
         $this->assertSame([1, 3], array_map(intval(...), array_column(DB::select('select id from videos order by id'), 'id')));
+    }
+
+    #[Test]
+    public function it_deletes_at_install_the_row_whichever_successor_holds_for_a_video_hard_deleted_after_the_backfill(): void
+    {
+        Compatibility::uninstall(Video::class);
+        (new Backfiller(Compatibility::of(Video::class)->resolve(), DB::connection()))->run();
+        DB::delete('delete from videos where id in (2, 3)');
+
+        Compatibility::install(Video::class);
+
+        $this->assertSame([1], array_map(intval(...), array_column(DB::select('select id from videos order by id'), 'id')));
+        $this->assertSame([['files', 1]], $this->holders([1, 2, 3]));
     }
 
     #[Test]

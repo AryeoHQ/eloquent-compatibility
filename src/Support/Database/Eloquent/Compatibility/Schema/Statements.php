@@ -351,7 +351,7 @@ final readonly class Statements
         $statements[] = "ALTER TABLE {$legacyTable} DROP COLUMN {$retainedKey}";
         $statements[] = "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", $constraints);
         [$replayed, $validations] = $captured === null ? [[], []] : self::replay($captured, $legacyTable, [...array_keys($served), ...array_keys($external)]);
-        $statements = [...$statements, ...$replayed];
+        $statements = [...$statements, ...$replayed, ...($captured === null || $captured['backfill'] === null ? [] : Backfiller::refill($map->table, $key, $shape[$key]->type))];
         $identifiers = [];
 
         foreach ($map->identifiers as $name => $identifier) {
@@ -447,7 +447,7 @@ final readonly class Statements
             }
         }
 
-        return new self('uninstall', [...$statements, ...$replayed], $validations, $external === [] ? [] : [$restoredAt => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
+        return new self('uninstall', [...$statements, ...$replayed, ...($captured === null || $captured['backfill'] === null ? [] : Backfiller::refill($map->table, $key, $shape[$key]->type))], $validations, $external === [] ? [] : [$restoredAt => array_map(fn (array $column, string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::restore($map, $connection, $name, $column['type']), $external, array_keys($external))]);
     }
 
     private static function successorNames(ResolvedMap $map): string

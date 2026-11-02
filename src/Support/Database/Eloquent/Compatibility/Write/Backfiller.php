@@ -29,8 +29,6 @@ final readonly class Backfiller
 
     private const string MARKER = 'compatibility backfill';
 
-    private const string WALKED = 'pg_temp.compatibility_walked';
-
     private const int BINDINGS = 65535;
 
     private const string SOURCE = 'compatibility_source';
@@ -67,7 +65,8 @@ final readonly class Backfiller
         }
 
         $updatedAt = $this->now('backfill');
-        [$read, $changed, $last] = $this->walk($chunk, $since === null ? null : $this->updatedSince(self::watermark($since)), $chunked, false);
+        $this->track();
+        [$read, $changed, $last] = $this->walk($chunk, $since === null ? null : $this->updatedSince(self::watermark($since)), $chunked);
         $watermark = ['key' => $since === null ? $last : $previous['key'] ?? null, 'updatedAt' => $updatedAt];
         $this->remember($watermark);
 
@@ -82,9 +81,10 @@ final readonly class Backfiller
     {
         $this->refuseUnwalkable(self::CHUNK);
         $updatedAt = $this->now('install');
+        $this->track();
         $updated = $this->updatedAt() === null ? null : $this->updatedSince($watermark['updatedAt']);
         $scope = $watermark['key'] === null || $updated === null ? null : fn (QueryBuilder $query) => $query->where($this->key, '>', $watermark['key'])->orWhere($updated);
-        [$read, $changed, $last] = $this->walk(self::CHUNK, $scope, null, true);
+        [$read, $changed, $last] = $this->walk(self::CHUNK, $scope, null);
 
         return [$changed + $this->deleteGone(), $read, ['key' => self::greater($watermark['key'], $last), 'updatedAt' => $updatedAt]];
     }
@@ -185,17 +185,24 @@ final readonly class Backfiller
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)));
     }
 
-    public function track(): void
+    /**
+     * @return list<string>
+     */
+    public static function refill(string $table, string $key, string $type): array
     {
-        $type = $this->catalog->type($this->map->table, $this->key) ?? throw InvalidCompatibilityMap::because($this->map->table, "{$this->map->table} has no column {$this->key}");
-        $this->connection->statement('CREATE TEMPORARY TABLE IF NOT EXISTS '.self::WALKED.' ('.SqlFragments::identifier(self::KEY)." {$type} PRIMARY KEY)");
-        $this->connection->statement('TRUNCATE '.self::WALKED);
-        $this->connection->statement('INSERT INTO '.self::WALKED.' SELECT '.SqlFragments::identifier($this->key).' FROM '.SqlFragments::identifier($this->map->table));
+        $column = SqlFragments::identifier($key);
+
+        return [
+            self::create($table, $key, $type),
+            'INSERT INTO '.SqlFragments::identifier(self::backfilledTable($table))." ({$column}) SELECT {$column} FROM ".SqlFragments::identifier($table).' ON CONFLICT DO NOTHING',
+        ];
     }
 
-    public function untrack(): void
+    public function forget(): void
     {
-        $this->connection->statement('DROP TABLE IF EXISTS '.self::WALKED);
+        if ($this->tracked()) {
+            $this->connection->statement('DROP TABLE '.SqlFragments::identifier(self::backfilledTable($this->map->table)));
+        }
     }
 
     public static function comment(ConnectionInterface $connection, string $table): null|string
@@ -224,14 +231,14 @@ final readonly class Backfiller
      * @param  null|Closure(list<int|string>, int): void  $chunked
      * @return array{int, int, null|int|string}
      */
-    private function walk(int $chunk, null|Closure $scope, null|Closure $chunked, bool $track): array
+    private function walk(int $chunk, null|Closure $scope, null|Closure $chunked): array
     {
         $read = 0;
         $changed = 0;
         $last = null;
 
         do {
-            $rows = $this->connection->transaction(function () use ($chunk, $scope, $chunked, $track, $last, &$changed): array {
+            $rows = $this->connection->transaction(function () use ($chunk, $scope, $chunked, $last, &$changed): array {
                 $zone = $this->inApplicationZone();
                 $query = $this->connection->table($this->map->table)->useWritePdo()->orderBy($this->key)->limit($chunk);
 
@@ -249,10 +256,7 @@ final readonly class Backfiller
                 if ($rows !== []) {
                     $written = $this->write($rows);
                     $changed += $written;
-
-                    if ($track) {
-                        $this->walked($keys);
-                    }
+                    $this->record($keys);
 
                     if ($chunked !== null) {
                         $chunked($keys, $written);
@@ -579,35 +583,59 @@ final readonly class Backfiller
     private function deleteGone(): int
     {
         $legacy = SqlFragments::identifier($this->map->table);
-        $gone = 'NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->key).' = walked.'.SqlFragments::identifier(self::KEY).')';
+        $backfilled = SqlFragments::identifier(self::backfilledTable($this->map->table));
+        $key = SqlFragments::identifier($this->key);
+        $gone = "NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$key} = backfilled.{$key})";
         $deleted = 0;
 
         foreach ($this->map->branches === [] ? [$this->map] : $this->map->branches as $branch) {
             $primary = SqlFragments::identifier($branch->primary->table);
 
             $deleted += $this->connection->affectingStatement(
-                "DELETE FROM {$primary} USING ".self::WALKED.' AS walked WHERE '.$primary.'.'.SqlFragments::identifier((string) $branch->identifiers[$this->key]->column()).' = walked.'.SqlFragments::identifier(self::KEY)
+                "DELETE FROM {$primary} USING {$backfilled} AS backfilled WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = backfilled.{$key}"
                     .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table))
                     .implode('', array_map(fn (string $condition) => ' AND NOT COALESCE(('.$condition.'), false)', ViewCompiler::hidden($branch)))
                     .' AND '.$gone,
             );
         }
 
-        $this->connection->delete('DELETE FROM '.self::WALKED.' AS walked WHERE '.$gone);
+        $this->connection->delete("DELETE FROM {$backfilled} AS backfilled WHERE {$gone}");
 
         return $deleted;
+    }
+
+    private function track(): void
+    {
+        if (! $this->tracked()) {
+            $this->connection->statement(self::create($this->map->table, $this->key, $this->catalog->type($this->map->table, $this->key) ?? throw InvalidCompatibilityMap::because($this->map->table, "{$this->map->table} has no column {$this->key}")));
+        }
+    }
+
+    private function tracked(): bool
+    {
+        return $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?) is not null", [SqlFragments::identifier(self::backfilledTable($this->map->table))], false) === true;
     }
 
     /**
      * @param  list<int|string>  $keys
      */
-    private function walked(array $keys): void
+    private function record(array $keys): void
     {
         $type = (string) $this->catalog->type($this->map->table, $this->key);
 
         foreach ($this->batches(array_map(fn (int|string $key) => [$key], $keys), 1) as $batch) {
-            $this->connection->insert('INSERT INTO '.self::WALKED.' VALUES '.implode(', ', array_fill(0, count($batch), "(CAST(? AS {$type}))")).' ON CONFLICT DO NOTHING', array_merge(...$batch));
+            $this->connection->insert('INSERT INTO '.SqlFragments::identifier(self::backfilledTable($this->map->table)).' VALUES '.implode(', ', array_fill(0, count($batch), "(CAST(? AS {$type}))")).' ON CONFLICT DO NOTHING', array_merge(...$batch));
         }
+    }
+
+    private static function backfilledTable(string $table): string
+    {
+        return SqlFragments::objectName($table, $table.'_backfilled');
+    }
+
+    private static function create(string $table, string $key, string $type): string
+    {
+        return 'CREATE TABLE IF NOT EXISTS '.SqlFragments::identifier(self::backfilledTable($table)).' ('.SqlFragments::identifier($key)." {$type} PRIMARY KEY)";
     }
 
     /**

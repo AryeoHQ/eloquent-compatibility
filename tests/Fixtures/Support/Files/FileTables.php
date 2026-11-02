@@ -189,7 +189,7 @@ final class FileTables
             }
         }
 
-        DB::statement('drop table if exists photos, photos_retained, floorplans, floorplans_retained, legacy_files, legacy_files_retained, videos, videos_retained, interactive_content, interactive_content_retained, files, links cascade');
+        DB::statement('drop table if exists photos, photos_retained, photos_backfilled, floorplans, floorplans_retained, floorplans_backfilled, legacy_files, legacy_files_retained, legacy_files_backfilled, videos, videos_retained, videos_backfilled, interactive_content, interactive_content_retained, interactive_content_backfilled, files, links cascade');
         DB::statement('drop sequence if exists compatibility_legacy_id_seq');
         LegacyBuilder::forgetViews();
     }

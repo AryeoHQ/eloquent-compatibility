@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
@@ -169,6 +170,24 @@ final class BackfillerTest extends TestCase
 
         $this->assertMatchesRegularExpression('/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/', $opened);
         $this->assertLessThanOrEqual($opened, $watermark);
+    }
+
+    #[Test]
+    public function it_records_each_legacy_key_it_writes_in_the_transaction_of_its_chunk(): void
+    {
+        try {
+            $this->backfiller(Listing::class)->run(chunk: 2, chunked: function (array $keys): void {
+                if ($keys === [3]) {
+                    throw new LogicException('The second chunk fails.');
+                }
+            });
+            $this->fail('The backfill did not fail.');
+        } catch (LogicException $exception) {
+            $this->assertSame('The second chunk fails.', $exception->getMessage());
+        }
+
+        $this->assertSame([1, 2], array_map(intval(...), array_column($this->rows('select id from listings_backfilled order by id'), 'id')));
+        $this->assertSame([1, 2], array_map(intval(...), array_column($this->rows('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
     }
 
     #[Test]

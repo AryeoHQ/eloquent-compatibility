@@ -123,7 +123,7 @@ final class ListingTables
             DB::statement('drop view listings');
         }
 
-        DB::statement('drop table if exists listings, listings_retained, job_sites, places, jobs cascade');
+        DB::statement('drop table if exists listings, listings_retained, listings_backfilled, job_sites, places, jobs cascade');
         LegacyBuilder::forgetViews();
     }
 }
