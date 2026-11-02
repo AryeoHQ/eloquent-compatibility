@@ -32,7 +32,7 @@ final readonly class Installer
             ), is_string(...)));
 
             if ($locked !== []) {
-                $this->connection->unprepared('LOCK TABLE '.implode(', ', $locked).' IN ACCESS SHARE MODE');
+                $this->connection->unprepared('LOCK TABLE '.implode(', ', $locked).' IN SHARE UPDATE EXCLUSIVE MODE');
             }
 
             $statements = $compile();
