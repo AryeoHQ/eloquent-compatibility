@@ -535,10 +535,42 @@ final readonly class MassWriter
                 ->orderBy($primary->table.'.'.$primary->key)
                 ->lockForUpdate()
                 ->pluck($primary->table.'.'.$primary->key);
+
+            foreach ($this->map->morphs as $variant) {
+                $writer = new self($variant, $this->connection);
+                $writer->lockDependents($writer->members($this->connection->table($primary->table))->whereIn($primary->table.'.'.$this->legacyColumn(), $selected)->select($primary->table.'.'.$primary->key));
+            }
+
+            $this->connection->table(self::SELECTED)->whereNotIn('key', $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']))->delete();
+
+            [$mapped, $retained] = $this->byOwner($values);
+            [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
+            $assigned = self::named($values);
+            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [];
+            $whole = array_filter($retained, fn (int|string $name) => ! str_contains((string) $name, '->'), ARRAY_FILTER_USE_KEY);
+            $sums = [];
+
+            foreach (array_diff_key(self::named($retainedAmounts), $assigned) as $column => $amount) {
+                $sums[$column] = new RawExpression(SqlFragments::identifier($alias).'.'.SqlFragments::identifier($column).' + '.($amount + 0));
+            }
+
+            $reads = $this->evaluateOnce($selected, array_filter($whole, fn (mixed $value) => $value instanceof Expression) + $sums, $alias);
+            $literals = $this->typed(array_filter($whole, fn (mixed $value) => ! $value instanceof Expression));
+            $values = array_replace($values, $literals, array_intersect_key($reads, $retained));
+            $known = array_filter(self::named(array_replace($mapped, $literals)), fn (mixed $value) => ! self::computesInSql($value));
+            [$holding, $chosen] = $this->refuseMorphMoves($selected, $known, self::named($reads), $alias, $exact);
             $updated = 0;
 
-            foreach ($this->refuseMorphMoves($selected, $values, $amounts, $alias) as $variant) {
+            foreach ($holding as $variant) {
                 $updated += (new self($variant, $this->connection))->update($selected, $values, $amounts, $alias);
+            }
+
+            if (! $exact) {
+                $this->refuseMorphMoved($selected, $chosen, $alias);
+            }
+
+            if ($reads !== []) {
+                $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::EVALUATED));
             }
 
             $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::SELECTED));
@@ -548,18 +580,82 @@ final readonly class MassWriter
     }
 
     /**
-     * @param  array<array-key, mixed>  $values
-     * @param  array<array-key, float|int|numeric-string>  $amounts
-     * @return list<ResolvedMap>
+     * @param  array<string, mixed>  $values
+     * @param  array<string, Expression>  $reads
+     * @return array{list<ResolvedMap>, array<array-key, ResolvedMap>}
      */
-    private function refuseMorphMoves(QueryBuilder $selected, array $values, array $amounts, string $alias): array
+    private function refuseMorphMoves(QueryBuilder $selected, array $values, array $reads, string $alias, bool $exact): array
+    {
+        $morph = $this->map->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' declares no relatedMorph().");
+        $key = (new $this->map->model)->getKeyName();
+        $holding = [];
+        $chosen = [];
+        $served = [];
+
+        foreach ($this->morphRows($selected, $reads, $alias)->cursor() as $row) {
+            [$before, $type, $evaluated] = $this->morphRow((array) $row, $reads);
+            $from = $this->map->morphHolding($type);
+            $record = $before[$key] ?? null;
+            $record = is_int($record) || is_string($record) ? $record : '';
+
+            if ($from === null) {
+                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.$record.', whose '.class_basename($this->map->primary->model).' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'successors: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
+            }
+
+            $holding[spl_object_id($from)] = $from;
+            $chosen[$record] = $this->map->morphFor((new $this->map->model)->setRawAttributes($before));
+
+            if ($exact) {
+                $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
+                $this->refuseMorphMove($before, $from, $chosen[$record], array_replace($before, $values, $served[spl_object_id($from)], $evaluated));
+            }
+        }
+
+        return [array_values($holding), $chosen];
+    }
+
+    /**
+     * @param  array<array-key, ResolvedMap>  $chosen
+     */
+    private function refuseMorphMoved(QueryBuilder $selected, array $chosen, string $alias): void
+    {
+        $key = (new $this->map->model)->getKeyName();
+
+        foreach ($this->morphRows($selected, [], $alias)->cursor() as $row) {
+            [$after, $type] = $this->morphRow((array) $row, []);
+            $record = $after[$key] ?? null;
+            $from = $this->map->morphHolding($type);
+
+            if ($from !== null && (is_int($record) || is_string($record)) && array_key_exists($record, $chosen)) {
+                $this->refuseMorphMove($after, $from, $chosen[$record], $after);
+            }
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $before
+     * @param  array<string, mixed>  $after
+     */
+    private function refuseMorphMove(array $before, ResolvedMap $from, ResolvedMap $chosen, array $after): void
+    {
+        $to = $this->map->morphFor((new $this->map->model)->setRawAttributes($after));
+
+        if ($to !== $from && $to !== $chosen) {
+            $record = $before[(new $this->map->model)->getKeyName()] ?? null;
+
+            throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');
+        }
+    }
+
+    /**
+     * @param  array<string, Expression>  $reads
+     */
+    private function morphRows(QueryBuilder $selected, array $reads, string $alias): QueryBuilder
     {
         $morph = $this->map->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' declares no relatedMorph().");
         $key = (new $this->map->model)->getKeyName();
         $primary = $this->map->primary->table;
         $grammar = $this->connection->getQueryGrammar();
-        $named = self::named($values);
-        $expressions = array_keys(array_filter($named, fn (mixed $value) => $value instanceof Expression));
         $rows = $this->connection->table($alias === $this->map->table ? $this->map->table : $this->map->table.' as '.$alias)
             ->select($alias.'.*')
             ->selectRaw(SqlFragments::identifier($primary).'.'.SqlFragments::identifier($morph->typeColumn).' AS '.$grammar->wrap('compatibility_morph_type'))
@@ -571,55 +667,30 @@ final readonly class MassWriter
             $rows->whereRaw($this->map->membership->of($primary));
         }
 
-        foreach ($expressions as $index => $name) {
-            $value = $named[$name];
-            $rows->selectRaw('('.($value instanceof Expression ? $value->getValue($grammar) : '').') as '.$grammar->wrap('compatibility_value_'.$index));
+        foreach (array_values($reads) as $index => $read) {
+            $rows->selectRaw('('.$read->getValue($grammar).') as '.$grammar->wrap('compatibility_value_'.$index));
         }
 
-        $holding = [];
-        $served = [];
+        return $rows;
+    }
 
-        foreach ($rows->cursor() as $row) {
-            $before = (array) $row;
-            $type = $before['compatibility_morph_type'] ?? null;
-            $from = $this->map->morphHolding($type);
-            $evaluated = [];
-            unset($before['compatibility_morph_type']);
+    /**
+     * @param  array<string, mixed>  $row
+     * @param  array<string, Expression>  $reads
+     * @return array{array<string, mixed>, mixed, array<string, mixed>}
+     */
+    private function morphRow(array $row, array $reads): array
+    {
+        $type = $row['compatibility_morph_type'] ?? null;
+        $evaluated = [];
+        unset($row['compatibility_morph_type']);
 
-            foreach ($expressions as $index => $name) {
-                $evaluated[$name] = $before['compatibility_value_'.$index] ?? null;
-                unset($before['compatibility_value_'.$index]);
-            }
-
-            if ($from === null) {
-                $record = $before[$key] ?? null;
-                $successor = class_basename($this->map->primary->model);
-
-                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.(is_int($record) || is_string($record) ? $record : '').', whose '.$successor.' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'successors: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
-            }
-
-            $sums = [];
-
-            foreach (self::named($amounts) as $name => $amount) {
-                $current = $before[$name] ?? null;
-
-                if (is_numeric($current)) {
-                    $sums[$name] = $current + $amount;
-                }
-            }
-
-            $holding[spl_object_id($from)] = $from;
-            $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
-            $to = $this->map->morphFor((new $this->map->model)->setRawAttributes(array_replace($before, $named, $served[spl_object_id($from)], $evaluated, $sums)));
-
-            if ($to !== $from && $to !== $this->map->morphFor((new $this->map->model)->setRawAttributes($before))) {
-                $record = $before[$key] ?? null;
-
-                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');
-            }
+        foreach (array_keys($reads) as $index => $name) {
+            $evaluated[$name] = $row['compatibility_value_'.$index] ?? null;
+            unset($row['compatibility_value_'.$index]);
         }
 
-        return array_values($holding);
+        return [$row, $type, $evaluated];
     }
 
     /**
@@ -640,7 +711,8 @@ final readonly class MassWriter
         $legacy = SqlFragments::identifier($alias);
         $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
         $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
-        $shape = [$retainedTable.'.'.SqlFragments::identifier((string) $this->map->retainedKey).' AS '.$grammar->wrap('key')];
+        $view = SqlFragments::identifier($this->map->table);
+        $shape = [$view.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName()).' AS '.$grammar->wrap('key')];
         $columns = [$grammar->wrap('key')];
         $selects = [$legacyKey];
         $reads = [];
@@ -654,7 +726,7 @@ final readonly class MassWriter
             $reads[$name] = new RawExpression('(SELECT evaluated.'.$column.' FROM '.$evaluated.' AS evaluated WHERE evaluated.'.$grammar->wrap('key').' = '.$legacyKey.')');
         }
 
-        $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.' WITH NO DATA');
+        $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.', '.$view.' WITH NO DATA');
         $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
         $this->connection->statement('ALTER TABLE '.$evaluated.' ADD PRIMARY KEY ('.$grammar->wrap('key').')');
         $this->connection->statement('ANALYZE '.$evaluated);

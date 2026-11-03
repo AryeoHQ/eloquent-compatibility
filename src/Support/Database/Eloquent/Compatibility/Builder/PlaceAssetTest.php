@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -11,21 +14,30 @@ use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\InteractiveContent;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\TrashablePlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\Video;
 use Tests\TestCase;
 
@@ -54,6 +66,7 @@ final class PlaceAssetTest extends TestCase
         AssetFile::flushEventListeners();
         AssetLink::flushEventListeners();
         PlaceAsset::flushEventListeners();
+        TrashablePlaceAsset::flushEventListeners();
         PlaceAssetTables::drop();
 
         parent::tearDown();
@@ -410,6 +423,200 @@ final class PlaceAssetTest extends TestCase
 
         $this->assertStringContainsString("Compatibility map 'place_videos' cannot install: 1 place_videos rows point at no target their relatedMorph() choose: closure picks; the first are id 2.", $refusal);
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('place_videos')"));
+    }
+
+    #[Test]
+    public function it_shows_the_listeners_of_a_soft_delete_the_external_value_of_a_morph_target_read_before_the_place_asset_deletes(): void
+    {
+        DB::statement('alter table place_assets add column deleted_at timestamp(0) with time zone');
+        DB::statement('alter table place_images add column deleted_at timestamp(0) without time zone');
+        $image = $this->trashableImage();
+        Compatibility::prepare($image::class);
+        (new Backfiller(Compatibility::of($image::class)->resolve(), DB::connection()))->run();
+        Compatibility::install($image::class);
+        $asset = (string) DB::table('place_assets')->where('legacy_type', 'place_image')->where('legacy_id', 1)->value('id');
+        $stored = (string) DB::table('asset_files')->where('id', DB::table('place_assets')->where('id', $asset)->value('asset_id'))->value('zml_asset_id');
+        TrashablePlaceAsset::deleting(function () use ($stored): void {
+            FakeMediaLibrary::bound()->put($stored, new FileMetadata(null));
+        });
+        $seen = [];
+        $image::deleted(function (Model $deleted) use (&$seen): void {
+            $seen[] = $deleted->getAttribute('mime_type');
+        });
+        $record = $image->newQuery()->findOrFail(1);
+
+        $record->delete();
+
+        $this->assertSame([['image/jpeg'], 'image/jpeg', null], [$seen, $record->getAttribute('mime_type'), FakeMediaLibrary::bound()->stored($stored)?->mimeType]);
+        $this->assertNotNull(DB::table('place_assets')->where('id', $asset)->value('deleted_at'));
+    }
+
+    #[Test]
+    public function it_backfills_an_unchanged_is_not_null_attribute_of_a_morph_target_without_replacing_the_value_it_stores(): void
+    {
+        DB::statement('alter table place_videos add column is_featured boolean');
+        DB::statement('alter table asset_files add column featured_at timestamp(0) without time zone');
+        DB::update('update place_videos set is_featured = true where id in (1, 3)');
+        $video = $this->featuredVideo();
+        Compatibility::prepare($video::class);
+        $backfiller = new Backfiller(Compatibility::of($video::class)->resolve(), DB::connection());
+        $backfiller->run();
+        $file = static fn (int $id): string => (string) DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('asset_id');
+        DB::update("update asset_files set featured_at = '2026-01-01 09:00:00' where id = ?", [$file(1)]);
+        $unchanged = $backfiller->run();
+        DB::update('update place_videos set is_featured = false where id = 3');
+
+        $changed = $backfiller->run();
+
+        $this->assertSame([0, 1], [$unchanged['changed'], $changed['changed']]);
+        $this->assertSame(['2026-01-01 09:00:00', null], [DB::scalar('select cast(featured_at as text) from asset_files where id = ?', [$file(1)]), DB::table('asset_files')->where('id', $file(3))->value('featured_at')]);
+    }
+
+    #[Test]
+    public function it_moves_a_record_without_copying_a_read_only_projection_of_the_target_the_write_omits_so_the_new_target_computes_it(): void
+    {
+        PlaceAssetTables::install();
+        $video = $this->namedLinkVideo();
+        DB::statement((new ViewCompiler(new ColumnCatalog(DB::connection()), DB::connection()))->replace(Compatibility::of($video::class)->resolve()));
+        LegacyBuilder::forgetViews();
+        $outcomes = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour']),
+            fn () => $video->newQuery()->findOrFail(3)->update(['youtube_embed_url' => 'https://youtu.be/drone', 'original_file_name' => 'drone']),
+            fn () => $video->newQuery()->findOrFail(2)->update(['original_file_name' => 'renamed']),
+        ] as $write) {
+            try {
+                $write();
+                $outcomes[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $outcomes[] = strstr($refusal->getMessage(), '. Why:', true);
+            }
+        }
+
+        $this->assertSame(['stored', $video::class.' record 3 cannot change $original_file_name', $video::class.' record 2 cannot change $original_file_name'], $outcomes);
+        $this->assertSame([[1, 'tour', 'https://youtu.be/tour'], [2, 'oak', 'https://youtu.be/oak'], [3, 'drone.mov', null]], $video->newQuery()->orderBy('id')->get()->map(fn (Model $served) => [$served->getKey(), $served->getAttribute('original_file_name'), $served->getAttribute('youtube_embed_url')])->all());
+        $this->assertSame([[1, 'place_asset_link'], [2, 'place_asset_link'], [3, 'place_asset_file']], $this->assets('place_video'));
+        $this->assertSame('https://youtu.be/tour', DB::table('asset_links')->where('id', DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('asset_id'))->value('url'));
+    }
+
+    private function trashableImage(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'place_images';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_image';
+            }
+
+            public static function compatibility(Compatibility $image): Compatibility
+            {
+                return $image
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_images_retained')
+                    ->timestamps()
+                    ->servedFrom(TrashablePlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->relatedMorph(fn (TrashablePlaceAsset $asset) => $asset->asset(),
+                            successors: fn (Successors $successors) => $successors
+                                ->as(AssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                        read: fn (Collection $files): array => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                        write: fn (AssetFile $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))));
+            }
+        };
+    }
+
+    private function featuredVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_videos_retained')
+                    ->timestamps()
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? AssetLink::class : AssetFile::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(AssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('is_featured', fn (Attribute $attribute) => $attribute->from('featured_at')->isNotNull(fn () => now())))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
+                                    ->attribute('is_featured', fn (Attribute $attribute) => $attribute->fixed(null)))));
+            }
+        };
+    }
+
+    private function namedLinkVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_videos_retained')
+                    ->timestamps()
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? AssetLink::class : AssetFile::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(AssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('url')->readAs("split_part(\"asset_links\".\"url\", '/', 4)")->readOnly('A link takes its name from its URL.'))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))));
+            }
+        };
     }
 
     /**

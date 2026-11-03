@@ -294,7 +294,7 @@ final class ExternalAttributes
         $legacyKey = SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier((string) $identifier->column());
         $model = (new $owner)->setConnection($connection);
         $table = $model->getTable();
-        $query = $model->newQuery()
+        $query = $model->newQueryWithoutScopes()
             ->fromRaw(SqlFragments::identifier($branch->primary->table).' '.implode(' ', ViewCompiler::laterals($branch, $table)))
             ->select($table.'.*')
             ->selectRaw($legacyKey.' AS '.SqlFragments::identifier(self::HELD_BY))

@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
+use ReflectionProperty;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
 final readonly class RelatedMorph
@@ -53,6 +54,10 @@ final readonly class RelatedMorph
             throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' to '.class_basename($compiled->getRelated()).' is a '.class_basename($compiled).', and relatedMorph() reads a MorphTo'.($compiled instanceof HasOne || $compiled instanceof BelongsTo ? '; declare it with related()' : ' only'));
         }
 
+        if (self::constrains($compiled)) {
+            throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() constrains the targets it reads, and the view and the writers join each target on its morph alias and key alone; drop the constraint, because relatedMorph() serves every target row a '.class_basename($parent).' names');
+        }
+
         $declared = [];
 
         foreach (Successors::declare($map, 'relatedMorph()', $choose, $successors, 'drop choose:, and relatedMorph() reads %s for every record') as $model => $branch) {
@@ -66,6 +71,25 @@ final readonly class RelatedMorph
         }
 
         return new self($relation, $parent, $compiled->getParent()->getTable(), $compiled->getMorphType(), $compiled->getForeignKeyName(), $choose, $declared);
+    }
+
+    /**
+     * @param  MorphTo<Model, Model>  $relation
+     */
+    private static function constrains(MorphTo $relation): bool
+    {
+        $base = $relation->getQuery()->getQuery();
+
+        return $base->wheres !== []
+            || ($base->orders ?? []) !== []
+            || $base->limit !== null
+            || $base->offset !== null
+            || ($base->joins ?? []) !== []
+            || ($base->groups ?? []) !== []
+            || ($base->havings ?? []) !== []
+            || ($base->unions ?? []) !== []
+            || (new ReflectionProperty($relation, 'macroBuffer'))->getValue($relation) !== []
+            || (new ReflectionProperty($relation, 'morphableConstraints'))->getValue($relation) !== [];
     }
 
     private static function refuseTarget(string $map, string $parent, string $parentTable, Successor $target): null|string

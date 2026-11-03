@@ -4,11 +4,21 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\Brochure;
@@ -24,6 +34,7 @@ use Tests\TestCase;
 #[CoversClass(MorphMove::class)]
 #[CoversClass(ExternalAttributes::class)]
 #[CoversClass(Backfiller::class)]
+#[CoversClass(MassWriter::class)]
 final class MorphTargetTest extends TestCase
 {
     /** @var list<string> */
@@ -258,6 +269,253 @@ final class MorphTargetTest extends TestCase
 
         $this->assertSame(['Site', null, 'https://site.example/oak', false], [$site->refresh()->title, $site->file_name, $site->url, $site->hosted]);
         $this->assertSame('place_asset_link', $this->asset('place_brochure', $site->id)['asset_type']);
+    }
+
+    #[Test]
+    public function it_chooses_the_target_of_a_mass_write_from_the_value_the_database_stores_for_a_retained_literal(): void
+    {
+        $this->installBrochures();
+        $before = $this->asset('place_brochure', 1);
+
+        try {
+            Brochure::query()->whereKey(1)->update(['hosted' => 'false']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $kept = Brochure::query()->whereKey(2)->update(['hosted' => 'off', 'pages' => 3]);
+
+        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertSame([true, $before], [Brochure::query()->findOrFail(1)->hosted, $this->asset('place_brochure', 1)]);
+        $this->assertSame([1, false, 3, 'place_asset_link'], [$kept, Brochure::query()->findOrFail(2)->hosted, Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
+    }
+
+    #[Test]
+    public function it_writes_only_the_records_that_still_match_the_mass_write_once_it_holds_their_place_assets(): void
+    {
+        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['title' => 'Tour']);
+        config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
+        $second = DB::connection('second');
+        $renamed = null;
+        DB::listen(function (QueryExecuted $query) use (&$renamed, $second): void {
+            if ($renamed !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'CREATE TEMPORARY TABLE') || ! str_contains($query->sql, 'compatibility_selected')) {
+                return;
+            }
+
+            try {
+                $second->transaction(function () use ($second): void {
+                    $second->statement("SET LOCAL lock_timeout = '1s'");
+                    $second->update("update place_assets set title = 'Changed' where legacy_type = 'place_video' and legacy_id = 1");
+                });
+                $renamed = true;
+            } catch (QueryException) {
+                $renamed = false;
+            }
+        });
+
+        try {
+            $updated = Video::query()->where('title', 'Tour')->update(['title' => 'Mass']);
+        } finally {
+            DB::purge('second');
+        }
+
+        $this->assertSame([true, 1], [$renamed, $updated]);
+        $this->assertSame(['Changed', 'Oak walkthrough', 'Mass'], Video::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_holds_the_target_of_each_selected_record_before_it_checks_the_mass_write_against_its_query_again(): void
+    {
+        $file = (string) $this->asset('place_video', 1)['asset_id'];
+        config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
+        $second = DB::connection('second');
+        $blocked = null;
+        DB::listen(function (QueryExecuted $query) use (&$blocked, $second, $file): void {
+            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'delete from "pg_temp"."compatibility_selected"')) {
+                return;
+            }
+
+            try {
+                $second->transaction(function () use ($second, $file): void {
+                    $second->statement("SET LOCAL lock_timeout = '1s'");
+                    $second->update("update asset_files set filename = 'raced.mp4' where id = ?", [$file]);
+                });
+                $blocked = false;
+            } catch (QueryException) {
+                $blocked = true;
+            }
+        });
+
+        try {
+            $updated = Video::query()->where('original_file_name', 'tour.mp4')->update(['title' => 'Held']);
+        } finally {
+            DB::purge('second');
+        }
+
+        $this->assertSame([true, 1], [$blocked, $updated]);
+        $this->assertSame(['tour.mp4', 'Held'], [Video::query()->findOrFail(1)->original_file_name, Video::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
+    public function it_evaluates_a_retained_expression_of_a_mass_write_once_and_chooses_from_the_value_it_stores(): void
+    {
+        $this->installBrochures();
+        DB::statement('create sequence brochure_parity');
+
+        try {
+            $updated = Brochure::query()->whereKey(2)->update(['hosted' => DB::raw("nextval('brochure_parity') % 2 = 0")]);
+            $calls = DB::scalar('select last_value from brochure_parity');
+        } finally {
+            DB::statement('drop sequence brochure_parity');
+        }
+
+        $this->assertSame([1, 1, false, 'place_asset_link'], [$updated, $calls, Brochure::query()->findOrFail(2)->hosted, $this->asset('place_brochure', 2)['asset_type']]);
+    }
+
+    #[Test]
+    public function it_chooses_the_target_of_a_mass_increment_from_the_value_it_assigns_over_the_amount(): void
+    {
+        $this->installBrochures();
+        $brochure = $this->pagedBrochure();
+
+        $kept = $brochure->newQuery()->whereKey(2)->increment('pages', 20, ['pages' => 2]);
+
+        try {
+            $brochure->newQuery()->whereKey(1)->increment('pages', 1, ['pages' => 2]);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame([1, 2, 'place_asset_link'], [$kept, Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
+        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertSame(12, Brochure::query()->findOrFail(1)->pages);
+    }
+
+    #[Test]
+    public function it_chooses_the_target_of_a_mass_increment_of_a_retained_column_from_the_value_the_column_stores(): void
+    {
+        $this->installBrochures();
+        $brochure = $this->pagedBrochure();
+        $brochure->newQuery()->whereKey(2)->update(['pages' => 9]);
+
+        try {
+            $brochure->newQuery()->whereKey(2)->increment('pages', 0.6);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString('It would move record 2 from AssetLink to TrashableAssetFile', $refusal);
+        $this->assertSame([9, 'place_asset_link'], [Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
+    }
+
+    #[Test]
+    public function it_chooses_the_target_of_a_mass_increment_of_a_mapped_attribute_from_the_value_its_column_stores(): void
+    {
+        $video = $this->sizedVideo();
+
+        $kept = $video->newQuery()->whereKey(3)->increment('size_kb', 0.0004);
+
+        try {
+            $video->newQuery()->whereKey(3)->increment('size_kb', 0.0006);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame([1, '512.000', 'place_asset_file'], [$kept, Video::query()->findOrFail(3)->size_kb, $this->asset('place_video', 3)['asset_type']]);
+        $this->assertStringContainsString('It would move record 3 from AssetFile to AssetLink', $refusal);
+        $this->assertSame('512.000', Video::query()->findOrFail(3)->size_kb);
+    }
+
+    #[Test]
+    public function it_evaluates_a_retained_expression_of_a_mass_write_against_the_legacy_columns_alone(): void
+    {
+        $updated = Video::query()->whereIn('id', [1, 2])->update(['views' => DB::raw('length(title)')]);
+
+        $this->assertSame([2, [4, 15, 0]], [$updated, Video::query()->orderBy('id')->pluck('views')->all()]);
+    }
+
+    private function pagedBrochure(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_brochures';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_brochure';
+            }
+
+            public static function compatibility(Compatibility $brochure): Compatibility
+            {
+                return $brochure
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_brochures_retained')
+                    ->timestamps()
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => $asset->getAttribute('title')])->all(),
+                            write: fn (PlaceAsset $asset, null|string $title) => $asset->title = $title))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $brochure): string => (int) $brochure->getAttribute('pages') >= 10 ? TrashableAssetFile::class : AssetLink::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+            }
+        };
+    }
+
+    private function sizedVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_videos_retained')
+                    ->timestamps()
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null || (float) $video->getAttribute('size_kb') > 512 && (float) $video->getAttribute('size_kb') < 600 ? AssetLink::class : AssetFile::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(AssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))));
+            }
+        };
     }
 
     private function installBrochures(): void
