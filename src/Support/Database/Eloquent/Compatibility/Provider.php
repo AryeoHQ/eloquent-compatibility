@@ -10,6 +10,7 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\ServiceProvider;
 use Support\Database\Eloquent\Compatibility\Console\Backfill;
 use Support\Database\Eloquent\Compatibility\Console\CacheServedModels;
+use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
 use Support\Database\Eloquent\Compatibility\Console\ClearServedModels;
 use Support\Database\Eloquent\Compatibility\Console\CompileSql;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
@@ -32,7 +33,7 @@ class Provider extends ServiceProvider
 
     public function boot(): void
     {
-        $this->commands([CompileSql::class, Backfill::class, CacheServedModels::class, ClearServedModels::class]);
+        $this->commands([CompileSql::class, Backfill::class, CheckDrift::class, CacheServedModels::class, ClearServedModels::class]);
         $this->optimizes(optimize: 'compatibility:cache', clear: 'compatibility:clear', key: 'compatibility');
         $this->forward();
     }
