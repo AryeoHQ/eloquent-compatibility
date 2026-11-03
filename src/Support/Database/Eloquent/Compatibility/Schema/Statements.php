@@ -124,6 +124,12 @@ final readonly class Statements
             if ($legacy[$name]->generated) {
                 throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated column, and attribute '{$name}' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly()");
             }
+
+            $ownedSequence = self::sequence($connection, $map->table, $name);
+
+            if ($ownedSequence !== null) {
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} owns the sequence {$ownedSequence}, and attribute '{$name}' is external(), so install() would drop the sequence with the column and uninstall() could not restore the default that reads it; detach it with ALTER SEQUENCE {$ownedSequence} OWNED BY NONE first");
+            }
         }
 
         if ($branched && $retainedKey !== $key) {

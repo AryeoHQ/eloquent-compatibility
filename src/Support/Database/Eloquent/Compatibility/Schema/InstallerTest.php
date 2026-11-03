@@ -618,6 +618,35 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_legacy_column_that_owns_a_sequence(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop sequence if exists photos_mime_type_seq cascade');
+        DB::statement('create sequence photos_mime_type_seq owned by photos.mime_type');
+        DB::statement("alter table photos alter column mime_type set default 'image/' || nextval('photos_mime_type_seq')");
+        FakeMediaLibrary::bound()->calls = [];
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and uninstall() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+
+        DB::statement('alter sequence photos_mime_type_seq owned by none');
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'image/1'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+
+        DB::statement('alter sequence photos_mime_type_seq owned by photos.mime_type');
+    }
+
+    #[Test]
     public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
     {
         $this->prepareFiles();
@@ -734,6 +763,37 @@ final class InstallerTest extends TestCase
         } finally {
             DB::purge('compatibility_replicated');
             DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_installs_when_the_legacy_and_successor_connections_reach_one_database_through_a_url_that_overrides_the_database_setting(): void
+    {
+        $pgsql = (array) config('database.connections.pgsql');
+        $url = sprintf('pgsql://%s:%s@%s:%s/%s', rawurlencode((string) $pgsql['username']), rawurlencode((string) $pgsql['password']), $pgsql['host'], $pgsql['port'], rawurlencode((string) $pgsql['database']));
+        $connection = [...$pgsql, 'url' => $url, 'database' => 'laravel'];
+        config(['database.connections.compatibility_url_legacy' => $connection, 'database.connections.compatibility_url_successor' => $connection, 'database.default' => 'compatibility_url_successor']);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_url_legacy';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+        } finally {
+            DB::purge('compatibility_url_legacy');
+            DB::purge('compatibility_url_successor');
         }
 
         $this->assertSame('v', $this->kind('listings'));
@@ -1144,6 +1204,29 @@ final class InstallerTest extends TestCase
 
         $this->assertSame($before, $this->listings());
         $this->assertSame(1, DB::scalar("select count(*) from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC'"));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_shared_successor_map_until_prepare_builds_the_unique_index_on_the_discriminator_and_the_integer_identifier_even_with_no_inbound_foreign_key(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop table photo_comments, photo_shares');
+        DB::statement('alter table files drop constraint files_legacy_type_legacy_id_unique');
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'photos' cannot install: files.legacy_id is not yet NOT NULL with a unique index on (legacy_type, legacy_id), so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::install(Photo::class);
+
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame([1, 2, 3], Photo::query()->orderBy('id')->pluck('id')->all());
     }
 
     #[Test]

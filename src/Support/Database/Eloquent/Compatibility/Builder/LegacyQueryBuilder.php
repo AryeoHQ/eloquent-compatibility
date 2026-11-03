@@ -309,7 +309,7 @@ final class LegacyQueryBuilder extends QueryBuilder
         }
 
         $externals = ExternalAttributes::of($legacy::class);
-        $reading = $externals === [] ? null : $this->reading($alias, $externals);
+        $reading = $externals === [] ? null : $this->reading($alias, $legacy->getTable(), $externals);
 
         if ($reading !== null && LegacyBuilder::serves($legacy)) {
             throw LegacyBuilder::refuseExternal($legacy::class, ...$reading);
@@ -320,20 +320,9 @@ final class LegacyQueryBuilder extends QueryBuilder
      * @param  list<string>  $externals
      * @return null|array{string, string}
      */
-    private function reading(string $table, array $externals): null|array
+    private function reading(string $table, string $legacyTable, array $externals): null|array
     {
-        $clauses = [
-            ...($this->aggregate === null ? [] : [[$this->aggregate['function'].'()', $this->aggregate['columns'] ?? []]]),
-            ['select', $this->columns ?? []],
-            ['distinct', is_array($this->distinct) ? $this->distinct : []],
-            ['groupBy', $this->groups ?? []],
-            ['having', self::havingColumns($this->havings ?? [])],
-            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], [...($this->orders ?? []), ...($this->unionOrders ?? [])]),
-            ['where', self::whereColumns($this->wheres)],
-            ['join', self::joinColumns($this->joins ?? [])],
-        ];
-
-        foreach ($clauses as [$operation, $columns]) {
+        foreach ([...self::clauses($this), ...self::subqueries($this->wheres, [$table => true], $legacyTable)] as [$operation, $columns]) {
             foreach ($columns as $column) {
                 $attribute = is_string($column) ? self::attributeOf($table, $column) : null;
 
@@ -344,6 +333,106 @@ final class LegacyQueryBuilder extends QueryBuilder
         }
 
         return null;
+    }
+
+    /**
+     * @return list<array{string, list<mixed>}>
+     */
+    private static function clauses(QueryBuilder $query): array
+    {
+        return [
+            ...($query->aggregate === null ? [] : [[$query->aggregate['function'].'()', $query->aggregate['columns'] ?? []]]),
+            ['select', $query->columns ?? []],
+            ['distinct', is_array($query->distinct) ? $query->distinct : []],
+            ['groupBy', $query->groups ?? []],
+            ['having', self::havingColumns($query->havings ?? [])],
+            ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], [...($query->orders ?? []), ...($query->unionOrders ?? [])]),
+            ['where', self::whereColumns($query->wheres)],
+            ['join', self::joinColumns($query->joins ?? [])],
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     * @param  array<string, bool>  $scope
+     * @return list<array{string, list<string>}>
+     */
+    private static function subqueries(array $wheres, array $scope, string $legacyTable): array
+    {
+        $clauses = [];
+
+        foreach ($wheres as $where) {
+            $query = is_array($where) ? $where['query'] ?? null : null;
+
+            if (! $query instanceof QueryBuilder) {
+                continue;
+            }
+
+            $operation = match ($where['type'] ?? null) {
+                'Nested' => null,
+                'Exists' => 'whereExists',
+                'NotExists' => 'whereNotExists',
+                'Sub' => 'where',
+                default => false,
+            };
+
+            if ($operation === null) {
+                $clauses = [...$clauses, ...self::subqueries($query->wheres, $scope, $legacyTable)];
+            } elseif ($operation !== false) {
+                if ($query instanceof self) {
+                    $query->refuseExternal();
+                }
+
+                $clauses[] = [$operation, self::outerReads($query, $scope, $legacyTable)];
+            }
+        }
+
+        return $clauses;
+    }
+
+    /**
+     * @param  array<string, bool>  $scope
+     * @return list<string>
+     */
+    private static function outerReads(QueryBuilder $query, array $scope, string $legacyTable): array
+    {
+        $reads = false;
+
+        foreach ([$query->from, ...array_map(fn (mixed $join) => $join instanceof JoinClause ? $join->table : null, $query->joins ?? [])] as $index => $source) {
+            $segments = is_string($source) ? preg_split('/\s+as\s+/i', trim($source)) : false;
+
+            if (is_array($segments) && count($segments) <= 2) {
+                $scope[(string) end($segments)] = $segments[0] === $legacyTable;
+                $reads = $reads || ($index === 0 && $segments[0] === $legacyTable);
+            }
+        }
+
+        $names = [];
+
+        foreach (self::clauses($query) as [, $columns]) {
+            foreach ($columns as $column) {
+                $qualifier = is_string($column) ? self::qualifierOf($column) : null;
+                $attribute = is_string($column) && ($qualifier === null ? $reads : ($scope[$qualifier] ?? false)) ? self::attributeOf((string) $qualifier, $column) : null;
+
+                if ($attribute !== null) {
+                    $names[] = $attribute;
+                }
+            }
+        }
+
+        foreach (self::subqueries($query->wheres, $scope, $legacyTable) as [, $nested]) {
+            $names = [...$names, ...$nested];
+        }
+
+        return $names;
+    }
+
+    private static function qualifierOf(string $column): null|string
+    {
+        $column = explode('->', trim((string) preg_replace('/\s+as\s+.*$/is', '', $column)), 2)[0];
+        $dot = strrpos($column, '.');
+
+        return $dot === false ? null : substr($column, 0, $dot);
     }
 
     /**
