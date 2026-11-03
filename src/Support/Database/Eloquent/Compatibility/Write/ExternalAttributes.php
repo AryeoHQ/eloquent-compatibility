@@ -147,7 +147,7 @@ final class ExternalAttributes
     public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
     {
         $values = [];
-        $served = $map->branches === [] && $map->owners[$name] !== $map->primary ? $map->morphs : $map->branches;
+        $served = $map->branches === [] && $map->isMorphed($name) ? $map->morphs : $map->branches;
 
         foreach ($served === [] ? [$map] : $served as $branch) {
             $attribute = $branch->attributes[$name];

@@ -39,6 +39,8 @@ final readonly class MassWriter
 
     private const string TYPED = 'pg_temp.compatibility_typed';
 
+    private const string HELD = 'pg_temp.compatibility_held';
+
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     public static function computesInSql(mixed $value): bool
@@ -546,8 +548,8 @@ final readonly class MassWriter
             [$mapped, $retained] = $this->byOwner($values);
             [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
             $assigned = self::named($values);
-            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [];
             $whole = array_filter($retained, fn (int|string $name) => ! str_contains((string) $name, '->'), ARRAY_FILTER_USE_KEY);
+            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [] && array_filter(array_keys($assigned), fn (int|string $name) => str_contains((string) $name, '->')) === [];
             $sums = [];
 
             foreach (array_diff_key(self::named($retainedAmounts), $assigned) as $column => $amount) {
@@ -559,6 +561,15 @@ final readonly class MassWriter
             $values = array_replace($values, $literals, array_intersect_key($reads, $retained));
             $known = array_filter(self::named(array_replace($mapped, $literals)), fn (mixed $value) => ! self::computesInSql($value));
             [$holding, $chosen] = $this->refuseMorphMoves($selected, $known, self::named($reads), $alias, $exact);
+            $held = $this->connection->table(self::HELD)->select('key');
+
+            if (! $exact) {
+                $successors = $this->members($this->connection->table($primary->table))
+                    ->whereIn($primary->table.'.'.$this->legacyColumn(), $selected)
+                    ->select($primary->table.'.'.$primary->key.' as key');
+                $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::HELD).' ON COMMIT DROP AS '.$successors->toSql(), $successors->getBindings());
+            }
+
             $updated = 0;
 
             foreach ($holding as $variant) {
@@ -566,7 +577,8 @@ final readonly class MassWriter
             }
 
             if (! $exact) {
-                $this->refuseMorphMoved($selected, $chosen, $alias);
+                $this->refuseMorphMoved($held, $chosen, $alias);
+                $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::HELD));
             }
 
             if ($reads !== []) {
@@ -582,7 +594,7 @@ final readonly class MassWriter
     /**
      * @param  array<string, mixed>  $values
      * @param  array<string, Expression>  $reads
-     * @return array{list<ResolvedMap>, array<array-key, ResolvedMap>}
+     * @return array{list<ResolvedMap>, array<array-key, array{int|string, ResolvedMap}>}
      */
     private function refuseMorphMoves(QueryBuilder $selected, array $values, array $reads, string $alias, bool $exact): array
     {
@@ -592,8 +604,8 @@ final readonly class MassWriter
         $chosen = [];
         $served = [];
 
-        foreach ($this->morphRows($selected, $reads, $alias)->cursor() as $row) {
-            [$before, $type, $evaluated] = $this->morphRow((array) $row, $reads);
+        foreach ($this->morphRows($alias.'.'.$key, $selected, $reads, $alias)->cursor() as $row) {
+            [$before, $type, $evaluated, $successor] = $this->morphRow((array) $row, $reads);
             $from = $this->map->morphHolding($type);
             $record = $before[$key] ?? null;
             $record = is_int($record) || is_string($record) ? $record : '';
@@ -603,11 +615,15 @@ final readonly class MassWriter
             }
 
             $holding[spl_object_id($from)] = $from;
-            $chosen[$record] = $this->map->morphFor((new $this->map->model)->setRawAttributes($before));
+            $choice = $this->map->morphFor((new $this->map->model)->setRawAttributes($before));
+
+            if (is_int($successor) || is_string($successor)) {
+                $chosen[$successor] = [$record, $choice];
+            }
 
             if ($exact) {
                 $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
-                $this->refuseMorphMove($before, $from, $chosen[$record], array_replace($before, $values, $served[spl_object_id($from)], $evaluated));
+                $this->refuseMorphMove($record, $from, $choice, array_replace($before, $values, $served[spl_object_id($from)], $evaluated));
             }
         }
 
@@ -615,42 +631,36 @@ final readonly class MassWriter
     }
 
     /**
-     * @param  array<array-key, ResolvedMap>  $chosen
+     * @param  array<array-key, array{int|string, ResolvedMap}>  $chosen
      */
-    private function refuseMorphMoved(QueryBuilder $selected, array $chosen, string $alias): void
+    private function refuseMorphMoved(QueryBuilder $held, array $chosen, string $alias): void
     {
-        $key = (new $this->map->model)->getKeyName();
-
-        foreach ($this->morphRows($selected, [], $alias)->cursor() as $row) {
-            [$after, $type] = $this->morphRow((array) $row, []);
-            $record = $after[$key] ?? null;
+        foreach ($this->morphRows($this->map->primary->table.'.'.$this->map->primary->key, $held, [], $alias)->cursor() as $row) {
+            [$after, $type, , $successor] = $this->morphRow((array) $row, []);
             $from = $this->map->morphHolding($type);
 
-            if ($from !== null && (is_int($record) || is_string($record)) && array_key_exists($record, $chosen)) {
-                $this->refuseMorphMove($after, $from, $chosen[$record], $after);
+            if ($from !== null && (is_int($successor) || is_string($successor)) && array_key_exists($successor, $chosen)) {
+                $this->refuseMorphMove($chosen[$successor][0], $from, $chosen[$successor][1], $after);
             }
         }
     }
 
     /**
-     * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $after
      */
-    private function refuseMorphMove(array $before, ResolvedMap $from, ResolvedMap $chosen, array $after): void
+    private function refuseMorphMove(int|string $record, ResolvedMap $from, ResolvedMap $chosen, array $after): void
     {
         $to = $this->map->morphFor((new $this->map->model)->setRawAttributes($after));
 
         if ($to !== $from && $to !== $chosen) {
-            $record = $before[(new $this->map->model)->getKeyName()] ?? null;
-
-            throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');
+            throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.$record.' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');
         }
     }
 
     /**
      * @param  array<string, Expression>  $reads
      */
-    private function morphRows(QueryBuilder $selected, array $reads, string $alias): QueryBuilder
+    private function morphRows(string $by, QueryBuilder $keys, array $reads, string $alias): QueryBuilder
     {
         $morph = $this->map->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' declares no relatedMorph().");
         $key = (new $this->map->model)->getKeyName();
@@ -659,8 +669,9 @@ final readonly class MassWriter
         $rows = $this->connection->table($alias === $this->map->table ? $this->map->table : $this->map->table.' as '.$alias)
             ->select($alias.'.*')
             ->selectRaw(SqlFragments::identifier($primary).'.'.SqlFragments::identifier($morph->typeColumn).' AS '.$grammar->wrap('compatibility_morph_type'))
+            ->selectRaw(SqlFragments::identifier($primary).'.'.SqlFragments::identifier($this->map->primary->key).' AS '.$grammar->wrap('compatibility_morph_successor'))
             ->join($primary, $primary.'.'.$this->legacyColumn(), '=', $alias.'.'.$key)
-            ->whereIn($alias.'.'.$key, $selected)
+            ->whereIn($by, $keys)
             ->orderBy($alias.'.'.$key);
 
         if ($this->map->membership !== null) {
@@ -677,20 +688,21 @@ final readonly class MassWriter
     /**
      * @param  array<string, mixed>  $row
      * @param  array<string, Expression>  $reads
-     * @return array{array<string, mixed>, mixed, array<string, mixed>}
+     * @return array{array<string, mixed>, mixed, array<string, mixed>, mixed}
      */
     private function morphRow(array $row, array $reads): array
     {
         $type = $row['compatibility_morph_type'] ?? null;
+        $successor = $row['compatibility_morph_successor'] ?? null;
         $evaluated = [];
-        unset($row['compatibility_morph_type']);
+        unset($row['compatibility_morph_type'], $row['compatibility_morph_successor']);
 
         foreach (array_keys($reads) as $index => $name) {
             $evaluated[$name] = $row['compatibility_value_'.$index] ?? null;
             unset($row['compatibility_value_'.$index]);
         }
 
-        return [$row, $type, $evaluated];
+        return [$row, $type, $evaluated, $successor];
     }
 
     /**
