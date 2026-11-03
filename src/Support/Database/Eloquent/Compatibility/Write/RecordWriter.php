@@ -371,7 +371,7 @@ final readonly class RecordWriter
     private function refuseStoredBranch(Model $legacy, null|int|string $key, int|string $stored, ResolvedMap $held): void
     {
         $row = $this->connection->table($this->map->table)->where($legacy->getKeyName(), $stored)->first();
-        $chosen = $row === null ? $held : $this->map->branchFor(self::probe($legacy, (array) $row));
+        $chosen = $row === null ? $held : $this->map->branchFor(self::stored($legacy, (array) $row));
 
         if ($chosen !== $held) {
             $successor = class_basename($chosen->primary->model);
@@ -534,6 +534,17 @@ final readonly class RecordWriter
     private static function probe(Model $legacy, array $attributes): Model
     {
         return (clone $legacy)->setRawAttributes($attributes);
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     */
+    private static function stored(Model $legacy, array $row): Model
+    {
+        $stored = $legacy->newInstance([], true)->setRawAttributes($row, true);
+        ExternalAttributes::readFrom($stored, true);
+
+        return $stored;
     }
 
     /**

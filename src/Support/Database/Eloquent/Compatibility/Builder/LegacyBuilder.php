@@ -818,6 +818,10 @@ final class LegacyBuilder extends Builder
         $table = $this->model->getTable();
         $attribute = str_contains($column, '.') ? (str_starts_with($column, $table.'.') ? substr($column, strlen($table) + 1) : null) : $column;
 
+        if ($attribute === $column && $this->map()->isExternal($column) && LegacyQueryBuilder::joinExposes($this->query, $column)) {
+            return null;
+        }
+
         return $attribute !== null && array_key_exists($attribute, $this->map()->attributes) ? $attribute : null;
     }
 
