@@ -15,6 +15,7 @@ use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Facades\Config;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\IsNotNull;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -327,12 +328,50 @@ final readonly class Backfiller
             [$stored[$key], $external[$key]] = $this->split($branch, $row, $key);
         }
 
-        $changed = array_filter($branch->attributes, fn ($attribute) => $attribute->isExternal()) === []
+        $changed = $this->rekey($branch, $stored);
+        $changed += array_filter($branch->attributes, fn ($attribute) => $attribute->isExternal()) === []
             ? $this->upsert($branch, $stored)
             : $this->saveEach($branch, $rows, $stored, $external);
 
         foreach ($branch->related as $related) {
             $changed += $this->writeRelated($branch, $related, $stored);
+        }
+
+        return $changed;
+    }
+
+    /**
+     * @param  non-empty-array<int|string, array<string, array<string, mixed>>>  $stored
+     */
+    private function rekey(ResolvedMap $branch, array $stored): int
+    {
+        $table = $branch->primary->table;
+        $keyColumn = (string) $branch->identifiers[$this->key]->column();
+        $target = SqlFragments::identifier(self::TARGET);
+        $source = SqlFragments::identifier(self::SOURCE);
+        $legacy = SqlFragments::identifier($this->map->table);
+        $changed = 0;
+
+        foreach ($branch->identifiers as $name => $identifier) {
+            $other = $identifier->column();
+
+            if ($name === $this->key || $other === null) {
+                continue;
+            }
+
+            $types = $this->typesOf($table, [$keyColumn, $other]);
+            $pairs = array_values(array_filter(array_map(fn (array $values) => [$values[$table][$keyColumn] ?? null, $values[$table][$other] ?? null], $stored), fn (array $pair) => $pair[0] !== null && $pair[1] !== null));
+
+            foreach ($this->batches($pairs, 2) as $batch) {
+                $changed += $this->connection->affectingStatement(
+                    'UPDATE '.SqlFragments::identifier($table)." AS {$target} SET ".SqlFragments::identifier($keyColumn)." = {$source}.compatibility_key"
+                        ."\nFROM (VALUES ".implode(', ', array_fill(0, count($batch), '(CAST(? AS '.$types[$keyColumn].'), CAST(? AS '.$types[$other].'))')).") AS {$source} (compatibility_key, compatibility_other)"
+                        ."\nWHERE {$target}.".SqlFragments::identifier($other)." = {$source}.compatibility_other AND {$target}.".SqlFragments::identifier($keyColumn)." IS DISTINCT FROM {$source}.compatibility_key"
+                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of(self::TARGET))
+                        ." AND NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.".SqlFragments::identifier($this->key)." = {$target}.".SqlFragments::identifier($keyColumn).')',
+                    array_merge(...$batch),
+                );
+            }
         }
 
         return $changed;
@@ -402,10 +441,13 @@ final readonly class Backfiller
         $inserted = [...$columns, ...$generated, ...array_filter([$created, $updated], is_string(...))];
         $types = $this->typesOf($table, $inserted);
         $changing = array_values(array_diff($columns, $conflict));
-        $wrapped = array_map(SqlFragments::identifier(...), $changing);
+        $presence = $this->presence($branch, $table);
         $target = SqlFragments::identifier(self::TARGET);
-        $action = $changing === [] ? 'DO NOTHING' : 'DO UPDATE SET '.implode(', ', array_map(fn (string $column) => "{$column} = excluded.{$column}", [...$wrapped, ...($updated === null ? [] : [SqlFragments::identifier($updated)])]))
-            .' WHERE '.$this->distinct($changing, $types, $target, 'excluded');
+        $action = $changing === [] ? 'DO NOTHING' : 'DO UPDATE SET '.implode(', ', [
+            ...array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$this->kept($column, $presence, $target, 'excluded'), $changing),
+            ...($updated === null ? [] : [SqlFragments::identifier($updated).' = excluded.'.SqlFragments::identifier($updated)]),
+        ])
+            .' WHERE '.$this->distinct($changing, $types, $target, 'excluded', $presence);
         $rows = [];
 
         foreach ($stored as $values) {
@@ -438,6 +480,7 @@ final readonly class Backfiller
         $table = $branch->primary->table;
         $column = (string) $branch->identifiers[$this->key]->column();
         $existing = $this->held($branch, array_keys($stored))->keyBy($column);
+        $presence = $this->presence($branch, $table);
         $read = [];
 
         foreach ($branch->externals() as $name) {
@@ -449,7 +492,15 @@ final readonly class Backfiller
         foreach ($rows as $row) {
             $key = self::keyOf($row[$this->key] ?? null);
             $successor = $existing[$key] ?? (new $branch->primary->model)->setConnection($this->connectionName);
-            $successor->setRawAttributes(array_replace($successor->getAttributes(), $stored[$key][$table]));
+            $values = $stored[$key][$table];
+
+            foreach ($successor->exists ? $presence : [] as $present) {
+                if (($values[$present] ?? null) !== null && $successor->getRawOriginal($present) !== null) {
+                    $values[$present] = $successor->getRawOriginal($present);
+                }
+            }
+
+            $successor->setRawAttributes(array_replace($successor->getAttributes(), $values));
             $written = false;
 
             foreach ($external[$key] as $name => $value) {
@@ -463,8 +514,16 @@ final readonly class Backfiller
                 continue;
             }
 
-            if ($this->stamps($successor, array_keys($stored[$key][$table])) === [null, null]) {
-                $successor->timestamps = false;
+            [$created, $updated] = $this->stamps($successor, array_keys($stored[$key][$table]));
+            $successor->timestamps = false;
+            $now = $successor->freshTimestamp();
+
+            if ($updated !== null && ! $successor->isDirty($updated)) {
+                $successor->setAttribute($updated, $now);
+            }
+
+            if ($created !== null && ! $successor->exists && ! $successor->isDirty($created)) {
+                $successor->setAttribute($created, $now);
             }
 
             if ($successor->save() === false) {
@@ -514,8 +573,9 @@ final readonly class Backfiller
         $target = SqlFragments::identifier(self::TARGET);
         $relatedKey = SqlFragments::identifier($successor->getKeyName());
         $wrapped = array_map(SqlFragments::identifier(...), $columns);
-        [$created, $updated] = $this->stamps($successor, $columns);
+        $presence = $this->presence($branch, $table);
         $fixed = array_diff_key($related->attributes, array_flip([...$columns, $related->relatedKey]));
+        [$created, $updated] = $this->stamps($successor, [...$columns, ...array_map(strval(...), array_keys($fixed))]);
         $generated = ! $related->belongsTo && $successor->usesUniqueIds() ? array_values(array_diff($successor->uniqueIds(), $columns, array_keys($fixed), [$related->relatedKey])) : [];
         $identifier = (string) $branch->identifiers[$this->key]->column();
         $types = $this->typesOf($table, [$related->relatedKey, ...array_keys($fixed), ...$columns, ...$generated, ...array_filter([$created, $updated], is_string(...))]);
@@ -540,9 +600,9 @@ final readonly class Backfiller
             $bindings = array_merge(...$batch);
 
             $changed += $this->connection->affectingStatement(
-                'UPDATE '.SqlFragments::identifier($table)." AS {$target} SET ".implode(', ', [...array_map(fn (string $column) => "{$column} = {$source}.{$column}", $wrapped), ...($updated === null ? [] : [SqlFragments::identifier($updated).' = CAST(? AS '.$types[$updated].')'])])
+                'UPDATE '.SqlFragments::identifier($table)." AS {$target} SET ".implode(', ', [...array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$this->kept($column, $presence, $target, $source), $columns), ...($updated === null ? [] : [SqlFragments::identifier($updated).' = CAST(? AS '.$types[$updated].')'])])
                     ."\nFROM {$from}"
-                    ."\nWHERE {$target}.{$relatedKey} = {$alias}.{$relatedKey} AND ".$this->distinct($columns, $types, $target, $source),
+                    ."\nWHERE {$target}.{$relatedKey} = {$alias}.{$relatedKey} AND ".$this->distinct($columns, $types, $target, $source, $presence),
                 [...($updated === null ? [] : [$stamp]), ...$bindings],
             );
 
@@ -581,12 +641,47 @@ final readonly class Backfiller
     /**
      * @param  list<string>  $columns
      * @param  array<string, string>  $types
+     * @param  list<string>  $presence
      */
-    private function distinct(array $columns, array $types, string $before, string $after): string
+    private function distinct(array $columns, array $types, string $before, string $after, array $presence = []): string
     {
-        $side = fn (string $alias) => implode(', ', array_map(fn (string $column) => $this->catalog->equatable($types[$column]) ? $alias.'.'.SqlFragments::identifier($column) : 'CAST('.$alias.'.'.SqlFragments::identifier($column).' AS text)', $columns));
+        $side = fn (string $alias) => implode(', ', array_map(fn (string $column) => match (true) {
+            in_array($column, $presence, true) => '('.$alias.'.'.SqlFragments::identifier($column).' IS NOT NULL)',
+            $this->catalog->equatable($types[$column]) => $alias.'.'.SqlFragments::identifier($column),
+            default => 'CAST('.$alias.'.'.SqlFragments::identifier($column).' AS text)',
+        }, $columns));
 
         return '('.$side($before).') IS DISTINCT FROM ('.$side($after).')';
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function presence(ResolvedMap $branch, string $table): array
+    {
+        $columns = [];
+
+        foreach ($branch->attributes as $name => $attribute) {
+            $column = $attribute->column();
+
+            if ($column !== null && ! $attribute->isExternal() && ($branch->owners[$name] ?? null)?->table === $table && ($attribute->conversions()[0] ?? null) instanceof IsNotNull) {
+                $columns[] = $column;
+            }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * @param  list<string>  $presence
+     */
+    private function kept(string $column, array $presence, string $before, string $after): string
+    {
+        $wrapped = SqlFragments::identifier($column);
+
+        return in_array($column, $presence, true)
+            ? "CASE WHEN {$before}.{$wrapped} IS NOT NULL AND {$after}.{$wrapped} IS NOT NULL THEN {$before}.{$wrapped} ELSE {$after}.{$wrapped} END"
+            : "{$after}.{$wrapped}";
     }
 
     private function deleteGone(): int

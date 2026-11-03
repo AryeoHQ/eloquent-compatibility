@@ -13,7 +13,7 @@ use WeakMap;
 
 final class ServedTable
 {
-    private const array VIEW_WRITE_STATES = ['55000', '42809'];
+    private const array VIEW_WRITE_STATES = ['55000', '42809', '42703'];
 
     private const string SESSION_CONTEXT = "/^\\s*(?:(?:set|reset)\\s+(?:(?:local|session)\\s+)?(?:search_path|role|session\\s+authorization|all)\\b|discard\\s+all\\b)|set_config\\s*\\(\\s*(?:'(?:search_path|role|session_authorization)'|\\?)/i";
 
@@ -70,8 +70,8 @@ final class ServedTable
         $row = (array) $connection->selectOne(
             "select array_to_string(current_schemas(true), ',') as path,
                     coalesce((select relkind = 'v' from pg_class where oid = to_regclass(?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table), false) as readable",
-            [SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
+                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table) and successor_table in (select dependency.refobjid from pg_rewrite rewrite join pg_depend dependency on dependency.classid = 'pg_rewrite'::regclass and dependency.objid = rewrite.oid and dependency.refclassid = 'pg_class'::regclass where rewrite.ev_class = to_regclass(?)), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table), false) as readable",
+            [SqlFragments::identifier($table), SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
         );
         $relations[$key] = ['path' => (string) ($row['path'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
 

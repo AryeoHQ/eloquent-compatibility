@@ -1959,6 +1959,116 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_installs_and_uninstalls_a_map_over_two_successors_that_maps_nothing_but_its_primary_identifier(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        DB::statement('alter table videos drop column uuid');
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('videos_retained')
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file)
+                    ->as(Link::class, fn (Successor $link) => $link);
+            }
+        };
+        $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        Compatibility::prepare($video::class);
+        DB::statement("insert into files (legacy_type, legacy_id, filename, mime_type) select 'video', id, 'video.bin', 'application/octet-stream' from videos where youtube_embed_url is null");
+        DB::statement("insert into links (legacy_type, legacy_id, url) select 'video', id, youtube_embed_url from videos where youtube_embed_url is not null");
+
+        Compatibility::install($video::class);
+        $installed = [$this->kind('videos'), $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')))];
+        Compatibility::uninstall($video::class);
+
+        $this->assertSame([['v', $before], 'r'], [$installed, $this->kind('videos')]);
+        $this->assertSame($before, $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'))));
+    }
+
+    #[Test]
+    public function it_uninstalls_a_map_over_two_successors_that_maps_only_its_primary_identifier_and_an_external_attribute_and_restores_the_external_values(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        DB::statement('alter table videos drop column uuid');
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('videos_retained')
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                            ->external(
+                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null)));
+            }
+        };
+        $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        Compatibility::prepare($video::class);
+        DB::statement("insert into files (legacy_type, legacy_id, filename, mime_type) select 'video', id, 'video.bin', mime_type from videos where youtube_embed_url is null");
+        DB::statement("insert into links (legacy_type, legacy_id, url) select 'video', id, youtube_embed_url from videos where youtube_embed_url is not null");
+        FileTables::catalog('video');
+        Compatibility::install($video::class);
+
+        Compatibility::uninstall($video::class);
+
+        $this->assertSame('r', $this->kind('videos'));
+        $this->assertSame($before, $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'))));
+    }
+
+    #[Test]
+    public function it_makes_the_retained_key_it_filled_off_the_lock_the_primary_key_only_after_commit_once_a_validated_check_proves_it_holds_no_null(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $proven = null;
+        $connection = DB::connection();
+
+        $connection->beforeExecuting(function (string $query) use (&$proven, $connection): void {
+            if ($proven === null && str_contains($query, 'PRIMARY KEY USING INDEX')) {
+                $proven = [$connection->transactionLevel(), $connection->scalar("select count(*) from pg_constraint where conrelid = to_regclass('listings_retained') and contype = 'c' and convalidated and pg_get_constraintdef(oid) = 'CHECK ((job_id IS NOT NULL))'")];
+            }
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([0, 1], $proven);
+        $this->assertSame(
+            ['listings_retained_job_id_foreign' => 'FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE', 'listings_retained_pkey' => 'PRIMARY KEY (job_id)'],
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass order by conname"), 'definition', 'conname'),
+        );
+        $this->assertSame([true, 3], [DB::scalar("select attnotnull from pg_attribute where attrelid = 'listings_retained'::regclass and attname = 'job_id'"), DB::scalar('select count(*) from listings')]);
+    }
+
+    #[Test]
     public function it_refuses_to_install_from_a_watermark_over_a_preparation_that_has_not_finished_and_drops_the_retained_key_it_filled(): void
     {
         $this->backfiller(Listing::class)->run();

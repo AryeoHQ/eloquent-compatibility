@@ -60,7 +60,7 @@ final readonly class ViewCompiler
         }
 
         $served = [];
-        $collations = self::collations($this->connection, $map->table);
+        $collations = self::collations($this->connection, $map->table, $this->columnCatalog->throughSearchPath);
 
         foreach ($shape as $name => $column) {
             if (! array_key_exists($name, $reads)) {

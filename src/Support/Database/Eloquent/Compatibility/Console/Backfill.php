@@ -40,7 +40,7 @@ final class Backfill extends Command
 
         try {
             $map = Compatibility::of($models[0])->resolve();
-            $backfilled = (new Backfiller($map, (new $map->model)->getConnection()))->run(
+            $backfilled = (new Backfiller($map, Compatibility::connection($map)))->run(
                 (int) $chunk,
                 is_string($since) && $since !== '' ? Backfiller::watermark($since) : null,
                 fn (array $keys, int $changed) => $this->line("Wrote {$changed} successor rows for {$map->table} ".reset($keys).' to '.end($keys).'.'),

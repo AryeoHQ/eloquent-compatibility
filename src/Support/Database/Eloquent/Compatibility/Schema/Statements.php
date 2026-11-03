@@ -209,7 +209,14 @@ final readonly class Statements
         $retainedPrimaryKey = SqlFragments::identifier($retainedPrimaryKeyName);
         $retainedForeignKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'));
         $indexed = $prefilled && $connection->scalar('select indisvalid and indisunique from pg_index where indexrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and indrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?)', [SqlFragments::identifier($retainedPrimaryKeyName), SqlFragments::identifier($map->table)]) === true;
-        $retainedConstraints = "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY ".($indexed ? "USING INDEX {$retainedPrimaryKey}" : '('.SqlFragments::identifier($retainedKey).')').',';
+        $retainedNotNullName = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_not_null');
+        $retainedNotNull = SqlFragments::identifier($retainedNotNullName);
+        $retainedConstraints = "ALTER TABLE {$retainedTable}\n  ".($indexed ? "ADD CONSTRAINT {$retainedNotNull} CHECK (".SqlFragments::identifier($retainedKey).' IS NOT NULL) NOT VALID' : "ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey).')').',';
+        $retainedPrimaryKeyAfterwards = $indexed ? [
+            self::validate($retainedTable, $retainedNotNullName),
+            "ALTER TABLE {$retainedTable} ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY USING INDEX {$retainedPrimaryKey}",
+            "ALTER TABLE {$retainedTable} DROP CONSTRAINT {$retainedNotNull}",
+        ] : [];
         $verifications = [
             ...($branched ? [fn (ConnectionInterface $connection) => (new Backfiller($map, $connection))->refuseMisplaced()] : []),
             ...array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external),
@@ -239,7 +246,7 @@ final readonly class Statements
             ...$repoints,
             ...$sequences,
             $readGrants,
-            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
+            ...($mapped === [] ? [] : ["ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped))]),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             ...($branched ? [] : ["{$retainedConstraints}\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID"]),
             "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, $notValid, array_column($constants, 1), $external)),
@@ -249,7 +256,7 @@ final readonly class Statements
             ...$check,
         ], [
             ...$validations,
-            ...($branched ? [] : [self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign')]),
+            ...($branched ? [] : [self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'), ...$retainedPrimaryKeyAfterwards]),
             ...$validateCheck,
         ], $verifications === [] ? [] : [1 + count($unfinished) => $verifications]);
     }
@@ -497,13 +504,13 @@ final readonly class Statements
             ...array_map(fn (ResolvedMap $branch) => "INSERT INTO {$legacyTable} ({$legacyKey}) SELECT {$held($branch)} FROM ".SqlFragments::identifier($branch->primary->table)
                 .' WHERE '.(string) $branch->membership?->of($branch->primary->table)
                 ." AND NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$legacyKey} = {$held($branch)})", $branches),
-            "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
+            ...($columns === [] && $external === [] ? [] : ["ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
                 ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type.(($collations[$column]['declared'] ?? false) ? ' COLLATE '.$collations[$column]['name'] : ''), $columns),
                 ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'].($column['collation'] === null ? '' : ' COLLATE '.$column['collation']), $external, array_keys($external)),
-            ]),
+            ])]),
             ...array_map(fn (ResolvedMap $branch, array $reads) => "UPDATE {$legacyTable} AS {$retainedTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$reads[$column], $columns))
                 ."\nFROM ".SqlFragments::identifier($branch->primary->table).implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($branch)))
-                ."\nWHERE {$held($branch)} = {$retainedTable}.{$legacyKey} AND ".(string) $branch->membership?->of($branch->primary->table), $branches, $served),
+                ."\nWHERE {$held($branch)} = {$retainedTable}.{$legacyKey} AND ".(string) $branch->membership?->of($branch->primary->table), $columns === [] ? [] : $branches, $columns === [] ? [] : $served),
         ];
         $restoredAt = count($statements) - 1;
         $restoredDefaults = [...array_map(fn (Column $column) => (string) $column->default, $defaults), ...array_filter(array_map(fn (array $column) => $column['default'], $external), is_string(...))];

@@ -69,11 +69,11 @@ final class LegacyRecord
     public static function compile(ResolvedMap $map, ResolvedMap $served, Model $successor): array
     {
         $connection = $successor->getConnection();
-        $catalog = new ColumnCatalog($connection);
+        $catalog = new ColumnCatalog($connection, throughSearchPath: true);
         $columns = (new ViewCompiler($catalog, $connection))->served($served, $catalog->of($map->table), $map->externals());
         $json = array_filter($catalog->of($successor->getTable()), fn (Column $column) => in_array($column->baseType ?? $column->type, ['json', 'jsonb'], true));
         $reads = $connection->select(
-            "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(quote_ident(current_schema()) || '.' || ?) and depend.refobjid = to_regclass(quote_ident(current_schema()) || '.' || ?)",
+            "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(?) and depend.refobjid = to_regclass(?)",
             [SqlFragments::identifier($map->table), SqlFragments::identifier($successor->getTable())],
             false,
         );

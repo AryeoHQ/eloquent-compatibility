@@ -149,6 +149,25 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_a_direct_successor_save_when_the_search_path_reaches_the_view_through_a_later_schema(): void
+    {
+        $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->street]);
+        DB::statement('create schema compatibility_empty');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_empty, '.$searchPath]);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_empty');
+        }
+
+        $this->assertSame([['updating', 1, 'Oak Lodge', '1 Oak St'], ['updated', 1, 'Oak Lodge', '1 Oak St']], $this->seen);
+        $this->assertSame('Oak Lodge', Listing::query()->findOrFail(1)->title);
+    }
+
+    #[Test]
     public function it_runs_no_query_of_its_own_when_no_listing_listener_takes_the_event(): void
     {
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);

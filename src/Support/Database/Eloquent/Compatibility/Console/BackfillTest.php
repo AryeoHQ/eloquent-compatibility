@@ -5,12 +5,17 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Console;
 
 use DateTimeImmutable;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
@@ -18,6 +23,8 @@ use Tests\TestCase;
 #[CoversClass(Backfill::class)]
 final class BackfillTest extends TestCase
 {
+    public static string $reporting = '';
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -103,6 +110,61 @@ final class BackfillTest extends TestCase
             ->expectsOutputToContain("--since takes a watermark no later than {$remembered}, which the last backfill of listings remembers, not {$later}; a later one skips the legacy rows updated in between.")
             ->doesntExpectOutputToContain('Watermark:')
             ->assertFailed();
+    }
+
+    #[Test]
+    public function it_refuses_to_backfill_over_a_connection_with_a_table_prefix_and_writes_nothing(): void
+    {
+        config(['database.connections.compatibility_prefixed' => [...(array) config('database.connections.pgsql'), 'prefix' => 'app_'], 'database.default' => 'compatibility_prefixed']);
+
+        try {
+            $this->artisan('compatibility:backfill', ['model' => Listing::class])
+                ->expectsOutputToContain("Compatibility map 'listings' is declared wrongly: Listing reads the connection compatibility_prefixed, which adds the table prefix app_, and the package reads and compiles every table by its unprefixed name; use a connection without a prefix.")
+                ->doesntExpectOutputToContain('Watermark:')
+                ->assertFailed();
+        } finally {
+            DB::purge('compatibility_prefixed');
+            config(['database.default' => 'pgsql']);
+        }
+
+        $this->assertSame(0, DB::scalar('select count(*) from jobs'));
+    }
+
+    #[Test]
+    public function it_refuses_to_backfill_a_successor_whose_read_configuration_reaches_another_search_path_and_writes_nothing(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'reporting'], 'write' => []]]);
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'jobs';
+
+            protected $guarded = [];
+        };
+        self::$reporting = $reporting::class;
+        $legacy = new class extends Model implements Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(BackfillTest::$reporting, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+
+        $this->artisan('compatibility:backfill', ['model' => $legacy::class])
+            ->expectsOutputToContain(' reads the connection compatibility_reporting, whose read configuration reaches another database or search_path than the connection pgsql of ')
+            ->doesntExpectOutputToContain('Watermark:')
+            ->assertFailed();
+
+        $this->assertSame(0, DB::scalar('select count(*) from jobs'));
     }
 
     #[Test]
