@@ -54,7 +54,7 @@ final class LegacyQueryBuilder extends QueryBuilder
 
     public function translatedFor(int $view): void
     {
-        $this->translatedFor = $view;
+        $this->translatedFor ??= $view;
     }
 
     /**
@@ -62,9 +62,11 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     public function cursor()
     {
-        $this->refuseStale();
+        return new LazyCollection(function () {
+            $this->refuseStale();
 
-        return parent::cursor();
+            yield from parent::cursor();
+        });
     }
 
     public function toSql(): string
@@ -334,8 +336,19 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $legacy = $this->legacy;
 
-        if ($legacy !== null && $this->translatedFor !== null && LegacyBuilder::relationOf($legacy)['oid'] !== $this->translatedFor) {
-            throw new CompatibilityQueryRefused($legacy::class." cannot run a query whose filters it translated for the view {$legacy->getTable()}. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$legacy->getTable()} no longer serves. Instead: build the query again.");
+        if ($legacy !== null && $this->translatedFor !== null) {
+            $relation = LegacyBuilder::relationOf($legacy);
+            $table = $legacy->getTable();
+            $why = match (true) {
+                $relation['oid'] !== $this->translatedFor => "Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$table} no longer serves.",
+                $relation['unbound'] !== [] => 'The search path now resolves '.implode(' and ', $relation['unbound']).(count($relation['unbound']) === 1 ? ' to another table' : ' to other tables')." than the view reads, so the filters would read rows that {$table} does not serve.",
+                ! $relation['readable'] => "The current role cannot read every successor table the view reads, so the filters would not read the rows that {$table} serves.",
+                default => null,
+            };
+
+            if ($why !== null) {
+                throw new CompatibilityQueryRefused($legacy::class." cannot run a query whose filters it translated for the view {$table}. Why: {$why} Instead: build the query again.");
+            }
         }
 
         foreach ($this->wheres as $where) {
@@ -606,7 +619,7 @@ final class LegacyQueryBuilder extends QueryBuilder
             return $native();
         }
 
-        return ServedTable::write($legacy, ServedTable::successorsOf(LegacyBuilder::mapOf($legacy::class)), $native, fn (): mixed => $translated($legacy));
+        return ServedTable::write($legacy, LegacyBuilder::mapOf($legacy::class), $native, fn (): mixed => $translated($legacy));
     }
 
     private function alias(Model $legacy): null|string
