@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
@@ -145,6 +146,8 @@ final class BackfillTest extends TestCase
         self::$reporting = $reporting::class;
         $legacy = new class extends Model implements Compatible
         {
+            use ServesCompatibility;
+
             protected $table = 'listings';
 
             public static function compatibility(Compatibility $listing): Compatibility

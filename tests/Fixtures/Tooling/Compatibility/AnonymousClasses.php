@@ -45,6 +45,15 @@ final class AnonymousClasses
                     return [];
                 }
             },
+            new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                public static function compatibility(Compatibility $compatibility): Compatibility
+                {
+                    return $compatibility;
+                }
+            },
         ];
     }
 }

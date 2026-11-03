@@ -5,25 +5,35 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Closure;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\PlaceAssets\Brochure;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(DriftQueries::class)]
 #[CoversClass(DriftFinding::class)]
+#[CoversClass(DriftCheck::class)]
 final class DriftQueriesTest extends TestCase
 {
     /** @var list<string> */
@@ -69,10 +79,10 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Listing|Photo|Video|Image>  $model
      */
     #[Test]
-    #[TestWith([Listing::class, "insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')", 'listings#4', 'no jobs row holds its id, so install() refuses it'])]
-    #[TestWith([Photo::class, "delete from files where legacy_type = 'photo' and legacy_id = 2", 'photos#2', "no files row whose legacy_type is 'photo' holds its id, so install() refuses it"])]
-    #[TestWith([Video::class, "insert into videos (original_file_name, title) values ('porch.mp4', 'Porch')", 'videos#4', "no files or links row whose legacy_type is 'video' holds its id, so install() refuses it"])]
-    #[TestWith([Image::class, "delete from place_assets where legacy_type = 'place_image' and legacy_id = 1", 'place_images#1', "no place_assets row whose legacy_type is 'place_image' holds its id, so install() refuses it"])]
+    #[TestWith([Listing::class, "insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')", 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'])]
+    #[TestWith([Photo::class, "delete from files where legacy_type = 'photo' and legacy_id = 2", 'photos#2', "no files row whose legacy_type is 'photo' holds its id and uuid, so install() refuses it"])]
+    #[TestWith([Video::class, "insert into videos (original_file_name, title) values ('porch.mp4', 'Porch')", 'videos#4', "no files or links row whose legacy_type is 'video' holds its id and uuid, so install() refuses it"])]
+    #[TestWith([Image::class, "delete from place_assets where legacy_type = 'place_image' and legacy_id = 1", 'place_images#1', "no place_assets row whose legacy_type is 'place_image' holds its id and uuid, so install() refuses it"])]
     public function it_names_each_legacy_row_no_primary_holds_before_install(string $model, string $drift, string $record, string $detail): void
     {
         $this->backfilled($model);
@@ -87,7 +97,7 @@ final class DriftQueriesTest extends TestCase
     #[Test]
     #[TestWith([Listing::class, "update listings set title = 'Oak Home', price = 1300 where id = 1", 'listings#1', 'listings holds other values for title, price than the view would serve from jobs'])]
     #[TestWith([Photo::class, "update photos set file_name = 'oak-side.jpg' where id = 1", 'photos#1', 'photos holds other values for file_name than the view would serve from files'])]
-    #[TestWith([Video::class, "update videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'videos#1', 'videos holds other values for youtube_embed_url than the view would serve from files'])]
+    #[TestWith([Video::class, "update videos set original_file_name = 'porch.mp4' where id = 1", 'videos#1', 'videos holds other values for original_file_name than the view would serve from files'])]
     #[TestWith([Image::class, "update place_images set file_name = 'side.jpg', title = 'Side' where id = 1", 'place_images#1', 'place_images holds other values for title, file_name than the view would serve from place_assets'])]
     public function it_names_each_legacy_row_whose_values_differ_from_what_the_view_would_serve_before_install(string $model, string $drift, string $record, string $detail): void
     {
@@ -108,11 +118,175 @@ final class DriftQueriesTest extends TestCase
         DB::unprepared("update listings set title = 'Oak Home' where id = 1");
         DB::unprepared("update listings set title = 'Pine Loft', updated_at = localtimestamp(0) where id = 2");
         DB::unprepared("insert into listings (title, company_id, updated_at) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21', '2026-01-01 00:00:00')");
+        DB::unprepared('delete from jobs where legacy_id in (2, 3)');
 
         $this->assertSame([
-            [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id, so install() refuses it'],
+            [Listing::class, 'no primary', 'listings#3', 'no jobs row holds its id and uuid, so install() refuses it'],
             [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
         ], $this->find(Listing::class));
+    }
+
+    #[Test]
+    public function it_compares_every_legacy_row_when_the_legacy_table_has_no_updated_at_to_limit_a_catch_up(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        $this->drop = ListingTables::drop(...);
+        DB::statement('alter table listings drop column updated_at');
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+            }
+        };
+        Compatibility::prepare($listing::class);
+        (new Backfiller(Compatibility::of($listing::class)->resolve(), DB::connection()))->run();
+        DB::unprepared("update listings set title = 'Oak Home' where id = 1");
+        DB::unprepared("insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')");
+
+        $this->assertSame([
+            [$listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+            [$listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
+        ], $this->find($listing::class));
+    }
+
+    #[Test]
+    public function it_names_a_legacy_row_whose_hidden_primary_holds_its_key_and_not_its_other_identifiers(): void
+    {
+        $this->backfilled(Listing::class);
+        DB::update('update jobs set merged_into_job_id = (select id from jobs where legacy_id = 3) where legacy_id = 1');
+        DB::update('update listings set uuid = gen_random_uuid() where id = 1');
+
+        $this->assertSame([
+            [Listing::class, 'no primary', 'listings#1', 'no jobs row holds its id and uuid, so install() refuses it'],
+        ], $this->find(Listing::class));
+    }
+
+    #[Test]
+    public function it_compares_a_json_column_as_jsonb_and_another_column_without_equality_as_text(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        $this->drop = ListingTables::drop(...);
+        DB::statement('alter table listings add column details json, add column location point');
+        DB::statement('alter table jobs add column details jsonb, add column location point');
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            protected $casts = ['details' => 'array'];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->timestamps()
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->attribute('details', fn (Attribute $attribute) => $attribute->from('details'))
+                        ->attribute('location', fn (Attribute $attribute) => $attribute->from('location')));
+            }
+        };
+        Compatibility::prepare($listing::class);
+
+        foreach ([1 => ['b' => 1, 'a' => 2], 2 => ['rooms' => 3], 3 => ['c' => [1, 2]]] as $id => $details) {
+            $record = $listing::query()->findOrFail($id);
+            $record->timestamps = false;
+            $record->forceFill(['details' => $details, 'location' => '(1,2)'])->save();
+        }
+
+        (new Backfiller(Compatibility::of($listing::class)->resolve(), DB::connection()))->run();
+        DB::unprepared("update listings set location = point(3, 4) where id = 2; update listings set details = '{\"c\":[2,1]}' where id = 3");
+
+        $this->assertSame([
+            [$listing::class, 'values differ', 'listings#2', 'listings holds other values for location than the view would serve from jobs'],
+            [$listing::class, 'values differ', 'listings#3', 'listings holds other values for details than the view would serve from jobs'],
+        ], $this->find($listing::class));
+    }
+
+    #[Test]
+    public function it_names_a_legacy_row_whose_external_attribute_differs_from_its_external_read_before_install(): void
+    {
+        $this->backfilled(Image::class);
+        DB::update("update place_images set mime_type = 'image/gif' where id = 1");
+
+        $this->assertSame([
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
+        ], $this->find(Image::class));
+    }
+
+    #[Test]
+    public function it_reads_external_attributes_only_until_the_limit_of_records_is_reached(): void
+    {
+        $this->backfilled(Image::class);
+        DB::update("update place_images set file_name = 'side.jpg' where id = 1");
+        DB::update("update place_images set mime_type = 'image/gif'");
+
+        $this->assertSame([
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
+        ], $this->find(Image::class, 1));
+        $this->assertSame([
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
+        ], $this->find(Image::class, 2));
+    }
+
+    /**
+     * @param  class-string<Video|PlaceVideo>  $model
+     */
+    #[Test]
+    #[TestWith([Video::class, "update videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'videos#1', 'videos holds other values for youtube_embed_url than the view would serve from files', "its servedFrom() selector chooses links, and no links row whose legacy_type is 'video' holds its id, so install() refuses it"])]
+    #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'place_videos holds other values for youtube_embed_url than the view would serve from place_assets', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() refuses it'])]
+    public function it_names_a_legacy_row_that_sits_in_another_successor_than_its_selector_chooses_before_install(string $model, string $drift, string $record, string $differs, string $misplaced): void
+    {
+        $this->backfilled($model);
+        DB::unprepared($drift);
+
+        $this->assertSame([
+            [$model, 'values differ', $record, $differs],
+            [$model, 'misplaced', $record, $misplaced],
+        ], $this->find($model));
+    }
+
+    #[Test]
+    public function it_names_a_primary_whose_morph_type_is_null(): void
+    {
+        $this->installed(Image::class);
+        DB::statement('alter table place_assets alter column asset_type drop not null');
+        DB::update("update place_assets set asset_type = null where legacy_type = 'place_image' and legacy_id = 1");
+
+        $this->assertSame([
+            [Image::class, 'no morph target', 'place_images#1', 'its asset_type is NULL, which names no target relatedMorph() declares'],
+        ], $this->find(Image::class));
+    }
+
+    #[Test]
+    public function it_names_a_primary_whose_morph_target_row_is_soft_deleted(): void
+    {
+        $this->installed(Brochure::class);
+        DB::update("update trashable_asset_files set deleted_at = now() where id = (select asset_id from place_assets where legacy_type = 'place_brochure' and legacy_id = 1)");
+
+        $this->assertSame([
+            [Brochure::class, 'no morph target', 'place_brochures#1', 'its trashable_asset_files row does not exist or is deleted'],
+        ], $this->find(Brochure::class));
     }
 
     /**
@@ -202,6 +376,8 @@ final class DriftQueriesTest extends TestCase
             ...($install ? [] : [
                 [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
                 [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for file_name than the view would serve from place_assets'],
+                [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
+                [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for mime_type than its external() read returns'],
             ]),
             [Image::class, 'no morph target', 'place_images#1', "its asset_type 'place_brochure' names no target relatedMorph() declares"],
             [Image::class, 'no morph target', 'place_images#2', 'its asset_files row does not exist'],
@@ -275,14 +451,14 @@ final class DriftQueriesTest extends TestCase
     }
 
     /**
-     * @param  class-string<Listing|Photo|Video|Image>  $model
+     * @param  class-string<Listing|Photo|Video|Image|PlaceVideo|Brochure>  $model
      */
     private function backfilled(string $model): void
     {
         $this->drop = match ($model) {
             Listing::class => ListingTables::drop(...),
             Photo::class, Video::class => FileTables::drop(...),
-            Image::class => PlaceAssetTables::drop(...),
+            Image::class, PlaceVideo::class, Brochure::class => PlaceAssetTables::drop(...),
         };
 
         match ($model) {
@@ -309,17 +485,23 @@ final class DriftQueriesTest extends TestCase
                 Compatibility::prepare(InteractiveContent::class);
                 FileTables::backfillMedia();
             })(),
-            Image::class => (function (): void {
+            Image::class, PlaceVideo::class => (function (): void {
                 PlaceAssetTables::create();
                 PlaceAssetTables::seed();
                 PlaceAssetTables::prepare();
                 PlaceAssetTables::backfill();
             })(),
+            Brochure::class => (function (): void {
+                PlaceAssetTables::create();
+                PlaceAssetTables::brochures();
+                Compatibility::prepare(Brochure::class);
+                (new Backfiller(Compatibility::of(Brochure::class)->resolve(), DB::connection()))->run();
+            })(),
         };
     }
 
     /**
-     * @param  class-string<Listing|Photo|Video|Image>  $model
+     * @param  class-string<Listing|Photo|Video|Image|PlaceVideo|Brochure>  $model
      */
     private function installed(string $model): void
     {
@@ -346,13 +528,13 @@ final class DriftQueriesTest extends TestCase
     }
 
     /**
-     * @param  class-string<Listing|Photo|Video|Image>  $model
+     * @param  class-string<Model>  $model
      * @return list<array{string, string, string, string}>
      */
     private function find(string $model, int $limit = 100): array
     {
         return array_map(
-            fn (DriftFinding $finding) => [$finding->model, $finding->check, $finding->record, $finding->detail],
+            fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
             (new DriftQueries(DB::connection()))->find(Compatibility::of($model)->resolve(), $limit),
         );
     }

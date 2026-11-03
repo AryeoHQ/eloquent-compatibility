@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Model;
 use PhpParser\Node;
 use PhpParser\Node\Stmt\Class_;
 use PHPStan\Analyser\Scope;
+use PHPStan\Reflection\ClassReflection;
+use PHPStan\Reflection\ReflectionProvider;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tooling\PhpStan\Rules\Rule;
@@ -19,15 +21,23 @@ use Tooling\Rules\Attributes\NodeType;
 #[NodeType(Class_::class)]
 final class CompatibleMustUseServesCompatibility extends Rule
 {
+    private readonly ReflectionProvider $reflectionProvider;
+
+    public function __construct(ReflectionProvider $reflectionProvider)
+    {
+        $this->reflectionProvider = $reflectionProvider;
+    }
+
     /**
      * @param  Class_  $node
      */
     public function shouldHandle(Node $node, Scope $scope): bool
     {
-        return ! $node->isAnonymous()
-            && $this->inherits($node, Model::class)
-            && $this->inherits($node, Compatible::class)
-            && $this->doesNotInherit($node, ServesCompatibility::class);
+        $class = $this->subject($node, $scope);
+
+        return $this->inherits($class, Model::class)
+            && $this->inherits($class, Compatible::class)
+            && $this->doesNotInherit($class, ServesCompatibility::class);
     }
 
     /**
@@ -40,5 +50,10 @@ final class CompatibleMustUseServesCompatibility extends Rule
             line: $node->name?->getStartLine() ?? $node->getStartLine(),
             identifier: 'compatibility.compatible.mustUse.servesCompatibility'
         );
+    }
+
+    private function subject(Class_ $node, Scope $scope): Class_|ClassReflection
+    {
+        return $node->isAnonymous() ? $this->reflectionProvider->getAnonymousClassReflection($node, $scope) : $node;
     }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tooling\Database\Eloquent\Compatibility\PhpStan;
 
+use PHPStan\Reflection\ReflectionProvider;
 use PHPStan\Rules\Rule;
 use PHPStan\Testing\RuleTestCase;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -18,7 +19,7 @@ class ServesCompatibilityMustNotRedeclareBuildersTest extends RuleTestCase
 
     protected function getRule(): Rule
     {
-        return new ServesCompatibilityMustNotRedeclareBuilders;
+        return new ServesCompatibilityMustNotRedeclareBuilders(self::getContainer()->getByType(ReflectionProvider::class));
     }
 
     #[Test]
@@ -46,9 +47,14 @@ class ServesCompatibilityMustNotRedeclareBuildersTest extends RuleTestCase
     }
 
     #[Test]
-    public function it_passes_when_class_is_anonymous(): void
+    public function it_fails_when_an_anonymous_subclass_of_serves_compatibility_redeclares_a_builder(): void
     {
-        $this->analyse([$this->getFixturePath('Compatibility/AnonymousClasses.php')], []);
+        $this->analyse([$this->getFixturePath('Compatibility/AnonymousClasses.php')], [
+            [
+                'ServesCompatibility must not redeclare getAttributesForInsert().',
+                38,
+            ],
+        ]);
     }
 
     #[Test]

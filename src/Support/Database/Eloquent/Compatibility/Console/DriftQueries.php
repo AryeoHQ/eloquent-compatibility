@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Closure;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\QueryException;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -14,12 +16,15 @@ use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
 final readonly class DriftQueries
 {
     private const int CHUNK = 1000;
 
     private const string COMPILED = 'compatibility_compiled';
+
+    private const array UNWRITABLE = ['25006', '42501'];
 
     public function __construct(private ConnectionInterface $connection) {}
 
@@ -29,11 +34,11 @@ final readonly class DriftQueries
     public function find(ResolvedMap $map, int $limit): array
     {
         $installed = $this->installed($map);
-        $compiled = $installed ? $this->staleView($map) : $this->differing($map, $limit);
 
         return [
             ...($installed ? [] : $this->withoutPrimary($map, $limit)),
-            ...$compiled,
+            ...($installed ? $this->staleView($map) : $this->differing($map, $limit)),
+            ...($installed ? [] : $this->misplaced($map, $limit)),
             ...($installed ? $this->retainedWithoutPrimary($map, $limit) : []),
             ...$this->heldTwice($map, $limit),
             ...$this->withoutMorphTarget($map, $limit),
@@ -61,7 +66,7 @@ final readonly class DriftQueries
         $this->connection->beginTransaction();
 
         try {
-            $this->connection->unprepared('CREATE TEMPORARY VIEW '.SqlFragments::identifier(self::COMPILED)." AS\n".substr($replace, strlen($prefix)));
+            $this->compile($map, substr($replace, strlen($prefix)));
             $views = (array) $this->connection->selectOne(
                 "select pg_get_viewdef(to_regclass(quote_ident(current_schema()) || '.' || ?), true) as installed, pg_get_viewdef(to_regclass(?), true) as compiled",
                 [SqlFragments::identifier($map->table), 'pg_temp.'.SqlFragments::identifier(self::COMPILED)],
@@ -72,6 +77,21 @@ final readonly class DriftQueries
         }
 
         return ['installed' => self::text($views['installed'] ?? null), 'compiled' => self::text($views['compiled'] ?? null)];
+    }
+
+    private function compile(ResolvedMap $map, string $select): void
+    {
+        try {
+            $this->connection->unprepared('CREATE TEMPORARY VIEW '.SqlFragments::identifier(self::COMPILED)." AS\n".$select);
+        } catch (QueryException $exception) {
+            $state = (string) $exception->getCode();
+
+            if (! in_array($state, self::UNWRITABLE, true)) {
+                throw $exception;
+            }
+
+            throw InvalidCompatibilityMap::cannot($map->table, 'check', "the stale-view check creates a temporary view, so it needs a writable connection with the TEMP privilege, and the connection refused it with SQLSTATE {$state}");
+        }
     }
 
     private function installed(ResolvedMap $map): bool
@@ -100,7 +120,7 @@ final readonly class DriftQueries
             return [];
         }
 
-        return [new DriftFinding($map->model, DriftFinding::STALE_VIEW, $map->table, 'the installed view differs from the view the map compiles; run Compatibility::recompile()')];
+        return [new DriftFinding($map->model, DriftCheck::StaleView, $map->table, 'the installed view differs from the view the map compiles; run Compatibility::recompile()')];
     }
 
     /**
@@ -108,17 +128,18 @@ final readonly class DriftQueries
      */
     private function withoutPrimary(ResolvedMap $map, int $limit): array
     {
-        $key = self::key($map);
-        $legacyKey = SqlFragments::identifier($map->table).'.'.SqlFragments::identifier($key);
-        $missing = array_map(fn (ResolvedMap $branch) => 'NOT EXISTS (SELECT FROM '.SqlFragments::identifier($branch->primary->table).' WHERE '.self::holding($branch, $key, $legacyKey).')', self::served($map));
+        $legacy = SqlFragments::identifier($map->table);
+        $legacyKey = $legacy.'.'.SqlFragments::identifier(self::key($map));
+        [$pending, $bindings] = $this->pending($map, $legacy);
+        $identifiers = implode(' and ', array_keys($map->identifiers));
         $rows = $this->connection->select(
-            "SELECT {$legacyKey} AS key FROM ".SqlFragments::identifier($map->table).' WHERE '.implode(' AND ', $missing)." ORDER BY {$legacyKey} LIMIT ?",
-            [$limit],
+            "SELECT {$legacyKey} AS key FROM {$legacy} WHERE NOT ".self::held($map, $legacy).($pending === '' ? '' : " AND {$pending}")." ORDER BY {$legacyKey} LIMIT ?",
+            [...$bindings, $limit],
             false,
         );
 
         return array_values(array_map(
-            fn (object $row) => new DriftFinding($map->model, DriftFinding::NO_PRIMARY, self::record($map->table, $row->key ?? null), 'no '.self::successors($map)." holds its {$key}, so install() refuses it"),
+            fn (object $row) => new DriftFinding($map->model, DriftCheck::NoPrimary, self::record($map->table, $row->key ?? null), 'no '.self::successors($map)." holds its {$identifiers}, so install() refuses it"),
             $rows,
         ));
     }
@@ -134,15 +155,14 @@ final readonly class DriftQueries
         $key = self::key($map);
         $retained = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $legacyKey = $retained.'.'.SqlFragments::identifier($key);
-        [$pending, $bindings] = $this->pending($map, $retained, $legacyKey, $shape);
+        [$pending, $bindings] = $this->pending($map, $retained);
         $findings = [];
 
         foreach (self::served($map) as $branch) {
             $differs = [];
 
             foreach ($compiler->served($branch, $shape, $map->externals(), $map->table) as $name => $read) {
-                $stored = $retained.'.'.SqlFragments::identifier($name);
-                [$read, $stored] = $catalog->equatable($shape[$name]->type) ? [$read, $stored] : ["CAST({$read} AS text)", "CAST({$stored} AS text)"];
+                [$read, $stored] = self::comparable($catalog, $shape[$name], $read, $retained.'.'.SqlFragments::identifier($name));
                 $differs[] = "CASE WHEN {$read} IS DISTINCT FROM {$stored} THEN ".SqlFragments::literal($name).' END';
             }
 
@@ -151,25 +171,187 @@ final readonly class DriftQueries
                     .' FROM '.ViewCompiler::primary($branch)
                     .' JOIN '.SqlFragments::identifier($map->table).' AS '.$retained.' ON '.$legacyKey.' = '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier((string) $branch->identifiers[$key]->column())
                     .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($branch)))
-                    .$pending.') AS compared WHERE cardinality(compared.attributes) > 0 ORDER BY compared.key LIMIT ?',
+                    .($pending === '' ? '' : " WHERE {$pending}").') AS compared WHERE cardinality(compared.attributes) > 0 ORDER BY compared.key LIMIT ?',
                 [...$bindings, $limit],
                 false,
             );
 
             foreach ($rows as $row) {
-                $findings[] = new DriftFinding($map->model, DriftFinding::VALUES_DIFFER, self::record($map->table, $row->key ?? null), "{$map->table} holds other values for ".self::text($row->attributes ?? null).' than the view would serve from '.$branch->primary->table);
+                $findings[] = new DriftFinding($map->model, DriftCheck::ValuesDiffer, self::record($map->table, $row->key ?? null), "{$map->table} holds other values for ".self::text($row->attributes ?? null).' than the view would serve from '.$branch->primary->table);
             }
         }
 
-        return array_slice($findings, 0, $limit);
+        $findings = array_slice($findings, 0, $limit);
+
+        return [...$findings, ...$this->externalsDiffering($map, $shape, $limit - count($findings))];
+    }
+
+    /**
+     * @return array{string, string}
+     */
+    private static function comparable(ColumnCatalog $catalog, Column $column, string $read, string $stored): array
+    {
+        $json = match ($column->baseType ?? $column->type) {
+            'json' => 'jsonb',
+            'json[]' => 'jsonb[]',
+            default => null,
+        };
+
+        return match (true) {
+            $json !== null => ["CAST({$read} AS {$json})", "CAST({$stored} AS {$json})"],
+            $catalog->equatable($column->type) => [$read, $stored],
+            default => ["CAST({$read} AS text)", "CAST({$stored} AS text)"],
+        };
     }
 
     /**
      * @param  array<string, Column>  $shape
+     * @return list<DriftFinding>
+     */
+    private function externalsDiffering(ResolvedMap $map, array $shape, int $limit): array
+    {
+        $externals = array_values(array_filter($map->externals(), fn (string $name) => array_key_exists($name, $shape)));
+
+        if ($externals === [] || $limit < 1) {
+            return [];
+        }
+
+        $connection = (new $map->model)->getConnectionName();
+        $findings = [];
+
+        $this->walk($map, function (array $rows) use ($map, $externals, $connection, $limit, &$findings): bool {
+            $differs = [];
+
+            foreach ($externals as $name) {
+                $values = ExternalAttributes::values($map, $name, array_keys($rows), $connection, true);
+
+                foreach ($rows as $key => $row) {
+                    if (! ExternalAttributes::same($row[$name] ?? null, $values[$key] ?? null)) {
+                        $differs[$key][] = $name;
+                    }
+                }
+            }
+
+            foreach (array_keys($rows) as $key) {
+                if (array_key_exists($key, $differs) && count($findings) < $limit) {
+                    $findings[] = new DriftFinding($map->model, DriftCheck::ValuesDiffer, self::record($map->table, $key), "{$map->table} holds other values for ".implode(', ', $differs[$key]).' than '.(count($differs[$key]) === 1 ? 'its external() read returns' : 'their external() reads return'));
+                }
+            }
+
+            return count($findings) < $limit;
+        });
+
+        return $findings;
+    }
+
+    /**
+     * @return list<DriftFinding>
+     */
+    private function misplaced(ResolvedMap $map, int $limit): array
+    {
+        if ($map->branches === [] && $map->morphs === []) {
+            return [];
+        }
+
+        $key = self::key($map);
+        $type = (string) (new ColumnCatalog($this->connection))->type($map->table, $key);
+        $connection = (new $map->model)->getConnectionName();
+        $found = [];
+
+        $this->walk($map, function (array $rows) use ($map, $key, $type, $connection, $limit, &$found): bool {
+            $chosen = [];
+
+            foreach ($rows as $legacyKey => $row) {
+                $probe = (new $map->model)->setConnection($connection);
+                $probe->setRawAttributes($row, true);
+                $chosen[$map->morphs === [] ? $map->branchFor($probe)->primary->model : (string) $map->morphFor($probe)->target?->model][] = $legacyKey;
+            }
+
+            foreach ($chosen as $model => $keys) {
+                $variant = $map->branches[$model] ?? $map->morphs[$model];
+                $candidate = "CAST(chosen.key AS {$type})";
+                $target = $variant->target === null ? '' : ' AND EXISTS (SELECT FROM '.SqlFragments::identifier($variant->target->table).' WHERE '.implode(' AND ', ViewCompiler::conditions($variant->target, true)).')';
+                $rows = $this->connection->select(
+                    "SELECT {$candidate} AS key FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS chosen (key)"
+                        .' WHERE NOT EXISTS (SELECT FROM '.SqlFragments::identifier($variant->primary->table).' WHERE '.self::holding($variant, $key, $candidate).$target.')'
+                        .self::reaching($map, $key, $candidate),
+                    [json_encode($keys, JSON_THROW_ON_ERROR)],
+                    false,
+                );
+
+                foreach ($rows as $row) {
+                    $found[] = [self::keyOf($row->key ?? null), $variant];
+                }
+            }
+
+            return count($found) < $limit;
+        });
+
+        usort($found, fn (array $first, array $second) => $first[0] <=> $second[0]);
+
+        return array_map(
+            fn (array $misplaced) => new DriftFinding($map->model, DriftCheck::Misplaced, self::record($map->table, $misplaced[0]), self::misplacement($misplaced[1], $key)),
+            array_slice($found, 0, $limit),
+        );
+    }
+
+    private static function reaching(ResolvedMap $map, string $key, string $candidate): string
+    {
+        $morph = $map->morph;
+
+        if ($morph === null || $map->morphs === []) {
+            return '';
+        }
+
+        $primary = SqlFragments::identifier($map->primary->table);
+        $reached = array_map(fn (Related $target) => 'EXISTS (SELECT FROM '.SqlFragments::identifier($target->table).' WHERE '.implode(' AND ', ViewCompiler::conditions($target, true)).')', array_values($morph->targets));
+
+        return " AND EXISTS (SELECT FROM {$primary} WHERE ".self::holding($map, $key, $candidate).' AND ('.implode(' OR ', $reached).'))';
+    }
+
+    private static function misplacement(ResolvedMap $variant, string $key): string
+    {
+        $primary = $variant->primary->table;
+        $membership = $variant->membership;
+
+        return $variant->target === null
+            ? "its servedFrom() selector chooses {$primary}, and no {$primary} row".($membership === null ? '' : " whose {$membership->column} is '{$membership->alias}'")." holds its {$key}, so install() refuses it"
+            : "its relatedMorph() choose: closure picks {$variant->target->table}, and its {$primary} row points at no {$variant->target->table} row, so install() refuses it";
+    }
+
+    /**
+     * @param  Closure(array<int|string, array<string, mixed>>): bool  $chunk
+     */
+    private function walk(ResolvedMap $map, Closure $chunk): void
+    {
+        $legacy = SqlFragments::identifier($map->table);
+        $key = self::key($map);
+        $legacyKey = $legacy.'.'.SqlFragments::identifier($key);
+        [$pending, $bindings] = $this->pending($map, $legacy);
+        $last = null;
+
+        do {
+            $rows = [];
+
+            foreach ($this->connection->select(
+                "SELECT {$legacy}.* FROM {$legacy} WHERE ".self::held($map, $legacy).($pending === '' ? '' : " AND {$pending}").($last === null ? '' : " AND {$legacyKey} > ?")." ORDER BY {$legacyKey} LIMIT ".self::CHUNK,
+                [...$bindings, ...($last === null ? [] : [$last])],
+                false,
+            ) as $row) {
+                $row = (array) $row;
+                $rows[self::keyOf($row[$key] ?? null)] = $row;
+            }
+
+            $last = array_key_last($rows) ?? $last;
+        } while ($rows !== [] && $chunk($rows) && count($rows) === self::CHUNK);
+    }
+
+    /**
      * @return array{string, list<int|string>}
      */
-    private function pending(ResolvedMap $map, string $retained, string $legacyKey, array $shape): array
+    private function pending(ResolvedMap $map, string $table): array
     {
+        $shape = (new ColumnCatalog($this->connection))->of($map->table);
         $watermark = (new Backfiller($map, $this->connection))->remembered();
         $legacy = new $map->model;
         $updatedAt = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;
@@ -180,7 +362,7 @@ final readonly class DriftQueries
 
         $bound = SqlFragments::isNaive($shape[$updatedAt]->type) ? SqlFragments::inApplicationZone('CAST(? AS timestamptz)') : 'CAST(? AS timestamptz)';
 
-        return [" WHERE NOT ({$legacyKey} > ? OR COALESCE({$retained}.".SqlFragments::identifier($updatedAt)." >= {$bound}, false))", [$watermark['key'], $watermark['updatedAt']]];
+        return ["NOT ({$table}.".SqlFragments::identifier(self::key($map))." > ? OR COALESCE({$table}.".SqlFragments::identifier($updatedAt)." >= {$bound}, false))", [$watermark['key'], $watermark['updatedAt']]];
     }
 
     /**
@@ -204,7 +386,7 @@ final readonly class DriftQueries
         $membership = $map->membership;
 
         return array_values(array_map(
-            fn (object $row) => new DriftFinding($map->model, DriftFinding::RETAINED_WITHOUT_PRIMARY, self::record($retainedTable, $row->key ?? null), ($row->reclassified ?? null) === true && $membership !== null
+            fn (object $row) => new DriftFinding($map->model, DriftCheck::RetainedWithoutPrimary, self::record($retainedTable, $row->key ?? null), ($row->reclassified ?? null) === true && $membership !== null
                 ? "its {$membership->table} row no longer has {$membership->column} '{$membership->alias}', so the view serves none of its legacy-only values"
                 : 'no '.self::successors($map).' holds it, so the view serves none of its legacy-only values'),
             $this->connection->select("{$sql} ORDER BY {$retainedKey} LIMIT ?", [$limit], false),
@@ -235,7 +417,7 @@ final readonly class DriftQueries
         );
 
         return array_values(array_map(
-            fn (object $row) => new DriftFinding($map->model, DriftFinding::HELD_TWICE, self::record($map->table, $row->key ?? null), self::text($row->successors ?? null)." both hold its {$key}, so the view serves the record twice"),
+            fn (object $row) => new DriftFinding($map->model, DriftCheck::HeldTwice, self::record($map->table, $row->key ?? null), self::text($row->successors ?? null)." both hold its {$key}, so the view serves the record twice"),
             $rows,
         ));
     }
@@ -274,7 +456,7 @@ final readonly class DriftQueries
                 ? "its {$morph->typeColumn} ".($named === null ? 'is NULL, which names' : "'{$named}' names").' no target relatedMorph() declares'
                 : "its {$target->table} row ".($target->deletedAt === null ? 'does not exist' : 'does not exist or is deleted');
 
-            return new DriftFinding($map->model, DriftFinding::NO_MORPH_TARGET, self::record($map->table, $row->key ?? null), $detail);
+            return new DriftFinding($map->model, DriftCheck::NoMorphTarget, self::record($map->table, $row->key ?? null), $detail);
         }, $rows));
     }
 
@@ -295,7 +477,7 @@ final readonly class DriftQueries
             $count = $this->connection->scalar('SELECT count(*) FROM '.SqlFragments::identifier($membership->table).' WHERE '.SqlFragments::identifier($membership->column).' IS NULL', [], false);
 
             if (is_int($count) && $count > 0) {
-                $findings[] = new DriftFinding($map->model, DriftFinding::UNCLASSIFIED, $membership->table, "{$count} ".($count === 1 ? 'row has' : 'rows have')." no {$membership->column}, so no legacy model serves ".($count === 1 ? 'it' : 'them'));
+                $findings[] = new DriftFinding($map->model, DriftCheck::Unclassified, $membership->table, "{$count} ".($count === 1 ? 'row has' : 'rows have')." no {$membership->column}, so no legacy model serves ".($count === 1 ? 'it' : 'them'));
             }
         }
 
@@ -316,7 +498,7 @@ final readonly class DriftQueries
         foreach ((new $map->model)->newModelQuery()->lazyById(self::CHUNK) as $record) {
             foreach ($map->guards as $guard) {
                 if (count($findings) < $limit && $guard->refuses(clone $record, $record)) {
-                    $findings[] = new DriftFinding($map->model, DriftFinding::GUARD_REFUSES, self::record($map->table, $record->getKey()), "guard '{$guard->name}' refuses the record as it stands: {$guard->because}");
+                    $findings[] = new DriftFinding($map->model, DriftCheck::GuardRefuses, self::record($map->table, $record->getKey()), "guard '{$guard->name}' refuses the record as it stands: {$guard->because}");
                 }
             }
 
@@ -349,6 +531,26 @@ final readonly class DriftQueries
             .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table));
     }
 
+    private static function held(ResolvedMap $map, string $legacy): string
+    {
+        $key = self::key($map);
+
+        return '('.implode(' OR ', array_map(function (ResolvedMap $branch) use ($key, $legacy): string {
+            $primary = SqlFragments::identifier($branch->primary->table);
+            $matches = [];
+
+            foreach ($branch->identifiers as $name => $identifier) {
+                $matches[] = "{$primary}.".SqlFragments::identifier((string) $identifier->column()).($name === $key ? ' = ' : ' IS NOT DISTINCT FROM ')."{$legacy}.".SqlFragments::identifier($name);
+            }
+
+            if ($branch->membership !== null) {
+                $matches[] = $branch->membership->of($branch->primary->table);
+            }
+
+            return "EXISTS (SELECT FROM {$primary} WHERE ".implode(' AND ', $matches).')';
+        }, self::served($map))).')';
+    }
+
     private static function successors(ResolvedMap $map): string
     {
         $served = self::served($map);
@@ -361,6 +563,11 @@ final readonly class DriftQueries
     private static function record(string $table, mixed $key): string
     {
         return "{$table}#".(is_int($key) || is_string($key) ? (string) $key : 'NULL');
+    }
+
+    private static function keyOf(mixed $key): int|string
+    {
+        return is_int($key) || is_string($key) ? $key : throw new LogicException('A legacy row has no key to compare it by.');
     }
 
     private static function text(mixed $value): string

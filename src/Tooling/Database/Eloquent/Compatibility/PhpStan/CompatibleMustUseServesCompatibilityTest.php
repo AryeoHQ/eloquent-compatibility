@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tooling\Database\Eloquent\Compatibility\PhpStan;
 
+use PHPStan\Reflection\ReflectionProvider;
 use PHPStan\Rules\Rule;
 use PHPStan\Testing\RuleTestCase;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -18,7 +19,7 @@ class CompatibleMustUseServesCompatibilityTest extends RuleTestCase
 
     protected function getRule(): Rule
     {
-        return new CompatibleMustUseServesCompatibility;
+        return new CompatibleMustUseServesCompatibility(self::getContainer()->getByType(ReflectionProvider::class));
     }
 
     #[Test]
@@ -52,9 +53,14 @@ class CompatibleMustUseServesCompatibilityTest extends RuleTestCase
     }
 
     #[Test]
-    public function it_passes_when_class_is_anonymous(): void
+    public function it_fails_when_an_anonymous_model_implements_compatible_without_serves_compatibility(): void
     {
-        $this->analyse([$this->getFixturePath('Compatibility/AnonymousClasses.php')], []);
+        $this->analyse([$this->getFixturePath('Compatibility/AnonymousClasses.php')], [
+            [
+                'Compatible must use ServesCompatibility.',
+                20,
+            ],
+        ]);
     }
 
     #[Test]

@@ -8,7 +8,7 @@ use Illuminate\Console\Command;
 use Illuminate\Console\OutputStyle;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
-use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Throwable;
 
 final class CheckDrift extends Command
 {
@@ -16,7 +16,7 @@ final class CheckDrift extends Command
         {--model=* : Check only these legacy models, each by its class or by the class name of one served model}
         {--limit=100 : Report at most this many records per check and model}';
 
-    protected $description = 'Name each record where a served model and its successors drifted apart, reading only, and exit non-zero on any finding.';
+    protected $description = 'Name each record where a served model and its successors drifted apart, reading only, and exit non-zero on any finding that is not informational.';
 
     public function handle(ServedModels $served): int
     {
@@ -53,30 +53,47 @@ final class CheckDrift extends Command
             try {
                 $map = Compatibility::of($model)->resolve();
                 $findings = [...$findings, ...(new DriftQueries(Compatibility::connection($map)))->find($map, (int) $limit)];
-            } catch (InvalidCompatibilityMap $exception) {
-                $refusals[] = $exception->getMessage();
+            } catch (Throwable $exception) {
+                $refusals[] = "{$model}: {$exception->getMessage()}";
             }
         }
 
-        if ($findings !== []) {
-            $this->table(
-                ['Model', 'Check', 'Record', 'Detail'],
-                array_map(fn (DriftFinding $finding) => [$finding->model, $finding->check, $finding->record, $finding->detail], $findings),
-            );
-            $this->components->error(count($findings).' drift '.str('finding')->plural(count($findings)).' in '.count($models).' served '.str('model')->plural(count($models)).'.');
+        $failing = array_values(array_filter($findings, fn (DriftFinding $finding) => ! $finding->check->informational()));
+        $informational = array_values(array_filter($findings, fn (DriftFinding $finding) => $finding->check->informational()));
+        $checked = ' in '.count($models).' served '.str('model')->plural(count($models));
+
+        if ($failing !== []) {
+            $this->findings($failing);
+            $this->components->error(count($failing).' drift '.str('finding')->plural(count($failing)).$checked.'.');
+        }
+
+        if ($informational !== []) {
+            $this->findings($informational);
+            $this->components->info(count($informational).' informational '.str('finding')->plural(count($informational)).$checked.', which '.(count($informational) === 1 ? 'does' : 'do').' not fail the check.');
         }
 
         foreach ($refusals as $refusal) {
             $this->output->getErrorStyle()->writeln($refusal, OutputStyle::OUTPUT_RAW);
         }
 
-        if ($findings !== [] || $refusals !== []) {
+        if ($failing !== [] || $refusals !== []) {
             return self::FAILURE;
         }
 
-        $this->components->info('No drift in '.count($models).' served '.str('model')->plural(count($models)).'.');
+        $this->components->info('No drift'.$checked.'.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * @param  list<DriftFinding>  $findings
+     */
+    private function findings(array $findings): void
+    {
+        $this->table(
+            ['Model', 'Check', 'Record', 'Detail'],
+            array_map(fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail], $findings),
+        );
     }
 
     private function refuse(string $message): int

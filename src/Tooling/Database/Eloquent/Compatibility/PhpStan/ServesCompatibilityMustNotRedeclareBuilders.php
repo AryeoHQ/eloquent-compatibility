@@ -7,7 +7,8 @@ namespace Tooling\Database\Eloquent\Compatibility\PhpStan;
 use PhpParser\Node;
 use PhpParser\Node\Stmt\Class_;
 use PHPStan\Analyser\Scope;
-use PHPStan\Type\ObjectType;
+use PHPStan\Reflection\ClassReflection;
+use PHPStan\Reflection\ReflectionProvider;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tooling\PhpStan\Rules\Rule;
 use Tooling\Rules\Attributes\NodeType;
@@ -25,14 +26,20 @@ final class ServesCompatibilityMustNotRedeclareBuilders extends Rule
         'getAttributesForInsert',
     ];
 
+    private readonly ReflectionProvider $reflectionProvider;
+
+    public function __construct(ReflectionProvider $reflectionProvider)
+    {
+        $this->reflectionProvider = $reflectionProvider;
+    }
+
     /**
      * @param  Class_  $node
      */
     public function shouldHandle(Node $node, Scope $scope): bool
     {
-        return ! $node->isAnonymous()
-            && $this->inherits($node, ServesCompatibility::class)
-            && $this->redeclared($node) !== [];
+        return $this->inherits($this->subject($node, $scope), ServesCompatibility::class)
+            && $this->redeclared($node, $scope) !== [];
     }
 
     /**
@@ -40,7 +47,7 @@ final class ServesCompatibilityMustNotRedeclareBuilders extends Rule
      */
     public function handle(Node $node, Scope $scope): void
     {
-        foreach ($this->redeclared($node) as $method) {
+        foreach ($this->redeclared($node, $scope) as $method) {
             $this->error(
                 message: "ServesCompatibility must not redeclare {$method}().",
                 line: $node->name?->getStartLine() ?? $node->getStartLine(),
@@ -52,16 +59,21 @@ final class ServesCompatibilityMustNotRedeclareBuilders extends Rule
     /**
      * @return list<string>
      */
-    private function redeclared(Class_ $node): array
+    private function redeclared(Class_ $node, Scope $scope): array
     {
-        $className = $node->namespacedName?->toString();
-        $class = $className === null ? null : (new ObjectType($className))->getClassReflection();
-        $trait = (new ObjectType(ServesCompatibility::class))->getClassReflection();
+        $subject = $this->subject($node, $scope);
+        $className = $subject instanceof ClassReflection ? null : $subject->namespacedName?->toString();
+        $class = match (true) {
+            $subject instanceof ClassReflection => $subject,
+            $className !== null && $this->reflectionProvider->hasClass($className) => $this->reflectionProvider->getClass($className),
+            default => null,
+        };
 
-        if ($class === null || $trait === null) {
+        if ($class === null || ! $this->reflectionProvider->hasClass(ServesCompatibility::class)) {
             return [];
         }
 
+        $trait = $this->reflectionProvider->getClass(ServesCompatibility::class);
         $found = [];
 
         foreach (self::METHODS as $method) {
@@ -74,5 +86,10 @@ final class ServesCompatibilityMustNotRedeclareBuilders extends Rule
         }
 
         return $found;
+    }
+
+    private function subject(Class_ $node, Scope $scope): Class_|ClassReflection
+    {
+        return $node->isAnonymous() ? $this->reflectionProvider->getAnonymousClassReflection($node, $scope) : $node;
     }
 }
