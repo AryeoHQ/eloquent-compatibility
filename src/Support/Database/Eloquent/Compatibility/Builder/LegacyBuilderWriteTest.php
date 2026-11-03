@@ -173,13 +173,14 @@ final class LegacyBuilderWriteTest extends TestCase
         $listing->fill(['title' => 'Oak Manor', 'street' => '2 Oak St', 'mls_number' => 'MLS-1B']);
         $statements = [];
         DB::listen(function (QueryExecuted $query) use (&$statements): void {
-            $statements[] = [$query->connection->transactionLevel(), self::statement($query->sql)];
+            $statements[] = [$query->connection->transactionLevel(), strtok(self::statement($query->sql), "\n")];
         });
 
         $listing->save();
 
         $this->assertSame([
             [0, "select cast(oid as bigint) from pg_class where oid = to_regclass(?) and relkind = 'v'"],
+            [0, "select array_to_string(current_schemas(true), ',') as path,"],
             [1, "select set_config('TimeZone', ?, true)"],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],

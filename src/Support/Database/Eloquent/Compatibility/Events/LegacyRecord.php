@@ -46,6 +46,9 @@ final class LegacyRecord
     /** @var array<array-key, bool> */
     private array $serves = [];
 
+    /** @var array<array-key, bool> */
+    private array $participates = [];
+
     private bool $expressed = false;
 
     private bool $inserts = false;
@@ -147,12 +150,10 @@ final class LegacyRecord
             $this->admit($successor);
         }
 
+        $this->records = array_intersect_key($this->admitted, $rows);
+
         foreach (array_keys($this->records) as $key) {
-            if (array_key_exists($key, $rows)) {
-                $this->apply($key, $rows[$key]);
-            } else {
-                unset($this->records[$key], $this->before[$key]);
-            }
+            $this->apply($key, $rows[$key]);
         }
     }
 
@@ -161,13 +162,15 @@ final class LegacyRecord
      */
     public function changed(): array
     {
-        if ($this->expressed) {
-            return $this->records;
-        }
-
         $changed = [];
 
         foreach ($this->records as $key => $legacy) {
+            if ($this->expressed && ($this->participates[$key] ?? false)) {
+                $changed[$key] = $legacy;
+
+                continue;
+            }
+
             foreach (array_keys($this->columns) as $name) {
                 if (($this->before[$key][$name] ?? null) !== ($legacy->getAttributes()[$name] ?? null)) {
                     $changed[$key] = $legacy;
@@ -382,6 +385,7 @@ final class LegacyRecord
 
         foreach (array_keys($rows) as $legacyKey) {
             $this->serves[$legacyKey] = ($owners[$legacyKey][self::WRITTEN] ?? null) === true;
+            $this->participates[$legacyKey] = $this->serves[$legacyKey] || ($rows[$legacyKey][self::WRITTEN] ?? null) === true;
             unset($rows[$legacyKey][self::WRITTEN]);
         }
 
@@ -422,11 +426,25 @@ final class LegacyRecord
 
         return $connection->select(
             'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(', ', $select).' FROM '.ViewCompiler::primary($this->served)
+                .$this->retained()
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
             [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
             false,
         );
+    }
+
+    private function retained(): string
+    {
+        $retained = $this->served->retainedTable;
+
+        if ($retained === null || $this->served->retainedKey === null) {
+            return '';
+        }
+
+        $by = $this->served->branch ? (string) $this->served->identifiers[$this->legacyKey()]->column() : $this->served->primary->key;
+
+        return ' LEFT JOIN '.SqlFragments::identifier($retained).' ON '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($this->served->retainedKey).' = '.SqlFragments::identifier($this->served->primary->table).'.'.SqlFragments::identifier($by);
     }
 
     /**

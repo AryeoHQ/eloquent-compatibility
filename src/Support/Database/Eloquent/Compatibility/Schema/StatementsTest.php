@@ -243,6 +243,8 @@ final class StatementsTest extends TestCase
             BEGIN
               IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '."listings_updated_at_index"') AND NOT indisvalid) THEN
                 DROP INDEX "listings_updated_at_index";
+              ELSIF to_regclass(quote_ident(current_schema()) || '."listings_updated_at_index"') IS NOT NULL THEN
+                RAISE EXCEPTION '%', 'Compatibility map ''listings'' cannot prepare: listings_updated_at_index already exists and is not a valid B-tree index on listings that leads with updated_at over every row, so the catch-up before install would scan listings. Rename or drop listings_updated_at_index, then prepare again.';
               END IF;
             END
             $compatibility$

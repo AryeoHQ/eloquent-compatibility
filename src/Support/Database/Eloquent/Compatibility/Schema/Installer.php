@@ -190,9 +190,10 @@ final readonly class Installer
     private function compile(Closure $compile, bool $outside): Statements
     {
         $statements = $compile();
+        $afterwards = [...$statements->afterwards, ...$statements->exclusive];
 
-        if ($statements->afterwards !== [] && ! $outside) {
-            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($statements->afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
+        if ($afterwards !== [] && ! $outside) {
+            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
         }
 
         return $statements;
@@ -213,6 +214,14 @@ final readonly class Installer
     {
         foreach ($statements->afterwards as $statement) {
             $this->connection->unprepared($statement);
+        }
+
+        if ($statements->exclusive !== []) {
+            $this->locked(function () use ($statements): void {
+                foreach ($statements->exclusive as $statement) {
+                    $this->connection->unprepared($statement);
+                }
+            });
         }
     }
 }

@@ -78,6 +78,27 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_the_retained_primary_key_install_adds_after_commit_in_a_transaction_of_its_own(): void
+    {
+        DB::statement('alter table listings add column job_id uuid');
+        DB::statement("comment on column listings.job_id is 'compatibility retained key'");
+        DB::statement('update listings set job_id = jobs.id from jobs where jobs.legacy_id = listings.id');
+        DB::statement('create unique index listings_retained_pkey on listings (job_id)');
+
+        Artisan::call('compatibility:sql', ['model' => Listing::class]);
+        $printed = Artisan::output();
+
+        $this->assertStringEndsWith(
+            "\n-- Then in one transaction of their own\n\nBEGIN;\n\n"
+            ."ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_pkey\" PRIMARY KEY USING INDEX \"listings_retained_pkey\"\n;\n\n"
+            ."ALTER TABLE \"listings_retained\" DROP CONSTRAINT \"listings_retained_job_id_not_null\"\n;\n\nCOMMIT;\n",
+            $printed,
+        );
+        $this->assertStringContainsString("ALTER TABLE \"listings_retained\" VALIDATE CONSTRAINT \"listings_retained_job_id_not_null\"\n;", $printed);
+        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
+    }
+
+    #[Test]
     public function it_prints_a_statement_list_without_an_afterwards_section_when_nothing_runs_after_the_transaction(): void
     {
         Compatibility::install(Listing::class);

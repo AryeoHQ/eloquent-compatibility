@@ -142,11 +142,15 @@ final readonly class Preparer
         }
 
         $index = SqlFragments::objectName($map->table, $map->table.'_'.$column.'_index');
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).')';
+        $refusal = InvalidCompatibilityMap::cannot($map->table, 'prepare', "{$index} already exists and is not a valid B-tree index on {$map->table} that leads with {$column} over every row, so the catch-up before install would scan {$map->table}. Rename or drop {$index}, then prepare again");
 
         return [
             "DO \$compatibility\$\nBEGIN\n"
-                .'  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).") AND NOT indisvalid) THEN\n"
+                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = {$relation} AND NOT indisvalid) THEN\n"
                 .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
+                ."  ELSIF {$relation} IS NOT NULL THEN\n"
+                ."    RAISE EXCEPTION '%', ".SqlFragments::literal($refusal->getMessage()).";\n"
                 ."  END IF;\nEND\n\$compatibility\$",
             'CREATE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($map->table).' ('.SqlFragments::identifier($column).')',
         ];

@@ -2234,18 +2234,77 @@ final class InstallerTest extends TestCase
 
         $connection->beforeExecuting(function (string $query) use (&$proven, $connection): void {
             if ($proven === null && str_contains($query, 'PRIMARY KEY USING INDEX')) {
-                $proven = [$connection->transactionLevel(), $connection->scalar("select count(*) from pg_constraint where conrelid = to_regclass('listings_retained') and contype = 'c' and convalidated and pg_get_constraintdef(oid) = 'CHECK ((job_id IS NOT NULL))'")];
+                $proven = [$this->writer()->scalar("select relkind::text from pg_class where oid = to_regclass('listings')"), $connection->scalar("select count(*) from pg_constraint where conrelid = to_regclass('listings_retained') and contype = 'c' and convalidated and pg_get_constraintdef(oid) = 'CHECK ((job_id IS NOT NULL))'")];
             }
         });
 
         Compatibility::install(Listing::class);
 
-        $this->assertSame([0, 1], $proven);
+        $this->assertSame(['v', 1], $proven);
         $this->assertSame(
             ['listings_retained_job_id_foreign' => 'FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE', 'listings_retained_pkey' => 'PRIMARY KEY (job_id)'],
-            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass order by conname"), 'definition', 'conname'),
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass and contype <> 'n' order by conname"), 'definition', 'conname'),
         );
         $this->assertSame([true, 3], [DB::scalar("select attnotnull from pg_attribute where attrelid = 'listings_retained'::regclass and attname = 'job_id'"), DB::scalar('select count(*) from listings')]);
+    }
+
+    #[Test]
+    public function it_retries_the_retained_primary_key_it_adds_after_commit_once_its_lock_wait_times_out_behind_a_read_through_the_view(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $attempts = [];
+        $holding = null;
+        $connection = DB::connection();
+
+        $connection->beforeExecuting(function (string $query) use (&$attempts, &$holding, $connection): void {
+            if (str_contains($query, 'PRIMARY KEY USING INDEX')) {
+                $attempts[] = $connection->scalar("select current_setting('lock_timeout')");
+                $holding ??= $this->holdConcurrently('select count(*) from listings', 6);
+            }
+        });
+        $started = microtime(true);
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame(["locked\n", [Installer::LOCK_TIMEOUT, Installer::LOCK_TIMEOUT]], [$holding, $attempts]);
+        $this->assertGreaterThanOrEqual(5.0, microtime(true) - $started);
+        $this->assertSame('', $this->concurrentFailure());
+        $this->assertSame(
+            ['listings_retained_job_id_foreign' => 'FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE', 'listings_retained_pkey' => 'PRIMARY KEY (job_id)'],
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass and contype <> 'n' order by conname"), 'definition', 'conname'),
+        );
+        $this->assertSame(['v', 3], [$this->kind('listings'), DB::scalar('select count(*) from listings')]);
+    }
+
+    #[Test]
+    public function it_refuses_to_retain_a_key_column_another_migration_adds_after_the_check_and_leaves_its_values(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $added = null;
+        $writer = $this->writer();
+
+        DB::connection()->beforeExecuting(function (string $query) use (&$added, $writer): void {
+            if ($added === null && str_starts_with($query, 'SET LOCAL lock_timeout')) {
+                $writer->statement('alter table listings add column job_id uuid');
+                $writer->update('update listings set job_id = gen_random_uuid()');
+                $added = $writer->table('listings')->orderBy('id')->pluck('job_id')->all();
+            }
+        });
+
+        try {
+            Compatibility::install(Listing::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' is declared wrongly: listings already has a column job_id, which install() adds as the key of the retained table.", $refusal);
+        $this->assertCount(3, (array) $added);
+        $this->assertSame(['r', null, $added], [
+            $this->kind('listings'),
+            DB::scalar("select col_description('listings'::regclass, attnum) from pg_attribute where attrelid = 'listings'::regclass and attname = 'job_id'"),
+            DB::table('listings')->orderBy('id')->pluck('job_id')->all(),
+        ]);
     }
 
     #[Test]

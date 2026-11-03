@@ -90,6 +90,9 @@ final class Forwarder
     /** @var null|array<string, class-string> */
     private null|array $objects = null;
 
+    /** @var null|WeakMap<object, true> */
+    private static null|WeakMap $emitted = null;
+
     private function __construct(private readonly ResolvedMap $map, private readonly ResolvedMap $served, private readonly null|Related $dependent)
     {
         $this->sequences = new WeakMap;
@@ -111,7 +114,7 @@ final class Forwarder
                 }
 
                 foreach (self::objects($successor, $forwarded) as $object) {
-                    self::prepend($events, $object, fn (object $fired): null|false => ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
+                    self::prepend($events, $object, fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
                 }
             }
         }
@@ -349,7 +352,7 @@ final class Forwarder
     {
         $record = $sequence->record;
 
-        if ($record === null) {
+        if ($record === null || ($this->dependent === null && $ahead && ! $record->removes && ! $this->member($successor, false))) {
             return null;
         }
 
@@ -398,9 +401,11 @@ final class Forwarder
                 }
             }
 
-            if (in_array('saved', $legacyEvents, true)) {
-                foreach (array_intersect_key($legacies, $record->records()) as $legacy) {
+            foreach (array_intersect_key($legacies, $record->records()) as $legacy) {
+                if (in_array('saved', $legacyEvents, true)) {
                     $legacy->syncOriginal();
+                } elseif ($sequence->start === 'updating' && in_array('updated', $legacyEvents, true)) {
+                    $legacy->syncOriginalAttributes(array_keys($legacy->getChanges()));
                 }
             }
         }
@@ -441,14 +446,15 @@ final class Forwarder
     {
         $listened = array_filter($this->dependent === null ? self::FOLLOWING[$event] : ['saving', 'updating', 'updated', 'saved'], $this->listens(...)) !== [];
 
-        return $listened && $this->member($successor) ? $this->read($successor, in_array($event, ['deleting', 'forceDeleting'], true)) : null;
+        return $listened && $this->member($successor, true) ? $this->read($successor, in_array($event, ['deleting', 'forceDeleting'], true)) : null;
     }
 
     private function read(Model $successor, bool $removes): null|LegacyRecord
     {
-        $view = ServedTable::view($successor->getConnection(), $this->map->table);
+        $relation = ServedTable::relation($successor->getConnection(), $this->map->table, ServedTable::successorsOf($this->served), writing: true);
+        $view = $relation['oid'];
 
-        if ($view === null) {
+        if ($view === 0 || $relation['unbound'] !== []) {
             return null;
         }
 
@@ -474,7 +480,7 @@ final class Forwarder
         return ($removes || $successor->exists) && $record->records() === [] ? null : $record;
     }
 
-    private function member(Model $successor): bool
+    private function member(Model $successor, bool $stored): bool
     {
         $membership = $this->served->membership;
 
@@ -483,17 +489,22 @@ final class Forwarder
         }
 
         $column = $membership->column;
-        $original = $successor->getRawOriginal();
-        $stored = array_key_exists($column, $original) && ! $original[$column] instanceof Expression || ! $successor->exists
-            ? $original[$column] ?? null
-            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
         $value = $successor->getAttributes()[$column];
 
-        if ($value instanceof Expression) {
-            $value = $successor->exists && ! $successor->isDirty($column) ? $stored : LegacyRecord::evaluate($successor, $column, $value)[0];
+        if ($stored || ($value instanceof Expression && $successor->exists && ! $successor->isDirty($column))) {
+            return ! $successor->exists || self::stored($successor, $column) === $membership->alias;
         }
 
-        return $value === $membership->alias && (! $successor->exists || $stored === $membership->alias);
+        return ($value instanceof Expression ? LegacyRecord::evaluate($successor, $column, $value)[0] : $value) === $membership->alias;
+    }
+
+    private static function stored(Model $successor, string $column): mixed
+    {
+        $original = $successor->getRawOriginal();
+
+        return array_key_exists($column, $original) && ! $original[$column] instanceof Expression
+            ? $original[$column]
+            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
     }
 
     /**
@@ -566,7 +577,10 @@ final class Forwarder
         $object = $legacy->dispatchesEvents()[$event] ?? null;
 
         if (is_string($object) && class_exists($object)) {
-            $result = $this->send($dispatcher, new $object($legacy), [], $halt);
+            $emitted = new $object($legacy);
+            self::$emitted ??= new WeakMap;
+            self::$emitted[$emitted] = true;
+            $result = $this->send($dispatcher, $emitted, [], $halt);
             $result = is_array($result) ? array_filter($result, fn (mixed $response) => $response !== null) : $result;
 
             if (! in_array($result, [null, 0, 0.0, '', '0', []], true)) {

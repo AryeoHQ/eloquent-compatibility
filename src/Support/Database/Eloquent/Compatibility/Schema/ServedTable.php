@@ -9,6 +9,9 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\QueryException;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use WeakMap;
 
 final class ServedTable
@@ -29,7 +32,7 @@ final class ServedTable
     /** @var null|WeakMap<Connection, array<string, false|int>> */
     private static null|WeakMap $views = null;
 
-    /** @var null|WeakMap<Connection, array<string, array{path: string, view: bool, readable: bool}>> */
+    /** @var null|WeakMap<Connection, array<string, array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}>> */
     private static null|WeakMap $relations = null;
 
     public static function forget(): void
@@ -53,27 +56,53 @@ final class ServedTable
     }
 
     /**
+     * @return list<string>
+     */
+    public static function successorsOf(ResolvedMap $map): array
+    {
+        if ($map->branches !== []) {
+            return array_values(array_unique(array_merge(...array_map(self::successorsOf(...), array_values($map->branches)))));
+        }
+
+        return [$map->primary->table, ...array_map(fn (Related $related) => $related->table, array_values($map->related))];
+    }
+
+    /**
      * @param  list<string>  $successors
-     * @return array{path: string, view: bool, readable: bool}
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
     public static function reading(Model $model, array $successors): array
     {
-        $connection = $model->getConnection();
-        $table = $model->getTable();
-        $key = implode(' ', [$table, ...$successors]);
+        return self::relation($model->getConnection(), $model->getTable(), $successors);
+    }
+
+    /**
+     * @param  list<string>  $successors
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
+     */
+    public static function relation(Connection $connection, string $table, array $successors, bool $writing = false): array
+    {
+        $key = implode(' ', [$writing ? 'writing' : 'reading', $table, ...$successors]);
         $relations = self::answering($connection) ? self::$relations[$connection] ?? [] : [];
 
         if (array_key_exists($key, $relations)) {
             return $relations[$key];
         }
 
+        $successorTables = 'jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table';
         $row = (array) $connection->selectOne(
             "select array_to_string(current_schemas(true), ',') as path,
-                    coalesce((select relkind = 'v' from pg_class where oid = to_regclass(?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table) and successor_table in (select dependency.refobjid from pg_rewrite rewrite join pg_depend dependency on dependency.classid = 'pg_rewrite'::regclass and dependency.objid = rewrite.oid and dependency.refclassid = 'pg_class'::regclass where rewrite.ev_class = to_regclass(?)), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table), false) as readable",
-            [SqlFragments::identifier($table), SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
+                    (select cast(oid as bigint) from pg_class where oid = legacy.oid and relkind = 'v') as view,
+                    (select cast(coalesce(json_agg(successor order by successor), '[]') as text) from {$successorTables} where not coalesce(successor_table = any(legacy.reads), false) and exists (select from pg_class read where read.oid = any(legacy.reads) and read.relname = successor)) as unbound,
+                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table) and successor_table = any(legacy.reads), false)) from {$successorTables}), false) as readable
+             from (select to_regclass(?) as oid) as relation
+             cross join lateral (select relation.oid, array(select dependency.refobjid from pg_rewrite rewrite join pg_depend dependency on dependency.classid = 'pg_rewrite'::regclass and dependency.objid = rewrite.oid and dependency.refclassid = 'pg_class'::regclass where rewrite.ev_class = relation.oid) as reads) as legacy",
+            [json_encode($successors, JSON_THROW_ON_ERROR), json_encode($successors, JSON_THROW_ON_ERROR), SqlFragments::identifier($table)],
+            ! $writing,
         );
-        $relations[$key] = ['path' => (string) ($row['path'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
+        $oid = is_int($row['view'] ?? null) ? $row['view'] : 0;
+        $unbound = array_values(array_filter((array) json_decode(is_string($row['unbound'] ?? null) ? $row['unbound'] : '[]', true, flags: JSON_THROW_ON_ERROR), is_string(...)));
+        $relations[$key] = ['path' => (string) ($row['path'] ?? ''), 'view' => $oid !== 0, 'oid' => $oid, 'unbound' => $unbound, 'readable' => $oid !== 0 && ($row['readable'] ?? null) === true];
 
         if (self::answer($connection)) {
             $answers = self::$relations ??= new WeakMap;
@@ -86,11 +115,12 @@ final class ServedTable
     /**
      * @template TResult
      *
+     * @param  list<string>  $successors
      * @param  Closure(): TResult  $native
      * @param  Closure(): TResult  $translated
      * @return TResult
      */
-    public static function write(Model $model, Closure $native, Closure $translated): mixed
+    public static function write(Model $model, array $successors, Closure $native, Closure $translated): mixed
     {
         $connection = $model->getConnection();
         $table = $model->getTable();
@@ -98,7 +128,7 @@ final class ServedTable
         $known = ! $nested && array_key_exists($table, self::$tables[$connection] ?? []);
 
         if (! $known && self::ask($connection, $table) !== null) {
-            return $translated();
+            return self::bound($model, $successors, $translated);
         }
 
         try {
@@ -107,6 +137,28 @@ final class ServedTable
             if (! in_array($exception->errorInfo[0] ?? null, self::VIEW_WRITE_STATES, true) || self::ask($connection, $table) === null) {
                 throw $exception;
             }
+        }
+
+        return self::bound($model, $successors, $translated);
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  list<string>  $successors
+     * @param  Closure(): TResult  $translated
+     * @return TResult
+     */
+    private static function bound(Model $model, array $successors, Closure $translated): mixed
+    {
+        $unbound = self::relation($model->getConnection(), $model->getTable(), $successors, writing: true)['unbound'];
+
+        if ($unbound !== []) {
+            throw new CompatibilityWriteRefused(
+                $model::class." records cannot be written through the view {$model->getTable()}",
+                'The search path resolves '.implode(' and ', $unbound).(count($unbound) === 1 ? ' to another table' : ' to other tables')." than the view reads, so the write would change rows that {$model->getTable()} does not serve.",
+                'Set a search path that resolves each successor to the table the view reads.',
+            );
         }
 
         return $translated();

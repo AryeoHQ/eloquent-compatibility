@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -13,8 +14,10 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\Query\Processors\Processor;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
+use Illuminate\Support\LazyCollection;
 use InvalidArgumentException;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
@@ -24,6 +27,8 @@ use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 final class LegacyQueryBuilder extends QueryBuilder
 {
     private bool $native = false;
+
+    private null|int $translatedFor = null;
 
     public function __construct(ConnectionInterface $connection, null|Grammar $grammar = null, null|Processor $processor = null, private readonly null|Model $legacy = null)
     {
@@ -47,6 +52,21 @@ final class LegacyQueryBuilder extends QueryBuilder
         }
     }
 
+    public function translatedFor(int $view): void
+    {
+        $this->translatedFor = $view;
+    }
+
+    /**
+     * @return LazyCollection<int, \stdClass>
+     */
+    public function cursor()
+    {
+        $this->refuseStale();
+
+        return parent::cursor();
+    }
+
     public function toSql(): string
     {
         $this->applyBeforeQueryCallbacks();
@@ -59,6 +79,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $this->applyBeforeQueryCallbacks();
         $this->refuseExternal();
+        $this->refuseStale();
 
         return parent::exists();
     }
@@ -241,6 +262,16 @@ final class LegacyQueryBuilder extends QueryBuilder
     }
 
     /**
+     * @return array<int, mixed>
+     */
+    protected function runSelect()
+    {
+        $this->refuseStale();
+
+        return parent::runSelect();
+    }
+
+    /**
      * @param  array<array-key, mixed>  $values
      * @return list<array<string, mixed>>
      */
@@ -299,6 +330,23 @@ final class LegacyQueryBuilder extends QueryBuilder
         return $keys->select($this->alias($legacy).'.'.$legacy->getKeyName());
     }
 
+    private function refuseStale(): void
+    {
+        $legacy = $this->legacy;
+
+        if ($legacy !== null && $this->translatedFor !== null && LegacyBuilder::relationOf($legacy)['oid'] !== $this->translatedFor) {
+            throw new CompatibilityQueryRefused($legacy::class." cannot run a query whose filters it translated for the view {$legacy->getTable()}. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$legacy->getTable()} no longer serves. Instead: build the query again.");
+        }
+
+        foreach ($this->wheres as $where) {
+            $query = is_array($where) ? $where['query'] ?? null : null;
+
+            if ($query instanceof self) {
+                $query->refuseStale();
+            }
+        }
+    }
+
     private function refuseExternal(): void
     {
         $legacy = $this->legacy;
@@ -322,17 +370,38 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     private function reading(string $table, string $legacyTable, array $externals): null|array
     {
-        foreach ([...self::clauses($this), ...self::subqueries($this->wheres, [$table => true], $legacyTable)] as [$operation, $columns]) {
+        foreach (self::clauses($this) as [$operation, $columns]) {
             foreach ($columns as $column) {
                 $attribute = is_string($column) ? self::attributeOf($table, $column) : null;
 
-                if ($attribute !== null && in_array($attribute, $externals, true)) {
+                if ($attribute !== null && in_array($attribute, $externals, true) && ! (self::qualifierOf((string) $column) === null && self::joinExposes($this, $attribute))) {
                     return [$attribute, $operation];
                 }
             }
         }
 
+        foreach (self::subqueries($this->wheres, [$table => true], $legacyTable, $externals) as [$operation, $attributes]) {
+            if ($attributes !== []) {
+                return [$attributes[0], $operation];
+            }
+        }
+
         return null;
+    }
+
+    public static function joinExposes(QueryBuilder $query, string $column): bool
+    {
+        $connection = $query->getConnection();
+
+        foreach ($query->joins ?? [] as $join) {
+            $segments = $join instanceof JoinClause && is_string($join->table) ? preg_split('/\s+as\s+/i', trim($join->table)) : false;
+
+            if (! is_array($segments) || count($segments) > 2 || ! $connection instanceof Connection || $connection->getSchemaBuilder()->hasColumn($segments[0], $column)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -355,9 +424,10 @@ final class LegacyQueryBuilder extends QueryBuilder
     /**
      * @param  array<array-key, mixed>  $wheres
      * @param  array<string, bool>  $scope
+     * @param  list<string>  $externals
      * @return list<array{string, list<string>}>
      */
-    private static function subqueries(array $wheres, array $scope, string $legacyTable): array
+    private static function subqueries(array $wheres, array $scope, string $legacyTable, array $externals): array
     {
         $clauses = [];
 
@@ -377,13 +447,13 @@ final class LegacyQueryBuilder extends QueryBuilder
             };
 
             if ($operation === null) {
-                $clauses = [...$clauses, ...self::subqueries($query->wheres, $scope, $legacyTable)];
+                $clauses = [...$clauses, ...self::subqueries($query->wheres, $scope, $legacyTable, $externals)];
             } elseif ($operation !== false) {
                 if ($query instanceof self) {
                     $query->refuseExternal();
                 }
 
-                $clauses[] = [$operation, self::outerReads($query, $scope, $legacyTable)];
+                $clauses[] = [$operation, self::outerReads($query, $scope, $legacyTable, $externals)];
             }
         }
 
@@ -392,9 +462,10 @@ final class LegacyQueryBuilder extends QueryBuilder
 
     /**
      * @param  array<string, bool>  $scope
+     * @param  list<string>  $externals
      * @return list<string>
      */
-    private static function outerReads(QueryBuilder $query, array $scope, string $legacyTable): array
+    private static function outerReads(QueryBuilder $query, array $scope, string $legacyTable, array $externals): array
     {
         $reads = false;
 
@@ -414,13 +485,13 @@ final class LegacyQueryBuilder extends QueryBuilder
                 $qualifier = is_string($column) ? self::qualifierOf($column) : null;
                 $attribute = is_string($column) && ($qualifier === null ? $reads : ($scope[$qualifier] ?? false)) ? self::attributeOf((string) $qualifier, $column) : null;
 
-                if ($attribute !== null) {
+                if ($attribute !== null && in_array($attribute, $externals, true) && ! ($qualifier === null && self::joinExposes($query, $attribute))) {
                     $names[] = $attribute;
                 }
             }
         }
 
-        foreach (self::subqueries($query->wheres, $scope, $legacyTable) as [, $nested]) {
+        foreach (self::subqueries($query->wheres, $scope, $legacyTable, $externals) as [, $nested]) {
             $names = [...$names, ...$nested];
         }
 
@@ -529,12 +600,13 @@ final class LegacyQueryBuilder extends QueryBuilder
     private function route(Closure $native, Closure $translated): mixed
     {
         $legacy = $this->legacy;
+        $this->refuseStale();
 
         if ($legacy === null || $this->native || $this->alias($legacy) === null) {
             return $native();
         }
 
-        return ServedTable::write($legacy, $native, fn (): mixed => $translated($legacy));
+        return ServedTable::write($legacy, ServedTable::successorsOf(LegacyBuilder::mapOf($legacy::class)), $native, fn (): mixed => $translated($legacy));
     }
 
     private function alias(Model $legacy): null|string
