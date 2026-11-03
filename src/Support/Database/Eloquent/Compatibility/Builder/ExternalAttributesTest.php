@@ -514,6 +514,47 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_runs_an_unqualified_name_that_a_joined_table_exposes_and_refuses_one_that_only_the_legacy_table_could_mean(): void
+    {
+        $results = [];
+
+        foreach ([
+            fn () => Photo::query()->toBase()->join('files', 'files.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('photos.id')->pluck('photos.id')->all(),
+            fn () => Photo::query()->toBase()->join('files as f', 'f.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('mime_type')->orderBy('photos.id')->pluck('photos.id')->all(),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join('files', 'files.legacy_id', '=', 'q.id')->whereColumn('q.id', 'photos.id')->where('mime_type', 'image/png'))->orderBy('id')->pluck('id')->all(),
+            fn () => Photo::query()->join('files', 'files.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('photos.id')->pluck('photos.id')->all(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->join('files', 'files.legacy_id', '=', 'photos.id')->where('photos.mime_type', 'image/png')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join('links', 'links.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join('photos as p', 'p.id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join('links', 'links.legacy_id', '=', 'q.id')->whereColumn('q.id', 'photos.id')->where('mime_type', 'image/png'))->get(),
+            fn () => Photo::query()->join('links', 'links.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']), // @phpstan-ignore staticMethod.dynamicCall
+        ] as $query) {
+            try {
+                $results[] = $query();
+            } catch (CompatibilityQueryRefused $refusal) {
+                $results[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $results[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = fn (string $operation) => Photo::class.'::$mime_type cannot take '.$operation.'. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            [2, 3],
+            [2, 3],
+            [2, 3],
+            [2, 3],
+            $refusal('where'),
+            $refusal('where'),
+            $refusal('where'),
+            $refusal('whereExists'),
+            $refusal('where ='),
+        ], $results);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
     public function it_reads_the_legacy_column_and_calls_nothing_before_install(): void
     {
         FileTables::create();

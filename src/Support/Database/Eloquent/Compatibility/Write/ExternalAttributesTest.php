@@ -658,6 +658,56 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_checks_the_branch_of_a_new_record_with_the_external_value_its_successor_now_holds(): void
+    {
+        $chosen = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('mime_type') === null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+
+        $upload = $chosen::query()->create(['original_file_name' => 'garden.mp4', 'mime_type' => 'video/mp4', 'title' => 'Garden']);
+        $link = $chosen::query()->create(['youtube_embed_url' => 'https://youtu.be/elm', 'title' => 'Elm']);
+        $file = File::query()->where('legacy_type', 'video')->where('legacy_id', $upload->getKey())->firstOrFail();
+
+        $this->assertSame(['garden.mp4', false], [$file->filename, DB::table('links')->where('legacy_type', 'video')->where('legacy_id', $upload->getKey())->exists()]);
+        $this->assertEquals(new FileMetadata('video/mp4'), FakeMediaLibrary::bound()->stored((string) $file->zml_asset_id));
+        $this->assertSame(['https://youtu.be/elm', false], [DB::table('links')->where('legacy_type', 'video')->where('legacy_id', $link->getKey())->value('url'), DB::table('files')->where('legacy_type', 'video')->where('legacy_id', $link->getKey())->exists()]);
+        $this->assertSame([[$upload->getKey(), 'video/mp4'], [$link->getKey(), null]], $chosen::query()->whereIn('id', [$upload->getKey(), $link->getKey()])->orderBy('id')->get()->map(fn (Model $video) => [$video->getKey(), $video->getAttribute('mime_type')])->all());
+    }
+
+    #[Test]
     public function it_shows_the_listeners_of_a_soft_delete_the_value_the_successor_held_before_its_delete(): void
     {
         $listing = new class extends Model implements Compatible
