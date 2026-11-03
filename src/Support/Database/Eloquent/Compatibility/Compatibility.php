@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\ConfigurationUrlParser;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
@@ -370,7 +371,7 @@ final class Compatibility
      */
     private static function readTargets(string $name): array
     {
-        $config = (array) Config::get("database.connections.{$name}");
+        $config = (new ConfigurationUrlParser)->parseConfiguration((array) Config::get("database.connections.{$name}"));
         $reads = $config['read'] ?? null;
         $sections = match (true) {
             ! is_array($reads) => [[]],

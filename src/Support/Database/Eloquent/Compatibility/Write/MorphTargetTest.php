@@ -221,6 +221,24 @@ final class MorphTargetTest extends TestCase
     }
 
     #[Test]
+    public function it_moves_the_place_asset_of_a_legacy_row_whose_key_changed_onto_the_new_key_by_its_other_identifier_and_keeps_its_target(): void
+    {
+        PlaceAssetTables::brochures();
+        Compatibility::prepare(Brochure::class);
+        $backfiller = new Backfiller(Compatibility::of(Brochure::class)->resolve(), DB::connection());
+        $watermark = $backfiller->run()['watermark'];
+        $before = $this->asset('place_brochure', 1);
+        DB::update('update place_brochures set id = 99, updated_at = localtimestamp(0) where id = 1');
+
+        $backfiller->run(since: $watermark['updatedAt']);
+        Compatibility::install(Brochure::class);
+
+        $this->assertSame([2, 99], DB::table('place_assets')->where('legacy_type', 'place_brochure')->orderBy('legacy_id')->pluck('legacy_id')->map(fn (mixed $id) => (int) $id)->all());
+        $this->assertSame($before, $this->asset('place_brochure', 99));
+        $this->assertSame([[2, 'Map', null, 'https://maps.example/oak'], [99, 'Guide', 'guide.pdf', null]], Brochure::query()->orderBy('id')->get()->map(fn (Brochure $brochure) => [$brochure->id, $brochure->title, $brochure->file_name, $brochure->url])->all());
+    }
+
+    #[Test]
     public function it_chooses_the_target_of_a_new_record_from_the_default_of_a_retained_column_it_omits(): void
     {
         $this->installBrochures();

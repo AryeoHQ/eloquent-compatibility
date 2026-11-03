@@ -16,8 +16,11 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
+use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -117,6 +120,58 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->assertSame([1, 0, 2], [count(array_keys($translated, 'update listings', true)), count(array_keys($translated, 'insert listings', true)), count(array_keys($translated, self::CATALOG, true))]);
         $this->assertSame(['Oak Manor', 'Cedar House'], [$this->job(1)->name, $this->job((int) $created->getKey())->name]);
         $this->assertSame(['Oak Manor', 'Cedar House'], [$this->served(1), $this->served((int) $created->getKey())]);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): string, string, string}>
+     */
+    public static function externalWritesAcrossTheInstall(): iterable
+    {
+        yield 'a record create' => [fn (): string => (string) Photo::query()->findOrFail(Photo::query()->create(['file_name' => 'oak-side.jpg', 'mime_type' => 'image/webp', 'size_kb' => 256, 'caption' => 'Side'])->getKey())->mime_type, 'insert photos', 'image/webp'];
+        yield 'a mass update' => [function (): string {
+            try {
+                Photo::query()->whereKey(2)->update(['mime_type' => 'image/webp']);
+
+                return 'written';
+            } catch (CompatibilityWriteRefused $refusal) {
+                return $refusal->getMessage();
+            }
+        }, 'update photos', Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.'];
+        yield 'a query builder insert' => [function (): string {
+            Photo::query()->toBase()->insert(['file_name' => 'oak-side.jpg', 'mime_type' => 'image/webp', 'size_kb' => 256, 'caption' => 'Side']);
+
+            return (string) Photo::query()->where('file_name', 'oak-side.jpg')->firstOrFail()->mime_type;
+        }, 'insert photos', 'image/webp'];
+    }
+
+    /**
+     * @param  Closure(): string  $write
+     */
+    #[DataProvider('externalWritesAcrossTheInstall')]
+    #[Test]
+    public function it_retries_a_native_write_of_an_external_attribute_the_view_omits_once_translated_after_another_process_installs_the_view(Closure $write, string $native, string $expected): void
+    {
+        FileTables::create();
+        FileTables::seed();
+
+        try {
+            Compatibility::prepare(Photo::class);
+            DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select 'photo', id, uuid, file_name, mime_type, round(size_kb * 1000), created_at, updated_at from photos");
+            Photo::query()->findOrFail(1)->update(['caption' => 'Front door']);
+            $this->inAnotherProcess("Tests\\Fixtures\\Support\\Files\\FileTables::catalog('photo'); Support\\Database\\Eloquent\\Compatibility\\Compatibility::install(Tests\\Fixtures\\Support\\Files\\Photo::class)");
+            $this->statements = [];
+
+            $outcome = $write();
+            $statements = $this->statements();
+            $attempt = array_search($native, $statements, true);
+        } finally {
+            FileTables::drop();
+        }
+
+        $this->assertIsInt($attempt);
+        $this->assertSame([$native, self::CATALOG], array_slice($statements, $attempt, 2));
+        $this->assertCount(1, array_keys($statements, $native, true));
+        $this->assertSame($expected, $outcome);
     }
 
     #[Test]
@@ -288,6 +343,28 @@ final class LegacyBuilderRolloutTest extends TestCase
         }
 
         $this->assertSame([[1, 3], [1, 3]], [$later, $read()]);
+    }
+
+    #[Test]
+    public function it_filters_on_the_view_when_the_search_path_resolves_a_successor_name_to_another_table_than_the_view_reads(): void
+    {
+        $this->install();
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
+        DB::update('update compatibility_tenant.jobs set price_cents = case legacy_id when 1 then 100 when 3 then 15000 else price_cents end');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            $tenant = [$read(), DB::scalar('select count(*) from listings where price > 100')];
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([[1], 1], $tenant);
+        $this->assertSame([1], $read());
     }
 
     #[Test]

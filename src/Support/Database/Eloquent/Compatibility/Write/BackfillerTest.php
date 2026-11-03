@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -20,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Photo;
@@ -377,6 +379,190 @@ final class BackfillerTest extends TestCase
 
         $this->assertSame([3, 0], [$first['changed'], $again['changed']]);
         $this->assertSame(['{"rooms": 3}', null, null], array_column($this->rows('select cast(details as text) as details from jobs order by legacy_id'), 'details'));
+    }
+
+    #[Test]
+    public function it_keeps_the_stored_value_that_already_serves_an_unchanged_is_not_null_attribute_and_writes_only_the_values_whose_presence_changed(): void
+    {
+        DB::statement('alter table listings add column is_published boolean');
+        DB::statement('alter table jobs add column published_at timestamp(0) without time zone');
+        DB::update('update listings set is_published = true where id in (1, 2)');
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->attribute('is_published', fn (Attribute $attribute) => $attribute->from('published_at')->isNotNull(fn () => now())));
+            }
+        };
+        $this->backfiller($listing::class)->run();
+        DB::update("update jobs set published_at = '2026-01-01 09:00:00' where legacy_id = 1");
+        $unchanged = $this->backfiller($listing::class)->run();
+        DB::update('update listings set is_published = false where id = 2');
+        DB::update('update listings set is_published = true where id = 3');
+
+        $changed = $this->backfiller($listing::class)->run();
+
+        $this->assertSame([0, 2], [$unchanged['changed'], $changed['changed']]);
+        $this->assertSame(
+            [['legacy_id' => 1, 'published_at' => '2026-01-01 09:00:00'], ['legacy_id' => 2, 'published_at' => null], ['legacy_id' => 3, 'published_at' => 'set']],
+            $this->rows("select legacy_id, case when legacy_id = 3 and published_at is not null then 'set' else cast(published_at as text) end as published_at from jobs order by legacy_id"),
+        );
+    }
+
+    #[Test]
+    public function it_keeps_the_stored_value_that_already_serves_an_unchanged_is_not_null_attribute_of_a_successor_it_saves_record_by_record(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        DB::statement('alter table photos add column is_featured boolean');
+        DB::statement('alter table files add column featured_at timestamp(0) without time zone');
+        DB::update('update photos set is_featured = true where id in (1, 2)');
+        $photo = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                            ->external(
+                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('is_featured', fn (Attribute $attribute) => $attribute->from('featured_at')->isNotNull(fn () => now())));
+            }
+        };
+        Compatibility::prepare($photo::class);
+        $this->backfiller($photo::class)->run();
+        DB::update("update files set featured_at = '2026-01-01 09:00:00' where legacy_type = 'photo' and legacy_id = 1");
+        $unchanged = $this->backfiller($photo::class)->run();
+        DB::update('update photos set is_featured = false where id = 2');
+
+        $changed = $this->backfiller($photo::class)->run();
+
+        $this->assertSame([0, 1], [$unchanged['changed'], $changed['changed']]);
+        $this->assertSame(
+            [['legacy_id' => 1, 'featured_at' => '2026-01-01 09:00:00'], ['legacy_id' => 2, 'featured_at' => null], ['legacy_id' => 3, 'featured_at' => null]],
+            $this->rows("select legacy_id, cast(featured_at as text) as featured_at from files where legacy_type = 'photo' order by legacy_id"),
+        );
+    }
+
+    #[Test]
+    public function it_moves_the_successor_of_a_legacy_row_whose_key_changed_onto_the_new_key_by_its_other_identifier_and_keeps_its_dependents(): void
+    {
+        $watermark = $this->backfiller(Listing::class)->run()['watermark'];
+        $before = [DB::scalar('select id from jobs where legacy_id = 1'), DB::scalar('select street from places join jobs on jobs.id = places.job_id where jobs.legacy_id = 1')];
+        DB::statement('alter table listing_photos drop constraint listing_photos_listing_id_foreign, add constraint listing_photos_listing_id_foreign foreign key (listing_id) references listings (id) on update cascade');
+        DB::update('update listings set id = 99, updated_at = localtimestamp(0) where id = 1');
+
+        $this->backfiller(Listing::class)->run(since: $watermark['updatedAt']);
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([2, 3, 99], array_map(intval(...), array_column($this->rows('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+        $this->assertSame($before, [DB::scalar('select id from jobs where legacy_id = 99'), DB::scalar('select street from places join jobs on jobs.id = places.job_id where jobs.legacy_id = 99')]);
+        $this->assertSame([[2, 'Pine Flat'], [3, 'Elm Cottage'], [99, 'Oak House']], array_map(fn (array $row) => [(int) $row['id'], $row['title']], $this->rows('select id, title from listings order by id')));
+    }
+
+    #[Test]
+    public function it_keeps_a_mapped_updated_at_while_it_saves_another_changed_value_of_a_successor_whose_created_at_it_stamps(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        $photo = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('updated_at', fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                            ->external(
+                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)));
+            }
+        };
+        Compatibility::prepare($photo::class);
+        $this->backfiller($photo::class)->run();
+        DB::update("update photos set file_name = 'oak-front-2.jpg' where id = 1");
+
+        $changed = $this->backfiller($photo::class)->run();
+
+        $this->assertSame(1, $changed['changed']);
+        $this->assertSame(
+            ['filename' => 'oak-front-2.jpg', 'updated_at' => '2026-01-01 10:00:00', 'created' => true],
+            (array) DB::selectOne("select filename, to_char(updated_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') as updated_at, created_at is not null as created from files where legacy_type = 'photo' and legacy_id = 1"),
+        );
+    }
+
+    #[Test]
+    public function it_creates_a_dependent_whose_relation_fixes_a_timestamp_with_that_timestamp_and_stamps_only_the_other(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->related(
+                            fn (Job $job) => $job->hasOne(Place::class)->withAttributes(['city' => 'Seattle', 'created_at' => '2026-01-01 00:00:00+00']),
+                            fn (Successor $place) => $place->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
+                        ));
+            }
+        };
+
+        $this->backfiller($listing::class)->run();
+
+        $this->assertSame(
+            [['legacy_id' => 1, 'street' => '1 Oak St', 'created_at' => '2026-01-01 00:00:00', 'updated' => true], ['legacy_id' => 3, 'street' => '3 Elm St', 'created_at' => '2026-01-01 00:00:00', 'updated' => true]],
+            $this->rows("select jobs.legacy_id, places.street, to_char(places.created_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') as created_at, places.updated_at is not null as updated from places join jobs on jobs.id = places.job_id order by jobs.legacy_id"),
+        );
     }
 
     #[Test]

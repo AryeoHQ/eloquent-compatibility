@@ -709,6 +709,35 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_legacy_column_that_owns_a_sequence(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop sequence if exists photos_mime_type_seq cascade');
+        DB::statement('create sequence photos_mime_type_seq owned by photos.mime_type');
+        DB::statement("alter table photos alter column mime_type set default 'image/' || nextval('photos_mime_type_seq')");
+        FakeMediaLibrary::bound()->calls = [];
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and uninstall() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+
+        DB::statement('alter sequence photos_mime_type_seq owned by none');
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'image/1'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+
+        DB::statement('alter sequence photos_mime_type_seq owned by photos.mime_type');
+    }
+
+    #[Test]
     public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
     {
         $this->prepareFiles();
@@ -825,6 +854,37 @@ final class InstallerTest extends TestCase
         } finally {
             DB::purge('compatibility_replicated');
             DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_installs_when_the_legacy_and_successor_connections_reach_one_database_through_a_url_that_overrides_the_database_setting(): void
+    {
+        $pgsql = (array) config('database.connections.pgsql');
+        $url = sprintf('pgsql://%s:%s@%s:%s/%s', rawurlencode((string) $pgsql['username']), rawurlencode((string) $pgsql['password']), $pgsql['host'], $pgsql['port'], rawurlencode((string) $pgsql['database']));
+        $connection = [...$pgsql, 'url' => $url, 'database' => 'laravel'];
+        config(['database.connections.compatibility_url_legacy' => $connection, 'database.connections.compatibility_url_successor' => $connection, 'database.default' => 'compatibility_url_successor']);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_url_legacy';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+        } finally {
+            DB::purge('compatibility_url_legacy');
+            DB::purge('compatibility_url_successor');
         }
 
         $this->assertSame('v', $this->kind('listings'));
@@ -1235,6 +1295,29 @@ final class InstallerTest extends TestCase
 
         $this->assertSame($before, $this->listings());
         $this->assertSame(1, DB::scalar("select count(*) from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC'"));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_shared_successor_map_until_prepare_builds_the_unique_index_on_the_discriminator_and_the_integer_identifier_even_with_no_inbound_foreign_key(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop table photo_comments, photo_shares');
+        DB::statement('alter table files drop constraint files_legacy_type_legacy_id_unique');
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'photos' cannot install: files.legacy_id is not yet NOT NULL with a unique index on (legacy_type, legacy_id), so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::install(Photo::class);
+
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame([1, 2, 3], Photo::query()->orderBy('id')->pluck('id')->all());
     }
 
     #[Test]
@@ -2049,6 +2132,120 @@ final class InstallerTest extends TestCase
         }
 
         $this->assertSame(['55P03', 'v', false], [$concurrent, $this->kind('listings'), DB::scalar("select count(*) > 0 from pg_attribute where attrelid = 'listings_retained'::regclass and attname = 'notes'")]);
+    }
+
+    #[Test]
+    public function it_installs_and_uninstalls_a_map_over_two_successors_that_maps_nothing_but_its_primary_identifier(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        DB::statement('alter table videos drop column uuid');
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('videos_retained')
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file)
+                            ->as(Link::class, fn (Successor $link) => $link));
+            }
+        };
+        $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        Compatibility::prepare($video::class);
+        DB::statement("insert into files (legacy_type, legacy_id, filename, mime_type) select 'video', id, 'video.bin', 'application/octet-stream' from videos where youtube_embed_url is null");
+        DB::statement("insert into links (legacy_type, legacy_id, url) select 'video', id, youtube_embed_url from videos where youtube_embed_url is not null");
+
+        Compatibility::install($video::class);
+        $installed = [$this->kind('videos'), $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')))];
+        Compatibility::uninstall($video::class);
+
+        $this->assertSame([['v', $before], 'r'], [$installed, $this->kind('videos')]);
+        $this->assertSame($before, $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'))));
+    }
+
+    #[Test]
+    public function it_uninstalls_a_map_over_two_successors_that_maps_only_its_primary_identifier_and_an_external_attribute_and_restores_the_external_values(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        DB::statement('alter table videos drop column uuid');
+        $video = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('videos_retained')
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                                    ->external(
+                                        read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                        write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))));
+            }
+        };
+        $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        Compatibility::prepare($video::class);
+        DB::statement("insert into files (legacy_type, legacy_id, filename, mime_type) select 'video', id, 'video.bin', mime_type from videos where youtube_embed_url is null");
+        DB::statement("insert into links (legacy_type, legacy_id, url) select 'video', id, youtube_embed_url from videos where youtube_embed_url is not null");
+        FileTables::catalog('video');
+        Compatibility::install($video::class);
+
+        Compatibility::uninstall($video::class);
+
+        $this->assertSame('r', $this->kind('videos'));
+        $this->assertSame($before, $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'))));
+    }
+
+    #[Test]
+    public function it_makes_the_retained_key_it_filled_off_the_lock_the_primary_key_only_after_commit_once_a_validated_check_proves_it_holds_no_null(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $proven = null;
+        $connection = DB::connection();
+
+        $connection->beforeExecuting(function (string $query) use (&$proven, $connection): void {
+            if ($proven === null && str_contains($query, 'PRIMARY KEY USING INDEX')) {
+                $proven = [$connection->transactionLevel(), $connection->scalar("select count(*) from pg_constraint where conrelid = to_regclass('listings_retained') and contype = 'c' and convalidated and pg_get_constraintdef(oid) = 'CHECK ((job_id IS NOT NULL))'")];
+            }
+        });
+
+        Compatibility::install(Listing::class);
+
+        $this->assertSame([0, 1], $proven);
+        $this->assertSame(
+            ['listings_retained_job_id_foreign' => 'FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE', 'listings_retained_pkey' => 'PRIMARY KEY (job_id)'],
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'listings_retained'::regclass order by conname"), 'definition', 'conname'),
+        );
+        $this->assertSame([true, 3], [DB::scalar("select attnotnull from pg_attribute where attrelid = 'listings_retained'::regclass and attname = 'job_id'"), DB::scalar('select count(*) from listings')]);
     }
 
     #[Test]

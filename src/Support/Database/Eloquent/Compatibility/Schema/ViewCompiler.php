@@ -64,7 +64,7 @@ final readonly class ViewCompiler
         }
 
         $served = [];
-        $collations = self::collations($this->connection, $map->table);
+        $collations = self::collations($this->connection, $map->table, $this->columnCatalog->throughSearchPath);
 
         foreach ($shape as $name => $column) {
             if (! array_key_exists($name, $reads)) {
@@ -92,7 +92,7 @@ final readonly class ViewCompiler
     {
         $external = [...$external, ...$map->externals()];
         $variants = array_map(fn (ResolvedMap $variant) => $this->served($variant, $shape, $external, $retainedFrom), $map->morphs);
-        $collations = self::collations($this->connection, $map->table);
+        $collations = self::collations($this->connection, $map->table, $this->columnCatalog->throughSearchPath);
         $type = SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $map->morph?->typeColumn);
         $served = [];
 

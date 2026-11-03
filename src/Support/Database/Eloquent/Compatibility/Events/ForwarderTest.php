@@ -149,6 +149,25 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_a_direct_successor_save_when_the_search_path_reaches_the_view_through_a_later_schema(): void
+    {
+        $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->street]);
+        DB::statement('create schema compatibility_empty');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_empty, '.$searchPath]);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_empty');
+        }
+
+        $this->assertSame([['updating', 1, 'Oak Lodge', '1 Oak St'], ['updated', 1, 'Oak Lodge', '1 Oak St']], $this->seen);
+        $this->assertSame('Oak Lodge', Listing::query()->findOrFail(1)->title);
+    }
+
+    #[Test]
     public function it_runs_no_query_of_its_own_when_no_listing_listener_takes_the_event(): void
     {
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);
@@ -1112,6 +1131,25 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_gives_a_listing_listener_the_json_null_a_dependent_write_stores_over_an_sql_null(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        DB::statement('alter table listings alter column city type jsonb using to_jsonb(city)');
+        DB::statement('alter table places alter column city type jsonb using to_jsonb(city)');
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(Listing::class);
+        $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('city'), $listing->city]);
+        $elm = Place::query()->where('job_id', Job::query()->where('legacy_id', 3)->value('id'))->firstOrFail();
+
+        $elm->update(['city' => 'null']);
+
+        $this->assertSame([['saving', 3, null, 'null'], ['updating', 3, null, 'null'], ['updated', 3, null, 'null'], ['saved', 3, null, 'null']], $this->seen);
+        $this->assertSame('null', DB::table('places')->where('id', $elm->id)->value('city'));
+    }
+
+    #[Test]
     public function it_forwards_a_dependent_write_of_a_record_loaded_without_its_relationship_key_to_the_records_it_leaves_and_reaches(): void
     {
         $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
@@ -1523,6 +1561,170 @@ final class ForwarderTest extends TestCase
         $this->assertSame([['updated', 2, null, '2 Pine St'], ['saved', 2, null, '2 Pine St']], $this->seen);
     }
 
+    #[Test]
+    public function it_lets_only_the_listing_a_dependent_moves_to_through_an_expression_on_its_relationship_key_change_its_facts(): void
+    {
+        $assigns = 1;
+        Event::listen('eloquent.updating: '.Listing::class, function (Listing $listing) use (&$assigns): void {
+            if ($listing->id === $assigns) {
+                $listing->street = '9 Pine St';
+            }
+        });
+        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+
+        try {
+            $root->update(['job_id' => DB::raw('(select id from jobs where legacy_id = 2)')]);
+            $refused = null;
+        } catch (CompatibilityWriteRefused $refusal) {
+            $refused = $refusal->getMessage();
+        }
+
+        $unmoved = [Place::query()->findOrFail($root->id)->job_id, Place::query()->findOrFail($root->id)->street];
+        $assigns = 2;
+        Place::query()->findOrFail($root->id)->update(['job_id' => DB::raw('(select id from jobs where legacy_id = 2)')]);
+
+        $this->assertSame('A listener of a '.Listing::class.' event that Place forwarded cannot change $street. Why: The written Place no longer serves this Listing, so the forwarded write cannot store it there. Instead: Write street through Listing, or change Place or the model that stores street directly.', $refused);
+        $this->assertSame([(string) Job::query()->where('legacy_id', 1)->value('id'), '1 Oak St'], $unmoved);
+        $this->assertSame(['9 Pine St', null], [Listing::withTrashed()->findOrFail(2)->street, Listing::query()->findOrFail(1)->street]); // @phpstan-ignore staticMethod.dynamicCall
+    }
+
+    #[Test]
+    public function it_forwards_the_after_events_of_a_dependent_write_without_timestamps_that_changes_the_input_of_a_stored_generated_column_the_listing_serves(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        DB::statement('alter table places add column town text');
+        DB::statement('update places set town = city');
+        DB::statement('alter table places drop column city');
+        DB::statement('alter table places add column city text generated always as (town) stored');
+        Compatibility::install(Listing::class);
+        $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('city'), $listing->city]);
+        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root->timestamps = false;
+
+        $root->update(['town' => 'Tacoma']);
+
+        $this->assertSame([['updated', 1, 'Seattle', 'Tacoma'], ['saved', 1, 'Seattle', 'Tacoma']], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_the_after_events_of_a_file_create_whose_discriminator_comes_from_a_database_default(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::statement("alter table files alter column legacy_type set default 'legacy_file'");
+        $this->listen(LegacyFile::class, ['saving', 'creating', 'created', 'saved'], fn (LegacyFile $legacyFile) => [$legacyFile->id, $legacyFile->wasRecentlyCreated, $legacyFile->file_name]);
+        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id]);
+
+        $file = File::query()->create(['filename' => 'lease.pdf', 'mime_type' => 'application/pdf']);
+        $id = File::query()->findOrFail($file->id)->legacy_id;
+
+        $this->assertSame([['created', $id, true, 'lease.pdf'], ['saved', $id, true, 'lease.pdf']], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_nothing_for_a_job_write_that_trips_a_hide_rule_over_its_sibling_jobs(): void
+    {
+        $outpriced = $this->outpricedListing();
+        Forwarder::register($this->app->make('events'), $outpriced::class);
+        $this->listen($outpriced::class, self::EVENTS, fn (Model $listing) => [$listing->getAttribute('id'), $listing->getAttribute('price')]);
+
+        Job::query()->where('legacy_id', 3)->firstOrFail()->update(['price_cents' => 1000]);
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([['saving', 1, '1250.50'], ['updating', 1, '1250.50'], ['updated', 1, '1250.50'], ['saved', 1, '1250.50']], $this->seen);
+    }
+
+    #[Test]
+    public function it_gives_a_listener_after_the_commit_of_a_forwarded_save_or_dependent_delete_the_synchronized_originals_a_native_save_gives(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::connection()->setTransactionManager($this->app->make('db.transactions'));
+        $files = [];
+        Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$files): void {
+            $files[] = [$event->legacyFile->getOriginal('file_name'), $event->legacyFile->isDirty('file_name'), $event->legacyFile->wasChanged('file_name')];
+        });
+        $listings = [];
+        Event::listen('eloquent.saved: '.Listing::class, function (Listing $listing) use (&$listings): void {
+            $listings[] = $listing;
+        });
+
+        DB::transaction(fn () => LegacyFile::query()->findOrFail(1)->update(['file_name' => 'contract-2.pdf']));
+        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-3.pdf']));
+        DB::transaction(fn () => Listing::query()->findOrFail(3)->update(['street' => '4 Elm St']));
+        DB::transaction(fn () => Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->delete());
+
+        $this->assertSame([['contract-2.pdf', false, true], ['contract-3.pdf', false, true]], $files);
+        $this->assertSame([[3, '4 Elm St', false, true], [1, null, false, true]], array_map(fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->isDirty('street'), $listing->wasChanged('street')], $listings));
+    }
+
+    #[Test]
+    public function it_forwards_a_write_that_keeps_the_discriminator_through_an_expression_to_the_legacy_model_the_discriminator_names(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $birch = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])->refresh();
+        $this->listen(Photo::class, ['saving', 'updating', 'updated', 'saved'], fn (Photo $photo) => [$photo->id, $photo->file_name]);
+        $this->listen(FloorPlan::class, self::EVENTS, fn (FloorPlan $floorPlan) => [$floorPlan->id]);
+        Event::listen('eloquent.saving: '.Photo::class, fn (Photo $photo) => $photo->file_name === 'refused.jpg' ? false : null);
+        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+
+        $file->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'renamed.jpg']);
+        $file->update(['filename' => 'renamed-again.jpg']);
+        $refused = File::query()->findOrFail($file->id)->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'refused.jpg']);
+        DB::statement('create temporary sequence discriminator_probe');
+
+        try {
+            $birch->update(['legacy_type' => DB::raw("(case when nextval('discriminator_probe') = 1 then legacy_type else 'floorplan' end)"), 'filename' => 'birch-porch.png']);
+            $probe = DB::scalar('select last_value from discriminator_probe');
+        } finally {
+            DB::statement('drop sequence discriminator_probe');
+        }
+
+        $kept = File::query()->findOrFail($birch->id)->legacy_type;
+        $birch->update(['legacy_type' => DB::raw("'floorplan'")]);
+
+        $this->assertSame([
+            ['saving', 1, 'renamed.jpg'], ['updating', 1, 'renamed.jpg'], ['updated', 1, 'renamed.jpg'], ['saved', 1, 'renamed.jpg'],
+            ['saving', 1, 'renamed-again.jpg'], ['updating', 1, 'renamed-again.jpg'], ['updated', 1, 'renamed-again.jpg'], ['saved', 1, 'renamed-again.jpg'],
+            ['saving', 1, 'refused.jpg'],
+            ['saving', $birch->legacy_id, 'birch-porch.png'], ['updating', $birch->legacy_id, 'birch-porch.png'], ['updated', $birch->legacy_id, 'birch-porch.png'], ['saved', $birch->legacy_id, 'birch-porch.png'],
+        ], $this->seen);
+        $this->assertSame([false, 'renamed-again.jpg', 1, 'photo', 'floorplan'], [$refused, File::query()->findOrFail($file->id)->filename, $probe, $kept, File::query()->findOrFail($birch->id)->legacy_type]);
+    }
+
+    #[Test]
+    public function it_forwards_a_job_write_to_the_listing_a_later_job_listener_keeps_in_the_legacy_shape(): void
+    {
+        $elm = Job::query()->where('legacy_id', 3)->value('id');
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->getOriginal('title'), $listing->title]);
+        $resets = 'saving';
+
+        foreach (['saving', 'updating'] as $event) {
+            Event::listen("eloquent.{$event}: ".Job::class, function (Job $job) use ($event, &$resets): void {
+                if ($event === $resets) {
+                    $job->merged_into_job_id = null;
+                }
+            });
+        }
+
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Lodge']);
+        $resets = 'updating';
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Cabin']);
+
+        $this->assertSame([
+            ['saving', 1, 'Oak House', 'Oak Lodge'], ['updating', 1, 'Oak House', 'Oak Lodge'], ['updated', 1, 'Oak House', 'Oak Lodge'], ['saved', 1, 'Oak House', 'Oak Lodge'],
+            ['updated', 1, 'Oak Lodge', 'Oak Cabin'], ['saved', 1, 'Oak Lodge', 'Oak Cabin'],
+        ], $this->seen);
+        $this->assertSame([null, 'Oak Cabin'], [Job::query()->where('legacy_id', 1)->value('merged_into_job_id'), Listing::query()->findOrFail(1)->title]);
+    }
+
     /**
      * @param  Application  $app
      * @return array<int, class-string>
@@ -1627,6 +1829,49 @@ final class ForwarderTest extends TestCase
                             ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))))
                     ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
                     ->hide(fn (Builder $jobs) => $jobs->whereHas('rootPlace', fn (Builder $places) => $places->where('city', 'Withheld')), because: 'A withheld address keeps its listing off the site.');
+            }
+        };
+    }
+
+    private function outpricedListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            protected function casts(): array
+            {
+                return ['price' => 'decimal:2', 'status' => ListingStatus::class, 'latitude' => 'float'];
+            }
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->timestamps()
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
+                        ->attribute('status', fn (Attribute $attribute) => $attribute
+                            ->from('lifecycle_status')
+                            ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
+                            ->transitions())
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->atMostOne(because: 'A listing has one address.')
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')))
+                        ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
+                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))))
+                    ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
+                    ->hide(fn (Builder $jobs) => $jobs->whereRaw('exists (select 1 from jobs as siblings where siblings.company_id = jobs.company_id and siblings.price_cents > jobs.price_cents * 100)'), because: 'A job priced under a hundredth of a sibling job is a placeholder.');
             }
         };
     }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Closure;
+use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
@@ -357,32 +358,21 @@ final class Forwarder
         }
 
         $events = ($this->dependent === null ? self::PRIMARY : self::DEPENDENT)[$event] ?? [];
-        $batches = null;
+        $batches = $this->dependent === null ? [] : $this->batches($sequence, $record->changed(), $event, $events, $ahead);
 
-        if ($this->dependent !== null) {
-            $joining = array_diff_key($record->changed(), $sequence->forwarding);
-            $batches = array_filter([
-                [$events, array_intersect_key($record->records(), $sequence->forwarding)],
-                [! $ahead || $event === $sequence->start ? $events : ['saving', ...$events], $joining],
-            ], fn (array $batch) => $batch[1] !== []);
-            $sequence->forwarding += array_fill_keys(array_keys($joining), true);
-
-            if ($batches === []) {
-                return null;
-            }
+        if ($this->dependent !== null && $batches === []) {
+            return null;
         }
 
         if (! $ahead && $saved) {
             $record->store($successor);
         }
 
-        if ($event === 'restored' && $saved) {
-            foreach ($record->records() as $legacy) {
-                $legacy->syncOriginal();
-            }
+        if ($this->dependent === null) {
+            $batches = $this->batches($sequence, $record->records(), $event, $events, $ahead);
         }
 
-        foreach ($batches ?? [[$events, $record->records()]] as [$legacyEvents, $legacies]) {
+        foreach ($batches as [$legacyEvents, $legacies]) {
             $legacies = array_intersect_key($legacies, $record->records());
 
             foreach ($legacyEvents as $legacyEvent) {
@@ -407,9 +397,32 @@ final class Forwarder
                     }
                 }
             }
+
+            if (in_array('saved', $legacyEvents, true)) {
+                foreach (array_intersect_key($legacies, $record->records()) as $legacy) {
+                    $legacy->syncOriginal();
+                }
+            }
         }
 
         return null;
+    }
+
+    /**
+     * @param  array<array-key, Model>  $candidates
+     * @param  list<string>  $events
+     * @return list<array{list<string>, array<array-key, Model>}>
+     */
+    private function batches(Sequence $sequence, array $candidates, string $event, array $events, bool $ahead): array
+    {
+        $joining = array_diff_key($candidates, $sequence->forwarding);
+        $batches = array_values(array_filter([
+            [$events, array_intersect_key($sequence->record?->records() ?? [], $sequence->forwarding)],
+            [! $ahead || $event === $sequence->start ? $events : ['saving', ...$events], $joining],
+        ], fn (array $batch) => $batch[1] !== []));
+        $sequence->forwarding += array_fill_keys(array_keys($joining), true);
+
+        return $batches;
     }
 
     private static function forceDeleting(Model $legacy, Model $successor): void
@@ -469,12 +482,18 @@ final class Forwarder
             return true;
         }
 
+        $column = $membership->column;
         $original = $successor->getRawOriginal();
-        $stored = array_key_exists($membership->column, $original) || ! $successor->exists
-            ? $original[$membership->column] ?? null
-            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($membership->column);
+        $stored = array_key_exists($column, $original) && ! $original[$column] instanceof Expression || ! $successor->exists
+            ? $original[$column] ?? null
+            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
+        $value = $successor->getAttributes()[$column];
 
-        return $successor->getAttributes()[$membership->column] === $membership->alias && (! $successor->exists || $stored === $membership->alias);
+        if ($value instanceof Expression) {
+            $value = $successor->exists && ! $successor->isDirty($column) ? $stored : LegacyRecord::evaluate($successor, $column, $value)[0];
+        }
+
+        return $value === $membership->alias && (! $successor->exists || $stored === $membership->alias);
     }
 
     /**

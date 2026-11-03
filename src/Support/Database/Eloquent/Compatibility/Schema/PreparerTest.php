@@ -102,6 +102,19 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_indexes_the_legacy_updated_at_when_only_a_hash_index_that_cannot_read_a_range_leads_with_it(): void
+    {
+        DB::statement('create index listings_updated_at_hash on listings using hash (updated_at)');
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(
+            ['listings_updated_at_hash' => 'hash', 'listings_updated_at_index' => 'btree'],
+            array_column(DB::select("select indexname, (select amname from pg_am join pg_class on pg_class.relam = pg_am.oid where pg_class.relname = indexname) as method from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'method', 'indexname'),
+        );
+    }
+
+    #[Test]
     public function it_indexes_the_legacy_updated_at_once_and_leaves_an_index_that_already_leads_with_it(): void
     {
         Compatibility::prepare(Listing::class);

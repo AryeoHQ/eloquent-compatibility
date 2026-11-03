@@ -27,6 +27,9 @@ final class LegacyRecord
     /** @var array<array-key, array<string, mixed>> */
     private array $before = [];
 
+    /** @var array<array-key, Model> */
+    private array $admitted = [];
+
     private null|string $computed = null;
 
     private bool $stored = false;
@@ -44,6 +47,8 @@ final class LegacyRecord
     private array $serves = [];
 
     private bool $expressed = false;
+
+    private bool $inserts = false;
 
     /** @var array<string, mixed> */
     private array $keys = [];
@@ -69,11 +74,11 @@ final class LegacyRecord
     public static function compile(ResolvedMap $map, ResolvedMap $served, Model $successor): array
     {
         $connection = $successor->getConnection();
-        $catalog = new ColumnCatalog($connection);
+        $catalog = new ColumnCatalog($connection, throughSearchPath: true);
         $columns = (new ViewCompiler($catalog, $connection))->served($served, $catalog->of($map->table), $map->externals());
         $json = array_filter($catalog->of($successor->getTable()), fn (Column $column) => in_array($column->baseType ?? $column->type, ['json', 'jsonb'], true));
         $reads = $connection->select(
-            "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(quote_ident(current_schema()) || '.' || ?) and depend.refobjid = to_regclass(quote_ident(current_schema()) || '.' || ?)",
+            "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(?) and depend.refobjid = to_regclass(?)",
             [SqlFragments::identifier($map->table), SqlFragments::identifier($successor->getTable())],
             false,
         );
@@ -91,6 +96,8 @@ final class LegacyRecord
         $record = new self($map, $served, $dependent, $columns, $json, $reads, $removes);
 
         if ($dependent === null && ! $successor->exists) {
+            $record->inserts = true;
+
             return $record;
         }
 
@@ -109,25 +116,27 @@ final class LegacyRecord
     {
         $this->expressed = $this->dependent !== null && $this->expresses($successor);
         $values = $this->values($successor);
-        $computed = serialize([$successor->exists, array_diff_key($values, [$successor->getKeyName() => true])]);
+        $nulls = $this->nulls($successor);
+        $computed = serialize([$written, $nulls, array_diff_key($values, [$successor->getKeyName() => true])]);
 
         if ($computed === $this->computed) {
             return;
         }
 
         $this->computed = $computed;
-        $rows = $this->compute($successor, $values, $written);
+        $rows = $this->compute($successor, $values, $nulls, $written);
 
         if ($this->dependent === null) {
-            $key = array_key_first($this->records) ?? '';
             $row = reset($rows);
 
-            if ($row === false || ($this->before !== [] && $this->records === [])) {
+            if ($row === false) {
                 $this->records = [];
 
                 return;
             }
 
+            $this->records = $this->records === [] ? $this->admitted : $this->records;
+            $key = array_key_first($this->records) ?? '';
             $this->records[$key] ??= (new $this->map->model)->setConnection($successor->getConnectionName());
             $this->apply($key, $row);
 
@@ -196,6 +205,14 @@ final class LegacyRecord
             return;
         }
 
+        if ($this->dependent === null && $this->records === []) {
+            $this->records = $this->admitted;
+        }
+
+        if ($this->inserts && $this->records === []) {
+            $this->records[''] = (new $this->map->model)->setConnection($successor->getConnectionName());
+        }
+
         foreach ($this->records as $key => $legacy) {
             $row = $this->dependent === null ? reset($rows) : $rows[$key] ?? false;
 
@@ -260,7 +277,7 @@ final class LegacyRecord
 
             $legacy = (new $this->map->model)->setConnection($successor->getConnectionName())->newInstance([], true);
             $legacy->setRawAttributes($row, true);
-            $this->records[$key] = $legacy;
+            $this->records[$key] = $this->admitted[$key] = $legacy;
             $this->before[$key] = $row;
             $admitted[] = $legacy;
         }
@@ -343,60 +360,104 @@ final class LegacyRecord
     }
 
     /**
-     * @param  array<string, mixed>  $values
+     * @param  array<string, string>  $values
+     * @param  list<string>  $nulls
      * @return array<array-key, array<string, mixed>>
      */
-    private function compute(Model $successor, array $values, bool $after): array
+    private function compute(Model $successor, array $values, array $nulls, bool $after): array
     {
-        $table = SqlFragments::identifier($successor->getTable());
-        $key = SqlFragments::identifier($successor->getKeyName());
-        $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
-        $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
-        $written = $this->dependent === null ? '' : ', true AS '.SqlFragments::identifier(self::WRITTEN);
-        [$row, $bindings] = $stored === null
-            ? ['SELECT (jsonb_populate_record(NULL::'.$table.', CAST(? AS jsonb))).*'.$written, [$json]]
-            : ['SELECT (jsonb_populate_record(stored, CAST(? AS jsonb))).*'.$written.' FROM '.$table.' AS stored WHERE stored.'.$key.' = ?', [$json, $stored]];
-        $filter = null;
-
-        if ($this->dependent !== null) {
-            $filter = $this->filter($successor, $after);
-
-            if ($filter === null) {
-                return [];
-            }
-
-            $hard = $this->removes && ! self::softDeletes($successor);
-            $others = 'SELECT '.$table.'.*, false AS '.SqlFragments::identifier(self::WRITTEN).' FROM '.$table.($stored === null ? '' : ' WHERE '.$table.'.'.$key.' <> ?');
-            $row = $hard ? $others : $others.' UNION ALL '.$row;
-            $bindings = [...($stored === null ? [] : [$stored]), ...($hard ? [] : $bindings), ...$filter[1]];
+        if ($this->dependent === null) {
+            return array_map(fn (object $row) => (array) $row, $this->select($successor, $values, $nulls, null));
         }
 
-        $select = $this->dependent === null ? [] : [SqlFragments::identifier($this->dependent->table).'.'.SqlFragments::identifier(self::WRITTEN).' AS '.SqlFragments::identifier(self::WRITTEN)];
+        $filter = $this->filter($successor, $after);
+
+        if ($filter === null) {
+            return [];
+        }
+
+        $rows = $this->keyed($this->select($successor, $values, $nulls, $filter));
+        $owner = $this->owner($successor, $after);
+        $owners = $owner === [] ? $rows : $this->keyed($this->select($successor, array_replace($values, $owner), $nulls, $filter));
+
+        foreach (array_keys($rows) as $legacyKey) {
+            $this->serves[$legacyKey] = ($owners[$legacyKey][self::WRITTEN] ?? null) === true;
+            unset($rows[$legacyKey][self::WRITTEN]);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  array<string, string>  $values
+     * @param  list<string>  $nulls
+     * @param  null|array{string, list<mixed>}  $filter
+     * @return array<int, object>
+     */
+    private function select(Model $successor, array $values, array $nulls, null|array $filter): array
+    {
+        $connection = $successor->getConnection();
+        $table = SqlFragments::identifier($successor->getTable());
+        $key = SqlFragments::identifier($successor->getKeyName());
+        $marker = SqlFragments::identifier(self::WRITTEN);
+        $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
+        $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
+        $catalog = $nulls === [] ? [] : (new ColumnCatalog($connection))->of($successor->getTable());
+        $columns = $catalog === [] ? 'populated.*' : implode(', ', array_map(
+            fn (string $name, Column $column) => (in_array($name, $nulls, true) ? "CAST('null' AS {$column->type})" : 'populated.'.SqlFragments::identifier($name)).' AS '.SqlFragments::identifier($name),
+            array_keys($catalog),
+            $catalog,
+        ));
+        $row = 'SELECT '.$columns.', true AS '.$marker.' FROM '.($stored === null
+            ? 'jsonb_populate_record(NULL::'.$table.', CAST(? AS jsonb)) AS populated'
+            : $table.' AS stored CROSS JOIN LATERAL jsonb_populate_record(stored, CAST(? AS jsonb)) AS populated WHERE stored.'.$key.' = ?');
+        $hard = $this->dependent !== null && $this->removes && ! self::softDeletes($successor);
+        $others = 'SELECT '.$table.'.*, false AS '.$marker.' FROM '.$table.($stored === null ? '' : ' WHERE '.$table.'.'.$key.' <> ?');
+        $owner = SqlFragments::identifier($this->dependent->table ?? $this->served->primary->table).'.'.$marker;
+        $select = $this->dependent === null ? [] : [$owner.' AS '.$marker];
 
         foreach ($this->columns as $name => $sql) {
             $select[] = $sql.' AS '.SqlFragments::identifier($name);
         }
 
-        $rows = $successor->getConnection()->select(
-            'WITH '.$table.' AS ('.$row.') SELECT '.implode(', ', $select).' FROM '.ViewCompiler::primary($this->served)
+        return $connection->select(
+            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(', ', $select).' FROM '.ViewCompiler::primary($this->served)
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
-                .($filter === null ? '' : ' WHERE '.$filter[0]),
-            $bindings,
+                .' WHERE '.($filter === null ? $owner : $filter[0]),
+            [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
             false,
         );
+    }
 
-        if ($this->dependent === null) {
-            return array_map(fn (object $row) => (array) $row, $rows);
+    /**
+     * @return array<string, string>
+     */
+    private function owner(Model $successor, bool $after): array
+    {
+        $column = $this->dependent?->relatedKey;
+        $value = $column === null ? null : $successor->getAttributes()[$column] ?? null;
+
+        if ($after || $column === null || ! $value instanceof Expression) {
+            return [];
         }
 
-        $keyed = $this->keyed($rows);
+        return [$column => json_encode($this->destination($successor, $column, $value, false), JSON_THROW_ON_ERROR)];
+    }
 
-        foreach ($keyed as $legacyKey => $computed) {
-            $this->serves[$legacyKey] = ($computed[self::WRITTEN] ?? null) === true;
-            unset($keyed[$legacyKey][self::WRITTEN]);
+    /**
+     * @return list<string>
+     */
+    private function nulls(Model $successor): array
+    {
+        $nulls = [];
+
+        foreach ($successor->exists ? $successor->getDirty() : $successor->getAttributes() as $column => $value) {
+            if (is_string($value) && in_array($column, $this->json, true) && json_validate($value) && json_decode($value) === null) {
+                $nulls[] = $column;
+            }
         }
 
-        return $keyed;
+        return $nulls;
     }
 
     private function expresses(Model $successor): bool
@@ -483,16 +544,28 @@ final class LegacyRecord
             return $this->destinations[$sql] = $successor->newModelQuery()->useWritePdo()->whereKey($successor->getKey())->value($column);
         }
 
-        $table = SqlFragments::identifier($successor->getTable());
-        $row = $successor->exists
-            ? $connection->selectOne('SELECT ('.$sql.') AS destination FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
-            : $connection->selectOne('SELECT ('.$sql.') AS destination', [], false);
-        $destination = is_object($row) ? $row->destination ?? null : null;
-        $literal = $connection->escape(is_scalar($destination) ? $destination : null);
-        $successor->setRawAttributes(array_replace($successor->getAttributes(), [$column => new QueryExpression($literal)]));
+        [$destination, $literal] = self::evaluate($successor, $column, $expression);
         $this->destinations[$sql] = $this->destinations[$literal] = $destination;
 
         return $destination;
+    }
+
+    /**
+     * @return array{mixed, string}
+     */
+    public static function evaluate(Model $successor, string $column, Expression $expression): array
+    {
+        $connection = $successor->getConnection();
+        $sql = (string) $expression->getValue($connection->getQueryGrammar());
+        $table = SqlFragments::identifier($successor->getTable());
+        $row = $successor->exists
+            ? $connection->selectOne('SELECT ('.$sql.') AS evaluated FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
+            : $connection->selectOne('SELECT ('.$sql.') AS evaluated', [], false);
+        $value = is_object($row) ? $row->evaluated ?? null : null;
+        $literal = $connection->escape(is_scalar($value) ? $value : null);
+        $successor->setRawAttributes(array_replace($successor->getAttributes(), [$column => new QueryExpression($literal)]));
+
+        return [$value, $literal];
     }
 
     private function relationshipKey(Model $successor, string $column): mixed

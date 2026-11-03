@@ -4,10 +4,21 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\Image;
@@ -202,6 +213,112 @@ final class MorphMoveTest extends TestCase
         $this->assertStringContainsString("cannot run a successor listener that repoints record 1 through its compatibility map. Why: PlaceAsset stored asset_type 'unknown_asset'", $refusal);
         $this->assertStringContainsString("after the delete of the old AssetFile, where the move gives 'place_asset_link'", $refusal);
         $this->assertSame($before, $this->rows());
+    }
+
+    #[Test]
+    public function it_runs_the_legacy_guards_of_a_move_against_the_values_the_new_target_fixes_for_the_attributes_the_write_omits(): void
+    {
+        $video = $this->guardedVideo();
+        $before = $this->rows();
+
+        try {
+            $video->newQuery()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringStartsWith($video::class." record 1 cannot take this write, because guard 'sized' refuses it", $refusal);
+        $this->assertSame($before, $this->rows());
+
+        $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'size_kb' => 300]);
+
+        $this->assertSame(['place_asset_file', 'oak.mp4', null], [DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 2)->value('asset_type'), $video->newQuery()->findOrFail(2)->getAttribute('original_file_name'), $video->newQuery()->findOrFail(2)->getAttribute('youtube_embed_url')]);
+    }
+
+    #[Test]
+    public function it_hands_the_external_write_of_an_updated_or_moved_record_the_place_asset_fields_the_same_write_changes(): void
+    {
+        $video = $this->guardedVideo();
+        $caption = fn (int $id) => FakeMediaLibrary::bound()->stored('caption-'.DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('id'))?->mimeType;
+
+        $video->newQuery()->findOrFail(1)->update(['title' => 'Tour v2', 'caption' => 'Tour caption']);
+        $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'title' => 'Oak upload', 'caption' => 'Oak caption']);
+
+        $this->assertSame(['Tour v2: Tour caption', 'Oak upload: Oak caption'], [$caption(1), $caption(2)]);
+        $this->assertSame([['Tour v2', 'place_asset_file'], ['Oak upload', 'place_asset_file']], array_map(fn (int $id) => [DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('title'), DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('asset_type')], [1, 2]));
+    }
+
+    #[Test]
+    public function it_refuses_a_query_or_a_relation_for_an_external_attribute_of_an_updated_or_moved_record_and_changes_nothing(): void
+    {
+        $video = $this->guardedVideo();
+        $before = $this->rows();
+        $refusals = [];
+
+        foreach ([
+            fn () => $video->newQuery()->findOrFail(1)->update(['caption' => PlaceAsset::query()->select('title')->limit(1)]),
+            fn () => $video->newQuery()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'caption' => PlaceAsset::query()->select('title')->limit(1)->toBase()]),
+            fn () => $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'caption' => (new PlaceAsset)->hasOne(PlaceAsset::class, 'id', 'id')]),
+        ] as $write) {
+            try {
+                $write();
+                $refusals[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $refusal = CompatibilityWriteRefused::rawExpression($video::class, 'caption', 'It is declared external(), so its value lives outside the database, and no SQL computes it.')->getMessage();
+
+        $this->assertSame([$refusal, $refusal, $refusal], $refusals);
+        $this->assertSame($before, $this->rows());
+    }
+
+    private function guardedVideo(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_videos_retained')
+                    ->timestamps()
+                    ->guard('sized', fn (Model $after, Model $before) => $before->getAttribute('size_kb') !== null && $after->getAttribute('size_kb') === null, because: 'A sized upload keeps its size.', instead: 'Keep the upload.')
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->attribute('caption', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => FakeMediaLibrary::bound()->stored('caption-'.$asset->getKey())?->mimeType])->all(),
+                            write: fn (PlaceAsset $asset, null|string $caption) => FakeMediaLibrary::bound()->put('caption-'.$asset->getKey(), new FileMetadata($asset->title.': '.$caption))))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? AssetLink::class : AssetFile::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(AssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute
+                                        ->from('size_bytes')
+                                        ->dividedBy(1000))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))));
+            }
+        };
     }
 
     /**
