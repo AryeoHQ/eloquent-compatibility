@@ -1619,6 +1619,93 @@ final class ForwarderTest extends TestCase
         $this->assertSame([['saving', 1, '1250.50'], ['updating', 1, '1250.50'], ['updated', 1, '1250.50'], ['saved', 1, '1250.50']], $this->seen);
     }
 
+    #[Test]
+    public function it_gives_a_listener_after_the_commit_of_a_forwarded_save_or_dependent_delete_the_synchronized_originals_a_native_save_gives(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::connection()->setTransactionManager($this->app->make('db.transactions'));
+        $files = [];
+        Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$files): void {
+            $files[] = [$event->legacyFile->getOriginal('file_name'), $event->legacyFile->isDirty('file_name'), $event->legacyFile->wasChanged('file_name')];
+        });
+        $listings = [];
+        Event::listen('eloquent.saved: '.Listing::class, function (Listing $listing) use (&$listings): void {
+            $listings[] = $listing;
+        });
+
+        DB::transaction(fn () => LegacyFile::query()->findOrFail(1)->update(['file_name' => 'contract-2.pdf']));
+        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-3.pdf']));
+        DB::transaction(fn () => Listing::query()->findOrFail(3)->update(['street' => '4 Elm St']));
+        DB::transaction(fn () => Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->delete());
+
+        $this->assertSame([['contract-2.pdf', false, true], ['contract-3.pdf', false, true]], $files);
+        $this->assertSame([[3, '4 Elm St', false, true], [1, null, false, true]], array_map(fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->isDirty('street'), $listing->wasChanged('street')], $listings));
+    }
+
+    #[Test]
+    public function it_forwards_a_write_that_keeps_the_discriminator_through_an_expression_to_the_legacy_model_the_discriminator_names(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $birch = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])->refresh();
+        $this->listen(Photo::class, ['saving', 'updating', 'updated', 'saved'], fn (Photo $photo) => [$photo->id, $photo->file_name]);
+        $this->listen(FloorPlan::class, self::EVENTS, fn (FloorPlan $floorPlan) => [$floorPlan->id]);
+        Event::listen('eloquent.saving: '.Photo::class, fn (Photo $photo) => $photo->file_name === 'refused.jpg' ? false : null);
+        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+
+        $file->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'renamed.jpg']);
+        $file->update(['filename' => 'renamed-again.jpg']);
+        $refused = File::query()->findOrFail($file->id)->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'refused.jpg']);
+        DB::statement('create temporary sequence discriminator_probe');
+
+        try {
+            $birch->update(['legacy_type' => DB::raw("(case when nextval('discriminator_probe') = 1 then legacy_type else 'floorplan' end)"), 'filename' => 'birch-porch.png']);
+            $probe = DB::scalar('select last_value from discriminator_probe');
+        } finally {
+            DB::statement('drop sequence discriminator_probe');
+        }
+
+        $kept = File::query()->findOrFail($birch->id)->legacy_type;
+        $birch->update(['legacy_type' => DB::raw("'floorplan'")]);
+
+        $this->assertSame([
+            ['saving', 1, 'renamed.jpg'], ['updating', 1, 'renamed.jpg'], ['updated', 1, 'renamed.jpg'], ['saved', 1, 'renamed.jpg'],
+            ['saving', 1, 'renamed-again.jpg'], ['updating', 1, 'renamed-again.jpg'], ['updated', 1, 'renamed-again.jpg'], ['saved', 1, 'renamed-again.jpg'],
+            ['saving', 1, 'refused.jpg'],
+            ['saving', $birch->legacy_id, 'birch-porch.png'], ['updating', $birch->legacy_id, 'birch-porch.png'], ['updated', $birch->legacy_id, 'birch-porch.png'], ['saved', $birch->legacy_id, 'birch-porch.png'],
+        ], $this->seen);
+        $this->assertSame([false, 'renamed-again.jpg', 1, 'photo', 'floorplan'], [$refused, File::query()->findOrFail($file->id)->filename, $probe, $kept, File::query()->findOrFail($birch->id)->legacy_type]);
+    }
+
+    #[Test]
+    public function it_forwards_a_job_write_to_the_listing_a_later_job_listener_keeps_in_the_legacy_shape(): void
+    {
+        $elm = Job::query()->where('legacy_id', 3)->value('id');
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->getOriginal('title'), $listing->title]);
+        $resets = 'saving';
+
+        foreach (['saving', 'updating'] as $event) {
+            Event::listen("eloquent.{$event}: ".Job::class, function (Job $job) use ($event, &$resets): void {
+                if ($event === $resets) {
+                    $job->merged_into_job_id = null;
+                }
+            });
+        }
+
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Lodge']);
+        $resets = 'updating';
+        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Cabin']);
+
+        $this->assertSame([
+            ['saving', 1, 'Oak House', 'Oak Lodge'], ['updating', 1, 'Oak House', 'Oak Lodge'], ['updated', 1, 'Oak House', 'Oak Lodge'], ['saved', 1, 'Oak House', 'Oak Lodge'],
+            ['updated', 1, 'Oak Lodge', 'Oak Cabin'], ['saved', 1, 'Oak Lodge', 'Oak Cabin'],
+        ], $this->seen);
+        $this->assertSame([null, 'Oak Cabin'], [Job::query()->where('legacy_id', 1)->value('merged_into_job_id'), Listing::query()->findOrFail(1)->title]);
+    }
+
     /**
      * @param  Application  $app
      * @return array<int, class-string>

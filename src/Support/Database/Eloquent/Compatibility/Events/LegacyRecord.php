@@ -27,6 +27,9 @@ final class LegacyRecord
     /** @var array<array-key, array<string, mixed>> */
     private array $before = [];
 
+    /** @var array<array-key, Model> */
+    private array $admitted = [];
+
     private null|string $computed = null;
 
     private bool $stored = false;
@@ -124,15 +127,16 @@ final class LegacyRecord
         $rows = $this->compute($successor, $values, $nulls, $written);
 
         if ($this->dependent === null) {
-            $key = array_key_first($this->records) ?? '';
             $row = reset($rows);
 
-            if ($row === false || ($this->before !== [] && $this->records === [])) {
+            if ($row === false) {
                 $this->records = [];
 
                 return;
             }
 
+            $this->records = $this->records === [] ? $this->admitted : $this->records;
+            $key = array_key_first($this->records) ?? '';
             $this->records[$key] ??= (new $this->map->model)->setConnection($successor->getConnectionName());
             $this->apply($key, $row);
 
@@ -199,6 +203,10 @@ final class LegacyRecord
             $this->records = [];
 
             return;
+        }
+
+        if ($this->dependent === null && $this->records === []) {
+            $this->records = $this->admitted;
         }
 
         if ($this->inserts && $this->records === []) {
@@ -269,7 +277,7 @@ final class LegacyRecord
 
             $legacy = (new $this->map->model)->setConnection($successor->getConnectionName())->newInstance([], true);
             $legacy->setRawAttributes($row, true);
-            $this->records[$key] = $legacy;
+            $this->records[$key] = $this->admitted[$key] = $legacy;
             $this->before[$key] = $row;
             $admitted[] = $legacy;
         }
@@ -535,16 +543,28 @@ final class LegacyRecord
             return $this->destinations[$sql] = $successor->newModelQuery()->useWritePdo()->whereKey($successor->getKey())->value($column);
         }
 
-        $table = SqlFragments::identifier($successor->getTable());
-        $row = $successor->exists
-            ? $connection->selectOne('SELECT ('.$sql.') AS destination FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
-            : $connection->selectOne('SELECT ('.$sql.') AS destination', [], false);
-        $destination = is_object($row) ? $row->destination ?? null : null;
-        $literal = $connection->escape(is_scalar($destination) ? $destination : null);
-        $successor->setRawAttributes(array_replace($successor->getAttributes(), [$column => new QueryExpression($literal)]));
+        [$destination, $literal] = self::evaluate($successor, $column, $expression);
         $this->destinations[$sql] = $this->destinations[$literal] = $destination;
 
         return $destination;
+    }
+
+    /**
+     * @return array{mixed, string}
+     */
+    public static function evaluate(Model $successor, string $column, Expression $expression): array
+    {
+        $connection = $successor->getConnection();
+        $sql = (string) $expression->getValue($connection->getQueryGrammar());
+        $table = SqlFragments::identifier($successor->getTable());
+        $row = $successor->exists
+            ? $connection->selectOne('SELECT ('.$sql.') AS evaluated FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
+            : $connection->selectOne('SELECT ('.$sql.') AS evaluated', [], false);
+        $value = is_object($row) ? $row->evaluated ?? null : null;
+        $literal = $connection->escape(is_scalar($value) ? $value : null);
+        $successor->setRawAttributes(array_replace($successor->getAttributes(), [$column => new QueryExpression($literal)]));
+
+        return [$value, $literal];
     }
 
     private function relationshipKey(Model $successor, string $column): mixed
