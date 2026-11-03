@@ -426,11 +426,25 @@ final class LegacyRecord
 
         return $connection->select(
             'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(', ', $select).' FROM '.ViewCompiler::primary($this->served)
+                .$this->retained()
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
             [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
             false,
         );
+    }
+
+    private function retained(): string
+    {
+        $retained = $this->served->retainedTable;
+
+        if ($retained === null || $this->served->retainedKey === null) {
+            return '';
+        }
+
+        $by = $this->served->branch ? (string) $this->served->identifiers[$this->legacyKey()]->column() : $this->served->primary->key;
+
+        return ' LEFT JOIN '.SqlFragments::identifier($retained).' ON '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($this->served->retainedKey).' = '.SqlFragments::identifier($this->served->primary->table).'.'.SqlFragments::identifier($by);
     }
 
     /**

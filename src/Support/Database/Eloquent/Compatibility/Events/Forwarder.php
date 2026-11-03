@@ -90,6 +90,9 @@ final class Forwarder
     /** @var null|array<string, class-string> */
     private null|array $objects = null;
 
+    /** @var null|WeakMap<object, true> */
+    private static null|WeakMap $emitted = null;
+
     private function __construct(private readonly ResolvedMap $map, private readonly ResolvedMap $served, private readonly null|Related $dependent)
     {
         $this->sequences = new WeakMap;
@@ -111,7 +114,7 @@ final class Forwarder
                 }
 
                 foreach (self::objects($successor, $forwarded) as $object) {
-                    self::prepend($events, $object, fn (object $fired): null|false => ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
+                    self::prepend($events, $object, fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
                 }
             }
         }
@@ -398,9 +401,11 @@ final class Forwarder
                 }
             }
 
-            if (in_array('saved', $legacyEvents, true)) {
-                foreach (array_intersect_key($legacies, $record->records()) as $legacy) {
+            foreach (array_intersect_key($legacies, $record->records()) as $legacy) {
+                if (in_array('saved', $legacyEvents, true)) {
                     $legacy->syncOriginal();
+                } elseif ($sequence->start === 'updating' && in_array('updated', $legacyEvents, true)) {
+                    $legacy->syncOriginalAttributes(array_keys($legacy->getChanges()));
                 }
             }
         }
@@ -575,7 +580,10 @@ final class Forwarder
         $object = $legacy->dispatchesEvents()[$event] ?? null;
 
         if (is_string($object) && class_exists($object)) {
-            $result = $this->send($dispatcher, new $object($legacy), [], $halt);
+            $emitted = new $object($legacy);
+            self::$emitted ??= new WeakMap;
+            self::$emitted[$emitted] = true;
+            $result = $this->send($dispatcher, $emitted, [], $halt);
             $result = is_array($result) ? array_filter($result, fn (mixed $response) => $response !== null) : $result;
 
             if (! in_array($result, [null, 0, 0.0, '', '0', []], true)) {
