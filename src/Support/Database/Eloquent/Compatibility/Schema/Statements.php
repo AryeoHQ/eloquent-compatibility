@@ -53,6 +53,7 @@ final readonly class Statements
         $index = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey');
 
         $theirs = InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$map->retainedKey}, which install() adds as the key of the retained table");
+        $taken = self::retainedIndexTaken($map);
 
         if (self::retainedKeyOf($connection, $map) === 'theirs') {
             throw $theirs;
@@ -79,8 +80,10 @@ final readonly class Statements
                 ."  END LOOP;\n"
                 ."END\n\$compatibility\$",
             "DO \$compatibility\$\nBEGIN\n"
-                .'  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).") AND NOT indisvalid) THEN\n"
+                .'  IF EXISTS ('.self::retainedIndex($map).' AND NOT retained_index.indisvalid) THEN'."\n"
                 .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
+                .'  ELSIF '.self::relationIn($index).' IS NOT NULL AND NOT EXISTS ('.self::retainedIndex($map).' AND retained_index.indisvalid) THEN'."\n"
+                ."    RAISE EXCEPTION '%', ".SqlFragments::literal($taken->getMessage()).";\n"
                 ."  END IF;\nEND\n\$compatibility\$",
             'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index)." ON {$legacyTable} ({$retainedKey})",
         ]);
@@ -222,7 +225,13 @@ final readonly class Statements
         $retainedPrimaryKeyName = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey');
         $retainedPrimaryKey = SqlFragments::identifier($retainedPrimaryKeyName);
         $retainedForeignKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'));
-        $indexed = $prefilled && $connection->scalar('select indisvalid and indisunique from pg_index where indexrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?) and indrelid = to_regclass(quote_ident(current_schema()) || \'.\' || ?)', [SqlFragments::identifier($retainedPrimaryKeyName), SqlFragments::identifier($map->table)]) === true;
+        $retainedIndex = $branched ? 'absent' : $connection->scalar('select case when '.self::relationIn($retainedPrimaryKeyName)." is null then 'absent' when exists (".self::retainedIndex($map)." and retained_index.indisvalid) then 'ours' else 'theirs' end");
+
+        if ($retainedIndex === 'theirs') {
+            throw self::retainedIndexTaken($map);
+        }
+
+        $indexed = $prefilled && $retainedIndex === 'ours';
         $retainedNotNullName = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_not_null');
         $retainedNotNull = SqlFragments::identifier($retainedNotNullName);
         $retainedConstraints = "ALTER TABLE {$retainedTable}\n  ".($indexed ? "ADD CONSTRAINT {$retainedNotNull} CHECK (".SqlFragments::identifier($retainedKey).' IS NOT NULL) NOT VALID' : "ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey).')').',';
@@ -1121,6 +1130,29 @@ final readonly class Statements
             $comment->comment === self::RETAINED_KEY => 'ours',
             default => 'theirs',
         };
+    }
+
+    private static function retainedIndex(ResolvedMap $map): string
+    {
+        $legacy = self::relationIn($map->table);
+
+        return 'SELECT FROM pg_index retained_index JOIN pg_class index_relation ON index_relation.oid = retained_index.indexrelid JOIN pg_am access_method ON access_method.oid = index_relation.relam'
+            .' WHERE retained_index.indexrelid = '.self::relationIn(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey'))
+            ." AND retained_index.indrelid = {$legacy} AND retained_index.indisunique AND retained_index.indimmediate AND access_method.amname = 'btree'"
+            .' AND retained_index.indnatts = 1 AND retained_index.indoption[0] = 0 AND retained_index.indpred IS NULL AND retained_index.indexprs IS NULL'
+            ." AND retained_index.indkey[0] = (SELECT attribute.attnum FROM pg_attribute attribute WHERE attribute.attrelid = {$legacy} AND attribute.attname = ".SqlFragments::literal((string) $map->retainedKey).' AND NOT attribute.attisdropped)';
+    }
+
+    private static function relationIn(string $name): string
+    {
+        return 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
+    }
+
+    private static function retainedIndexTaken(ResolvedMap $map): InvalidCompatibilityMap
+    {
+        $index = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey');
+
+        return InvalidCompatibilityMap::cannot($map->table, 'install', "{$index} already exists and is not a valid unique B-tree index on {$map->table} ({$map->retainedKey}) over every row, so install() cannot make it the primary key of ".ViewCompiler::retainedTable($map).". Rename or drop {$index}, then install again");
     }
 
     private static function kind(ConnectionInterface $connection, string $table): null|string

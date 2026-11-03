@@ -122,9 +122,9 @@ final class LegacyBuilder extends Builder
     /**
      * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
-    public static function relationOf(Model $model): array
+    public static function relationOf(Model $model, bool $fresh = false): array
     {
-        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)));
+        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)), $fresh);
     }
 
     /**
@@ -196,7 +196,7 @@ final class LegacyBuilder extends Builder
             return $this->toBase()->insert($values);
         }
 
-        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn (): bool => $this->natively(fn (): bool => $this->toBase()->insert($values)), function () use ($values): bool {
+        return ServedTable::write($this->model, $this->map(), fn (): bool => $this->natively(fn (): bool => $this->toBase()->insert($values)), function () use ($values): bool {
             $this->writer()->insert($this->model, $values);
 
             return true;
@@ -213,7 +213,7 @@ final class LegacyBuilder extends Builder
             return $this->toBase()->insertGetId($values, $sequence);
         }
 
-        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn () => $this->natively(fn () => $this->toBase()->insertGetId($values, $sequence)), fn (): int|string => $this->writer()->insert($this->model, $values));
+        return ServedTable::write($this->model, $this->map(), fn () => $this->natively(fn () => $this->toBase()->insertGetId($values, $sequence)), fn (): int|string => $this->writer()->insert($this->model, $values));
     }
 
     /**
@@ -900,7 +900,7 @@ final class LegacyBuilder extends Builder
      */
     private function own(Closure $native, Closure $translated): mixed
     {
-        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn (): mixed => $this->natively($native), $translated);
+        return ServedTable::write($this->model, $this->map(), fn (): mixed => $this->natively($native), $translated);
     }
 
     /**

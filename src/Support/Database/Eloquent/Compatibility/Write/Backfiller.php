@@ -451,6 +451,8 @@ final readonly class Backfiller
             $models[self::keyOf($primary->getAttribute((string) $branch->identifiers[$this->key]->column()))] = [$branch->primary->table => $primary];
         }
 
+        $changed = 0;
+
         foreach ($branch->related as $related) {
             if (! array_key_exists($related->table, $reached)) {
                 continue;
@@ -479,28 +481,40 @@ final readonly class Backfiller
                     $models[$key][$related->table] = $model;
                 }
             }
+
+            if (array_key_exists($related->table, $owned)) {
+                $changed += $this->saveOwned($branch, $related->table, $owned[$related->table], $models, $stored, $external);
+            }
         }
 
+        return $changed;
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  array<int|string, array<string, Model>>  $models
+     * @param  array<int|string, array<string, array<string, mixed>>>  $stored
+     * @param  array<int|string, array<string, mixed>>  $external
+     */
+    private function saveOwned(ResolvedMap $branch, string $table, array $names, array $models, array $stored, array $external): int
+    {
+        $located = array_filter(array_map(fn (array $held) => $held[$table] ?? null, $models));
+        $first = reset($located);
+
+        if ($first === false) {
+            return 0;
+        }
+
+        $existing = $first->newCollection(array_values(array_filter($located, fn (Model $model) => $model->exists)));
+        $read = [];
         $changed = 0;
 
-        foreach ($owned as $table => $names) {
-            $located = array_filter(array_map(fn (array $held) => $held[$table] ?? null, $models));
-            $first = reset($located);
+        foreach ($names as $name) {
+            $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
+        }
 
-            if ($first === false) {
-                continue;
-            }
-
-            $existing = $first->newCollection(array_values(array_filter($located, fn (Model $model) => $model->exists)));
-            $read = [];
-
-            foreach ($names as $name) {
-                $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
-            }
-
-            foreach ($located as $key => $model) {
-                $changed += $this->saveExternals($branch, $model, array_intersect_key($external[$key] ?? [], array_flip($names)), $read, $key, array_keys($stored[$key][$table] ?? []));
-            }
+        foreach ($located as $key => $model) {
+            $changed += $this->saveExternals($branch, $model, array_intersect_key($external[$key] ?? [], array_flip($names)), $read, $key, array_keys($stored[$key][$table] ?? []));
         }
 
         return $changed;
