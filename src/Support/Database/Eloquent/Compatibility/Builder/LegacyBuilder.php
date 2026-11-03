@@ -52,8 +52,8 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $restores = null;
 
-    /** @var array<string, list<string>> */
-    private static array $nondeterministic = [];
+    /** @var array<string, array<string, array{name: string, deterministic: bool, declared: bool}>> */
+    private static array $collations = [];
 
     private int $negations = 0;
 
@@ -63,7 +63,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         ServedTable::forget();
-        self::$nondeterministic = [];
+        self::$collations = [];
     }
 
     public static function insertOf(Model $model): void
@@ -761,34 +761,29 @@ final class LegacyBuilder extends Builder
     private function served(string $attribute, string $owner): array
     {
         $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
+        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['path']] ??= new ColumnCatalog($connection, throughSearchPath: true);
         $definition = $this->definition($attribute);
         $column = $definition->column();
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
         $served = $catalog->of($this->map()->table)[$attribute] ?? null;
+        $collation = $this->collations($this->map()->table)[$attribute] ?? null;
 
-        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ! in_array($column, $this->nondeterministic($owner), true) && ! in_array($attribute, $this->nondeterministic($this->map()->table), true))) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ($this->collations($owner)[(string) $column]['deterministic'] ?? true) && ($collation['deterministic'] ?? true))) {
             return [$type, null];
         }
 
-        return [$type, ViewCompiler::cast($definition->read($owner, $type, $catalog->baseType(...)), $catalog->baseType($definition->type($type)), $served->type, $served->baseType)];
+        return [$type, ViewCompiler::cast($definition->read($owner, $type, $catalog->baseType(...)), $catalog->baseType($definition->type($type)), $served->type, $served->baseType, $collation['name'] ?? null)];
     }
 
     /**
-     * @return list<string>
+     * @return array<string, array{name: string, deterministic: bool, declared: bool}>
      */
-    private function nondeterministic(string $table): array
+    private function collations(string $table): array
     {
         $connection = $this->model->getConnection();
 
-        return self::$nondeterministic[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= array_values(array_map(fn (object $row) => (string) $row->name, $connection->select(
-            "select attribute.attname as name
-             from pg_attribute attribute
-             join pg_collation column_collation on column_collation.oid = attribute.attcollation
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped and not column_collation.collisdeterministic",
-            [SqlFragments::identifier($table)],
-        )));
+        return self::$collations[$connection->getName().'.'.$this->relation()['path'].'.'.$table] ??= ViewCompiler::collations($connection, $table, throughSearchPath: true);
     }
 
     /**
@@ -877,7 +872,7 @@ final class LegacyBuilder extends Builder
     }
 
     /**
-     * @return array{schema: string, view: bool, readable: bool}
+     * @return array{path: string, view: bool, readable: bool}
      */
     private function relation(): array
     {

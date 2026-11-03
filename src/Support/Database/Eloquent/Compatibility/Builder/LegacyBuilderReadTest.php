@@ -340,6 +340,61 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
+    public function it_compares_an_attribute_divided_by_a_whole_number_beyond_the_integer_range_as_the_view_serves_it(): void
+    {
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(1e100)));
+            }
+        };
+        $this->installMap($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a price of nothing' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 0),
+            'not a price of nothing' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '!=', 0),
+            'a price above nothing' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '>', 0),
+        ]);
+        $this->assertSame([1, 3, 5], array_map(intval(...), DB::table('listings')->where('price', 0)->orderBy('id')->pluck('id')->all()));
+    }
+
+    #[Test]
+    public function it_compares_a_multiplied_real_served_as_double_precision_as_the_view_serves_it(): void
+    {
+        DB::statement('alter table listings add column score double precision');
+        DB::statement('alter table jobs add column score real');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('score', fn (Attribute $attribute) => $attribute->from('score')->multipliedBy(2)));
+            }
+        };
+        $this->installMap($model::class);
+        DB::update('update jobs set score = 0.1 where legacy_id = 1');
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'the doubled value' => fn (Builder|QueryBuilder $listings) => $listings->where('score', 0.2),
+            'not the doubled value' => fn (Builder|QueryBuilder $listings) => $listings->where('score', '!=', 0.2),
+            'above the doubled value' => fn (Builder|QueryBuilder $listings) => $listings->where('score', '>', 0.2),
+        ]);
+        $this->assertSame([1], array_map(intval(...), DB::table('listings')->where('score', '>', 0.2)->pluck('id')->all()));
+    }
+
+    #[Test]
     public function it_compares_a_bound_beyond_the_range_of_the_stored_integer_as_the_view_does(): void
     {
         $this->install();
@@ -421,6 +476,41 @@ final class LegacyBuilderReadTest extends TestCase
         } finally {
             ListingTables::drop();
             DB::statement('drop domain if exists compatibility_case_insensitive_text');
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    #[Test]
+    public function it_filters_a_mapping_in_the_collation_the_legacy_column_declares(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+
+        try {
+            DB::statement('alter table listings alter column status type varchar(255) collate compatibility_case_insensitive');
+            $model = new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return LegacyBuilderReadTest::identified($listing)
+                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'Draft', 'closed' => 'Sold'])));
+                }
+            };
+            $before = array_map(intval(...), DB::table('listings')->where('status', 'active')->orderBy('id')->pluck('id')->all());
+            $this->installMap($model::class);
+
+            $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+                'a value in another case' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'active'),
+                'not a value in another case' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '!=', 'sold'),
+                'values in another case' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('status', ['SOLD', 'draft']),
+            ]);
+            $this->assertSame([[1, 4], [1, 4]], [$before, array_map(intval(...), DB::table('listings')->where('status', 'active')->orderBy('id')->pluck('id')->all())]);
+        } finally {
+            ListingTables::drop();
             DB::statement('drop collation if exists compatibility_case_insensitive');
         }
     }

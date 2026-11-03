@@ -40,10 +40,10 @@ final readonly class ViewCompiler
      * @param  list<string>  $external
      * @return array<string, string>
      */
-    public function served(ResolvedMap $map, array $shape, array $external = []): array
+    public function served(ResolvedMap $map, array $shape, array $external = [], null|string $retainedFrom = null): array
     {
         if ($map->morphs !== []) {
-            return $this->morphed($map, $shape, $external);
+            return $this->morphed($map, $shape, $external, $retainedFrom);
         }
 
         $external = [...$external, ...$map->externals()];
@@ -64,6 +64,7 @@ final readonly class ViewCompiler
         }
 
         $served = [];
+        $collations = self::collations($this->connection, $map->table);
 
         foreach ($shape as $name => $column) {
             if (! array_key_exists($name, $reads)) {
@@ -73,10 +74,10 @@ final readonly class ViewCompiler
             [$read, $type, $raw] = $reads[$name];
 
             if ($raw && SqlFragments::isNaive($column->baseType ?? $column->type)) {
-                $type = $this->expressionType($map, $read);
+                $type = $this->expressionType($map, $read, $retainedFrom ?? self::retainedTable($map));
             }
 
-            $served[$name] = self::cast($read, $type, $column->type, $column->baseType);
+            $served[$name] = self::cast($read, $type, $column->type, $column->baseType, $collations[$name]['name'] ?? null);
         }
 
         return $served;
@@ -87,10 +88,11 @@ final readonly class ViewCompiler
      * @param  list<string>  $external
      * @return array<string, string>
      */
-    private function morphed(ResolvedMap $map, array $shape, array $external): array
+    private function morphed(ResolvedMap $map, array $shape, array $external, null|string $retainedFrom): array
     {
         $external = [...$external, ...$map->externals()];
-        $variants = array_map(fn (ResolvedMap $variant) => $this->served($variant, $shape, $external), $map->morphs);
+        $variants = array_map(fn (ResolvedMap $variant) => $this->served($variant, $shape, $external, $retainedFrom), $map->morphs);
+        $collations = self::collations($this->connection, $map->table);
         $type = SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $map->morph?->typeColumn);
         $served = [];
 
@@ -102,19 +104,42 @@ final readonly class ViewCompiler
             }
 
             $cases = array_map(fn (ResolvedMap $variant, string $target) => 'WHEN '.SqlFragments::literal((string) $variant->target?->morphAlias).' THEN '.$variants[$target][$name], $map->morphs, array_keys($map->morphs));
-            $served[$name] = 'CAST(CASE '.$type.' '.implode(' ', $cases).' END AS '.$shape[$name]->type.')';
+            $served[$name] = self::cast('CASE '.$type.' '.implode(' ', $cases).' END', null, $shape[$name]->type, null, $collations[$name]['name'] ?? null);
         }
 
         return $served;
     }
 
-    public static function cast(string $read, null|string $type, string $served, null|string $servedBase = null): string
+    public static function cast(string $read, null|string $type, string $served, null|string $servedBase = null, null|string $collation = null): string
     {
         if (SqlFragments::isZoned($type) && SqlFragments::isNaive($servedBase ?? $served)) {
             $read = SqlFragments::inApplicationZone($read);
         }
 
-        return 'CAST('.$read.' AS '.$served.')';
+        return 'CAST('.$read.' AS '.$served.')'.($collation === null ? '' : ' COLLATE '.$collation);
+    }
+
+    /**
+     * @return array<string, array{name: string, deterministic: bool, declared: bool}>
+     */
+    public static function collations(ConnectionInterface $connection, string $table, bool $throughSearchPath = false): array
+    {
+        $collations = [];
+
+        foreach ($connection->select(
+            "select attribute.attname as name, quote_ident(collation_schema.nspname) || '.' || quote_ident(column_collation.collname) as collation,
+                    column_collation.collisdeterministic as deterministic, attribute.attcollation <> column_type.typcollation as declared
+             from pg_attribute attribute
+             join pg_type column_type on column_type.oid = attribute.atttypid
+             join pg_collation column_collation on column_collation.oid = attribute.attcollation
+             join pg_namespace collation_schema on collation_schema.oid = column_collation.collnamespace
+             where attribute.attrelid = ".($throughSearchPath ? 'to_regclass(?)' : "to_regclass(quote_ident(current_schema()) || '.' || ?)").' and attribute.attnum > 0 and not attribute.attisdropped',
+            [SqlFragments::identifier($table)],
+        ) as $row) {
+            $collations[(string) $row->name] = ['name' => (string) $row->collation, 'deterministic' => $row->deterministic === true, 'declared' => $row->declared === true];
+        }
+
+        return $collations;
     }
 
     public static function retainedTable(ResolvedMap $map): string
@@ -193,7 +218,7 @@ final readonly class ViewCompiler
      */
     private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, array $external): string
     {
-        $served = $this->served($map, $shape, $external);
+        $served = $this->served($map, $shape, $external, $defaultsOn);
         $retainedTable = self::retainedTable($map);
         $legacyOnly = $map->legacyOnly(array_keys($shape));
         $volatile = $this->volatileDefaults($defaultsOn);
@@ -252,11 +277,13 @@ final readonly class ViewCompiler
         return $stored === null ? null : $stored->baseType ?? $stored->type;
     }
 
-    private function expressionType(ResolvedMap $map, string $read): null|string
+    private function expressionType(ResolvedMap $map, string $read, string $retainedFrom): null|string
     {
+        $retainedTable = self::retainedTable($map);
         $type = $this->connection->scalar(
-            'SELECT CAST(pg_typeof('.$read.') AS text) FROM (SELECT) AS compatibility_row LEFT JOIN '.SqlFragments::identifier($map->primary->table).' ON false'
-                .implode('', array_map(fn (string $lateral) => ' '.$lateral, self::laterals($map))),
+            'SELECT CAST(pg_typeof(probe.value) AS text) FROM (SELECT) AS compatibility_row LEFT JOIN (SELECT '.$read.' AS value FROM '.self::primary($map)
+                .' LEFT JOIN '.SqlFragments::identifier($retainedFrom).($retainedFrom === $retainedTable ? '' : ' AS '.SqlFragments::identifier($retainedTable)).' ON false'
+                .implode('', array_map(fn (string $lateral) => ' '.$lateral, self::laterals($map))).' WHERE false) AS probe ON true',
         );
 
         return is_string($type) ? $this->columnCatalog->baseType($type) : null;

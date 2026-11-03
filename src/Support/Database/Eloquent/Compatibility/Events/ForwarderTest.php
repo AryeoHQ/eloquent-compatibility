@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Closure;
 use Illuminate\Broadcasting\BroadcastEvent;
+use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -1355,6 +1356,171 @@ final class ForwarderTest extends TestCase
         $job = Job::query()->findOrFail(Job::query()->create(['name' => 'Birch House'])->id);
 
         $this->assertSame([ListingTables::COMPANY, ListingTables::COMPANY], [$job->company_id, Listing::query()->findOrFail($job->legacy_id)->company_id]);
+    }
+
+    #[Test]
+    public function it_raises_the_restored_event_of_a_job_restore_a_listing_saving_or_updating_listener_refuses_as_a_native_listing_restore_does(): void
+    {
+        /** @var list<string> $refuses */
+        $refuses = [];
+        Event::listen('eloquent.saving: '.Listing::class, function () use (&$refuses): null|false {
+            return in_array('saving', $refuses, true) ? false : null;
+        });
+        Event::listen('eloquent.updating: '.Listing::class, function () use (&$refuses): null|false {
+            return in_array('updating', $refuses, true) ? false : null;
+        });
+        $this->listen(Listing::class, ['restoring', 'saving', 'updating', 'restored'], fn (Listing $listing) => [$listing->id, $listing->deleted_at === null, $listing->isDirty('deleted_at'), $listing->exists]);
+        $native = [];
+        $forwarded = [];
+
+        foreach (['saving', 'updating'] as $event) {
+            $refuses = [$event];
+            $this->seen = [];
+            $native[$event] = [Listing::withTrashed()->findOrFail(2)->restore()]; // @phpstan-ignore staticMethod.dynamicCall
+            $native[$event][] = $this->seen;
+            $this->seen = [];
+            $forwarded[$event] = [Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->restore(), $this->seen]; // @phpstan-ignore staticMethod.dynamicCall
+        }
+
+        $this->assertSame($native, $forwarded);
+        $this->assertTrue(Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->trashed()); // @phpstan-ignore staticMethod.dynamicCall
+    }
+
+    #[Test]
+    public function it_keeps_a_listener_named_in_without_forwarding_to_and_registered_on_an_interface_of_a_forwarded_event_object_from_that_object(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $seen = [];
+        Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$seen): void {
+            $seen[] = $event->legacyFile->file_name;
+        });
+        Event::listen(ShouldDispatchAfterCommit::class, ArchiveLegacyFile::class);
+        Event::listen(ShouldDispatchAfterCommit::class, function (object $event) use (&$seen): void {
+            $seen[] = $event instanceof LegacyFileUpdated ? 'interface' : $event::class;
+        });
+
+        File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-2.pdf']);
+
+        $this->assertSame([['contract-2.pdf', 'interface'], []], [$seen, ArchiveLegacyFile::$archived]);
+    }
+
+    #[Test]
+    public function it_gives_the_after_events_of_a_successor_write_that_changes_the_legacy_id_the_external_fact_the_new_key_reads(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $this->listen(Photo::class, ['updated', 'saved'], fn (Photo $photo) => [$photo->id, $photo->getOriginal('id'), $photo->mime_type, $photo->getOriginal('mime_type')]);
+
+        File::query()->where('legacy_type', 'photo')->where('legacy_id', 2)->firstOrFail()->update(['legacy_id' => 20]);
+
+        $this->assertSame([['updated', 20, 2, 'image/jpeg', 'image/jpeg'], ['saved', 20, 2, 'image/jpeg', 'image/jpeg']], $this->seen);
+        $this->assertSame('image/jpeg', Photo::query()->findOrFail(20)->mime_type);
+    }
+
+    #[Test]
+    public function it_evaluates_an_expression_on_a_dependent_relationship_key_once_and_forwards_the_write_to_the_record_it_stores(): void
+    {
+        $pine = Job::withTrashed()->where('legacy_id', 2)->value('id'); // @phpstan-ignore staticMethod.dynamicCall
+        DB::statement('create temporary sequence forwarding_probe');
+        $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
+        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+
+        try {
+            $root->update(['job_id' => DB::raw("(select id from jobs order by legacy_id offset nextval('forwarding_probe') limit 1)")]);
+            $probe = DB::scalar('select last_value from forwarding_probe');
+        } finally {
+            DB::statement('drop sequence forwarding_probe');
+        }
+
+        $this->assertSame([
+            ['updating', 1, '1 Oak St', '1 Oak St'], ['updating', 2, null, null],
+            ['updated', 1, '1 Oak St', null], ['updated', 2, null, '1 Oak St'],
+        ], $this->seen);
+        $this->assertSame([1, $pine], [$probe, Place::query()->findOrFail($root->id)->job_id]);
+    }
+
+    #[Test]
+    public function it_reads_the_relationship_key_a_dependent_was_loaded_without_from_the_write_connection(): void
+    {
+        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        DB::statement('create schema compatibility_replica');
+        DB::statement('create table compatibility_replica.places as table public.places');
+
+        foreach (['jobs', 'job_sites', 'listings_retained', 'listings'] as $table) {
+            DB::statement("create view compatibility_replica.{$table} as select * from public.{$table}");
+        }
+
+        DB::table('compatibility_replica.places')->where('id', $root->id)->update(['job_id' => Job::query()->where('legacy_id', 3)->value('id')]);
+        config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.'.DB::getDefaultConnection()), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
+        $this->listen(Listing::class, ['saving', 'updated'], fn (Listing $listing) => [$listing->id, $listing->street]);
+
+        try {
+            Place::on('compatibility_replicated')->useWritePdo()->select(['id', 'street'])->whereKey($root->id)->firstOrFail()->update(['street' => '2 Oak St']); // @phpstan-ignore staticMethod.dynamicCall
+        } finally {
+            DB::purge('compatibility_replicated');
+            DB::statement('drop schema compatibility_replica cascade');
+        }
+
+        $this->assertSame([['saving', 1, '2 Oak St'], ['updated', 1, '2 Oak St']], $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_no_write_a_job_created_listener_makes_through_another_instance_to_the_record_a_legacy_create_retries_after_a_rollback(): void
+    {
+        $fails = true;
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            Job::query()->findOrFail($job->id)->update(['price_cents' => 7]);
+        });
+        Event::listen('eloquent.saved: '.Job::class, function () use (&$fails): void {
+            if ($fails) {
+                $fails = false;
+
+                throw new RuntimeException('Roll the create back.');
+            }
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+        $listing = new Listing(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        try {
+            $listing->save();
+        } catch (RuntimeException) {
+        }
+
+        $listing->save();
+
+        $this->assertSame([['saving', null], ['creating', null], ['saving', null], ['creating', null], ['created', $listing->id], ['saved', $listing->id]], $this->seen);
+        $this->assertSame('0.07', Listing::query()->findOrFail($listing->id)->price);
+    }
+
+    #[Test]
+    public function it_gives_the_restored_event_of_a_job_restore_the_synchronized_originals_a_native_listing_restore_gives(): void
+    {
+        $this->listen(Listing::class, ['restored'], fn (Listing $listing) => [$listing->getOriginal('deleted_at') === null, $listing->isDirty(), $listing->wasChanged('deleted_at')]);
+
+        Listing::withTrashed()->findOrFail(2)->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        $native = $this->seen;
+        Listing::query()->findOrFail(2)->delete();
+        $this->seen = [];
+        Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->restore(); // @phpstan-ignore staticMethod.dynamicCall
+
+        $this->assertSame([['restored', true, false, true]], $native);
+        $this->assertSame($native, $this->seen);
+    }
+
+    #[Test]
+    public function it_forwards_the_after_events_of_a_dependent_insert_without_timestamps_whose_served_value_comes_from_a_database_default(): void
+    {
+        DB::statement("alter table places alter column street set default '2 Pine St'");
+        $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
+        $place = new Place(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id')]); // @phpstan-ignore staticMethod.dynamicCall
+        $place->timestamps = false;
+
+        $place->save();
+
+        $this->assertSame([['updated', 2, null, '2 Pine St'], ['saved', 2, null, '2 Pine St']], $this->seen);
     }
 
     /**

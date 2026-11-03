@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Expression as QueryExpression;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -108,14 +109,14 @@ final class LegacyRecord
     {
         $this->expressed = $this->dependent !== null && $this->expresses($successor);
         $values = $this->values($successor);
-        $computed = serialize(array_diff_key($values, [$successor->getKeyName() => true]));
+        $computed = serialize([$successor->exists, array_diff_key($values, [$successor->getKeyName() => true])]);
 
         if ($computed === $this->computed) {
             return;
         }
 
         $this->computed = $computed;
-        $rows = $this->compute($successor, $values);
+        $rows = $this->compute($successor, $values, $written);
 
         if ($this->dependent === null) {
             $key = array_key_first($this->records) ?? '';
@@ -292,6 +293,12 @@ final class LegacyRecord
         }
 
         $original = $legacy->getRawOriginal();
+        $key = $legacy->getKey();
+
+        if ((is_int($key) || is_string($key)) && (string) $key !== (string) ($original[$legacy->getKeyName()] ?? $key)) {
+            ExternalAttributes::refreshed($legacy, $key);
+        }
+
         $legacy->setRawAttributes(array_diff_key($legacy->getAttributes(), $resolved));
 
         foreach (array_keys($resolved) as $name) {
@@ -339,7 +346,7 @@ final class LegacyRecord
      * @param  array<string, mixed>  $values
      * @return array<array-key, array<string, mixed>>
      */
-    private function compute(Model $successor, array $values): array
+    private function compute(Model $successor, array $values, bool $after): array
     {
         $table = SqlFragments::identifier($successor->getTable());
         $key = SqlFragments::identifier($successor->getKeyName());
@@ -352,7 +359,7 @@ final class LegacyRecord
         $filter = null;
 
         if ($this->dependent !== null) {
-            $filter = $this->filter($successor, false);
+            $filter = $this->filter($successor, $after);
 
             if ($filter === null) {
                 return [];
@@ -444,7 +451,7 @@ final class LegacyRecord
         $old = $this->relationshipKey($successor, $related->relatedKey);
         $attributes = $successor->getAttributes();
         $new = array_key_exists($related->relatedKey, $attributes) ? $attributes[$related->relatedKey] : $old;
-        $new = $new instanceof Expression ? $this->destination($successor, $new) : $new;
+        $new = $new instanceof Expression ? $this->destination($successor, $related->relatedKey, $new, $written) : $new;
         $values = array_values(array_unique(array_filter([$old, $new], fn (mixed $value) => $value !== null), SORT_REGULAR));
 
         if ($values === []) {
@@ -463,20 +470,29 @@ final class LegacyRecord
         return [$condition, $values];
     }
 
-    private function destination(Model $successor, Expression $expression): mixed
+    private function destination(Model $successor, string $column, Expression $expression, bool $written): mixed
     {
         $connection = $successor->getConnection();
         $sql = (string) $expression->getValue($connection->getQueryGrammar());
 
-        if (! array_key_exists($sql, $this->destinations)) {
-            $table = SqlFragments::identifier($successor->getTable());
-            $row = $successor->exists
-                ? $connection->selectOne('SELECT ('.$sql.') AS destination FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
-                : $connection->selectOne('SELECT ('.$sql.') AS destination', [], false);
-            $this->destinations[$sql] = is_object($row) ? $row->destination ?? null : null;
+        if (array_key_exists($sql, $this->destinations)) {
+            return $this->destinations[$sql];
         }
 
-        return $this->destinations[$sql];
+        if ($written) {
+            return $this->destinations[$sql] = $successor->newModelQuery()->useWritePdo()->whereKey($successor->getKey())->value($column);
+        }
+
+        $table = SqlFragments::identifier($successor->getTable());
+        $row = $successor->exists
+            ? $connection->selectOne('SELECT ('.$sql.') AS destination FROM '.$table.' WHERE '.$table.'.'.SqlFragments::identifier($successor->getKeyName()).' = ?', [$successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey()], false)
+            : $connection->selectOne('SELECT ('.$sql.') AS destination', [], false);
+        $destination = is_object($row) ? $row->destination ?? null : null;
+        $literal = $connection->escape(is_scalar($destination) ? $destination : null);
+        $successor->setRawAttributes(array_replace($successor->getAttributes(), [$column => new QueryExpression($literal)]));
+        $this->destinations[$sql] = $this->destinations[$literal] = $destination;
+
+        return $destination;
     }
 
     private function relationshipKey(Model $successor, string $column): mixed
@@ -488,7 +504,7 @@ final class LegacyRecord
         }
 
         if (! array_key_exists($column, $this->keys)) {
-            $this->keys[$column] = $successor->exists ? $successor->newModelQuery()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column) : null;
+            $this->keys[$column] = $successor->exists ? $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column) : null;
         }
 
         return $this->keys[$column];

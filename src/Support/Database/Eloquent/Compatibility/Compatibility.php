@@ -89,7 +89,7 @@ final class Compatibility
         $connection = self::connection($map);
 
         try {
-            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection));
+            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection, catchingUp: true));
         } finally {
             LegacyBuilder::forgetViews();
         }
@@ -329,6 +329,8 @@ final class Compatibility
             }
         }
 
+        self::refusePrefix($map, $connection, class_basename($legacy));
+
         foreach ($successors as [$name, $successor]) {
             $name ??= DB::getDefaultConnection();
 
@@ -340,12 +342,47 @@ final class Compatibility
                 throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which config/database.php does not declare");
             }
 
+            self::refusePrefix($map, DB::connection($name), $successor);
+
             if (self::database(DB::connection($name)) !== self::database($connection)) {
                 throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which reaches another database than the connection {$connection->getName()} of ".class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database');
+            }
+
+            foreach (self::readTargets($name) as $target) {
+                if ($target !== array_map($connection->getConfig(...), ['driver' => 'driver', 'database' => 'database', 'search_path' => 'search_path'])) {
+                    throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, whose read configuration reaches another database or search_path than the connection {$connection->getName()} of ".class_basename($legacy).'; the view joins the successors the connection of '.class_basename($legacy).' writes, so the successor model would read other rows than the view serves');
+                }
             }
         }
 
         return $connection;
+    }
+
+    private static function refusePrefix(ResolvedMap $map, Connection $connection, string $reader): void
+    {
+        if ($connection->getTablePrefix() !== '') {
+            throw InvalidCompatibilityMap::because($map->table, "{$reader} reads the connection {$connection->getName()}, which adds the table prefix {$connection->getTablePrefix()}, and the package reads and compiles every table by its unprefixed name; use a connection without a prefix");
+        }
+    }
+
+    /**
+     * @return list<array{driver: mixed, database: mixed, search_path: mixed}>
+     */
+    private static function readTargets(string $name): array
+    {
+        $config = (array) Config::get("database.connections.{$name}");
+        $reads = $config['read'] ?? null;
+        $sections = match (true) {
+            ! is_array($reads) => [[]],
+            array_is_list($reads) && $reads !== [] => $reads,
+            default => [$reads],
+        };
+        $base = array_diff_key($config, ['read' => true, 'write' => true]);
+
+        return array_values(array_map(fn (mixed $section) => array_map(
+            fn (string $key) => [...$base, ...(is_array($section) ? $section : [])][$key] ?? null,
+            ['driver' => 'driver', 'database' => 'database', 'search_path' => 'search_path'],
+        ), $sections));
     }
 
     /**

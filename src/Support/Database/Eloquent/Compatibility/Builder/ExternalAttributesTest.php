@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use LogicException;
@@ -339,6 +340,128 @@ final class ExternalAttributesTest extends TestCase
             Photo::class.'::$mime_type cannot take orderBy desc. '.$because,
             Photo::class.'::$mime_type cannot take orderBy asc. '.$because,
             6,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
+    public function it_refuses_a_distinct_read_on_the_attribute_and_runs_one_on_a_stored_column(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->distinct('mime_type')->get(['id']), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->distinct('mime_type')->count(),
+            fn () => Photo::query()->toBase()->distinct(['file_name', 'photos.mime_type'])->get(['id']),
+            fn () => Photo::query()->toBase()->from('photos as p')->distinct('p.mime_type')->get(['p.id']),
+            fn () => Video::query()->toBase()->distinct('mime_type')->count(),
+            fn () => Photo::query()->toBase()->distinct('file_name')->count(),
+            fn () => Photo::query()->distinct('file_name')->get(['id']), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->distinct()->get(['file_name']), // @phpstan-ignore staticMethod.dynamicCall
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : $result;
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = fn (string $model) => $model.'::$mime_type cannot take distinct. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Video::class),
+            3,
+            3,
+            3,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
+    public function it_refuses_a_join_predicate_on_the_attribute_and_runs_one_on_a_column_of_the_joined_table(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->toBase()->join('files', 'photos.mime_type', '=', 'files.mime_type')->get(['photos.id']),
+            fn () => Photo::query()->join('files', 'files.mime_type', '=', 'photos.mime_type')->get(['photos.id']), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->leftJoin('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where(fn (QueryBuilder $nested) => $nested->where('photos.mime_type', 'image/png')))->get(['photos.id']),
+            fn () => Photo::query()->toBase()->joinWhere('files', 'photos.mime_type', '=', 'image/png')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->from('photos as p')->join('files', 'p.mime_type', '=', 'files.mime_type')->get(['p.id']),
+            fn () => Video::query()->toBase()->join('files', 'videos.mime_type', '=', 'files.mime_type')->get(['videos.id']),
+            fn () => Photo::query()->toBase()->join('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where('files.legacy_type', 'photo')->where('mime_type', 'image/png'))->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where('files.legacy_type', 'photo'))->where('files.mime_type', 'like', 'image/%')->get(['photos.id']),
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : 'ran';
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = fn (string $model) => $model.'::$mime_type cannot take join. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Photo::class),
+            $refusal(Video::class),
+            1,
+            3,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
+    public function it_refuses_a_json_selector_on_the_attribute_and_compiles_one_on_a_stored_column(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->where('mime_type->format', 'png')->get(),
+            fn () => Photo::query()->toBase()->where('photos.mime_type->format', 'png')->get(),
+            fn () => Photo::query()->toBase()->whereJsonContains('mime_type->tags', 'png')->get(),
+            fn () => Photo::query()->select('mime_type->format as format')->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->orderBy('photos.mime_type->format')->get(),
+            fn () => Photo::query()->toBase()->from('photos as p')->where('p.mime_type->format', 'png')->get(),
+            fn () => Photo::query()->toBase()->distinct('mime_type->format')->get(['id']),
+            fn () => Video::query()->toBase()->where('mime_type->format', 'mp4')->get(),
+            fn () => Photo::query()->toBase()->where('caption->lang', 'en')->orderBy('photos.caption->lang')->toSql(),
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : $result;
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $because = 'Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            Photo::class.'::$mime_type cannot take where. '.$because,
+            Photo::class.'::$mime_type cannot take where. '.$because,
+            Photo::class.'::$mime_type cannot take where. '.$because,
+            Photo::class.'::$mime_type cannot take select. '.$because,
+            Photo::class.'::$mime_type cannot take orderBy asc. '.$because,
+            Photo::class.'::$mime_type cannot take where. '.$because,
+            Photo::class.'::$mime_type cannot take distinct. '.$because,
+            Video::class.'::$mime_type cannot take where. '.$because,
+            'select * from "photos" where "caption"->>\'lang\' = ? order by "photos"."caption"->>\'lang\' asc',
         ], $refusals);
         $this->assertSame([], FakeMediaLibrary::bound()->calls);
     }

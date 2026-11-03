@@ -7,12 +7,15 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\QueryException;
 use WeakMap;
 
 final class ServedTable
 {
     private const array VIEW_WRITE_STATES = ['55000', '42809'];
+
+    private const string SESSION_CONTEXT = "/^\\s*(?:(?:set|reset)\\s+(?:(?:local|session)\\s+)?(?:search_path|role|session\\s+authorization|all)\\b|discard\\s+all\\b)|set_config\\s*\\(\\s*(?:'(?:search_path|role|session_authorization)'|\\?)/i";
 
     /** @var null|WeakMap<Connection, array<string, true>> */
     private static null|WeakMap $tables = null;
@@ -26,7 +29,7 @@ final class ServedTable
     /** @var null|WeakMap<Connection, array<string, false|int>> */
     private static null|WeakMap $views = null;
 
-    /** @var null|WeakMap<Connection, array<string, array{schema: string, view: bool, readable: bool}>> */
+    /** @var null|WeakMap<Connection, array<string, array{path: string, view: bool, readable: bool}>> */
     private static null|WeakMap $relations = null;
 
     public static function forget(): void
@@ -51,7 +54,7 @@ final class ServedTable
 
     /**
      * @param  list<string>  $successors
-     * @return array{schema: string, view: bool, readable: bool}
+     * @return array{path: string, view: bool, readable: bool}
      */
     public static function reading(Model $model, array $successors): array
     {
@@ -65,12 +68,12 @@ final class ServedTable
         }
 
         $row = (array) $connection->selectOne(
-            "select coalesce((select relnamespace::regnamespace::text from pg_class where oid = to_regclass(?)), current_schema()) as schema,
+            "select array_to_string(current_schemas(true), ',') as path,
                     coalesce((select relkind = 'v' from pg_class where oid = to_regclass(?)), false) as view,
                     coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(successor)) as successor_table), false) as readable",
-            [SqlFragments::identifier($table), SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
+            [SqlFragments::identifier($table), json_encode($successors, JSON_THROW_ON_ERROR)],
         );
-        $relations[$key] = ['schema' => (string) ($row['schema'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
+        $relations[$key] = ['path' => (string) ($row['path'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
 
         if (self::answer($connection)) {
             $answers = self::$relations ??= new WeakMap;
@@ -169,6 +172,14 @@ final class ServedTable
                 if ($connection->transactionLevel() === 0 && self::$transactions !== null) {
                     self::$transactions[$connection] = (self::$transactions[$connection] ?? 0) + 1;
                 }
+            });
+            $connection->beforeExecuting(static function (string $query, array $bindings, Connection $connection): void {
+                if (preg_match(self::SESSION_CONTEXT, $query) === 1) {
+                    self::$answered?->offsetUnset($connection);
+                }
+            });
+            $connection->getEventDispatcher()?->listen(TransactionRolledBack::class, static function (TransactionRolledBack $event): void {
+                self::$answered?->offsetUnset($event->connection);
             });
         }
 

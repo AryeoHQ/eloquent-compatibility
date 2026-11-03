@@ -34,6 +34,8 @@ final readonly class RecordWriter
      */
     public function insert(Model $legacy, array $values): int|string
     {
+        Applying::unidentified($legacy);
+
         if ($this->map->branches !== []) {
             $this->refuseRaw($values);
             $writer = new MassWriter($this->map, $this->connection);
@@ -623,7 +625,7 @@ final readonly class RecordWriter
         $consistent = [];
 
         foreach ($this->map->branches as $branch) {
-            $served = (new MassWriter($branch, $this->connection))->served($values);
+            $served = (new MassWriter($branch, $this->connection))->served($values, fixed: true);
 
             if ($served !== null && $this->map->branchFor(self::probe($legacy, array_replace($before, $values, $served))) === $branch) {
                 $consistent[] = $branch;

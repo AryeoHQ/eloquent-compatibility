@@ -12,10 +12,12 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\MultipliedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
@@ -257,7 +259,7 @@ final readonly class MassWriter
      * @param  array<array-key, mixed>  $values
      * @return null|array<string, mixed>
      */
-    public function served(array $values): null|array
+    public function served(array $values, bool $fixed = false): null|array
     {
         $grammar = $this->connection->getQueryGrammar();
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
@@ -266,7 +268,9 @@ final readonly class MassWriter
         $selects = [];
         $bindings = [];
 
-        foreach (self::named($values) as $name => $value) {
+        $named = self::named($values);
+
+        foreach ($named as $name => $value) {
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null || $attribute->isExternal() || $value instanceof Expression || ($attribute->conversions()[0] ?? null) instanceof ReadAs || ! array_key_exists($name, $view)) {
@@ -295,11 +299,25 @@ final readonly class MassWriter
             $selects[$name] = ViewCompiler::cast($read, $attribute->type($type), $view[$name]->type, $view[$name]->baseType).' AS '.$grammar->wrap($name);
         }
 
+        foreach ($fixed ? $this->map->attributes : [] as $name => $attribute) {
+            if (! array_key_exists($name, $named) && ($attribute->conversions()[0] ?? null) instanceof Fixed && array_key_exists($name, $view)) {
+                $selects[$name] = ViewCompiler::cast($attribute->read($this->map->owners[$name]->table), $attribute->type(null), $view[$name]->type, $view[$name]->baseType).' AS '.$grammar->wrap($name);
+            }
+        }
+
         if ($selects === []) {
             return [];
         }
 
-        $row = $this->connection->selectOne('SELECT '.implode(', ', $selects).($inputs === [] ? '' : ' FROM (SELECT '.implode(', ', $inputs).') AS input'), $this->connection->table($this->map->table)->cleanBindings($bindings));
+        try {
+            $row = $this->connection->transaction(fn () => $this->connection->selectOne('SELECT '.implode(', ', $selects).($inputs === [] ? '' : ' FROM (SELECT '.implode(', ', $inputs).') AS input'), $this->connection->table($this->map->table)->cleanBindings($bindings)));
+        } catch (QueryException $exception) {
+            if (str_starts_with((string) $exception->getCode(), '22')) {
+                return null;
+            }
+
+            throw $exception;
+        }
 
         return (array) $row;
     }
@@ -1060,13 +1078,13 @@ final readonly class MassWriter
 
         foreach ($row as $column => $value) {
             if ($value instanceof Expression) {
-                $selects[] = (string) $value->getValue($this->connection->getQueryGrammar());
+                $selects[] = (string) $value->getValue($grammar);
 
                 continue;
             }
 
             $selects[] = 'CAST(? AS '.($catalog->type($related->table, (string) $column) ?? 'text').')';
-            $bindings[] = $value;
+            $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [(string) $column => $value])];
         }
 
         $source = $this->reached()->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereNull(self::target($index))->whereNotNull(self::parentOf($index));

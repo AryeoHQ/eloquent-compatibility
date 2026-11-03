@@ -9,6 +9,8 @@ final class Sequence
     /** @var array<array-key, true> */
     public array $forwarding = [];
 
+    public bool $vetoed = false;
+
     /**
      * @param  null|array{int, string}  $frame
      */

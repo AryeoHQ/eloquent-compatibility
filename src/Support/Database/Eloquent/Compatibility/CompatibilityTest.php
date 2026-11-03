@@ -25,6 +25,7 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
@@ -192,7 +193,7 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_or_schema_before_reading_the_database(): void
+    public function it_refuses_to_prepare_a_map_whose_second_successor_or_its_relation_reads_another_database_schema_read_configuration_or_table_prefix_before_reading_the_database(): void
     {
         $reporting = new class extends Model
         {
@@ -253,7 +254,7 @@ final class CompatibilityTest extends TestCase
             $queries++;
         });
 
-        foreach ([['database' => 'compatibility_reporting'], ['search_path' => 'reporting']] as $elsewhere) {
+        foreach ([['database' => 'compatibility_reporting'], ['search_path' => 'reporting'], ['read' => ['search_path' => 'reporting'], 'write' => []], ['prefix' => 'app_']] as $elsewhere) {
             DB::purge('compatibility_reporting');
             config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), ...$elsewhere]]);
 
@@ -269,10 +270,19 @@ final class CompatibilityTest extends TestCase
         DB::purge('compatibility_reporting');
         $another = ' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of ';
         $oneDatabase = '; the view and its filters read every successor through the connection of ';
-        $this->assertSame(array_merge(...array_fill(0, 2, [
-            "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
-            "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
-        ])), $refusals);
+        $anotherRead = ' reads the connection compatibility_reporting, whose read configuration reaches another database or search_path than the connection pgsql of ';
+        $otherRows = '; the view joins the successors the connection of ';
+        $prefixed = ' reads the connection compatibility_reporting, which adds the table prefix app_, and the package reads and compiles every table by its unprefixed name; use a connection without a prefix.';
+        $this->assertSame([
+            ...array_merge(...array_fill(0, 2, [
+                "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$another.class_basename($legacies[0]).$oneDatabase.class_basename($legacies[0]).', so a map reads one database.',
+                "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$another.class_basename($legacies[1]).$oneDatabase.class_basename($legacies[1]).', so a map reads one database.',
+            ])),
+            "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$anotherRead.class_basename($legacies[0]).$otherRows.class_basename($legacies[0]).' writes, so the successor model would read other rows than the view serves.',
+            "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$anotherRead.class_basename($legacies[1]).$otherRows.class_basename($legacies[1]).' writes, so the successor model would read other rows than the view serves.',
+            "Compatibility map 'videos' is declared wrongly: the successor ".class_basename($reporting).$prefixed,
+            "Compatibility map 'videos' is declared wrongly: the relation from Link to ".class_basename($reporting).$prefixed,
+        ], $refusals);
         $this->assertSame(0, $queries);
     }
 
@@ -323,6 +333,79 @@ final class CompatibilityTest extends TestCase
         DB::purge('compatibility_reporting');
         $this->assertSame("Compatibility map 'place_videos' is declared wrongly: the relation from PlaceAsset to ".class_basename($reporting).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database.', $refusal);
         $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_each_schema_operation_for_a_successor_whose_read_configuration_reaches_another_search_path_before_reading_the_database(): void
+    {
+        config(['database.connections.compatibility_reporting' => [...(array) config('database.connections.pgsql'), 'read' => ['search_path' => 'reporting'], 'write' => []]]);
+        $reporting = new class extends Model
+        {
+            protected $connection = 'compatibility_reporting';
+
+            protected $table = 'jobs';
+        };
+        self::$reporting = $reporting::class;
+        $legacy = new class extends Model implements Contracts\Compatible
+        {
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->servedFrom(CompatibilityTest::$reporting, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+        $refusals = [];
+        $queries = 0;
+        DB::listen(function () use (&$queries): void {
+            $queries++;
+        });
+
+        foreach ([Compatibility::prepare(...), Compatibility::install(...), Compatibility::recompile(...), Compatibility::uninstall(...)] as $operation) {
+            try {
+                $operation($legacy::class);
+            } catch (InvalidCompatibilityMap $refusal) {
+                $refusals[] = $refusal->getMessage();
+            }
+        }
+
+        $this->assertSame(array_fill(0, 4, "Compatibility map 'listings' is declared wrongly: the successor ".class_basename($reporting).' reads the connection compatibility_reporting, whose read configuration reaches another database or search_path than the connection pgsql of '.class_basename($legacy).'; the view joins the successors the connection of '.class_basename($legacy).' writes, so the successor model would read other rows than the view serves.'), $refusals);
+        $this->assertSame(0, $queries);
+    }
+
+    #[Test]
+    public function it_refuses_each_schema_operation_on_a_connection_with_a_table_prefix_before_reading_the_database(): void
+    {
+        config(['database.connections.compatibility_prefixed' => [...(array) config('database.connections.pgsql'), 'prefix' => 'app_'], 'database.default' => 'compatibility_prefixed']);
+        $refusals = [];
+        $queries = 0;
+
+        try {
+            ListingTables::create();
+            ListingTables::seed();
+            DB::listen(function () use (&$queries): void {
+                $queries++;
+            });
+
+            foreach ([Compatibility::prepare(...), Compatibility::install(...), Compatibility::recompile(...), Compatibility::uninstall(...)] as $operation) {
+                try {
+                    $operation(Listing::class);
+                } catch (InvalidCompatibilityMap $refusal) {
+                    $refusals[] = $refusal->getMessage();
+                }
+            }
+
+            $counted = $queries;
+        } finally {
+            ListingTables::drop();
+            DB::purge('compatibility_prefixed');
+            config(['database.default' => 'pgsql']);
+        }
+
+        $this->assertSame(array_fill(0, 4, "Compatibility map 'listings' is declared wrongly: Listing reads the connection compatibility_prefixed, which adds the table prefix app_, and the package reads and compiles every table by its unprefixed name; use a connection without a prefix."), $refusals);
+        $this->assertSame(0, $counted);
     }
 
     #[Test]
