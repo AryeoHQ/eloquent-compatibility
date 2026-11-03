@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -24,7 +25,10 @@ use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
+use TypeError;
 
 #[CoversClass(RecordWriter::class)]
 #[CoversClass(MassWriter::class)]
@@ -519,5 +523,195 @@ final class ExternalAttributesTest extends TestCase
 
         $this->assertSame([20, 'video/mp4'], [$video->getKey(), $video->getAttribute('mime_type')]);
         $this->assertSame('video/mp4', $generating::query()->findOrFail(20)->getAttribute('mime_type'));
+    }
+
+    #[Test]
+    public function it_hands_the_external_write_the_successor_fields_the_same_write_changes_and_keeps_what_the_write_sets(): void
+    {
+        $named = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'photos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => $files->pluck('filename', 'id')->map(fn (mixed $asset) => is_string($asset) ? FakeMediaLibrary::bound()->stored($asset)?->mimeType : null)->all(),
+                            write: function (File $file, null|string $mimeType): void {
+                                $file->filename = strtolower($file->filename);
+                                FakeMediaLibrary::bound()->put($file->filename, new FileMetadata($mimeType));
+                            }))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
+            }
+        };
+        $library = FakeMediaLibrary::bound();
+        $library->put('oak-back.jpg', new FileMetadata('image/jpeg'));
+        $library->put('elm.png', new FileMetadata('image/png'));
+        $updated = $named::query()->findOrFail(2);
+        $incremented = $named::query()->findOrFail(3);
+
+        $updated->update(['file_name' => 'Birch.JPG', 'mime_type' => 'image/avif']);
+        $incremented->increment('views', 1, ['file_name' => 'Ash.PNG', 'mime_type' => 'image/webp']);
+
+        $this->assertEquals(
+            [new FileMetadata('image/avif'), new FileMetadata('image/webp'), new FileMetadata('image/jpeg'), new FileMetadata('image/png')],
+            [$library->stored('birch.jpg'), $library->stored('ash.png'), $library->stored('oak-back.jpg'), $library->stored('elm.png')],
+        );
+        $this->assertSame(['birch.jpg', 'ash.png'], DB::table('files')->where('legacy_type', 'photo')->whereIn('legacy_id', [2, 3])->orderBy('legacy_id')->pluck('filename')->all());
+        $this->assertSame([['birch.jpg', 'image/avif'], ['ash.png', 'image/webp', 1]], [[$updated->getAttribute('file_name'), $updated->getAttribute('mime_type')], [$incremented->getAttribute('file_name'), $incremented->getAttribute('mime_type'), $incremented->getAttribute('views')]]);
+    }
+
+    #[Test]
+    public function it_refuses_a_query_or_a_relation_for_an_external_attribute_and_changes_nothing(): void
+    {
+        $before = DB::select('select * from files order by legacy_type, legacy_id');
+        $source = (string) File::query()->where('legacy_type', 'photo')->where('legacy_id', 3)->value('id');
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->findOrFail(1)->update(['mime_type' => File::query()->select('mime_type')->whereKey($source)]),
+            fn () => Photo::query()->findOrFail(1)->update(['file_name' => 'oak.jpg', 'mime_type' => File::query()->select('mime_type')->whereKey($source)->toBase()]),
+            fn () => Photo::query()->findOrFail(1)->update(['mime_type' => (new File)->hasOne(File::class, 'id', 'id')]),
+            fn () => Photo::query()->findOrFail(1)->increment('views', 1, ['mime_type' => File::query()->select('mime_type')->whereKey($source)]),
+            fn () => Photo::query()->create(['file_name' => 'ash.jpg', 'mime_type' => File::query()->select('mime_type')->whereKey($source)]),
+            fn () => Video::query()->findOrFail(1)->update(['mime_type' => File::query()->select('mime_type')->whereKey($source)]),
+        ] as $write) {
+            try {
+                $write();
+                $refusals[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (TypeError $error) {
+                $refusals[] = 'TypeError: '.$error->getMessage();
+            }
+        }
+
+        $refusal = fn (string $model) => CompatibilityWriteRefused::rawExpression($model, 'mime_type', 'It is declared external(), so its value lives outside the database, and no SQL computes it.')->getMessage();
+
+        $this->assertSame([$refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Video::class)], $refusals);
+        $this->assertEquals($before, DB::select('select * from files order by legacy_type, legacy_id'));
+        $this->assertSame([], array_values(array_filter(FakeMediaLibrary::bound()->calls, fn (array $call) => $call[0] !== 'fetch')));
+    }
+
+    #[Test]
+    public function it_chooses_a_branch_by_the_value_the_branch_fixes_for_an_external_attribute_the_write_omits(): void
+    {
+        $chosen = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'video';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return $video
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('videos_retained')
+                    ->timestamps()
+                    ->servedFrom(fn (Model $video): string => $video->getAttribute('mime_type') === null ? Link::class : File::class)
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            }
+        };
+        $held = fn (int $id) => [DB::table('files')->where('legacy_type', 'video')->where('legacy_id', $id)->exists(), DB::table('links')->where('legacy_type', 'video')->where('legacy_id', $id)->value('url')];
+
+        $chosen::query()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'original_file_name' => null, 'size_kb' => null]);
+        $chosen::query()->findOrFail(3)->update(['title' => 'Drone']);
+
+        $this->assertSame([[false, 'https://youtu.be/tour'], [true, null]], [$held(1), $held(3)]);
+        $this->assertSame([[1, null], [3, 'video/quicktime']], $chosen::query()->whereIn('id', [1, 3])->orderBy('id')->get()->map(fn (Model $video) => [$video->getKey(), $video->getAttribute('mime_type')])->all());
+    }
+
+    #[Test]
+    public function it_shows_the_listeners_of_a_soft_delete_the_value_the_successor_held_before_its_delete(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->timestamps()
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $jobs): array => $jobs->pluck('id', 'id')->map(fn (mixed $job) => is_string($job) ? FakeMediaLibrary::bound()->stored('mls-'.$job)?->mimeType : null)->all(),
+                            write: fn (Job $job, null|string $number) => FakeMediaLibrary::bound()->put('mls-'.$job->getKey(), new FileMetadata($number)))));
+            }
+        };
+
+        try {
+            ListingTables::create();
+            ListingTables::seed();
+            Compatibility::prepare($listing::class);
+            ListingTables::backfill();
+
+            foreach (DB::table('jobs')->join('listings', 'listings.id', '=', 'jobs.legacy_id')->get(['jobs.id', 'listings.mls_number']) as $row) {
+                FakeMediaLibrary::bound()->put('mls-'.$row->id, new FileMetadata(is_string($row->mls_number) ? $row->mls_number : null));
+            }
+
+            Compatibility::install($listing::class);
+            $job = (string) DB::table('jobs')->where('legacy_id', 1)->value('id');
+            Job::deleting(function (Job $deleted): void {
+                FakeMediaLibrary::bound()->put('mls-'.$deleted->getKey(), new FileMetadata(null));
+            });
+            $seen = [];
+            $listing::deleted(function (Model $deleted) use (&$seen): void {
+                $seen[] = $deleted->getAttribute('mls_number');
+            });
+            $record = $listing->newQuery()->findOrFail(1);
+
+            $record->delete();
+
+            $this->assertSame([['MLS-1'], 'MLS-1', null], [$seen, $record->getAttribute('mls_number'), FakeMediaLibrary::bound()->stored('mls-'.$job)?->mimeType]);
+            $this->assertNotNull(DB::table('jobs')->where('id', $job)->value('deleted_at'));
+        } finally {
+            ListingTables::drop();
+        }
     }
 }

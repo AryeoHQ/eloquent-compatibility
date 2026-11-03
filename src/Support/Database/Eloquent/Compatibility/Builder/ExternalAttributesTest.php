@@ -466,6 +466,54 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_subquery_that_reads_the_attribute_and_runs_one_that_reads_a_column_of_another_table(): void
+    {
+        $refusals = [];
+
+        foreach ([
+            fn () => Photo::query()->whereExists(Photo::query()->toBase()->where('mime_type', 'image/png'))->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'photos.mime_type'))->get(),
+            fn () => Photo::query()->whereNotExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'photos.mime_type'))->get(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->whereColumn('q.id', 'photos.id')->where('q.mime_type', 'image/png'))->get(),
+            fn () => Photo::query()->toBase()->from('photos as p')->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'p.mime_type'))->get(['p.id']),
+            fn () => Photo::query()->toBase()->where(fn (QueryBuilder $nested) => $nested->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'photos.mime_type')))->get(),
+            fn () => Photo::query()->toBase()->where('file_name', '=', fn (QueryBuilder $files) => $files->from('files')->select('filename')->whereColumn('files.mime_type', 'photos.mime_type')->limit(1))->get(),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereExists(fn (QueryBuilder $links) => $links->from('links')->whereColumn('links.url', 'photos.mime_type')))->get(),
+            fn () => Video::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'videos.mime_type'))->get(),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.legacy_id', 'photos.id')->where('files.legacy_type', 'photo')->where('mime_type', 'image/png'))->get(),
+            fn () => Photo::query()->toBase()->from('photos as p')->whereExists(fn (QueryBuilder $files) => $files->from('files as p')->where('p.mime_type', 'image/png'))->get(['id']),
+            fn () => Photo::query()->whereExists(Photo::query()->where('file_name', 'elm.png'))->get(), // @phpstan-ignore staticMethod.dynamicCall
+        ] as $query) {
+            try {
+                $result = $query();
+                $refusals[] = is_countable($result) ? count($result) : 'ran';
+            } catch (CompatibilityQueryRefused $refusal) {
+                $refusals[] = $refusal->getMessage();
+            } catch (QueryException $exception) {
+                $refusals[] = 'reached SQL: '.$exception->getPrevious()?->getMessage();
+            }
+        }
+
+        $refusal = fn (string $model, string $operation) => $model.'::$mime_type cannot take '.$operation.'. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
+
+        $this->assertSame([
+            $refusal(Photo::class, 'where'),
+            $refusal(Photo::class, 'whereExists'),
+            $refusal(Photo::class, 'whereNotExists'),
+            $refusal(Photo::class, 'whereExists'),
+            $refusal(Photo::class, 'whereExists'),
+            $refusal(Photo::class, 'whereExists'),
+            $refusal(Photo::class, 'where'),
+            $refusal(Photo::class, 'whereExists'),
+            $refusal(Video::class, 'whereExists'),
+            1,
+            3,
+            3,
+        ], $refusals);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+    }
+
+    #[Test]
     public function it_reads_the_legacy_column_and_calls_nothing_before_install(): void
     {
         FileTables::create();
