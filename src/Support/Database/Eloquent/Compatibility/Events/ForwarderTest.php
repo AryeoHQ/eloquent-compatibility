@@ -1913,7 +1913,7 @@ final class ForwarderTest extends TestCase
         DB::transaction(fn () => Listing::query()->findOrFail(1)->increment('price', 5));
         DB::transaction(fn () => Job::query()->where('legacy_id', 1)->firstOrFail()->increment('price_cents', 500));
         DB::transaction(fn () => Job::query()->where('legacy_id', 1)->firstOrFail()->decrement('price_cents', 1000));
-        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->incrementEach(['size_bytes' => 1], ['filename' => 'contract-4.pdf']));
+        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->increment('size_bytes', 1, ['filename' => 'contract-4.pdf']));
 
         $this->assertSame([
             ['1250.50', '1255.50', true, true], ['1255.50', '1260.50', true, true], ['1260.50', '1250.50', true, true],
@@ -1922,6 +1922,25 @@ final class ForwarderTest extends TestCase
             ['1255.50', '1255.50', false, true], ['1260.50', '1260.50', false, true], ['1250.50', '1250.50', false, true],
         ], $after);
         $this->assertSame([['contract-4.pdf', false, true]], $files);
+    }
+
+    #[RequiresMethod(Model::class, 'incrementEach')]
+    #[Test]
+    public function it_gives_a_listener_of_a_forwarded_increment_of_each_column_the_synchronized_originals_of_its_extra_values(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::connection()->setTransactionManager($this->app->make('db.transactions'));
+        $files = [];
+        Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$files): void {
+            $files[] = [$event->legacyFile->getOriginal('file_name'), $event->legacyFile->isDirty('file_name'), $event->legacyFile->wasChanged('file_name')];
+        });
+
+        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->incrementEach(['size_bytes' => 1], ['filename' => 'contract-4.pdf']));
+        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->decrementEach(['size_bytes' => 1], ['filename' => 'contract-5.pdf']));
+
+        $this->assertSame([['contract-4.pdf', false, true], ['contract-5.pdf', false, true]], $files);
     }
 
     #[Test]
