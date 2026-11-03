@@ -446,9 +446,10 @@ final class Forwarder
 
     private function read(Model $successor, bool $removes): null|LegacyRecord
     {
-        $view = ServedTable::view($successor->getConnection(), $this->map->table);
+        $relation = ServedTable::relation($successor->getConnection(), $this->map->table, ServedTable::successorsOf($this->served), writing: true);
+        $view = $relation['oid'];
 
-        if ($view === null) {
+        if ($view === 0 || $relation['unbound'] !== []) {
             return null;
         }
 

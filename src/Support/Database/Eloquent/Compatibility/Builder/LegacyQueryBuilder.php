@@ -13,8 +13,10 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\Query\Processors\Processor;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
+use Illuminate\Support\LazyCollection;
 use InvalidArgumentException;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
@@ -24,6 +26,8 @@ use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 final class LegacyQueryBuilder extends QueryBuilder
 {
     private bool $native = false;
+
+    private null|int $translatedFor = null;
 
     public function __construct(ConnectionInterface $connection, null|Grammar $grammar = null, null|Processor $processor = null, private readonly null|Model $legacy = null)
     {
@@ -47,6 +51,21 @@ final class LegacyQueryBuilder extends QueryBuilder
         }
     }
 
+    public function translatedFor(int $view): void
+    {
+        $this->translatedFor = $view;
+    }
+
+    /**
+     * @return LazyCollection<int, \stdClass>
+     */
+    public function cursor()
+    {
+        $this->refuseStale();
+
+        return parent::cursor();
+    }
+
     public function toSql(): string
     {
         $this->applyBeforeQueryCallbacks();
@@ -59,6 +78,7 @@ final class LegacyQueryBuilder extends QueryBuilder
     {
         $this->applyBeforeQueryCallbacks();
         $this->refuseExternal();
+        $this->refuseStale();
 
         return parent::exists();
     }
@@ -241,6 +261,16 @@ final class LegacyQueryBuilder extends QueryBuilder
     }
 
     /**
+     * @return array<int, mixed>
+     */
+    protected function runSelect()
+    {
+        $this->refuseStale();
+
+        return parent::runSelect();
+    }
+
+    /**
      * @param  array<array-key, mixed>  $values
      * @return list<array<string, mixed>>
      */
@@ -297,6 +327,23 @@ final class LegacyQueryBuilder extends QueryBuilder
             ->cloneWithoutBindings($limited ? ['select'] : ['select', 'order']);
 
         return $keys->select($this->alias($legacy).'.'.$legacy->getKeyName());
+    }
+
+    private function refuseStale(): void
+    {
+        $legacy = $this->legacy;
+
+        if ($legacy !== null && $this->translatedFor !== null && LegacyBuilder::relationOf($legacy)['oid'] !== $this->translatedFor) {
+            throw new CompatibilityQueryRefused($legacy::class." cannot run a query whose filters it translated for the view {$legacy->getTable()}. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$legacy->getTable()} no longer serves. Instead: build the query again.");
+        }
+
+        foreach ($this->wheres as $where) {
+            $query = is_array($where) ? $where['query'] ?? null : null;
+
+            if ($query instanceof self) {
+                $query->refuseStale();
+            }
+        }
     }
 
     private function refuseExternal(): void
@@ -529,12 +576,13 @@ final class LegacyQueryBuilder extends QueryBuilder
     private function route(Closure $native, Closure $translated): mixed
     {
         $legacy = $this->legacy;
+        $this->refuseStale();
 
         if ($legacy === null || $this->native || $this->alias($legacy) === null) {
             return $native();
         }
 
-        return ServedTable::write($legacy, $native, fn (): mixed => $translated($legacy));
+        return ServedTable::write($legacy, ServedTable::successorsOf(LegacyBuilder::mapOf($legacy::class)), $native, fn (): mixed => $translated($legacy));
     }
 
     private function alias(Model $legacy): null|string

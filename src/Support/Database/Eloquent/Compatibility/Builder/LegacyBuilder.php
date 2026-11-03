@@ -17,7 +17,6 @@ use Illuminate\Support\LazyCollection;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -58,6 +57,11 @@ final class LegacyBuilder extends Builder
     private int $negations = 0;
 
     private null|Model $writeOf = null;
+
+    private bool $operating = false;
+
+    /** @var null|array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool} */
+    private null|array $relation = null;
 
     public static function forgetViews(): void
     {
@@ -113,6 +117,14 @@ final class LegacyBuilder extends Builder
     public static function serves(Model $model): bool
     {
         return ServedTable::serves($model);
+    }
+
+    /**
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
+     */
+    public static function relationOf(Model $model): array
+    {
+        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)));
     }
 
     /**
@@ -184,7 +196,7 @@ final class LegacyBuilder extends Builder
             return $this->toBase()->insert($values);
         }
 
-        return ServedTable::write($this->model, fn (): bool => $this->natively(fn (): bool => $this->toBase()->insert($values)), function () use ($values): bool {
+        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn (): bool => $this->natively(fn (): bool => $this->toBase()->insert($values)), function () use ($values): bool {
             $this->writer()->insert($this->model, $values);
 
             return true;
@@ -201,7 +213,7 @@ final class LegacyBuilder extends Builder
             return $this->toBase()->insertGetId($values, $sequence);
         }
 
-        return ServedTable::write($this->model, fn () => $this->natively(fn () => $this->toBase()->insertGetId($values, $sequence)), fn (): int|string => $this->writer()->insert($this->model, $values));
+        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn () => $this->natively(fn () => $this->toBase()->insertGetId($values, $sequence)), fn (): int|string => $this->writer()->insert($this->model, $values));
     }
 
     /**
@@ -291,11 +303,19 @@ final class LegacyBuilder extends Builder
      */
     public function where($column, $operator = null, $value = null, $boolean = 'and')
     {
+        if (! $this->operating) {
+            $arguments = func_get_args();
+
+            return $this->operation(fn () => $this->where(...$arguments));
+        }
+
         if ($column instanceof Closure && $operator === null) {
             $nested = $this->model->newQueryWithoutRelationships();
 
             if ($nested instanceof self) {
                 $nested->negations = $this->negations + (self::negates($boolean) ? 1 : 0);
+                $nested->operating = true;
+                $nested->relation = $this->relation;
             }
 
             $column($nested);
@@ -345,6 +365,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereIn($column, $values, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereIn($column, $values, $boolean, $not));
+        }
+
         $attribute = is_string($column) ? $this->converted($column) : null;
         $values = $values instanceof Arrayable ? $values->toArray() : $values;
 
@@ -403,6 +427,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereBetween($column, iterable $values, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereBetween($column, $values, $boolean, $not));
+        }
+
         $attribute = is_string($column) ? $this->converted($column) : null;
 
         if ($attribute === null) {
@@ -461,6 +489,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereNull($columns, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereNull($columns, $boolean, $not));
+        }
+
         foreach (Arr::wrap($columns) as $column) {
             $attribute = is_string($column) ? $this->converted($column) : null;
 
@@ -676,6 +708,11 @@ final class LegacyBuilder extends Builder
 
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
         $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
+        $view = $this->relation()['oid'];
+
+        if ($view !== 0 && $this->query instanceof LegacyQueryBuilder) {
+            $this->query->translatedFor($view);
+        }
 
         return $this;
     }
@@ -761,7 +798,7 @@ final class LegacyBuilder extends Builder
     private function served(string $attribute, string $owner): array
     {
         $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['path']] ??= new ColumnCatalog($connection, throughSearchPath: true);
+        $catalog = self::$catalogs[$this->servedKey()] ??= new ColumnCatalog($connection, throughSearchPath: true);
         $definition = $this->definition($attribute);
         $column = $definition->column();
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
@@ -783,7 +820,14 @@ final class LegacyBuilder extends Builder
     {
         $connection = $this->model->getConnection();
 
-        return self::$collations[$connection->getName().'.'.$this->relation()['path'].'.'.$table] ??= ViewCompiler::collations($connection, $table, throughSearchPath: true);
+        return self::$collations[$this->servedKey().'.'.$table] ??= ViewCompiler::collations($connection, $table, throughSearchPath: true);
+    }
+
+    private function servedKey(): string
+    {
+        $relation = $this->relation();
+
+        return $this->model->getConnection()->getName().'.'.$relation['path'].'.'.$relation['oid'];
     }
 
     /**
@@ -852,7 +896,7 @@ final class LegacyBuilder extends Builder
      */
     private function own(Closure $native, Closure $translated): mixed
     {
-        return ServedTable::write($this->model, fn (): mixed => $this->natively($native), $translated);
+        return ServedTable::write($this->model, ServedTable::successorsOf($this->map()), fn (): mixed => $this->natively($native), $translated);
     }
 
     /**
@@ -872,13 +916,37 @@ final class LegacyBuilder extends Builder
     }
 
     /**
-     * @return array{path: string, view: bool, readable: bool}
+     * @param  Closure(): $this  $operation
+     * @return $this
+     */
+    private function operation(Closure $operation): self
+    {
+        $this->operating = true;
+
+        try {
+            return $operation();
+        } finally {
+            $this->operating = false;
+            $this->relation = null;
+        }
+    }
+
+    /**
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
     private function relation(): array
     {
-        $map = $this->map();
+        if ($this->relation !== null) {
+            return $this->relation;
+        }
 
-        return ServedTable::reading($this->model, [$map->primary->table, ...array_map(fn (Related $related) => $related->table, array_values($map->related))]);
+        $relation = self::relationOf($this->model);
+
+        if ($this->operating) {
+            $this->relation = $relation;
+        }
+
+        return $relation;
     }
 
     private function map(): ResolvedMap

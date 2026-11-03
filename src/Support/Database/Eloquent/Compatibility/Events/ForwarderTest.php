@@ -168,6 +168,26 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_nothing_for_a_successor_save_when_the_search_path_resolves_the_successor_to_another_table_than_the_view_reads(): void
+    {
+        $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->street]);
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Tenant Lodge']);
+            $tenant = DB::scalar('select name from compatibility_tenant.jobs where legacy_id = 1');
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([[], 'Tenant Lodge', 'Oak House'], [$this->seen, $tenant, Listing::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
     public function it_runs_no_query_of_its_own_when_no_listing_listener_takes_the_event(): void
     {
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);

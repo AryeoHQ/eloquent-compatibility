@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
@@ -520,6 +521,91 @@ final class LegacyBuilderRolloutTest extends TestCase
         $query->where('price', '<', 5000);
 
         $this->assertSame(1, substr_count($query->toBase()->toSql(), '"jobs"."price_cents"'));
+    }
+
+    #[Test]
+    public function it_refuses_to_run_a_filter_it_translated_once_another_process_uninstalls_the_view_and_a_new_query_reads_the_native_rows(): void
+    {
+        $this->install();
+        $query = Listing::query()->where('price', '>', 100)->orderBy('id');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+
+        try {
+            $stale = array_map(intval(...), $query->pluck('id')->all());
+        } catch (CompatibilityQueryRefused $refusal) {
+            $stale = $refusal->getMessage();
+        }
+
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
+        $this->assertSame([1, 3], array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all()));
+    }
+
+    #[Test]
+    public function it_filters_on_the_types_the_view_serves_once_another_process_reinstalls_it_over_a_legacy_column_whose_type_changed(): void
+    {
+        $this->install();
+        $warmed = array_map(intval(...), Listing::query()->where('price', 1)->pluck('id')->all());
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class);'
+            .' Illuminate\Support\Facades\DB::statement(\'alter table listings alter column price type numeric(10,0)\');'
+            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        DB::update('update jobs set price_cents = 149 where legacy_id = 3');
+
+        $this->assertSame([[], [3], 1], [$warmed, array_map(intval(...), Listing::query()->where('price', 1)->pluck('id')->all()), DB::scalar('select count(*) from listings where price = 1')]);
+    }
+
+    #[Test]
+    public function it_reads_the_served_relation_once_for_each_filter_it_translates_outside_a_transaction(): void
+    {
+        $this->install();
+        Listing::query()->where('price', '>', 100)->toBase()->toSql();
+        $reads = [];
+
+        foreach ([fn () => Listing::query()->where('price', '>', 100), fn () => Listing::query()->where(['price' => '1250.50', 'title' => 'Oak House'])] as $filter) {
+            $this->statements = [];
+            $filter()->toBase()->toSql();
+            $reads[] = count(array_filter($this->statements(), fn (string $statement) => str_starts_with($statement, 'select array_to_string(current_schemas(true)')));
+        }
+
+        $this->assertSame([1, 1], $reads);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): mixed}>
+     */
+    public static function writesUnderAnotherSuccessor(): iterable
+    {
+        yield 'a record update' => [fn () => Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor'])];
+        yield 'a mass update' => [fn () => Listing::query()->whereKey(1)->update(['title' => 'Oak Manor'])];
+        yield 'a record update retried inside a transaction' => [fn () => DB::transaction(fn () => Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']))];
+    }
+
+    #[DataProvider('writesUnderAnotherSuccessor')]
+    #[Test]
+    public function it_refuses_a_write_through_the_view_when_the_search_path_resolves_a_successor_name_to_another_table_than_the_view_reads(Closure $write): void
+    {
+        $this->install();
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+
+            try {
+                $write();
+                $refusal = 'no refusal';
+            } catch (CompatibilityWriteRefused $exception) {
+                $refusal = $exception->getMessage();
+            }
+
+            $tenant = DB::scalar('select name from compatibility_tenant.jobs where legacy_id = 1');
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([Listing::class.' records cannot be written through the view listings. Why: The search path resolves jobs to another table than the view reads, so the write would change rows that listings does not serve. Instead: Set a search path that resolves each successor to the table the view reads.', 'Oak House', 'Oak House'], [$refusal, $tenant, $this->job(1)->name]);
     }
 
     private function prepare(): void

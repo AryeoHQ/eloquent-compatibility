@@ -52,11 +52,18 @@ final readonly class Statements
         $keyType = $columnCatalog->type($map->table, $key) ?? throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$key}");
         $index = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey');
 
+        $theirs = InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$map->retainedKey}, which install() adds as the key of the retained table");
+
         if (self::retainedKeyOf($connection, $map) === 'theirs') {
-            throw InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$map->retainedKey}, which install() adds as the key of the retained table");
+            throw $theirs;
         }
 
         return new self('retain', [
+            "LOCK TABLE {$legacyTable} IN ACCESS EXCLUSIVE MODE",
+            "DO \$compatibility\$\nBEGIN\n"
+                .'  IF EXISTS (SELECT FROM pg_attribute attribute WHERE attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.$legacyTable).') AND attribute.attname = '.SqlFragments::literal((string) $map->retainedKey).' AND attribute.attnum > 0 AND NOT attribute.attisdropped AND col_description(attribute.attrelid, attribute.attnum) IS DISTINCT FROM '.SqlFragments::literal(self::RETAINED_KEY).") THEN\n"
+                ."    RAISE EXCEPTION '%', ".SqlFragments::literal($theirs->getMessage()).";\n"
+                ."  END IF;\nEND\n\$compatibility\$",
             "ALTER TABLE {$legacyTable} ADD COLUMN IF NOT EXISTS {$retainedKey} ".$columnCatalog->of($map->primary->table)[$map->primary->key]->type,
             "COMMENT ON COLUMN {$legacyTable}.{$retainedKey} IS ".SqlFragments::literal(self::RETAINED_KEY),
         ], [
