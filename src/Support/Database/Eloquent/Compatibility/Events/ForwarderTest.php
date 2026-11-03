@@ -190,6 +190,49 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_nothing_for_a_successor_save_when_the_search_path_resolves_the_retained_table_to_another_table_than_the_view_reads(): void
+    {
+        $retained = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.')));
+            }
+        };
+        Forwarder::register($this->app->make('events'), $retained::class);
+        $this->listen($retained::class, ['updating', 'updated'], fn (Model $listing) => [$listing->getAttribute('id'), $listing->getAttribute('title'), $listing->getAttribute('mls_number')]);
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.listings_retained (like public.listings_retained including all)');
+        DB::statement('insert into compatibility_tenant.listings_retained select * from public.listings_retained');
+        DB::update("update compatibility_tenant.listings_retained set mls_number = 'MLS-T'");
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $listing = Listing::query()->findOrFail(1);
+
+        $this->assertSame([[], 'Oak Lodge', 'MLS-1'], [$this->seen, $listing->title, $listing->mls_number]);
+    }
+
+    #[Test]
     public function it_runs_no_query_of_its_own_when_no_listing_listener_takes_the_event(): void
     {
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);

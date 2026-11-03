@@ -6,12 +6,14 @@ namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
+use stdClass;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -368,8 +370,19 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->assertSame([1], $read());
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function searchPathSettings(): iterable
+    {
+        yield 'set local search_path' => ['set local search_path to compatibility_tenant'];
+        yield 'set schema' => ["set schema 'compatibility_tenant'"];
+        yield 'set local with a quoted name' => ['set local "search_path" to compatibility_tenant'];
+    }
+
+    #[DataProvider('searchPathSettings')]
     #[Test]
-    public function it_filters_the_native_table_once_the_search_path_leaves_the_installed_view_within_one_transaction(): void
+    public function it_filters_the_native_table_once_the_search_path_leaves_the_installed_view_within_one_transaction(string $setting): void
     {
         DB::statement('create schema compatibility_tenant');
         $searchPath = DB::scalar("select current_setting('search_path')");
@@ -382,9 +395,9 @@ final class LegacyBuilderRolloutTest extends TestCase
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             $this->install();
             $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
-            $answers = DB::transaction(function () use ($read): array {
+            $answers = DB::transaction(function () use ($read, $setting): array {
                 $installed = $read();
-                DB::statement('set local search_path to compatibility_tenant');
+                DB::statement($setting);
 
                 return [$installed, $read()];
             });
@@ -434,8 +447,18 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->assertSame([[1], [1, 3]], $answers);
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function roleSettings(): iterable
+    {
+        yield 'set local role' => ['set local role %s'];
+        yield 'set local with a quoted name' => ['set local "role" to %s'];
+    }
+
+    #[DataProvider('roleSettings')]
     #[Test]
-    public function it_filters_on_the_view_once_the_transaction_switches_to_a_role_that_cannot_read_the_successors(): void
+    public function it_filters_on_the_view_once_the_transaction_switches_to_a_role_that_cannot_read_the_successors(string $setting): void
     {
         $this->install();
         $role = 'compatibility_rollout_role_'.getmypid();
@@ -444,9 +467,9 @@ final class LegacyBuilderRolloutTest extends TestCase
 
         try {
             DB::statement("grant select on listings to {$role}");
-            $answers = DB::transaction(function () use ($read, $role): array {
+            $answers = DB::transaction(function () use ($read, $role, $setting): array {
                 $owner = $read();
-                DB::statement("set local role {$role}");
+                DB::statement(sprintf($setting, $role));
 
                 return [$owner, $read()];
             });
@@ -703,6 +726,52 @@ final class LegacyBuilderRolloutTest extends TestCase
 
         $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
         $this->assertSame([1, 3], array_map(fn (Listing $listing) => (int) $listing->id, Listing::query()->where('price', '>', 100)->orderBy('id')->cursor()->all()));
+    }
+
+    #[Test]
+    public function it_refuses_to_run_a_union_whose_operand_filter_it_translated_once_another_process_uninstalls_the_view(): void
+    {
+        $this->install();
+        $union = fn () => Listing::query()->toBase()->where('id', 0)->union(Listing::query()->where('price', '>', 100));
+        $ids = function (QueryBuilder $query): array {
+            $ids = array_map(fn (stdClass $row) => intval($row->id), $query->get()->all());
+            sort($ids);
+
+            return $ids;
+        };
+        $query = $union();
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+
+        try {
+            $stale = $ids($query);
+        } catch (CompatibilityQueryRefused $refusal) {
+            $stale = $refusal->getMessage();
+        }
+
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], [$stale, $ids($union())]);
+    }
+
+    #[Test]
+    public function it_refuses_to_run_a_filter_it_translated_inside_a_transaction_once_another_process_uninstalls_the_view_before_the_query_runs(): void
+    {
+        $this->install();
+
+        $answers = DB::transaction(function (): array {
+            $query = Listing::query()->where('price', '>', 100)->orderBy('id');
+            $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+            DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+
+            try {
+                $stale = array_map(intval(...), $query->pluck('id')->all());
+            } catch (CompatibilityQueryRefused $refusal) {
+                $stale = $refusal->getMessage();
+            }
+
+            return [$stale, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())];
+        });
+
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], $answers);
     }
 
     /**
