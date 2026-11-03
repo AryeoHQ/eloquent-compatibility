@@ -147,7 +147,7 @@ final class ExternalAttributes
     public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
     {
         $values = [];
-        $served = $map->branches === [] ? $map->morphs : $map->branches;
+        $served = $map->branches === [] && $map->owners[$name] !== $map->primary ? $map->morphs : $map->branches;
 
         foreach ($served === [] ? [$map] : $served as $branch) {
             $attribute = $branch->attributes[$name];
@@ -155,7 +155,7 @@ final class ExternalAttributes
 
             if ($attribute->isExternal()) {
                 $values += $owner === $branch->primary
-                    ? self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...))
+                    ? self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...), false)
                     : self::heldThrough($map, $branch, $owner->model, $keys, $connection, $writePdo, $attribute->readExternally(...));
             }
         }
@@ -246,7 +246,7 @@ final class ExternalAttributes
      * @param  null|Closure(Collection<array-key, Model>): array<array-key, mixed>  $read
      * @return array<array-key, mixed>
      */
-    private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, null|Closure $read = null): array
+    private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, null|Closure $read = null, bool $aliased = true): array
     {
         $identifier = $branch->identifiers[(new $map->model)->getKeyName()];
         $column = (string) $identifier->column();
@@ -262,7 +262,7 @@ final class ExternalAttributes
             $query->where($branch->membership->column, $branch->membership->alias);
         }
 
-        if ($branch->target !== null && $branch->morph !== null) {
+        if ($aliased && $branch->target !== null && $branch->morph !== null) {
             $query->where($branch->morph->typeColumn, $branch->target->morphAlias);
         }
 

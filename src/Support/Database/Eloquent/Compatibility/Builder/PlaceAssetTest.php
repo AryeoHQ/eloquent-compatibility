@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -223,6 +225,98 @@ final class PlaceAssetTest extends TestCase
         $this->assertStringContainsString('It would move record 1 from AssetFile to AssetLink', $refusal);
         $this->assertEquals($before, DB::table('place_assets')->orderBy('id')->get()->all());
         $this->assertSame([null, 'https://youtu.be/oak'], [Video::query()->findOrFail(1)->youtube_embed_url, Video::query()->findOrFail(2)->youtube_embed_url]);
+    }
+
+    #[Test]
+    public function it_refuses_a_mass_write_that_reaches_a_record_whose_place_asset_names_an_undeclared_alias_and_changes_nothing(): void
+    {
+        PlaceAssetTables::install();
+        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_type' => 'retired_asset']);
+        $before = DB::table('place_assets')->orderBy('id')->get()->all();
+
+        try {
+            Video::query()->update(['title' => 'All']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("cannot run a mass write that reaches record 3, whose PlaceAsset stores asset_type 'retired_asset' through its compatibility map", $refusal);
+        $this->assertEquals($before, DB::table('place_assets')->orderBy('id')->get()->all());
+        $this->assertSame(['Tour', 'Oak walkthrough', null], Video::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_mass_write_that_reaches_a_record_whose_place_asset_stores_no_morph_type_and_changes_nothing(): void
+    {
+        PlaceAssetTables::install();
+        DB::statement('alter table place_assets alter column asset_type drop not null');
+        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 2)->update(['asset_type' => null]);
+
+        try {
+            Video::query()->whereIn('id', [1, 2])->increment('views');
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString('cannot run a mass write that reaches record 2, whose PlaceAsset stores no asset_type through its compatibility map', $refusal);
+        $this->assertSame([5, 2, 0], Video::query()->orderBy('id')->pluck('views')->all());
+    }
+
+    #[Test]
+    public function it_locks_every_selected_place_asset_before_it_reads_which_target_holds_each_record(): void
+    {
+        PlaceAssetTables::install();
+        config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
+        $second = DB::connection('second');
+        $link = (string) $second->scalar("insert into asset_links (url, created_at, updated_at) values ('https://youtu.be/race', now(), now()) returning id");
+        $blocked = null;
+        DB::listen(function (QueryExecuted $query) use (&$blocked, $second, $link): void {
+            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'CREATE TEMPORARY TABLE') || ! str_contains($query->sql, 'compatibility_pinned')) {
+                return;
+            }
+
+            try {
+                $second->transaction(function () use ($second, $link): void {
+                    $second->statement("SET LOCAL lock_timeout = '1s'");
+                    $second->update("update place_assets set asset_type = 'place_asset_link', asset_id = ? where legacy_type = 'place_video' and legacy_id = 1", [$link]);
+                });
+                $blocked = false;
+            } catch (QueryException) {
+                $blocked = true;
+            }
+        });
+
+        try {
+            $updated = Video::query()->whereIn('id', [1, 3])->update(['title' => 'Raced']);
+        } finally {
+            DB::purge('second');
+        }
+
+        $this->assertSame([true, 2], [$blocked, $updated]);
+        $this->assertSame(['Raced', 'Oak walkthrough', 'Raced'], Video::query()->orderBy('id')->pluck('title')->all());
+        $this->assertSame([[1, 'place_asset_file'], [2, 'place_asset_link'], [3, 'place_asset_file']], $this->assets('place_video'));
+    }
+
+    #[Test]
+    public function it_backfills_a_move_and_keeps_the_old_target_while_another_place_asset_still_names_it(): void
+    {
+        PlaceAssetTables::prepare();
+        $backfiller = new Backfiller(Compatibility::of(Video::class)->resolve(), DB::connection());
+        $backfiller->run();
+        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('asset_id');
+        $drone = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('asset_id');
+        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_id' => $file]);
+        DB::table('asset_files')->where('id', $drone)->delete();
+
+        DB::table('place_videos')->where('id', 1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'original_file_name' => null, 'size_kb' => null]);
+        $backfiller->run();
+        Compatibility::install(Video::class);
+
+        $this->assertSame([[1, 'place_asset_link'], [2, 'place_asset_link'], [3, 'place_asset_file']], $this->assets('place_video'));
+        $this->assertSame([$file, 'drone.mov'], [DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('asset_id'), DB::table('asset_files')->where('id', $file)->value('filename')]);
+        $this->assertSame([[1, null, 'https://youtu.be/tour'], [3, 'drone.mov', null]], Video::query()->whereIn('id', [1, 3])->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all());
     }
 
     #[Test]

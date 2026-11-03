@@ -34,6 +34,8 @@ final class ResolvedMapTest extends TestCase
 
     private static string $untimed = '';
 
+    private static string $sharedFile = '';
+
     #[Test]
     public function it_resolves_the_listing_map_into_its_identifiers_retained_table_and_successors(): void
     {
@@ -390,6 +392,20 @@ final class ResolvedMapTest extends TestCase
      */
     public static function invalidMorphMaps(): iterable
     {
+        $sharedFile = new class extends Model
+        {
+            protected $table = 'asset_files';
+        };
+        self::$sharedFile = $sharedFile::class;
+
+        yield 'two targets over one table' => [
+            fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                choose: fn (PlaceVideo $video): string => AssetFile::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(AssetFile::class, fn (Successor $file) => $file)
+                    ->as(self::$sharedFile, fn (Successor $file) => $file))),
+            'relatedMorph() reaches the table asset_files through '.class_basename($sharedFile::class).' and through AssetFile; give each successors: class a table of its own',
+        ];
         yield 'an attribute one target cannot read' => [
             fn (Compatibility $video) => self::identified($video)->discriminatedBy('legacy_type')->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
                 choose: fn (PlaceVideo $video): string => AssetFile::class,

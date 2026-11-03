@@ -56,6 +56,12 @@ final readonly class RelatedMorph
         $declared = [];
 
         foreach (Successors::declare($map, 'relatedMorph()', $choose, $successors, 'drop choose:, and relatedMorph() reads %s for every record') as $model => $branch) {
+            $key = (new $model)->getKeyName();
+
+            if (! in_array($compiled->getOwnerKeyName(), [null, $key], true)) {
+                throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() matches each target on the owner key '.$compiled->getOwnerKeyName().', and '.class_basename($model)." keys its rows by {$key}; drop the owner key, because the view and the writers join each target on its key");
+            }
+
             $declared[$model] = [$branch->successor, self::refuseTarget($map, $parent, $compiled->getParent()->getTable(), $branch->successor)];
         }
 

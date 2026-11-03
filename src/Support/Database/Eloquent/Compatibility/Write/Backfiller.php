@@ -11,6 +11,8 @@ use Exception;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Facades\Config;
 use LogicException;
@@ -357,8 +359,16 @@ final readonly class Backfiller
         $read = [];
 
         foreach ($variant->externals() as $name) {
-            $owned = $variant->owners[$name] === $variant->primary ? $existing : $targets;
-            $read[$name] = $owned->isEmpty() ? [] : $variant->attributes[$name]->readExternally($owned);
+            $owner = $variant->owners[$name];
+            $owned = match ($owner) {
+                $variant->primary => $existing,
+                $related->successor => $targets,
+                default => null,
+            };
+
+            if ($owned !== null) {
+                $read[$name] = $owned->isEmpty() ? [] : $variant->attributes[$name]->readExternally($owned);
+            }
         }
 
         $changed = 0;
@@ -387,7 +397,134 @@ final readonly class Backfiller
             }
         }
 
+        return $changed + $this->writeRelatedExternals($variant, $stored, $external);
+    }
+
+    /**
+     * @param  array<int|string, array<string, array<string, mixed>>>  $stored
+     * @param  array<int|string, array<string, mixed>>  $external
+     */
+    private function writeRelatedExternals(ResolvedMap $branch, array $stored, array $external): int
+    {
+        $owned = [];
+
+        foreach ($branch->externals() as $name) {
+            $owner = $branch->owners[$name];
+
+            if ($owner !== $branch->primary && $owner !== $branch->target?->successor) {
+                $owned[$owner->table][] = $name;
+            }
+        }
+
+        if ($owned === []) {
+            return 0;
+        }
+
+        $parents = [];
+        $reached = [];
+        $wanted = [];
+
+        foreach ($branch->related as $related) {
+            $parents[$related->table] = $related->parentTable;
+        }
+
+        foreach ($owned as $table => $names) {
+            for ($reach = $table; array_key_exists($reach, $parents); $reach = $parents[$reach]) {
+                $reached[$reach] = true;
+
+                foreach ($external as $key => $values) {
+                    if (array_filter(array_intersect_key($values, array_flip($names)), fn (mixed $value) => $value !== null) !== []) {
+                        $wanted[$key][$reach] = true;
+                    }
+                }
+            }
+        }
+
+        $models = [];
+
+        foreach ($this->held($branch, array_keys($stored)) as $primary) {
+            $models[self::keyOf($primary->getAttribute((string) $branch->identifiers[$this->key]->column()))] = [$branch->primary->table => $primary];
+        }
+
+        foreach ($branch->related as $related) {
+            if (! array_key_exists($related->table, $reached)) {
+                continue;
+            }
+
+            foreach ($models as $key => $held) {
+                $parent = $held[$related->parentTable] ?? null;
+                $relation = $parent === null ? null : ($related->relation)($parent);
+
+                if ($relation !== null && ! $relation instanceof Relation) {
+                    throw new LogicException('The related() relation from '.class_basename($related->parent).' to '.class_basename($related->model).' returns no relation.');
+                }
+
+                $model = $relation?->getQuery()->useWritePdo()->first();
+                $wants = $wanted[$key][$related->table] ?? false;
+
+                if ($model === null && $wants && $relation instanceof HasOneOrMany && array_key_exists($related->table, $owned)) {
+                    $model = $relation->make();
+                }
+
+                if ($model === null && $wants) {
+                    throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} row {$this->key} {$key} holds external() values for {$related->table}, and the related() relation from {$related->parentTable} reads no {$related->table} row the backfill can create for it; its parent row is missing, or it is a BelongsTo");
+                }
+
+                if ($model instanceof Model) {
+                    $models[$key][$related->table] = $model;
+                }
+            }
+        }
+
+        $changed = 0;
+
+        foreach ($owned as $table => $names) {
+            $located = array_filter(array_map(fn (array $held) => $held[$table] ?? null, $models));
+            $first = reset($located);
+
+            if ($first === false) {
+                continue;
+            }
+
+            $existing = $first->newCollection(array_values(array_filter($located, fn (Model $model) => $model->exists)));
+            $read = [];
+
+            foreach ($names as $name) {
+                $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
+            }
+
+            foreach ($located as $key => $model) {
+                $changed += $this->saveExternals($branch, $model, array_intersect_key($external[$key] ?? [], array_flip($names)), $read, $key);
+            }
+        }
+
         return $changed;
+    }
+
+    /**
+     * @param  array<string, mixed>  $external
+     * @param  array<string, array<array-key, mixed>>  $read
+     */
+    private function saveExternals(ResolvedMap $branch, Model $successor, array $external, array $read, int|string $key): int
+    {
+        $written = false;
+
+        foreach ($external as $name => $value) {
+            if (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null)) {
+                $branch->attributes[$name]->writeExternally($successor, $value);
+                $written = true;
+            }
+        }
+
+        if (! $written && ! $successor->isDirty()) {
+            return 0;
+        }
+
+        if ($successor->save() === false) {
+            throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', 'a '.class_basename($successor).' listener refused the save of the successor of '.$this->map->table.' row '.$this->key.' '.$key);
+        }
+
+        return 1;
     }
 
     /**
@@ -439,7 +576,11 @@ final readonly class Backfiller
 
     private function deleteTarget(Related $old, mixed $id, int|string $key): int
     {
-        $target = $id === null ? null : (new $old->model)->setConnection($this->connectionName)->newQuery()->useWritePdo()->whereKey($id)->first();
+        if ($id === null || $this->connection->table($old->parentTable)->useWritePdo()->where((string) $old->morphType, $old->morphAlias)->where($old->parentKey, $id)->exists()) {
+            return 0;
+        }
+
+        $target = (new $old->model)->setConnection($this->connectionName)->newQuery()->useWritePdo()->whereKey($id)->first();
 
         if ($target === null) {
             return 0;
@@ -473,7 +614,7 @@ final readonly class Backfiller
             [$stored[$key], $external[$key]] = $this->split($branch, $row, $key);
         }
 
-        $changed = array_filter($branch->attributes, fn ($attribute) => $attribute->isExternal()) === []
+        $changed = array_filter($branch->attributes, fn ($attribute, string $name) => $attribute->isExternal() && $branch->owners[$name] === $branch->primary, ARRAY_FILTER_USE_BOTH) === []
             ? $this->upsert($branch, $stored)
             : $this->saveEach($branch, $rows, $stored, $external);
 
@@ -481,7 +622,7 @@ final readonly class Backfiller
             $changed += $this->writeRelated($branch, $related, $stored);
         }
 
-        return $changed;
+        return $changed + $this->writeRelatedExternals($branch, $stored, $external);
     }
 
     /**
@@ -583,11 +724,9 @@ final readonly class Backfiller
         $read = [];
 
         foreach ($branch->externals() as $name) {
-            if ($branch->owners[$name] !== $branch->primary) {
-                throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "attribute '{$name}' is external() on ".class_basename($branch->owners[$name]->model).', which related() reaches, and the backfill writes external() values through the servedFrom() successor '.class_basename($branch->primary->model).' or a relatedMorph() target only; write each value through its external() write before install()');
+            if ($branch->owners[$name] === $branch->primary) {
+                $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
             }
-
-            $read[$name] = $existing->isEmpty() ? [] : $branch->attributes[$name]->readExternally($existing);
         }
 
         $changed = 0;
@@ -598,7 +737,7 @@ final readonly class Backfiller
             $successor->setRawAttributes(array_replace($successor->getAttributes(), $stored[$key][$table]));
             $written = false;
 
-            foreach ($external[$key] as $name => $value) {
+            foreach (array_intersect_key($external[$key], $read) as $name => $value) {
                 if (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null)) {
                     $branch->attributes[$name]->writeExternally($successor, $value);
                     $written = true;

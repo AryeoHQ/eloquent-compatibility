@@ -103,6 +103,69 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_moves_a_record_whose_legacy_row_changes_target_after_its_last_pass_before_it_takes_the_lock(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('asset_id');
+        $writer = $this->writer();
+        $landed = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$landed): void {
+            if (! $landed && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "place_videos" IS')) {
+                $landed = true;
+                $writer->update("update place_videos set youtube_embed_url = 'https://youtu.be/tour', original_file_name = null, size_kb = null, updated_at = localtimestamp(0) where id = 1");
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            $videos = PlaceVideo::query()->orderBy('id')->get()->map(fn (PlaceVideo $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all();
+            $asset = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->first(['asset_type', 'asset_id']);
+            $state = [$asset?->asset_type, DB::table('asset_links')->where('id', $asset?->asset_id)->value('url'), DB::table('asset_files')->where('id', $file)->exists()];
+        } finally {
+            DB::purge('writer');
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertTrue($landed);
+        $this->assertSame([[1, null, 'https://youtu.be/tour'], [2, null, 'https://youtu.be/oak'], [3, 'drone.mov', null]], $videos);
+        $this->assertSame(['place_asset_link', 'https://youtu.be/tour', false], $state);
+    }
+
+    #[Test]
+    public function it_deletes_the_place_asset_of_a_legacy_row_deleted_after_its_last_pass_and_leaves_its_target(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('asset_id');
+        $writer = $this->writer();
+        $landed = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$landed): void {
+            if (! $landed && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "place_videos" IS')) {
+                $landed = true;
+                $writer->delete('delete from place_videos where id = 3');
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            $videos = PlaceVideo::query()->orderBy('id')->pluck('id')->all();
+            $state = [DB::table('place_assets')->where('legacy_type', 'place_video')->orderBy('legacy_id')->pluck('legacy_id')->all(), DB::table('asset_files')->where('id', $file)->value('filename')];
+        } finally {
+            DB::purge('writer');
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertTrue($landed);
+        $this->assertSame([1, 2], $videos);
+        $this->assertSame([[1, 2], 'drone.mov'], $state);
+    }
+
+    #[Test]
     public function it_serves_every_legacy_row_with_the_same_columns_and_values_once_installed(): void
     {
         $before = $this->listings();

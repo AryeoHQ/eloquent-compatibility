@@ -144,6 +144,55 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_backfills_an_external_attribute_of_a_successor_related_reaches_through_that_successor_and_installs(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->timestamps()
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
+                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
+                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute('city', fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all(),
+                                write: fn (Place $place, null|string $city) => $place->setAttribute('city', $city)))));
+            }
+        };
+
+        try {
+            Compatibility::prepare($listing::class);
+            $backfiller = new Backfiller(Compatibility::of($listing::class)->resolve(), DB::connection());
+            $first = $backfiller->run();
+            $second = $backfiller->run();
+            Compatibility::install($listing::class);
+            $places = DB::table('places')->orderBy('street')->get(['street', 'city'])->map(fn (object $place) => [$place->street, $place->city])->all();
+            $cities = $listing::withTrashed()->orderBy('id')->get()->map(fn (Model $record) => [$record->getKey(), $record->getAttribute('city')])->all();
+        } finally {
+            ListingTables::drop();
+        }
+
+        $this->assertSame([[3, 6], [3, 0]], [[$first['read'], $first['changed']], [$second['read'], $second['changed']]]);
+        $this->assertSame([['1 Oak St', 'Seattle'], ['3 Elm St', null]], $places);
+        $this->assertSame([[1, 'Seattle'], [2, null], [3, null]], $cities);
+    }
+
+    #[Test]
     public function it_serves_the_value_the_external_system_keeps_after_a_write_it_normalizes(): void
     {
         $normalizing = new class extends Model implements Compatible

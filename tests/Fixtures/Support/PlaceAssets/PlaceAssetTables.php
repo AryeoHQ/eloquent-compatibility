@@ -91,6 +91,32 @@ final class PlaceAssetTables
         ]);
     }
 
+    public static function brochures(): void
+    {
+        Schema::create('trashable_asset_files', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('filename');
+            $table->timestampsTz();
+            $table->softDeletesTz();
+        });
+
+        Schema::create('place_brochures', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
+            $table->string('title')->nullable();
+            $table->string('file_name')->nullable();
+            $table->string('url')->nullable();
+            $table->boolean('hosted')->default(true);
+            $table->integer('pages')->default(0);
+            $table->timestamps();
+        });
+
+        DB::table('place_brochures')->insert([
+            ['title' => 'Guide', 'file_name' => 'guide.pdf', 'url' => null, 'hosted' => true, 'pages' => 12, 'created_at' => '2026-03-07 10:00:00', 'updated_at' => '2026-03-07 10:00:00'],
+            ['title' => 'Map', 'file_name' => null, 'url' => 'https://maps.example/oak', 'hosted' => false, 'pages' => 0, 'created_at' => '2026-03-08 10:00:00', 'updated_at' => '2026-03-08 10:00:00'],
+        ]);
+    }
+
     public static function prepare(): void
     {
         foreach (self::MODELS as $model) {
@@ -117,13 +143,13 @@ final class PlaceAssetTables
 
     public static function drop(): void
     {
-        foreach (['place_images', 'place_videos', 'place_interactive_content'] as $view) {
+        foreach (['place_images', 'place_videos', 'place_interactive_content', 'place_brochures'] as $view) {
             if (Schema::hasView($view)) {
                 DB::statement("drop view {$view}");
             }
         }
 
-        DB::statement('drop table if exists place_images, place_images_retained, place_images_backfilled, place_videos, place_videos_retained, place_videos_backfilled, place_interactive_content, place_interactive_content_retained, place_interactive_content_backfilled, place_assets, asset_files, asset_links cascade');
+        DB::statement('drop table if exists place_images, place_images_retained, place_images_backfilled, place_videos, place_videos_retained, place_videos_backfilled, place_interactive_content, place_interactive_content_retained, place_interactive_content_backfilled, place_brochures, place_brochures_retained, place_brochures_backfilled, place_assets, asset_files, asset_links, trashable_asset_files cascade');
         DB::statement('drop sequence if exists compatibility_legacy_id_seq');
         LegacyBuilder::forgetViews();
     }

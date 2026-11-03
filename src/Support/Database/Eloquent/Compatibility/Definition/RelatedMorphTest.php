@@ -54,6 +54,20 @@ final class RelatedMorphTest extends TestCase
     }
 
     #[Test]
+    public function it_compiles_a_morph_to_whose_owner_key_is_the_key_of_every_target(): void
+    {
+        $morph = (new Successor('place_videos', PlaceAsset::class))
+            ->relatedMorph(fn (PlaceAsset $asset) => $asset->morphTo('asset', 'asset_type', 'asset_id', 'id'),
+                choose: fn (Video $video): string => $video->youtube_embed_url !== null ? AssetLink::class : AssetFile::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(AssetFile::class, fn (Successor $file) => $file)
+                    ->as(AssetLink::class, fn (Successor $link) => $link))
+            ->morph();
+
+        $this->assertSame(['id', 'id'], array_values(array_map(fn (Related $target) => $target->relatedKey, $morph->targets ?? [])));
+    }
+
+    #[Test]
     public function it_refuses_a_morph_to_through_related_and_names_related_morph(): void
     {
         $this->expectExceptionObject(InvalidCompatibilityMap::because('place_videos', 'the related() relation from PlaceAsset through asset() is a MorphTo, whose related model varies per record, and related() reads a HasOne or a BelongsTo; declare it with relatedMorph()'));
@@ -77,6 +91,7 @@ final class RelatedMorphTest extends TestCase
         yield 'a transition on a target' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file->attribute('status', fn (Attribute $attribute) => $attribute->from('mime_type')->transitions()))), "attribute 'status' on AssetFile, which relatedMorph() reaches, is declared transitions(), and a change of target creates its row anew; declare transitions() on an attribute of PlaceAsset"];
         yield 'a scoped target' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(), successors: fn (Successors $successors) => $successors->as(ScopedAssetFile::class, fn (Successor $file) => $file)), 'ScopedAssetFile, which relatedMorph() reaches, applies the global scope visible, which would read the application\'s state once and keep it; only SoftDeletes may apply'];
         yield 'a second morph' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file))->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(), successors: fn (Successors $successors) => $successors->as(AssetLink::class, fn (Successor $link) => $link)), 'relatedMorph() on PlaceAsset is declared twice; one legacy record reads one MorphTo of its successor'];
+        yield 'an owner key a target does not key by' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->morphTo('asset', 'asset_type', 'asset_id', 'zml_asset_id'), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), 'the relatedMorph() relation from PlaceAsset through asset() matches each target on the owner key zml_asset_id, and AssetFile keys its rows by id; drop the owner key, because the view and the writers join each target on its key'];
         yield 'a relation closure that captures' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->morphTo($relation), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), 'a relatedMorph() relation closure on PlaceAsset captures $relation, and a map reads nothing but its own arguments'];
     }
 

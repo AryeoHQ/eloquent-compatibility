@@ -506,6 +506,12 @@ final readonly class MassWriter
             $key = (new $this->map->model)->getKeyName();
             $selected = $this->connection->table(self::SELECTED)->select('key');
             $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT DISTINCT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
+            $primary = $this->map->primary;
+            $this->members($this->connection->table($primary->table))
+                ->whereIn($primary->table.'.'.$this->legacyColumn(), $selected)
+                ->orderBy($primary->table.'.'.$primary->key)
+                ->lockForUpdate()
+                ->pluck($primary->table.'.'.$primary->key);
             $updated = 0;
 
             foreach ($this->refuseMorphMoves($selected, $values, $amounts, $alias) as $variant) {
@@ -552,7 +558,8 @@ final readonly class MassWriter
 
         foreach ($rows->cursor() as $row) {
             $before = (array) $row;
-            $from = $this->map->morphHolding($before['compatibility_morph_type'] ?? null);
+            $type = $before['compatibility_morph_type'] ?? null;
+            $from = $this->map->morphHolding($type);
             $evaluated = [];
             unset($before['compatibility_morph_type']);
 
@@ -562,7 +569,10 @@ final readonly class MassWriter
             }
 
             if ($from === null) {
-                continue;
+                $record = $before[$key] ?? null;
+                $successor = class_basename($this->map->primary->model);
+
+                throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.(is_int($record) || is_string($record) ? $record : '').', whose '.$successor.' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'successors: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
             }
 
             $sums = [];
@@ -579,7 +589,7 @@ final readonly class MassWriter
             $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
             $to = $this->map->morphFor((new $this->map->model)->setRawAttributes(array_replace($before, $named, $served[spl_object_id($from)], $evaluated, $sums)));
 
-            if ($to !== $from) {
+            if ($to !== $from && $to !== $this->map->morphFor((new $this->map->model)->setRawAttributes($before))) {
                 $record = $before[$key] ?? null;
 
                 throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.(is_int($record) || is_string($record) ? $record : '').' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');

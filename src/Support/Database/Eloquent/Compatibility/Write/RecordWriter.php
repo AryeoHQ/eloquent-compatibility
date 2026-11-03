@@ -27,7 +27,7 @@ final readonly class RecordWriter
     /**
      * @param  list<string>  $external
      */
-    public function __construct(private ResolvedMap $map, private Connection $connection, private array $external = []) {}
+    public function __construct(private ResolvedMap $map, private Connection $connection, private array $external = [], private bool $moving = false) {}
 
     /**
      * @param  array<string, mixed>  $values
@@ -54,6 +54,7 @@ final readonly class RecordWriter
             $this->refuseRaw($values);
 
             return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy, $values): int|string {
+                $values = $this->evaluateRetained($legacy, null, $this->withRetainedDefaults($values));
                 $variant = $this->map->morphFor(self::probe($legacy, $values));
                 $key = $this->through($variant)->insert($legacy, $values);
                 $this->refuseStoredMorph($legacy, null, $key, $variant);
@@ -83,6 +84,7 @@ final readonly class RecordWriter
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
             $this->refuseReclassified($legacy, $primary, null);
+            $this->refuseRepointed($legacy, $primary, null, $known, []);
             (new RetainedRows($this->map, $this->connection))->upsert($this->map->branch ? $key : self::keyOf($primary), $retained);
             $this->readBack($legacy, $key, array_keys($values));
             $this->readBackExternal($legacy, $key, array_keys($external));
@@ -120,12 +122,13 @@ final readonly class RecordWriter
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states + $this->reachedBy($external));
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
-            $this->createTarget($legacy, $primary, $stored, $external, $missing);
+            $created = $this->createTarget($legacy, $primary, $stored, $external, $missing);
             $touched = $this->writeExternal($primary, $external);
             $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], $deleting, $restoring, $touched);
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
             $this->refuseReclassified($legacy, $primary, $key);
+            $this->refuseRepointed($legacy, $primary, $key, $created, $original);
             $after = $this->rekey($legacy, $primary, $key, $values);
             $this->readBack($legacy, $after, array_keys($values));
             $this->readBackExternal($legacy, $after, array_keys($external));
@@ -166,12 +169,13 @@ final readonly class RecordWriter
             $stored = $this->transition($legacy, $key, $models, $states, $stored);
             $this->assignEach($models, $stored);
             $this->addEach($models, $added, $stored);
-            $this->createTarget($legacy, $primary, $stored, $external, $missing);
+            $created = $this->createTarget($legacy, $primary, $stored, $external, $missing);
             $touched = $this->writeExternal($primary, $external);
             $this->savePrimary($legacy, $primary, $original, $stored[$this->map->primary->table] ?? [], false, false, $touched);
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
             $this->refuseReclassified($legacy, $primary, $key);
+            $this->refuseRepointed($legacy, $primary, $key, $created, $original);
             $after = $this->rekey($legacy, $primary, $key, $extra + $amounts);
             $this->readBack($legacy, $after, [...array_keys($amounts), ...array_keys($extra)]);
             $this->readBackExternal($legacy, $after, array_keys($external));
@@ -252,9 +256,18 @@ final readonly class RecordWriter
             return 0;
         }
 
-        $current = $this->map->morphHolding($primary->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null);
+        $type = $primary->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null;
+        $current = $this->map->morphHolding($type);
         $before = $this->before($legacy, $key);
         $target = $this->map->morphFor(self::probe($legacy, array_replace($before, $values)));
+
+        if (! $this->writesTarget($values) && ! $this->holds($current, $primary)) {
+            return $this->through($current ?? $target)->update($legacy, $values, $deleting, $restoring);
+        }
+
+        if ($current === null) {
+            $this->refuseUnsupplied($legacy, $key, $type, $target, $values);
+        }
 
         if ($target === $current) {
             $updated = $this->through($current)->update($legacy, $values, $deleting, $restoring);
@@ -287,12 +300,99 @@ final readonly class RecordWriter
             return 0;
         }
 
-        $current = $this->map->morphHolding($primary->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null)
-            ?? $this->map->morphFor(self::probe($legacy, $this->before($legacy, $key)));
+        $holding = $this->map->morphHolding($primary->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null);
+        $current = $holding ?? $this->map->morphFor(self::probe($legacy, $this->before($legacy, $key)));
+        $held = $this->holds($holding, $primary);
         $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
-        $this->refuseStoredMorph($legacy, $key, self::keyAfter($legacy, $key, $extra), $current);
+
+        if ($held) {
+            $this->refuseStoredMorph($legacy, $key, self::keyAfter($legacy, $key, $extra), $current);
+        }
 
         return $incremented;
+    }
+
+    private function holds(null|ResolvedMap $variant, Model $primary): bool
+    {
+        $related = $variant?->target;
+
+        return $related !== null && $this->morphTarget($related, $primary) !== null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    private function writesTarget(array $values): bool
+    {
+        foreach ($values as $name => $value) {
+            if ($value !== null && $this->map->isMorphed((string) $name)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    private function refuseUnsupplied(Model $legacy, int|string $key, mixed $type, ResolvedMap $variant, array $values): void
+    {
+        $related = $variant->target ?? throw new LogicException("Compatibility map '{$this->map->table}' moves a record into no relatedMorph() target.");
+        $columns = (new ColumnCatalog($this->connection, throughSearchPath: true))->of($related->table);
+        $unsupplied = [];
+        $required = [];
+
+        foreach ($variant->attributes as $name => $attribute) {
+            $column = $attribute->column();
+
+            if ($variant->owners[$name] === $related->successor && $attribute->isWritable() && $column !== null && ($columns[$column] ?? null)?->needsAValue() === true && ($values[$name] ?? null) === null) {
+                $unsupplied[] = $name;
+                $required[] = $related->table.'.'.$column;
+            }
+        }
+
+        if ($unsupplied !== []) {
+            $column = (string) $this->map->morph?->typeColumn;
+            $stores = $type === null ? 'no '.$column : $column.' '.self::quoted($type);
+
+            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'successors: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
+        }
+    }
+
+    /**
+     * @param  array<string, Model>  $created
+     * @param  array<string, mixed>  $original
+     */
+    private function refuseRepointed(Model $legacy, Model $primary, null|int|string $key, array $created, array $original): void
+    {
+        $morph = $this->map->morph;
+        $related = $this->map->target;
+
+        if ($morph === null || $related === null) {
+            return;
+        }
+
+        $target = $created[$related->table] ?? null;
+        $expected = $target === null ? [$original[$morph->typeColumn] ?? null, $original[$morph->idColumn] ?? null] : [$related->morphAlias, $target->getKey()];
+        $table = $this->map->primary->table;
+        $stored = (array) $this->connection->table($table)->where($table.'.'.$this->map->primary->key, $primary->getKey())->first([$morph->typeColumn, $morph->idColumn]);
+        $pointer = [$stored[$morph->typeColumn] ?? null, $stored[$morph->idColumn] ?? null];
+        $record = $key === null ? 'a new record' : 'record '.$key;
+        $successor = class_basename($this->map->primary->model);
+
+        if (array_map(self::quoted(...), $pointer) !== array_map(self::quoted(...), $expected)) {
+            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that repoints '.$record, $successor.' stored '.$morph->typeColumn.' '.self::quoted($pointer[0]).' and '.$morph->idColumn.' '.self::quoted($pointer[1]).' where the write gives '.self::quoted($expected[0]).' and '.self::quoted($expected[1]).', so the record would point at a target the write did not store.');
+        }
+
+        if ($target !== null && ! $this->successor($related->model)->newQuery()->whereKey($target->getKey())->exists()) {
+            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that removes the target of '.$record, $successor.' names '.class_basename($related->model).' '.self::quoted($target->getKey()).', and no such row remains for the record to read.');
+        }
+    }
+
+    private static function quoted(mixed $value): string
+    {
+        return is_scalar($value) ? SqlFragments::literal((string) $value) : 'null';
     }
 
     private function refuseStoredMorph(Model $legacy, null|int|string $key, int|string $stored, ResolvedMap $held): void
@@ -322,6 +422,10 @@ final readonly class RecordWriter
             return [];
         }
 
+        if ($primary->exists && ! $this->moving && ! $this->stores($related->table, $stored, $external)) {
+            return [];
+        }
+
         $target = $this->successor($related->model);
         $this->assign($target, $stored[$related->table] ?? []);
         $this->writeExternal($target, $external);
@@ -329,6 +433,17 @@ final readonly class RecordWriter
         $this->assign($primary, [$morph->typeColumn => $related->morphAlias, $morph->idColumn => $target->getKey()]);
 
         return [$related->table => $target];
+    }
+
+    /**
+     * @param  array<string, array<string, mixed>>  $stored
+     * @param  array<string, mixed>  $external
+     */
+    private function stores(string $table, array $stored, array $external): bool
+    {
+        $written = array_filter($external, fn (mixed $value, string $name) => $value !== null && $this->map->owners[$name]->table === $table, ARRAY_FILTER_USE_BOTH);
+
+        return $written !== [] || array_filter($stored[$table] ?? [], fn (mixed $value) => $value !== null) !== [];
     }
 
     private function morphTarget(Related $related, Model $parent): null|Model
@@ -1053,7 +1168,7 @@ final readonly class RecordWriter
     private function locate(Model $primary, array $stored, array $known = []): array
     {
         $parents = [];
-        $reached = $this->map->target === null ? [] : [$this->map->target->table => true];
+        $reached = $this->map->target === null || ! $this->moving ? [] : [$this->map->target->table => true];
         $models = [$this->map->primary->table => $primary, ...$known];
         $existing = [];
         $missing = [];
