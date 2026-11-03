@@ -18,7 +18,7 @@ final class ServedTable
 {
     private const array VIEW_WRITE_STATES = ['55000', '42809', '42703'];
 
-    private const string SESSION_CONTEXT = "/^\\s*(?:(?:set|reset)\\s+(?:(?:local|session)\\s+)?(?:search_path|role|session\\s+authorization|all)\\b|discard\\s+all\\b)|set_config\\s*\\(\\s*(?:'(?:search_path|role|session_authorization)'|\\?)/i";
+    private const string SESSION_CONTEXT = "/^\\s*(?:(?:set|reset)\\s+(?:(?:local|session)\\s+)?(?:\"(?:search_path|role|session_authorization)\"|(?:search_path|schema|role|session_authorization|session\\s+authorization|all)\\b)|discard\\s+all\\b)|set_config\\s*\\(\\s*(?:'(?:search_path|role|session_authorization)'|\\?)/i";
 
     /** @var null|WeakMap<Connection, array<string, true>> */
     private static null|WeakMap $tables = null;
@@ -68,24 +68,32 @@ final class ServedTable
     }
 
     /**
-     * @param  list<string>  $successors
-     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
+     * @return list<string>
      */
-    public static function reading(Model $model, array $successors): array
+    public static function readsOf(ResolvedMap $map): array
     {
-        return self::relation($model->getConnection(), $model->getTable(), $successors);
+        return [...self::successorsOf($map), ...($map->retainedTable === null ? [] : [$map->retainedTable])];
     }
 
     /**
      * @param  list<string>  $successors
      * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
-    public static function relation(Connection $connection, string $table, array $successors, bool $writing = false): array
+    public static function reading(Model $model, array $successors, bool $fresh = false): array
+    {
+        return self::relation($model->getConnection(), $model->getTable(), $successors, fresh: $fresh);
+    }
+
+    /**
+     * @param  list<string>  $successors
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
+     */
+    public static function relation(Connection $connection, string $table, array $successors, bool $writing = false, bool $fresh = false): array
     {
         $key = implode(' ', [$writing ? 'writing' : 'reading', $table, ...$successors]);
         $relations = self::answering($connection) ? self::$relations[$connection] ?? [] : [];
 
-        if (array_key_exists($key, $relations)) {
+        if (! $fresh && array_key_exists($key, $relations)) {
             return $relations[$key];
         }
 
@@ -121,7 +129,7 @@ final class ServedTable
      */
     public static function write(Model $model, ResolvedMap $map, Closure $native, Closure $translated): mixed
     {
-        $successors = [...self::successorsOf($map), ...($map->retainedTable === null ? [] : [$map->retainedTable])];
+        $successors = self::readsOf($map);
         $connection = $model->getConnection();
         $table = $model->getTable();
         $nested = $connection->transactionLevel() > 0;

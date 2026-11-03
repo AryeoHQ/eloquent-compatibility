@@ -122,9 +122,9 @@ final class LegacyBuilder extends Builder
     /**
      * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
-    public static function relationOf(Model $model): array
+    public static function relationOf(Model $model, bool $fresh = false): array
     {
-        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)));
+        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)), $fresh);
     }
 
     /**

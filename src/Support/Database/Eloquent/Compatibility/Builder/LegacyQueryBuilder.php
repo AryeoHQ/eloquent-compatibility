@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Builder;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Grammars\Grammar;
@@ -337,7 +338,7 @@ final class LegacyQueryBuilder extends QueryBuilder
         $legacy = $this->legacy;
 
         if ($legacy !== null && $this->translatedFor !== null) {
-            $relation = LegacyBuilder::relationOf($legacy);
+            $relation = LegacyBuilder::relationOf($legacy, fresh: true);
             $table = $legacy->getTable();
             $why = match (true) {
                 $relation['oid'] !== $this->translatedFor => "Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$table} no longer serves.",
@@ -351,8 +352,9 @@ final class LegacyQueryBuilder extends QueryBuilder
             }
         }
 
-        foreach ($this->wheres as $where) {
-            $query = is_array($where) ? $where['query'] ?? null : null;
+        foreach ([...$this->wheres, ...($this->unions ?? [])] as $clause) {
+            $query = is_array($clause) ? $clause['query'] ?? null : null;
+            $query = $query instanceof EloquentBuilder ? $query->getQuery() : $query;
 
             if ($query instanceof self) {
                 $query->refuseStale();
