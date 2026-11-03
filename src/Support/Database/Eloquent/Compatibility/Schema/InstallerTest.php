@@ -2210,6 +2210,52 @@ final class InstallerTest extends TestCase
         ]);
     }
 
+    /**
+     * @return iterable<string, array{bool}>
+     */
+    public static function applicationIndexesTakingTheRetainedPrimaryKeyName(): iterable
+    {
+        yield 'created before retention' => [false];
+        yield 'created while retention builds its index' => [true];
+    }
+
+    #[DataProvider('applicationIndexesTakingTheRetainedPrimaryKeyName')]
+    #[Test]
+    public function it_refuses_to_install_when_an_index_on_another_column_takes_the_name_of_the_retained_primary_key_and_leaves_the_index(bool $concurrently): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::statement('alter table listings add column legacy_code text');
+        DB::update("update listings set legacy_code = 'code-' || id");
+        $application = 'create unique index listings_retained_pkey on listings (legacy_code)';
+        $created = false;
+        $writer = $this->writer();
+
+        if ($concurrently) {
+            DB::connection()->beforeExecuting(function (string $query) use (&$created, $writer, $application): void {
+                if (! $created && str_starts_with($query, 'CREATE UNIQUE INDEX CONCURRENTLY')) {
+                    $writer->statement($application);
+                    $created = true;
+                }
+            });
+        } else {
+            DB::statement($application);
+        }
+
+        try {
+            Compatibility::install(Listing::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap|QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' cannot install: listings_retained_pkey already exists and is not a valid unique B-tree index on listings (job_id) over every row, so install() cannot make it the primary key of listings_retained. Rename or drop listings_retained_pkey, then install again.", $refusal);
+        $this->assertSame(['r', 'CREATE UNIQUE INDEX listings_retained_pkey ON public.listings USING btree (legacy_code)', 0], [
+            $this->kind('listings'),
+            DB::scalar("select pg_get_indexdef('listings_retained_pkey'::regclass)"),
+            DB::scalar("select count(*) from pg_attribute where attrelid = 'listings'::regclass and attname = 'job_id' and not attisdropped"),
+        ]);
+    }
+
     #[Test]
     public function it_refuses_to_install_from_a_watermark_over_a_preparation_that_has_not_finished_and_drops_the_retained_key_it_filled(): void
     {

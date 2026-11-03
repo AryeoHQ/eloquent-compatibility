@@ -608,6 +608,141 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->assertSame([Listing::class.' records cannot be written through the view listings. Why: The search path resolves jobs to another table than the view reads, so the write would change rows that listings does not serve. Instead: Set a search path that resolves each successor to the table the view reads.', 'Oak House', 'Oak House'], [$refusal, $tenant, $this->job(1)->name]);
     }
 
+    #[Test]
+    public function it_refuses_a_query_that_adds_a_filter_after_another_process_reinstalls_the_view_to_a_filter_it_translated_for_the_view_before(): void
+    {
+        $this->install();
+        $query = Listing::query()->where('price', 1)->orderBy('id');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class);'
+            .' Illuminate\Support\Facades\DB::statement(\'alter table listings alter column price type numeric(10,0)\');'
+            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        DB::update('update jobs set price_cents = 149 where legacy_id = 3');
+        $query->where('price', '>=', 0);
+
+        try {
+            $mixed = array_map(intval(...), $query->pluck('id')->all());
+        } catch (CompatibilityQueryRefused $refusal) {
+            $mixed = $refusal->getMessage();
+        }
+
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $mixed);
+        $this->assertSame([3], array_map(intval(...), Listing::query()->where('price', 1)->where('price', '>=', 0)->orderBy('id')->pluck('id')->all()));
+    }
+
+    #[Test]
+    public function it_refuses_to_run_a_filter_it_translated_once_the_search_path_resolves_a_successor_name_to_another_table_than_the_view_reads(): void
+    {
+        $this->install();
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
+        DB::update('update compatibility_tenant.jobs set price_cents = case legacy_id when 1 then 100 when 3 then 15000 else price_cents end');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+        $query = Listing::query()->where('price', '>', 100)->orderBy('id');
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+
+            try {
+                $shadowed = array_map(intval(...), $query->pluck('id')->all());
+            } catch (CompatibilityQueryRefused $refusal) {
+                $shadowed = $refusal->getMessage();
+            }
+
+            $rebuilt = array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: The search path now resolves jobs to another table than the view reads, so the filters would read rows that listings does not serve. Instead: build the query again.', [1]], [$shadowed, $rebuilt]);
+    }
+
+    #[Test]
+    public function it_refuses_to_run_a_filter_it_translated_once_the_transaction_switches_to_a_role_that_cannot_read_the_successors(): void
+    {
+        $this->install();
+        $role = 'compatibility_rollout_role_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant select on listings to {$role}");
+            $answers = DB::transaction(function () use ($role): array {
+                $query = Listing::query()->where('price', '>', 100)->orderBy('id');
+                DB::statement("set local role {$role}");
+
+                try {
+                    $translated = array_map(intval(...), $query->pluck('id')->all());
+                } catch (CompatibilityQueryRefused $refusal) {
+                    $translated = $refusal->getMessage();
+                }
+
+                return [$translated, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())];
+            });
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: The current role cannot read every successor table the view reads, so the filters would not read the rows that listings serves. Instead: build the query again.', [1]], $answers);
+    }
+
+    #[Test]
+    public function it_refuses_to_iterate_a_cursor_whose_filter_it_translated_once_another_process_uninstalls_the_view_after_the_cursor_was_created(): void
+    {
+        $this->install();
+        $cursor = Listing::query()->where('price', '>', 100)->orderBy('id')->cursor();
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
+
+        try {
+            $stale = array_map(fn (Listing $listing) => (int) $listing->id, $cursor->all());
+        } catch (CompatibilityQueryRefused $refusal) {
+            $stale = $refusal->getMessage();
+        }
+
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
+        $this->assertSame([1, 3], array_map(fn (Listing $listing) => (int) $listing->id, Listing::query()->where('price', '>', 100)->orderBy('id')->cursor()->all()));
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): mixed}>
+     */
+    public static function retainedWritesUnderAnotherTable(): iterable
+    {
+        yield 'a record update' => [fn () => Listing::query()->findOrFail(1)->update(['mls_number' => 'MLS-9'])];
+        yield 'a mass update' => [fn () => Listing::query()->whereKey(1)->update(['mls_number' => 'MLS-9'])];
+    }
+
+    #[DataProvider('retainedWritesUnderAnotherTable')]
+    #[Test]
+    public function it_refuses_a_write_through_the_view_when_the_search_path_resolves_the_retained_table_to_another_table_than_the_view_reads(Closure $write): void
+    {
+        $this->install();
+        DB::statement('create schema compatibility_tenant');
+        DB::statement('create table compatibility_tenant.listings_retained (like public.listings_retained including all)');
+        DB::statement('insert into compatibility_tenant.listings_retained select * from public.listings_retained');
+        $searchPath = DB::scalar("select current_setting('search_path')");
+
+        try {
+            DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
+
+            try {
+                $write();
+                $refusal = 'no refusal';
+            } catch (CompatibilityWriteRefused $exception) {
+                $refusal = $exception->getMessage();
+            }
+
+            $tenant = DB::scalar('select mls_number from compatibility_tenant.listings_retained where job_id = ?', [$this->job(1)->getKey()]);
+        } finally {
+            DB::select("select set_config('search_path', ?, false)", [$searchPath]);
+            DB::statement('drop schema compatibility_tenant cascade');
+        }
+
+        $this->assertSame([Listing::class.' records cannot be written through the view listings. Why: The search path resolves listings_retained to another table than the view reads, so the write would change rows that listings does not serve. Instead: Set a search path that resolves each successor to the table the view reads.', 'MLS-1', 'MLS-1'], [$refusal, $tenant, DB::table('listings')->where('id', 1)->value('mls_number')]);
+    }
+
     private function prepare(): void
     {
         Compatibility::prepare(Listing::class);

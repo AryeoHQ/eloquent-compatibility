@@ -115,13 +115,13 @@ final class ServedTable
     /**
      * @template TResult
      *
-     * @param  list<string>  $successors
      * @param  Closure(): TResult  $native
      * @param  Closure(): TResult  $translated
      * @return TResult
      */
-    public static function write(Model $model, array $successors, Closure $native, Closure $translated): mixed
+    public static function write(Model $model, ResolvedMap $map, Closure $native, Closure $translated): mixed
     {
+        $successors = [...self::successorsOf($map), ...($map->retainedTable === null ? [] : [$map->retainedTable])];
         $connection = $model->getConnection();
         $table = $model->getTable();
         $nested = $connection->transactionLevel() > 0;
