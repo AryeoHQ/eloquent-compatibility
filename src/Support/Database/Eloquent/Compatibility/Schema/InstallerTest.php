@@ -605,6 +605,35 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_legacy_column_that_owns_a_sequence(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop sequence if exists photos_mime_type_seq cascade');
+        DB::statement('create sequence photos_mime_type_seq owned by photos.mime_type');
+        DB::statement("alter table photos alter column mime_type set default 'image/' || nextval('photos_mime_type_seq')");
+        FakeMediaLibrary::bound()->calls = [];
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and uninstall() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+
+        DB::statement('alter sequence photos_mime_type_seq owned by none');
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'image/1'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+
+        DB::statement('alter sequence photos_mime_type_seq owned by photos.mime_type');
+    }
+
+    #[Test]
     public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
     {
         $this->prepareFiles();

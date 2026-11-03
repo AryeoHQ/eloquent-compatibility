@@ -41,9 +41,14 @@ final readonly class MassWriter
 
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
+    public static function computesInSql(mixed $value): bool
+    {
+        return $value instanceof Expression || $value instanceof QueryBuilder || $value instanceof Builder || $value instanceof Relation || $value instanceof Closure;
+    }
+
     public static function refuseRaw(ResolvedMap $map, string $name, mixed $value): void
     {
-        if (! $value instanceof Expression && ! $value instanceof QueryBuilder && ! $value instanceof Builder && ! $value instanceof Relation && ! $value instanceof Closure) {
+        if (! self::computesInSql($value)) {
             return;
         }
 
