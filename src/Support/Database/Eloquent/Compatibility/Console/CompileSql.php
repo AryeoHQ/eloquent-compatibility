@@ -73,6 +73,10 @@ final class CompileSql extends Command
             $sql .= "\n-- After the transaction commits, outside any transaction\n\n".implode("\n\n", array_map($terminate, $statements->afterwards))."\n";
         }
 
+        if ($statements->exclusive !== []) {
+            $sql .= "\n-- Then in one transaction of their own\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, $statements->exclusive))."\n\nCOMMIT;\n";
+        }
+
         if (! is_string($file) || $file === '') {
             $this->output->write($sql, false, OutputStyle::OUTPUT_RAW);
 

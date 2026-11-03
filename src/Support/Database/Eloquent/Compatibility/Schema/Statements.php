@@ -28,8 +28,9 @@ final readonly class Statements
      * @param  list<string>  $transaction
      * @param  list<string>  $afterwards
      * @param  array<int, list<Closure(ConnectionInterface): void>>  $steps
+     * @param  list<string>  $exclusive
      */
-    public function __construct(public string $operation, public array $transaction, public array $afterwards = [], public array $steps = []) {}
+    public function __construct(public string $operation, public array $transaction, public array $afterwards = [], public array $steps = [], public array $exclusive = []) {}
 
     public static function prepare(ResolvedMap $map, ConnectionInterface $connection): self
     {
@@ -218,8 +219,7 @@ final readonly class Statements
         $retainedNotNullName = SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_not_null');
         $retainedNotNull = SqlFragments::identifier($retainedNotNullName);
         $retainedConstraints = "ALTER TABLE {$retainedTable}\n  ".($indexed ? "ADD CONSTRAINT {$retainedNotNull} CHECK (".SqlFragments::identifier($retainedKey).' IS NOT NULL) NOT VALID' : "ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey).')').',';
-        $retainedPrimaryKeyAfterwards = $indexed ? [
-            self::validate($retainedTable, $retainedNotNullName),
+        $retainedPrimaryKeyExclusive = $indexed ? [
             "ALTER TABLE {$retainedTable} ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY USING INDEX {$retainedPrimaryKey}",
             "ALTER TABLE {$retainedTable} DROP CONSTRAINT {$retainedNotNull}",
         ] : [];
@@ -262,9 +262,9 @@ final readonly class Statements
             ...$check,
         ], [
             ...$validations,
-            ...($branched ? [] : [self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'), ...$retainedPrimaryKeyAfterwards]),
+            ...($branched ? [] : [self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'), ...($indexed ? [self::validate($retainedTable, $retainedNotNullName)] : [])]),
             ...$validateCheck,
-        ], $verifications === [] ? [] : [1 + count($unfinished) => $verifications]);
+        ], $verifications === [] ? [] : [1 + count($unfinished) => $verifications], $retainedPrimaryKeyExclusive);
     }
 
     public static function recompile(ResolvedMap $map, ConnectionInterface $connection): self
@@ -477,7 +477,7 @@ final readonly class Statements
      */
     public function all(): array
     {
-        return [...$this->transaction, ...$this->afterwards];
+        return [...$this->transaction, ...$this->afterwards, ...$this->exclusive];
     }
 
     private static function uninstallBranches(ResolvedMap $map, ConnectionInterface $connection): self
