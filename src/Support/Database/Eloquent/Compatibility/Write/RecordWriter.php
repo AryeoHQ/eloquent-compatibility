@@ -14,6 +14,7 @@ use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -206,7 +207,7 @@ final readonly class RecordWriter
         }
 
         $this->through($target)->split($legacy, $values, $key);
-        $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values);
+        $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values, $target);
         $this->rekey($legacy, null, $key, $values);
         $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
         $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
@@ -539,6 +540,31 @@ final readonly class RecordWriter
 
     /**
      * @param  array<string, mixed>  $values
+     * @return null|array<string, mixed>
+     */
+    private function projected(ResolvedMap $branch, array $values): null|array
+    {
+        $served = (new MassWriter($branch, $this->connection))->served($values, fixed: true);
+
+        if ($served === null) {
+            return null;
+        }
+
+        $named = array_flip(array_map(fn (int|string $name) => Str::afterLast((string) $name, '.'), array_keys($values)));
+
+        foreach ($branch->attributes as $name => $attribute) {
+            $conversion = $attribute->conversions()[0] ?? null;
+
+            if ($conversion instanceof Fixed && ! array_key_exists($name, $named) && ! array_key_exists($name, $served)) {
+                $served[$name] = $conversion->value;
+            }
+        }
+
+        return $served;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
      * @return array{array<string, array<string, mixed>>, array<string, mixed>, array<string, array<string, array{string, mixed}>>, array<string, mixed>}
      */
     private function split(Model $legacy, array $values, null|int|string $key): array
@@ -684,7 +710,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $retained
      * @return array<string, mixed>
      */
-    private function guard(Model $legacy, Model $primary, int|string $key, array $values, array $amounts, array $retained): array
+    private function guard(Model $legacy, Model $primary, int|string $key, array $values, array $amounts, array $retained, null|ResolvedMap $target = null): array
     {
         if ($this->map->guards === []) {
             return $retained;
@@ -709,8 +735,9 @@ final readonly class RecordWriter
             }
         }
 
+        $projected = $target === null ? [] : $this->projected($target, $values) ?? [];
         $after = clone $before;
-        $after->setRawAttributes(array_replace($before->getAttributes(), $values));
+        $after->setRawAttributes(array_replace($before->getAttributes(), $projected, $values));
 
         foreach ($this->map->guards as $guard) {
             if ($guard->refuses($after, $before)) {

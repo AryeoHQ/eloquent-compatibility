@@ -726,6 +726,37 @@ final class InstallerTest extends TestCase
         $this->assertSame('v', $this->kind('listings'));
     }
 
+    #[Test]
+    public function it_installs_when_the_legacy_and_successor_connections_reach_one_database_through_a_url_that_overrides_the_database_setting(): void
+    {
+        $pgsql = (array) config('database.connections.pgsql');
+        $url = sprintf('pgsql://%s:%s@%s:%s/%s', rawurlencode((string) $pgsql['username']), rawurlencode((string) $pgsql['password']), $pgsql['host'], $pgsql['port'], rawurlencode((string) $pgsql['database']));
+        $connection = [...$pgsql, 'url' => $url, 'database' => 'laravel'];
+        config(['database.connections.compatibility_url_legacy' => $connection, 'database.connections.compatibility_url_successor' => $connection, 'database.default' => 'compatibility_url_successor']);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $connection = 'compatibility_url_legacy';
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing);
+            }
+        };
+
+        try {
+            Compatibility::install($model::class);
+        } finally {
+            DB::purge('compatibility_url_legacy');
+            DB::purge('compatibility_url_successor');
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
+    }
+
     /**
      * @return array<string, array{string, string}>
      */
@@ -1124,6 +1155,29 @@ final class InstallerTest extends TestCase
 
         $this->assertSame($before, $this->listings());
         $this->assertSame(1, DB::scalar("select count(*) from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC'"));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_shared_successor_map_until_prepare_builds_the_unique_index_on_the_discriminator_and_the_integer_identifier_even_with_no_inbound_foreign_key(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop table photo_comments, photo_shares');
+        DB::statement('alter table files drop constraint files_legacy_type_legacy_id_unique');
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString("Compatibility map 'photos' cannot install: files.legacy_id is not yet NOT NULL with a unique index on (legacy_type, legacy_id), so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::install(Photo::class);
+
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame([1, 2, 3], Photo::query()->orderBy('id')->pluck('id')->all());
     }
 
     #[Test]
