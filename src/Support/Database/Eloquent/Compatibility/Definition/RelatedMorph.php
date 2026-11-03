@@ -58,6 +58,10 @@ final readonly class RelatedMorph
             throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() constrains the targets it reads, and the view and the writers join each target on its morph alias and key alone; drop the constraint, because relatedMorph() serves every target row a '.class_basename($parent).' names');
         }
 
+        if (! in_array((new ReflectionProperty($compiled, 'withDefault'))->getValue($compiled), [null, false], true)) {
+            throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() returns a default model when no target row exists, and the view and the writers serve NULL for each attribute of a missing target; drop withDefault()');
+        }
+
         $declared = [];
 
         foreach (Successors::declare($map, 'relatedMorph()', $choose, $successors, 'drop choose:, and relatedMorph() reads %s for every record') as $model => $branch) {

@@ -109,6 +109,15 @@ final readonly class MassWriter
             return $this->updateMorphs($keys, $values, $amounts, $alias ?? $this->map->table);
         }
 
+        return $this->updateOwned($keys, $values, $amounts, $alias);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @param  array<array-key, float|int|numeric-string>  $amounts
+     */
+    private function updateOwned(QueryBuilder $keys, array $values, array $amounts, null|string $alias): int
+    {
         [$stored, $retained] = $this->split($values);
         [$added, $retainedAmounts] = $this->amounts($amounts, null);
 
@@ -549,7 +558,7 @@ final readonly class MassWriter
             [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
             $assigned = self::named($values);
             $whole = array_filter($retained, fn (int|string $name) => ! str_contains((string) $name, '->'), ARRAY_FILTER_USE_KEY);
-            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [] && array_filter(array_keys($assigned), fn (int|string $name) => str_contains((string) $name, '->')) === [];
+            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [] && array_filter(array_keys($assigned), fn (int|string $name) => str_contains((string) $name, '->')) === [] && ! $this->projectsMorphs();
             $sums = [];
 
             foreach (array_diff_key(self::named($retainedAmounts), $assigned) as $column => $amount) {
@@ -571,9 +580,15 @@ final readonly class MassWriter
             }
 
             $updated = 0;
+            [$sharedValues, $ownValues] = $this->byShared($values);
+            [$sharedAmounts, $ownAmounts] = $this->byShared($amounts);
 
             foreach ($holding as $variant) {
-                $updated += (new self($variant, $this->connection))->update($selected, $values, $amounts, $alias);
+                $updated += (new self($variant, $this->connection))->update($selected, $ownValues, $ownAmounts, $alias);
+            }
+
+            if ($sharedValues !== [] || $sharedAmounts !== []) {
+                $this->updateOwned($selected, $sharedValues, $sharedAmounts, $alias);
             }
 
             if (! $exact) {
@@ -900,6 +915,44 @@ final readonly class MassWriter
         }
 
         return [$mapped, $retained];
+    }
+
+    /**
+     * @template TValue
+     *
+     * @param  array<array-key, TValue>  $values
+     * @return array{array<array-key, TValue>, array<array-key, TValue>}
+     */
+    private function byShared(array $values): array
+    {
+        $shared = [];
+        $own = [];
+
+        foreach ($values as $key => $value) {
+            $name = Str::afterLast(explode('->', (string) $key, 2)[0], '.');
+            $owner = array_key_exists($name, $this->map->identifiers) ? null : $this->map->owners[$name] ?? null;
+
+            if ($owner !== null && $owner !== $this->map->primary && ! $this->map->isMorphed($name)) {
+                $shared[$key] = $value;
+            } else {
+                $own[$key] = $value;
+            }
+        }
+
+        return [$shared, $own];
+    }
+
+    private function projectsMorphs(): bool
+    {
+        foreach ($this->map->morphs as $variant) {
+            foreach ($variant->attributes as $attribute) {
+                if (($attribute->conversions()[0] ?? null) instanceof ReadAs) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

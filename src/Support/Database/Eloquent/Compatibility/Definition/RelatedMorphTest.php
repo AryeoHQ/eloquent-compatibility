@@ -98,6 +98,10 @@ final class RelatedMorphTest extends TestCase
         yield 'an order on the targets' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset()->orderBy('filename'), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), $constrained];
         yield 'a scope call replayed on the targets' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset()->withTrashed(), successors: fn (Successors $successors) => $successors->as(TrashableAssetFile::class, fn (Successor $file) => $file)), $constrained];
         yield 'a constraint for one target class' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset()->constrain([AssetFile::class => fn (Builder $files) => $files->whereNotNull('zml_asset_id')]), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), $constrained];
+        $defaulted = 'the relatedMorph() relation from PlaceAsset through asset() returns a default model when no target row exists, and the view and the writers serve NULL for each attribute of a missing target; drop withDefault()';
+
+        yield 'a default model' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset()->withDefault(), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), $defaulted];
+        yield 'a default model with attributes' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->asset()->withDefault(['filename' => 'Unknown']), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), $defaulted];
         yield 'a relation closure that captures' => [fn () => $asset()->relatedMorph(fn (PlaceAsset $asset) => $asset->morphTo($relation), successors: fn (Successors $successors) => $successors->as(AssetFile::class, fn (Successor $file) => $file)), 'a relatedMorph() relation closure on PlaceAsset captures $relation, and a map reads nothing but its own arguments'];
     }
 
