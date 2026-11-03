@@ -607,6 +607,91 @@ final class MorphTargetTest extends TestCase
         $this->assertSame(['Lobby', 'Ana', 1, 1, [['Lobby', 'Ana'], [null, null]]], $written);
     }
 
+    #[Test]
+    public function it_applies_a_mass_increment_to_the_shared_successor_row_of_a_record_the_same_write_renumbers(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id')->nullable();
+            $table->string('body')->nullable();
+            $table->integer('pins')->default(0);
+            $table->timestampsTz();
+        });
+
+        try {
+            $brochure = $this->installed($this->pinnedBrochure(), function (): void {
+                Schema::table('place_brochures', fn (Blueprint $table) => $table->integer('pins')->nullable());
+                Schema::table('place_assets', fn (Blueprint $table) => $table->uuid('note_id')->nullable());
+            });
+            $note = (string) DB::table('asset_notes')->insertGetId(['pins' => 5]);
+            DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->update(['note_id' => $note]);
+
+            $updated = $brochure->newQuery()->whereKey(1)->increment('pins', 1, ['id' => 30]);
+            $written = [$updated, DB::table('asset_notes')->where('id', $note)->value('pins'), $brochure->newQuery()->orderBy('id')->pluck('pins', 'id')->all(), $this->asset('place_brochure', 30)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        $this->assertSame([1, 6, [2 => null, 30 => 6], TrashableAssetFile::class], $written);
+    }
+
+    #[Test]
+    public function it_refuses_a_mass_write_that_changes_the_target_its_choose_closure_reads_with_an_external_attribute_and_changes_nothing(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id');
+            $table->string('body')->nullable();
+        });
+
+        try {
+            $brochure = $this->installed($this->annotatedBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
+
+            try {
+                $brochure->newQuery()->whereKey(1)->update(['title' => 'Embed']);
+                $refusal = 'no refusal';
+            } catch (CompatibilityWriteRefused $exception) {
+                $refusal = $exception->getMessage();
+            }
+
+            $refused = [$this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']];
+            $kept = $brochure->newQuery()->whereKey(1)->update(['title' => 'Manual']);
+            $written = [$kept, $this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertSame([['Guide', TrashableAssetFile::class], [1, 'Manual', TrashableAssetFile::class]], [$refused, $written]);
+    }
+
+    #[Test]
+    public function it_writes_a_record_whose_choose_closure_already_picks_another_target_from_an_external_attribute_when_the_write_keeps_that_pick(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id');
+            $table->string('body')->nullable();
+        });
+
+        try {
+            $brochure = $this->installed($this->annotatedBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
+            DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->update(['title' => 'Embed']);
+
+            $updated = $brochure->newQuery()->whereKey(1)->update(['pages' => 3]);
+            $written = [$updated, $brochure->newQuery()->findOrFail(1)->getAttribute('pages'), $this->asset('place_brochure', 1)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        $this->assertSame([1, 3, TrashableAssetFile::class], $written);
+    }
+
     private function pagedBrochure(): Model
     {
         return new class extends Model implements Compatible
@@ -912,6 +997,48 @@ final class MorphTargetTest extends TestCase
                                     write: fn (NoteAuthor $author, null|string $name) => $author->name = $name))))
                         ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
+                            successors: fn (Successors $successors) => $successors
+                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
+                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                                ->as(AssetLink::class, fn (Successor $link) => $link
+                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+            }
+        };
+    }
+
+    private function annotatedBrochure(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_brochures';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_brochure';
+            }
+
+            public static function compatibility(Compatibility $brochure): Compatibility
+            {
+                return $brochure
+                    ->discriminatedBy('legacy_type')
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('place_brochures_retained')
+                    ->timestamps()
+                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
+                        ->related(fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'), fn (Successor $note) => $note
+                            ->attribute('note', fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
+                                write: fn (AssetNote $note, null|string $body) => $note->body = $body)))
+                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'Embed' && $brochure->getAttribute('note') !== null || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
                             successors: fn (Successors $successors) => $successors
                                 ->as(TrashableAssetFile::class, fn (Successor $file) => $file
                                     ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
