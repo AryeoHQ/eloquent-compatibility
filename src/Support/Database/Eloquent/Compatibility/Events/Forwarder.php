@@ -184,7 +184,7 @@ final class Forwarder
         $sequences = $this->sequences[$successor] ?? [];
         $frames = null;
 
-        while ($sequences !== [] && end($sequences)->frame !== null && ! self::active(end($sequences)->frame, $successor, $frames ??= self::frames())) {
+        while ($sequences !== [] && ((end($sequences)->vetoed && $event !== 'restored') || (end($sequences)->frame !== null && ! self::active(end($sequences)->frame, $successor, $frames ??= self::frames())))) {
             array_pop($sequences);
         }
 
@@ -199,10 +199,13 @@ final class Forwarder
         }
 
         $sequence = $sequences[$top];
+        $saved = $event !== 'restored' || $sequence->last === 'saved';
         $sequence->last = $event;
-        $result = $this->raise($event, $successor, $sequence, $ahead);
+        $result = $this->raise($event, $successor, $sequence, $ahead, $saved);
 
-        if ($result === false || self::ENDS[$sequence->start] === $event) {
+        if ($result === false && $sequence->start === 'restoring' && $event !== 'restoring') {
+            $sequence->vetoed = true;
+        } elseif ($result === false || self::ENDS[$sequence->start] === $event) {
             array_pop($sequences);
             $outer = array_key_last($sequences);
 
@@ -341,7 +344,7 @@ final class Forwarder
         }
     }
 
-    private function raise(string $event, Model $successor, Sequence $sequence, bool $ahead): null|false
+    private function raise(string $event, Model $successor, Sequence $sequence, bool $ahead, bool $saved): null|false
     {
         $record = $sequence->record;
 
@@ -369,8 +372,14 @@ final class Forwarder
             }
         }
 
-        if (! $ahead) {
+        if (! $ahead && $saved) {
             $record->store($successor);
+        }
+
+        if ($event === 'restored' && $saved) {
+            foreach ($record->records() as $legacy) {
+                $legacy->syncOriginal();
+            }
         }
 
         foreach ($batches ?? [[$events, $record->records()]] as [$legacyEvents, $legacies]) {
@@ -669,17 +678,22 @@ final class Forwarder
      */
     private function raw(Dispatcher $dispatcher, string $name): array
     {
-        $raw = array_values($dispatcher->getRawListeners()[$name] ?? []);
+        $registered = $dispatcher->getRawListeners();
+        $raw = array_values($registered[$name] ?? []);
 
-        if (! $dispatcher->hasWildcardListeners($name)) {
-            return $raw;
+        if ($dispatcher->hasWildcardListeners($name)) {
+            $wildcards = Closure::bind(fn (): array => $this->wildcards, $dispatcher, Dispatcher::class)();
+
+            foreach ($wildcards as $pattern => $listeners) {
+                if (Str::is($pattern, $name)) {
+                    array_push($raw, ...array_values($listeners));
+                }
+            }
         }
 
-        $wildcards = Closure::bind(fn (): array => $this->wildcards, $dispatcher, Dispatcher::class)();
-
-        foreach ($wildcards as $pattern => $listeners) {
-            if (Str::is($pattern, $name)) {
-                array_push($raw, ...array_values($listeners));
+        if (class_exists($name, false)) {
+            foreach (class_implements($name) as $interface) {
+                array_push($raw, ...array_values($registered[$interface] ?? []));
             }
         }
 

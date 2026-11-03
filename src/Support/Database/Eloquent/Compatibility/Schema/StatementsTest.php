@@ -391,7 +391,11 @@ final class StatementsTest extends TestCase
             DO $compatibility$
             DECLARE
               granted text;
+              inherited text;
             BEGIN
+              FOR inherited IN SELECT DISTINCT CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END FROM pg_class relation CROSS JOIN LATERAL aclexplode(relation.relacl) AS granted WHERE relation.oid = to_regclass(quote_ident(current_schema()) || '."listings"') AND granted.grantee <> relation.relowner LOOP
+                EXECUTE 'REVOKE ALL ON "listings" FROM ' || inherited;
+              END LOOP;
               FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP
                 EXECUTE granted;
               END LOOP;
@@ -478,15 +482,15 @@ final class StatementsTest extends TestCase
               ADD COLUMN "deleted_at" timestamp(0) without time zone
             SQL,
             <<<'SQL'
-            UPDATE "listings" SET
+            UPDATE "listings" AS "listings_retained" SET
               "id" = CAST("jobs"."legacy_id" AS integer),
               "uuid" = CAST("jobs"."legacy_uuid" AS uuid),
-              "title" = CAST("jobs"."name" AS character varying(255)),
+              "title" = CAST("jobs"."name" AS character varying(255)) COLLATE pg_catalog."default",
               "company_id" = CAST("jobs"."company_id" AS uuid),
               "price" = CAST((CAST("jobs"."price_cents" AS numeric) / 100) AS numeric(10,2)),
-              "status" = CAST((CASE CAST("jobs"."lifecycle_status" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)),
-              "street" = CAST("places"."street" AS character varying(255)),
-              "city" = CAST("places"."city" AS character varying(255)),
+              "status" = CAST((CASE CAST("jobs"."lifecycle_status" AS text) WHEN 'drafting' THEN 'Draft' WHEN 'live' THEN 'Active' WHEN 'closed' THEN 'Sold' END) AS character varying(255)) COLLATE pg_catalog."default",
+              "street" = CAST("places"."street" AS character varying(255)) COLLATE pg_catalog."default",
+              "city" = CAST("places"."city" AS character varying(255)) COLLATE pg_catalog."default",
               "latitude" = CAST("job_sites"."latitude" AS double precision),
               "created_at" = CAST(("jobs"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone),
               "updated_at" = CAST(("jobs"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone),
@@ -494,7 +498,7 @@ final class StatementsTest extends TestCase
             FROM "jobs"
             LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
             LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true
-            WHERE "jobs"."id" = "listings"."job_id"
+            WHERE "jobs"."id" = "listings_retained"."job_id"
             SQL,
             <<<'SQL'
             ALTER TABLE "listings"

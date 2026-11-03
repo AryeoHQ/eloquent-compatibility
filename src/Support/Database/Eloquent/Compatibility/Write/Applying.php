@@ -63,6 +63,13 @@ final class Applying
         $keys[$legacy] = $key;
     }
 
+    public static function unidentified(Model $legacy): void
+    {
+        if (self::$keys !== null && self::$keys->offsetExists($legacy)) {
+            self::$keys->offsetUnset($legacy);
+        }
+    }
+
     /**
      * @param  class-string<Model>  $model
      * @param  null|Closure(Model): (null|int|string)  $identify

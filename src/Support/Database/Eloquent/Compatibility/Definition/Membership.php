@@ -56,6 +56,6 @@ final readonly class Membership
             throw InvalidCompatibilityMap::because($this->map, 'when() on '.class_basename($this->successor)." compiles to no plain condition on {$this->table}; it takes where clauses only, because it becomes a CHECK constraint on {$this->table}");
         }
 
-        return SqlFragments::bind(Str::after($where, 'where '), array_values($base->getRawBindings()['where']));
+        return SqlFragments::bind(Str::after($where, 'where '), SqlFragments::asSent(array_values($base->getRawBindings()['where']), $base->getGrammar()->getDateFormat()));
     }
 }

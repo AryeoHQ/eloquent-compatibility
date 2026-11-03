@@ -391,28 +391,7 @@ final class MassWriterTest extends TestCase
             ['name' => 'Pine', 'settings' => '{"color": "blue"}', 'preferences' => '{"theme": "light", "font": "serif"}', 'options' => null],
             ['name' => 'Elm', 'settings' => null, 'preferences' => null, 'options' => null],
         ]);
-        $holder = new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            public $timestamps = false;
-
-            protected $table = 'settings_holders';
-
-            protected $guarded = [];
-
-            public static function compatibility(Compatibility $holder): Compatibility
-            {
-                return $holder
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
-                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
-                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('settings', fn (Attribute $attribute) => $attribute->from('settings'))
-                        ->related(fn (ConfiguredJob $job) => $job->site(), fn (Successor $site) => $site
-                            ->attribute('options', fn (Attribute $attribute) => $attribute->from('options'))));
-            }
-        };
+        $holder = $this->sitedJsonHolder();
 
         try {
             Compatibility::prepare($holder::class);
@@ -508,6 +487,77 @@ final class MassWriterTest extends TestCase
         $this->assertSame([[1, ['theme' => 'light'], null], [10, [], null]], $before);
         $this->assertSame(2, $updated);
         $this->assertSame([[1, ['theme' => 'dark'], null], [10, ['theme' => 'dark'], null]], $after);
+    }
+
+    #[Test]
+    public function it_writes_a_whole_json_value_into_a_mapped_and_a_related_column_for_records_with_and_without_the_related_row_as_a_native_update_does(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'options' => '{"a": 1}'],
+            ['name' => 'Pine', 'options' => null],
+        ]);
+        DB::statement('create table settings_natives as select * from settings_holders');
+        $values = ['settings' => ['enabled' => true], 'options' => ['theme' => 'dark', 'sizes' => [1, 2]]];
+        $rows = fn (string $table): array => DB::table($table)->orderBy('id')->get(['settings', 'options'])->map(fn (object $row) => [json_decode((string) $row->settings, true), json_decode((string) $row->options, true)])->all();
+        $holder = $this->sitedJsonHolder();
+
+        try {
+            DB::table('settings_natives')->whereIn('id', [1, 2])->update($values);
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name, settings) select id, name, settings from settings_holders');
+            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.legacy_id = settings_holders.id where settings_holders.options is not null');
+            Compatibility::install($holder::class);
+
+            $updated = $holder->newQuery()->whereKey([1, 2])->update($values);
+            $served = $rows('settings_holders');
+            $native = $rows('settings_natives');
+            $sites = DB::table('configured_sites')->count();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_sites, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame(2, $updated);
+        $this->assertSame(array_fill(0, 2, [['enabled' => true], ['sizes' => [1, 2], 'theme' => 'dark']]), $native);
+        $this->assertSame($native, $served);
+        $this->assertSame(2, $sites);
+    }
+
+    #[Test]
+    public function it_writes_a_whole_json_value_into_a_legacy_only_column_for_records_with_and_without_a_retained_row_as_a_native_update_does(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, notes json)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
+        DB::statement('create table settings_natives as select * from settings_holders');
+        DB::table('settings_natives')->insert(['id' => 10, 'name' => 'Ash']);
+        $values = ['preferences' => ['theme' => 'dark'], 'notes' => ['seen', 'pinned']];
+        $rows = fn (string $table): array => DB::table($table)->orderBy('id')->get(['id', 'preferences', 'notes'])->map(fn (object $row) => [$row->id, json_decode((string) $row->preferences, true), json_decode((string) $row->notes, true)])->all();
+        $holder = $this->jsonHolder();
+
+        try {
+            DB::table('settings_natives')->whereIn('id', [1, 10])->update($values);
+            Compatibility::prepare($holder::class);
+            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
+            Compatibility::install($holder::class);
+            DB::table('configured_jobs')->insert(['legacy_id' => 10, 'name' => 'Ash']);
+
+            $updated = $holder->newQuery()->whereKey([1, 10])->update($values);
+            $served = $rows('settings_holders');
+            $native = $rows('settings_natives');
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_jobs cascade');
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame(2, $updated);
+        $this->assertSame([[1, ['theme' => 'dark'], ['seen', 'pinned']], [10, ['theme' => 'dark'], ['seen', 'pinned']]], $native);
+        $this->assertSame($native, $served);
     }
 
     #[Test]
@@ -773,6 +823,32 @@ final class MassWriterTest extends TestCase
                     ->retainedIn('settings_holders_retained', key: 'configured_job_id')
                     ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
                         ->attribute('name', fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+    }
+
+    private function sitedJsonHolder(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
+                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
+                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('settings', fn (Attribute $attribute) => $attribute->from('settings'))
+                        ->related(fn (ConfiguredJob $job) => $job->site(), fn (Successor $site) => $site
+                            ->attribute('options', fn (Attribute $attribute) => $attribute->from('options'))));
             }
         };
     }

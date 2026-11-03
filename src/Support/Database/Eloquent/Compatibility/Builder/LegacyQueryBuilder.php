@@ -9,6 +9,7 @@ use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Grammars\Grammar;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\Query\Processors\Processor;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
@@ -324,10 +325,12 @@ final class LegacyQueryBuilder extends QueryBuilder
         $clauses = [
             ...($this->aggregate === null ? [] : [[$this->aggregate['function'].'()', $this->aggregate['columns'] ?? []]]),
             ['select', $this->columns ?? []],
+            ['distinct', is_array($this->distinct) ? $this->distinct : []],
             ['groupBy', $this->groups ?? []],
             ['having', self::havingColumns($this->havings ?? [])],
             ...array_map(fn (array $order) => ['orderBy '.($order['direction'] ?? 'asc'), [$order['column'] ?? null]], [...($this->orders ?? []), ...($this->unionOrders ?? [])]),
             ['where', self::whereColumns($this->wheres)],
+            ['join', self::joinColumns($this->joins ?? [])],
         ];
 
         foreach ($clauses as [$operation, $columns]) {
@@ -377,6 +380,23 @@ final class LegacyQueryBuilder extends QueryBuilder
     }
 
     /**
+     * @param  array<array-key, mixed>  $joins
+     * @return list<string>
+     */
+    private static function joinColumns(array $joins): array
+    {
+        $columns = [];
+
+        foreach ($joins as $join) {
+            if ($join instanceof JoinClause) {
+                $columns = [...$columns, ...array_filter(self::whereColumns($join->wheres), fn (mixed $column) => is_string($column) && str_contains(explode('->', $column, 2)[0], '.'))];
+            }
+        }
+
+        return array_values($columns);
+    }
+
+    /**
      * @param  array<array-key, mixed>  $havings
      * @return list<mixed>
      */
@@ -401,7 +421,7 @@ final class LegacyQueryBuilder extends QueryBuilder
 
     private static function attributeOf(string $table, string $column): null|string
     {
-        $column = trim((string) preg_replace('/\s+as\s+.*$/is', '', $column));
+        $column = explode('->', trim((string) preg_replace('/\s+as\s+.*$/is', '', $column)), 2)[0];
 
         if (! str_contains($column, '.')) {
             return $column;

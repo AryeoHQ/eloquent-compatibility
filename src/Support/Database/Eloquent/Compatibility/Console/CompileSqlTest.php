@@ -34,6 +34,8 @@ final class CompileSqlTest extends TestCase
     /** @var class-string<Model> */
     public static string $successor = Model::class;
 
+    public static string $read = '';
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -327,6 +329,46 @@ final class CompileSqlTest extends TestCase
 
         $this->assertSame([0, 1], $exits);
         $this->assertSame("Compatibility map 'listings' is declared wrongly: the successor ".class_basename($successors[1]).' reads the connection compatibility_reporting, which reaches another database than the connection pgsql of '.class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).", so a map reads one database.\n", Artisan::output());
+    }
+
+    #[Test]
+    #[TestWith(['"jobs"."listed_at" + make_interval(secs => 0 * nextval(\'compatibility_probe\'))', 'a sequence it draws from'])]
+    #[TestWith(['CAST(coalesce(CAST("jobs"."listed_at" AS text), \'never\') AS timestamptz)', 'a value no row holds'])]
+    public function it_prints_a_raw_wall_clock_read_without_evaluating_it(string $read, string $case): void
+    {
+        DB::statement('create sequence compatibility_probe');
+        DB::statement('alter table listings add column listed_wall timestamp(0)');
+        DB::statement('alter table jobs add column listed_at timestamptz');
+        DB::update("update jobs set listed_at = '2026-01-01 10:00:00+00'");
+        self::$read = $read;
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
+                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
+                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->servedFrom(Job::class, fn (Successor $job) => $job
+                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
+                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.')));
+            }
+        };
+
+        try {
+            $exit = Artisan::call('compatibility:sql', ['model' => $model::class]);
+            $sequence = (array) DB::selectOne('select last_value, is_called from compatibility_probe');
+        } finally {
+            DB::statement('drop sequence compatibility_probe');
+        }
+
+        $this->assertSame([0, ['last_value' => 1, 'is_called' => false]], [$exit, $sequence], $case);
+        $this->assertStringContainsString('CAST((('.$read.') AT TIME ZONE \'UTC\') AS timestamp(0) without time zone) AS "listed_wall"', Artisan::output());
     }
 
     /**

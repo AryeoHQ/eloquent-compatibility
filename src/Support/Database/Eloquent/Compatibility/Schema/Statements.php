@@ -337,6 +337,7 @@ final readonly class Statements
         $external = $captured === null ? [] : array_intersect_key($captured['external'], array_flip($map->externals()));
         $repointed = [];
         $locked = implode(', ', array_values(array_unique([$primary, ...array_map(fn ($related) => SqlFragments::identifier($related->table), $map->related)])));
+        $collations = ViewCompiler::collations($connection, $map->table);
 
         $membership = $map->membership;
         $statements = [
@@ -348,12 +349,12 @@ final readonly class Statements
                 .($membership === null ? '' : $membership->of($map->primary->table).' AND ')
                 ."NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
-                ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns),
-                ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'], $external, array_keys($external)),
+                ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type.(($collations[$column]['declared'] ?? false) ? ' COLLATE '.$collations[$column]['name'] : ''), $columns),
+                ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'].($column['collation'] === null ? '' : ' COLLATE '.$column['collation']), $external, array_keys($external)),
             ]),
-            "UPDATE {$legacyTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
+            "UPDATE {$legacyTable} AS {$retainedTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
-                ."\nWHERE {$primary}.{$primaryKey} = {$legacyTable}.{$retainedKey}",
+                ."\nWHERE {$primary}.{$primaryKey} = {$retainedTable}.{$retainedKey}",
         ];
         $filled = count($statements) - 1;
 
@@ -487,6 +488,7 @@ final readonly class Statements
             ...array_map(fn (ResolvedMap $branch) => SqlFragments::identifier($branch->primary->table), $branches),
             ...array_merge(...array_map(fn (ResolvedMap $branch) => array_map(fn ($related) => SqlFragments::identifier($related->table), $branch->related), $branches)),
         ])));
+        $collations = ViewCompiler::collations($connection, $map->table);
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
             "DROP VIEW {$legacyTable}",
@@ -496,12 +498,12 @@ final readonly class Statements
                 .' WHERE '.(string) $branch->membership?->of($branch->primary->table)
                 ." AND NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$legacyKey} = {$held($branch)})", $branches),
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", [
-                ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type, $columns),
-                ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'], $external, array_keys($external)),
+                ...array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type.(($collations[$column]['declared'] ?? false) ? ' COLLATE '.$collations[$column]['name'] : ''), $columns),
+                ...array_map(fn (array $column, string $name) => 'ADD COLUMN '.SqlFragments::identifier($name).' '.$column['type'].($column['collation'] === null ? '' : ' COLLATE '.$column['collation']), $external, array_keys($external)),
             ]),
-            ...array_map(fn (ResolvedMap $branch, array $reads) => "UPDATE {$legacyTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$reads[$column], $columns))
+            ...array_map(fn (ResolvedMap $branch, array $reads) => "UPDATE {$legacyTable} AS {$retainedTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$reads[$column], $columns))
                 ."\nFROM ".SqlFragments::identifier($branch->primary->table).implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($branch)))
-                ."\nWHERE {$held($branch)} = {$legacyTable}.{$legacyKey} AND ".(string) $branch->membership?->of($branch->primary->table), $branches, $served),
+                ."\nWHERE {$held($branch)} = {$retainedTable}.{$legacyKey} AND ".(string) $branch->membership?->of($branch->primary->table), $branches, $served),
         ];
         $restoredAt = count($statements) - 1;
         $restoredDefaults = [...array_map(fn (Column $column) => (string) $column->default, $defaults), ...array_filter(array_map(fn (array $column) => $column['default'], $external), is_string(...))];
@@ -798,6 +800,7 @@ final readonly class Statements
         $table = SqlFragments::identifier($map->table);
         $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
         $columns = json_encode($mapped, JSON_THROW_ON_ERROR);
+        $collations = $external === [] ? [] : ViewCompiler::collations($connection, $map->table);
         $generated = [];
 
         foreach ($connection->select(
@@ -852,7 +855,7 @@ final readonly class Statements
                     : ['memberships' => array_values(array_map(fn (ResolvedMap $branch) => ['table' => (string) $branch->membership?->table, 'column' => (string) $branch->membership?->column, 'alias' => (string) $branch->membership?->alias], $map->branches))]),
             ]),
             ...($backfill === null ? [] : ['backfill' => $backfill]),
-            ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => ['type' => $legacy[$name]->type, 'default' => $legacy[$name]->default], $external))]),
+            ...($external === [] ? [] : ['external' => array_combine($external, array_map(fn (string $name) => ['type' => $legacy[$name]->type, 'default' => $legacy[$name]->default, 'collation' => ($collations[$name]['declared'] ?? false) ? $collations[$name]['name'] : null], $external))]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
@@ -873,7 +876,7 @@ final readonly class Statements
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>, backfill: null|array{key: null|int|string}}
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string, collation: null|string}>, backfill: null|array{key: null|int|string}}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -904,7 +907,7 @@ final readonly class Statements
 
         foreach (is_array($captured['external'] ?? null) ? $captured['external'] : [] as $name => $column) {
             if (is_string($name) && is_array($column) && is_string($column['type'] ?? null)) {
-                $external[$name] = ['type' => $column['type'], 'default' => is_string($column['default'] ?? null) ? $column['default'] : null];
+                $external[$name] = ['type' => $column['type'], 'default' => is_string($column['default'] ?? null) ? $column['default'] : null, 'collation' => is_string($column['collation'] ?? null) ? $column['collation'] : null];
             }
         }
 
@@ -926,7 +929,7 @@ final readonly class Statements
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string}>, backfill: null|array{key: null|int|string}}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>, external: array<string, array{type: string, default: null|string, collation: null|string}>, backfill: null|array{key: null|int|string}}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */
@@ -984,7 +987,10 @@ final readonly class Statements
                 .'    AND attribute.attname IN (SELECT jsonb_array_elements_text(CAST('.SqlFragments::literal(json_encode($columns, JSON_THROW_ON_ERROR)).' AS jsonb)))'."\n"
                 ."  GROUP BY granted.grantee, granted.is_grantable\n"
                 .') AS grants',
-            "DO \$compatibility\$\nDECLARE\n  granted text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  granted text;\n  inherited text;\nBEGIN\n"
+                ."  FOR inherited IN SELECT DISTINCT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(relation.relacl) AS granted WHERE relation.oid = {$relation} AND granted.grantee <> relation.relowner LOOP\n"
+                .'    EXECUTE '.SqlFragments::literal('REVOKE ALL ON '.$view.' FROM ')." || inherited;\n"
+                ."  END LOOP;\n"
                 ."  FOR granted IN SELECT json_array_elements_text(CAST(current_setting('compatibility.grants') AS json)) LOOP\n"
                 ."    EXECUTE granted;\n"
                 ."  END LOOP;\n"
