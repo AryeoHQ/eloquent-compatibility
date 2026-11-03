@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -369,17 +370,38 @@ final class LegacyQueryBuilder extends QueryBuilder
      */
     private function reading(string $table, string $legacyTable, array $externals): null|array
     {
-        foreach ([...self::clauses($this), ...self::subqueries($this->wheres, [$table => true], $legacyTable)] as [$operation, $columns]) {
+        foreach (self::clauses($this) as [$operation, $columns]) {
             foreach ($columns as $column) {
                 $attribute = is_string($column) ? self::attributeOf($table, $column) : null;
 
-                if ($attribute !== null && in_array($attribute, $externals, true)) {
+                if ($attribute !== null && in_array($attribute, $externals, true) && ! (self::qualifierOf((string) $column) === null && self::joinExposes($this, $attribute))) {
                     return [$attribute, $operation];
                 }
             }
         }
 
+        foreach (self::subqueries($this->wheres, [$table => true], $legacyTable, $externals) as [$operation, $attributes]) {
+            if ($attributes !== []) {
+                return [$attributes[0], $operation];
+            }
+        }
+
         return null;
+    }
+
+    public static function joinExposes(QueryBuilder $query, string $column): bool
+    {
+        $connection = $query->getConnection();
+
+        foreach ($query->joins ?? [] as $join) {
+            $segments = $join instanceof JoinClause && is_string($join->table) ? preg_split('/\s+as\s+/i', trim($join->table)) : false;
+
+            if (! is_array($segments) || count($segments) > 2 || ! $connection instanceof Connection || $connection->getSchemaBuilder()->hasColumn($segments[0], $column)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -402,9 +424,10 @@ final class LegacyQueryBuilder extends QueryBuilder
     /**
      * @param  array<array-key, mixed>  $wheres
      * @param  array<string, bool>  $scope
+     * @param  list<string>  $externals
      * @return list<array{string, list<string>}>
      */
-    private static function subqueries(array $wheres, array $scope, string $legacyTable): array
+    private static function subqueries(array $wheres, array $scope, string $legacyTable, array $externals): array
     {
         $clauses = [];
 
@@ -424,13 +447,13 @@ final class LegacyQueryBuilder extends QueryBuilder
             };
 
             if ($operation === null) {
-                $clauses = [...$clauses, ...self::subqueries($query->wheres, $scope, $legacyTable)];
+                $clauses = [...$clauses, ...self::subqueries($query->wheres, $scope, $legacyTable, $externals)];
             } elseif ($operation !== false) {
                 if ($query instanceof self) {
                     $query->refuseExternal();
                 }
 
-                $clauses[] = [$operation, self::outerReads($query, $scope, $legacyTable)];
+                $clauses[] = [$operation, self::outerReads($query, $scope, $legacyTable, $externals)];
             }
         }
 
@@ -439,9 +462,10 @@ final class LegacyQueryBuilder extends QueryBuilder
 
     /**
      * @param  array<string, bool>  $scope
+     * @param  list<string>  $externals
      * @return list<string>
      */
-    private static function outerReads(QueryBuilder $query, array $scope, string $legacyTable): array
+    private static function outerReads(QueryBuilder $query, array $scope, string $legacyTable, array $externals): array
     {
         $reads = false;
 
@@ -461,13 +485,13 @@ final class LegacyQueryBuilder extends QueryBuilder
                 $qualifier = is_string($column) ? self::qualifierOf($column) : null;
                 $attribute = is_string($column) && ($qualifier === null ? $reads : ($scope[$qualifier] ?? false)) ? self::attributeOf((string) $qualifier, $column) : null;
 
-                if ($attribute !== null) {
+                if ($attribute !== null && in_array($attribute, $externals, true) && ! ($qualifier === null && self::joinExposes($query, $attribute))) {
                     $names[] = $attribute;
                 }
             }
         }
 
-        foreach (self::subqueries($query->wheres, $scope, $legacyTable) as [, $nested]) {
+        foreach (self::subqueries($query->wheres, $scope, $legacyTable, $externals) as [, $nested]) {
             $names = [...$names, ...$nested];
         }
 

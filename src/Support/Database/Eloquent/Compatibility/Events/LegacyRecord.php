@@ -46,6 +46,9 @@ final class LegacyRecord
     /** @var array<array-key, bool> */
     private array $serves = [];
 
+    /** @var array<array-key, bool> */
+    private array $participates = [];
+
     private bool $expressed = false;
 
     private bool $inserts = false;
@@ -147,12 +150,10 @@ final class LegacyRecord
             $this->admit($successor);
         }
 
+        $this->records = array_intersect_key($this->admitted, $rows);
+
         foreach (array_keys($this->records) as $key) {
-            if (array_key_exists($key, $rows)) {
-                $this->apply($key, $rows[$key]);
-            } else {
-                unset($this->records[$key], $this->before[$key]);
-            }
+            $this->apply($key, $rows[$key]);
         }
     }
 
@@ -161,13 +162,15 @@ final class LegacyRecord
      */
     public function changed(): array
     {
-        if ($this->expressed) {
-            return $this->records;
-        }
-
         $changed = [];
 
         foreach ($this->records as $key => $legacy) {
+            if ($this->expressed && ($this->participates[$key] ?? false)) {
+                $changed[$key] = $legacy;
+
+                continue;
+            }
+
             foreach (array_keys($this->columns) as $name) {
                 if (($this->before[$key][$name] ?? null) !== ($legacy->getAttributes()[$name] ?? null)) {
                     $changed[$key] = $legacy;
@@ -382,6 +385,7 @@ final class LegacyRecord
 
         foreach (array_keys($rows) as $legacyKey) {
             $this->serves[$legacyKey] = ($owners[$legacyKey][self::WRITTEN] ?? null) === true;
+            $this->participates[$legacyKey] = $this->serves[$legacyKey] || ($rows[$legacyKey][self::WRITTEN] ?? null) === true;
             unset($rows[$legacyKey][self::WRITTEN]);
         }
 

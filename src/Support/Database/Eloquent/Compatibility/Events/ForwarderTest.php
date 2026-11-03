@@ -649,7 +649,7 @@ final class ForwarderTest extends TestCase
         $file->update(['legacy_type' => 'legacy_file']);
 
         $this->assertSame([], $this->seen);
-        $this->assertSame([false, false], [str_contains($reclassified, '"photos"'), str_contains($reclassified, '"floorplans"')]);
+        $this->assertSame([true, false], [str_contains($reclassified, '"photos"'), str_contains($reclassified, '"floorplans"')]);
         $this->assertSame([true, 'birch.png'], [Listing::query()->find(1) !== null, LegacyFile::query()->findOrFail(File::query()->whereKey($file->id)->value('legacy_id'))->file_name]);
     }
 
@@ -1743,6 +1743,94 @@ final class ForwarderTest extends TestCase
             ['updated', 1, 'Oak Lodge', 'Oak Cabin'], ['saved', 1, 'Oak Lodge', 'Oak Cabin'],
         ], $this->seen);
         $this->assertSame([null, 'Oak Cabin'], [Job::query()->where('legacy_id', 1)->value('merged_into_job_id'), Listing::query()->findOrFail(1)->title]);
+    }
+
+    #[Test]
+    public function it_forwards_a_file_write_to_the_photo_a_later_file_listener_keeps_in_its_legacy_type(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id, $photo->getOriginal('file_name'), $photo->file_name]);
+        $this->listen(FloorPlan::class, self::EVENTS, fn (FloorPlan $floorPlan) => [$floorPlan->id]);
+        $restores = 'saving';
+
+        foreach (['saving', 'updating'] as $event) {
+            Event::listen("eloquent.{$event}: ".File::class, function (File $file) use ($event, &$restores): void {
+                if ($event === $restores) {
+                    $file->legacy_type = 'photo';
+                }
+            });
+        }
+
+        $file = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])->refresh();
+        $this->seen = [];
+
+        $file->update(['legacy_type' => 'floorplan', 'filename' => 'restored.jpg']);
+        $restores = 'updating';
+        $file->update(['legacy_type' => 'floorplan', 'filename' => 'restored-late.jpg']);
+        $restores = null;
+        $file->update(['legacy_type' => 'floorplan', 'filename' => 'moved.jpg']);
+        $restores = 'saving';
+        $aspen = File::query()->create(['legacy_type' => 'floorplan', 'filename' => 'aspen.png', 'mime_type' => 'image/png'])->refresh();
+
+        $this->assertSame([
+            ['saving', $file->legacy_id, 'birch.png', 'restored.jpg'], ['updating', $file->legacy_id, 'birch.png', 'restored.jpg'], ['updated', $file->legacy_id, 'birch.png', 'restored.jpg'], ['saved', $file->legacy_id, 'birch.png', 'restored.jpg'],
+            ['updated', $file->legacy_id, 'restored.jpg', 'restored-late.jpg'], ['saved', $file->legacy_id, 'restored.jpg', 'restored-late.jpg'],
+            ['saving', null],
+            ['saving', null, null, 'aspen.png'], ['creating', null, null, 'aspen.png'], ['created', $aspen->legacy_id, null, 'aspen.png'], ['saved', $aspen->legacy_id, null, 'aspen.png'],
+        ], $this->seen);
+        $this->assertSame('photo', $aspen->legacy_type);
+        $this->assertSame(['floorplan', 'moved.jpg'], [File::query()->findOrFail($file->id)->legacy_type, File::query()->findOrFail($file->id)->filename]);
+    }
+
+    #[Test]
+    public function it_forwards_a_dependent_write_to_the_listing_a_later_place_listener_keeps_visible_and_never_to_one_hidden_before_the_write(): void
+    {
+        $withheld = $this->withheldListing();
+        Forwarder::register($this->app->make('events'), $withheld::class);
+        $this->listen($withheld::class, self::EVENTS, fn (Model $listing) => [$listing->getAttribute('id'), $listing->getOriginal('street'), $listing->getAttribute('street'), $listing->getAttribute('city')]);
+        $restores = 'saving';
+
+        foreach (['saving', 'updating'] as $event) {
+            Event::listen("eloquent.{$event}: ".Place::class, function (Place $place) use ($event, &$restores): void {
+                if ($event === $restores) {
+                    $place->city = 'Seattle';
+                }
+            });
+        }
+
+        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+
+        $root->update(['city' => 'Withheld', 'street' => '7 Oak St']);
+        $restores = 'updating';
+        $root->update(['city' => 'Withheld', 'street' => '8 Oak St']);
+        $restores = null;
+        $root->update(['city' => 'Withheld', 'street' => '9 Oak St']);
+        $root->update(['city' => 'Seattle', 'street' => '10 Oak St']);
+
+        $this->assertSame([
+            ['saving', 1, '1 Oak St', '7 Oak St', 'Seattle'], ['updating', 1, '1 Oak St', '7 Oak St', 'Seattle'], ['updated', 1, '1 Oak St', '7 Oak St', 'Seattle'], ['saved', 1, '1 Oak St', '7 Oak St', 'Seattle'],
+            ['updated', 1, '7 Oak St', '8 Oak St', 'Seattle'], ['saved', 1, '7 Oak St', '8 Oak St', 'Seattle'],
+        ], $this->seen);
+        $this->assertSame(['10 Oak St', 'Seattle'], [Place::query()->findOrFail($root->id)->street, Place::query()->findOrFail($root->id)->city]);
+    }
+
+    #[Test]
+    public function it_lets_a_listing_listener_refuse_an_expression_write_only_of_a_dependent_row_that_serves_the_listing(): void
+    {
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
+        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $root = Place::query()->where('job_id', $oak->id)->firstOrFail();
+        $unit = Place::query()->create(['job_id' => $oak->id, 'parent_id' => $root->id, 'street' => 'Unit 2']);
+        Event::listen('eloquent.saving: '.Listing::class, fn (Listing $listing) => false);
+        $this->seen = [];
+
+        $saved = $unit->update(['street' => DB::raw("'Unit 3'")]);
+        $refused = $root->update(['street' => DB::raw("'5 Oak St'")]);
+
+        $this->assertSame([['saving', 1, '1 Oak St']], $this->seen);
+        $this->assertSame([true, false, 'Unit 3', '1 Oak St'], [$saved, $refused, Place::query()->findOrFail($unit->id)->street, Place::query()->findOrFail($root->id)->street]);
     }
 
     /**

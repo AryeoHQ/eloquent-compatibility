@@ -349,7 +349,7 @@ final class Forwarder
     {
         $record = $sequence->record;
 
-        if ($record === null) {
+        if ($record === null || ($this->dependent === null && $ahead && ! $record->removes && ! $this->member($successor, false))) {
             return null;
         }
 
@@ -441,7 +441,7 @@ final class Forwarder
     {
         $listened = array_filter($this->dependent === null ? self::FOLLOWING[$event] : ['saving', 'updating', 'updated', 'saved'], $this->listens(...)) !== [];
 
-        return $listened && $this->member($successor) ? $this->read($successor, in_array($event, ['deleting', 'forceDeleting'], true)) : null;
+        return $listened && $this->member($successor, true) ? $this->read($successor, in_array($event, ['deleting', 'forceDeleting'], true)) : null;
     }
 
     private function read(Model $successor, bool $removes): null|LegacyRecord
@@ -475,7 +475,7 @@ final class Forwarder
         return ($removes || $successor->exists) && $record->records() === [] ? null : $record;
     }
 
-    private function member(Model $successor): bool
+    private function member(Model $successor, bool $stored): bool
     {
         $membership = $this->served->membership;
 
@@ -484,17 +484,22 @@ final class Forwarder
         }
 
         $column = $membership->column;
-        $original = $successor->getRawOriginal();
-        $stored = array_key_exists($column, $original) && ! $original[$column] instanceof Expression || ! $successor->exists
-            ? $original[$column] ?? null
-            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
         $value = $successor->getAttributes()[$column];
 
-        if ($value instanceof Expression) {
-            $value = $successor->exists && ! $successor->isDirty($column) ? $stored : LegacyRecord::evaluate($successor, $column, $value)[0];
+        if ($stored || ($value instanceof Expression && $successor->exists && ! $successor->isDirty($column))) {
+            return ! $successor->exists || self::stored($successor, $column) === $membership->alias;
         }
 
-        return $value === $membership->alias && (! $successor->exists || $stored === $membership->alias);
+        return ($value instanceof Expression ? LegacyRecord::evaluate($successor, $column, $value)[0] : $value) === $membership->alias;
+    }
+
+    private static function stored(Model $successor, string $column): mixed
+    {
+        $original = $successor->getRawOriginal();
+
+        return array_key_exists($column, $original) && ! $original[$column] instanceof Expression
+            ? $original[$column]
+            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
     }
 
     /**
