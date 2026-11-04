@@ -1,0 +1,54 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Fixtures\Support\Listings;
+
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\SoftDeletes;
+
+/**
+ * @property string $id
+ * @property int $legacy_id
+ * @property string $legacy_uuid
+ * @property string $name
+ * @property string $company_id
+ * @property null|int $price_cents
+ * @property LifecycleStatus $lifecycle_status
+ * @property null|string $merged_into_job_id
+ */
+final class Job extends Model
+{
+    use HasUuids;
+    use SoftDeletes;
+
+    protected $table = 'jobs';
+
+    protected $guarded = [];
+
+    protected function casts(): array
+    {
+        return ['lifecycle_status' => LifecycleStatus::class];
+    }
+
+    /** @return HasMany<Place, $this> */
+    public function places(): HasMany
+    {
+        return $this->hasMany(Place::class);
+    }
+
+    /** @return HasOne<Place, $this> */
+    public function rootPlace(): HasOne
+    {
+        return $this->hasOne(Place::class)->withAttributes(['parent_id' => null])->oldest('id');
+    }
+
+    /** @return HasOne<JobSite, $this> */
+    public function site(): HasOne
+    {
+        return $this->hasOne(JobSite::class);
+    }
+}
