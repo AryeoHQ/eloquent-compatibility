@@ -23,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
@@ -38,6 +39,8 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(Installer::class)]
@@ -73,6 +76,94 @@ final class InstallerTest extends TestCase
         FileTables::drop();
 
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_locks_every_morph_target_while_it_installs_and_uninstalls_a_map_through_a_morph(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (str_starts_with($query->sql, 'LOCK TABLE')) {
+                $locks[] = $query->sql;
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            Compatibility::uninstall(PlaceVideo::class);
+        } finally {
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertContains('LOCK TABLE place_videos, place_assets, asset_files, asset_links IN SHARE UPDATE EXCLUSIVE MODE', $locks);
+        $this->assertContains('LOCK TABLE "place_assets", "asset_files", "asset_links" IN SHARE ROW EXCLUSIVE MODE', $locks);
+    }
+
+    #[Test]
+    public function it_moves_a_record_whose_legacy_row_changes_target_after_its_last_pass_before_it_takes_the_lock(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('asset_id');
+        $writer = $this->writer();
+        $landed = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$landed): void {
+            if (! $landed && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "place_videos" IS')) {
+                $landed = true;
+                $writer->update("update place_videos set youtube_embed_url = 'https://youtu.be/tour', original_file_name = null, size_kb = null, updated_at = localtimestamp(0) where id = 1");
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            $videos = PlaceVideo::query()->orderBy('id')->get()->map(fn (PlaceVideo $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all();
+            $asset = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->first(['asset_type', 'asset_id']);
+            $state = [$asset?->asset_type, DB::table('asset_links')->where('id', $asset?->asset_id)->value('url'), DB::table('asset_files')->where('id', $file)->exists()];
+        } finally {
+            DB::purge('writer');
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertTrue($landed);
+        $this->assertSame([[1, null, 'https://youtu.be/tour'], [2, null, 'https://youtu.be/oak'], [3, 'drone.mov', null]], $videos);
+        $this->assertSame(['place_asset_link', 'https://youtu.be/tour', false], $state);
+    }
+
+    #[Test]
+    public function it_deletes_the_place_asset_of_a_legacy_row_deleted_after_its_last_pass_and_leaves_its_target(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::prepare();
+        PlaceAssetTables::backfill();
+        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('asset_id');
+        $writer = $this->writer();
+        $landed = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$landed): void {
+            if (! $landed && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'COMMENT ON TABLE "place_videos" IS')) {
+                $landed = true;
+                $writer->delete('delete from place_videos where id = 3');
+            }
+        });
+
+        try {
+            Compatibility::install(PlaceVideo::class);
+            $videos = PlaceVideo::query()->orderBy('id')->pluck('id')->all();
+            $state = [DB::table('place_assets')->where('legacy_type', 'place_video')->orderBy('legacy_id')->pluck('legacy_id')->all(), DB::table('asset_files')->where('id', $file)->value('filename')];
+        } finally {
+            DB::purge('writer');
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertTrue($landed);
+        $this->assertSame([1, 2], $videos);
+        $this->assertSame([[1, 2], 'drone.mov'], $state);
     }
 
     #[Test]
@@ -1626,17 +1717,19 @@ final class InstallerTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained', key: 'video_id')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
 
@@ -2064,9 +2157,11 @@ final class InstallerTest extends TestCase
                     ->discriminatedBy('legacy_type')
                     ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
                     ->retainedIn('videos_retained')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file)
-                    ->as(Link::class, fn (Successor $link) => $link);
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file)
+                            ->as(Link::class, fn (Successor $link) => $link));
             }
         };
         $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
@@ -2105,14 +2200,16 @@ final class InstallerTest extends TestCase
                     ->discriminatedBy('legacy_type')
                     ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
                     ->retainedIn('videos_retained')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute
-                            ->external(
-                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null)));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                                    ->external(
+                                        read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                        write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))));
             }
         };
         $before = $this->sorted(array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));

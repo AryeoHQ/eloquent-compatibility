@@ -240,7 +240,7 @@ final readonly class Statements
             "ALTER TABLE {$retainedTable} DROP CONSTRAINT {$retainedNotNull}",
         ] : [];
         $verifications = [
-            ...($branched ? [fn (ConnectionInterface $connection) => (new Backfiller($map, $connection))->refuseMisplaced()] : []),
+            ...($branched || $map->morphs !== [] ? [fn (ConnectionInterface $connection) => (new Backfiller($map, $connection))->refuseMisplaced()] : []),
             ...array_map(fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify($map, $connection, $name), $external),
         ];
         $mapped = array_values(array_diff(array_keys($legacy), $map->legacyOnly(array_keys($legacy)), $branched ? [$retainedKey] : []));

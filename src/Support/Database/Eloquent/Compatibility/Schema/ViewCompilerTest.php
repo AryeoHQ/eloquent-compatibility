@@ -25,6 +25,8 @@ use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(ViewCompiler::class)]
@@ -177,6 +179,37 @@ final class ViewCompilerTest extends TestCase
             FROM (SELECT * FROM "links" WHERE "links"."legacy_type" = 'video') AS "links"
             LEFT JOIN "videos_retained" ON "videos_retained"."id" = "links"."legacy_id"
             SQL, $this->viewCompiler()->create(Compatibility::of(Video::class)->resolve()));
+    }
+
+    #[Test]
+    public function it_joins_each_morph_target_on_its_alias_and_reads_each_target_attribute_through_the_morph_type(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::prepare();
+
+        try {
+            $view = $this->viewCompiler()->create(Compatibility::of(PlaceVideo::class)->resolve());
+        } finally {
+            PlaceAssetTables::drop();
+        }
+
+        $this->assertSame(<<<'SQL'
+            CREATE VIEW "place_videos" AS
+            SELECT
+              CAST("place_assets"."legacy_id" AS integer) AS "id",
+              CAST("place_assets"."legacy_uuid" AS uuid) AS "uuid",
+              CAST("place_assets"."title" AS character varying(255)) COLLATE pg_catalog."default" AS "title",
+              CAST(CASE "place_assets"."asset_type" WHEN 'place_asset_file' THEN CAST("asset_files"."filename" AS character varying(255)) COLLATE pg_catalog."default" WHEN 'place_asset_link' THEN CAST(NULL AS character varying(255)) COLLATE pg_catalog."default" END AS character varying(255)) COLLATE pg_catalog."default" AS "original_file_name",
+              CAST(CASE "place_assets"."asset_type" WHEN 'place_asset_file' THEN CAST((CAST("asset_files"."size_bytes" AS numeric) / 1000) AS numeric(12,3)) WHEN 'place_asset_link' THEN CAST(NULL AS numeric(12,3)) END AS numeric(12,3)) AS "size_kb",
+              CAST(CASE "place_assets"."asset_type" WHEN 'place_asset_file' THEN CAST(NULL AS character varying(255)) COLLATE pg_catalog."default" WHEN 'place_asset_link' THEN CAST("asset_links"."url" AS character varying(255)) COLLATE pg_catalog."default" END AS character varying(255)) COLLATE pg_catalog."default" AS "youtube_embed_url",
+              CAST(CASE WHEN "place_videos_retained"."place_asset_id" IS NULL THEN 0 ELSE "place_videos_retained"."views" END AS integer) AS "views",
+              CAST(("place_assets"."created_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "created_at",
+              CAST(("place_assets"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "updated_at"
+            FROM (SELECT * FROM "place_assets" WHERE "place_assets"."legacy_type" = 'place_video') AS "place_assets"
+            LEFT JOIN "place_videos_retained" ON "place_videos_retained"."place_asset_id" = "place_assets"."id"
+            LEFT JOIN "asset_files" ON "place_assets"."asset_type" = 'place_asset_file' AND "place_assets"."asset_id" = "asset_files"."id"
+            LEFT JOIN "asset_links" ON "place_assets"."asset_type" = 'place_asset_link' AND "place_assets"."asset_id" = "asset_links"."id"
+            SQL, $view);
     }
 
     #[Test]

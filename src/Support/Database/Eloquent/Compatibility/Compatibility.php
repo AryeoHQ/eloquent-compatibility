@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Hide;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
@@ -163,22 +164,20 @@ final class Compatibility
 
     /**
      * @param  null|Closure(Successor): mixed  $definition
+     * @param  null|Closure(Successors): mixed  $successors
      */
-    public function servedFrom(string|Closure $successor, null|Closure $definition = null): self
+    public function servedFrom(null|string $successor = null, null|Closure $definition = null, null|Closure $choose = null, null|Closure $successors = null): self
     {
         if ($this->primary !== null || $this->selector !== null) {
             throw $this->invalid('servedFrom() is declared twice');
         }
 
-        if ($successor instanceof Closure) {
-            if ($definition !== null) {
-                throw $this->invalid('servedFrom() takes a selector closure alone; declare each successor it chooses with as()');
-            }
+        if ($successor === null) {
+            return $this->servedFromSeveral($definition, $choose, $successors);
+        }
 
-            ResolvedMap::refuseCaptures($this->map, 'the servedFrom() selector', $successor);
-            $this->selector = $successor;
-
-            return $this;
+        if ($choose !== null || $successors !== null) {
+            throw $this->invalid("servedFrom() names {$successor} and also takes choose: or successors:; declare one successor with servedFrom(".class_basename($successor).'::class, fn (Successor $successor) => ...), or several with choose: and successors: alone');
         }
 
         if ($definition === null) {
@@ -193,25 +192,6 @@ final class Compatibility
 
         $this->primary = new Successor($this->map, $successor);
         $definition($this->primary);
-
-        return $this;
-    }
-
-    /**
-     * @param  Closure(Successor): mixed  $definition
-     */
-    public function as(string $successor, Closure $definition): self
-    {
-        if ($this->selector === null) {
-            throw $this->invalid('as() declares a successor for the servedFrom() selector, and no servedFrom() selector precedes it');
-        }
-
-        if (array_key_exists($successor, $this->branches)) {
-            throw $this->invalid("as({$successor}) is declared twice");
-        }
-
-        $branch = Branch::declare($this->map, $successor, $definition);
-        $this->branches[$branch->model] = $branch;
 
         return $this;
     }
@@ -266,6 +246,33 @@ final class Compatibility
     }
 
     /**
+     * @param  null|Closure(Successors): mixed  $successors
+     */
+    private function servedFromSeveral(null|Closure $definition, null|Closure $choose, null|Closure $successors): self
+    {
+        if ($definition !== null) {
+            throw $this->invalid('servedFrom() takes a closure without a successor class; name the class before it, or declare several successors with choose: and successors:');
+        }
+
+        if ($successors === null) {
+            throw $this->invalid('servedFrom() names no successor; declare one with servedFrom(Successor::class, fn (Successor $successor) => ...), or several with choose: and successors:');
+        }
+
+        $branches = Successors::declare($this->map, 'servedFrom()', $choose, $successors, 'declare servedFrom(%s::class, fn (Successor $successor) => ...) instead');
+
+        if (count($branches) === 1) {
+            $this->primary = reset($branches)->successor;
+
+            return $this;
+        }
+
+        $this->selector = $choose;
+        $this->branches = $branches;
+
+        return $this;
+    }
+
+    /**
      * @return array<class-string<Model>, list<class-string<Model>>>
      */
     public function successors(): array
@@ -279,7 +286,7 @@ final class Compatibility
                 $successor = array_shift($pending);
                 $models[] = $successor->model;
 
-                foreach ($successor->relations() as $relation) {
+                foreach ([...$successor->relations(), ...array_values($successor->morph()->targets ?? [])] as $relation) {
                     $pending[] = $relation->successor;
                 }
             }

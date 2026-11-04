@@ -663,7 +663,7 @@ final class LegacyBuilder extends Builder
             }
         }
 
-        if ($map->branches !== []) {
+        if ($map->branches !== [] || $map->isMorphed($attribute)) {
             $onView();
 
             return $this;

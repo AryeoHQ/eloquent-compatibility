@@ -20,6 +20,8 @@ final class Successor
     /** @var list<Related> */
     private array $related = [];
 
+    private null|RelatedMorph $morph = null;
+
     private null|string $atMostOne = null;
 
     private null|Closure $when = null;
@@ -66,6 +68,20 @@ final class Successor
         return $this;
     }
 
+    /**
+     * @param  Closure(Successors): mixed  $successors
+     */
+    public function relatedMorph(Closure $relation, Closure $successors, null|Closure $choose = null): self
+    {
+        if ($this->morph !== null) {
+            throw InvalidCompatibilityMap::because($this->map, 'relatedMorph() on '.class_basename($this->model).' is declared twice; one legacy record reads one MorphTo of its successor');
+        }
+
+        $this->morph = RelatedMorph::compile($this->map, $this->model, $relation, $successors, $choose);
+
+        return $this;
+    }
+
     public function atMostOne(string $because): self
     {
         if (trim($because) === '') {
@@ -104,6 +120,11 @@ final class Successor
     public function relations(): array
     {
         return $this->related;
+    }
+
+    public function morph(): null|RelatedMorph
+    {
+        return $this->morph;
     }
 
     public function atMostOneBecause(): null|string

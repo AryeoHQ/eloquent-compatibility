@@ -14,6 +14,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
 /**
@@ -54,21 +55,23 @@ final class Video extends Model implements Compatible
             ->retainedIn('videos_retained')
             ->timestamps()
             ->guard('embed host', fn (Video $after, Video $before) => $after->youtube_embed_url !== null && ! str_starts_with($after->youtube_embed_url, 'https://youtu.be/'), because: 'The listing page plays embeds from YouTube only.', instead: 'Write a https://youtu.be/ link.')
-            ->servedFrom(fn (Video $video): string => $video->youtube_embed_url !== null ? Link::class : File::class)
-            ->as(File::class, fn (Successor $file) => $file
-                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute
-                    ->external(
-                        read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                        write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                ->attribute('size_kb', fn (Attribute $attribute) => $attribute
-                    ->from('size_bytes')
-                    ->dividedBy(1000))
-                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-            ->as(Link::class, fn (Successor $link) => $link
-                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+            ->servedFrom(
+                choose: fn (Video $video): string => $video->youtube_embed_url !== null ? Link::class : File::class,
+                successors: fn (Successors $successors) => $successors
+                    ->as(File::class, fn (Successor $file) => $file
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                            ->external(
+                                read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
+                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute
+                            ->from('size_bytes')
+                            ->dividedBy(1000))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                    ->as(Link::class, fn (Successor $link) => $link
+                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
     }
 }

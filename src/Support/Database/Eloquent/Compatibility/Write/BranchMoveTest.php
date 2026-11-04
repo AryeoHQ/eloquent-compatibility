@@ -17,6 +17,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -342,21 +343,23 @@ final class BranchMoveTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')->readOnly('The upload names its own file.'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => null])->all(), write: fn (File $file, mixed $value) => $value)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
-                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $links): array => $links->mapWithKeys(fn (Model $link) => [$link->getKey() => null])->all(), write: fn (Link $link, mixed $value) => $value)));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')->readOnly('The upload names its own file.'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => null])->all(), write: fn (File $file, mixed $value) => $value)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
+                                ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $links): array => $links->mapWithKeys(fn (Model $link) => [$link->getKey() => null])->all(), write: fn (Link $link, mixed $value) => $value))));
             }
         };
     }
@@ -385,19 +388,21 @@ final class BranchMoveTest extends TestCase
                     ->retainedIn('videos_retained')
                     ->timestamps()
                     ->guard('typed', fn (Model $after, Model $before) => $before->getAttribute('mime_type') !== null && $after->getAttribute('mime_type') === null, because: 'A typed upload keeps its MIME type.', instead: 'Keep the upload.')
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
     }
@@ -425,19 +430,21 @@ final class BranchMoveTest extends TestCase
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('videos_retained')
                     ->timestamps()
-                    ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
-                    ->as(File::class, fn (Successor $file) => $file
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                    ->as(Link::class, fn (Successor $link) => $link
-                        ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('url')->readAs("split_part(\"links\".\"url\", '/', 4)")->readOnly('A link takes its name from its URL.'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
+                    ->servedFrom(
+                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
+                        successors: fn (Successors $successors) => $successors
+                            ->as(File::class, fn (Successor $file) => $file
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
+                            ->as(Link::class, fn (Successor $link) => $link
+                                ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('url')->readAs("split_part(\"links\".\"url\", '/', 4)")->readOnly('A link takes its name from its URL.'))
+                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
+                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))));
             }
         };
     }
