@@ -43,11 +43,6 @@ final readonly class IsNotNull implements Conversion
         return $set === null ? null : [$set === $equal ? '!=' : '=', null];
     }
 
-    public function order(string $direction): null|string
-    {
-        return null;
-    }
-
     public function type(null|string $type): string
     {
         return 'boolean';

@@ -74,10 +74,10 @@ final class InTimeZoneTest extends TestCase
     }
 
     #[Test]
-    public function it_cannot_filter_with_a_pattern_and_orders_in_the_same_direction(): void
+    public function it_cannot_filter_with_a_pattern(): void
     {
         $conversion = new InTimeZone('America/New_York');
 
-        $this->assertSame([null, 'desc'], [$conversion->filter('like', '2026%'), $conversion->order('DESC')]);
+        $this->assertNull($conversion->filter('like', '2026%'));
     }
 }

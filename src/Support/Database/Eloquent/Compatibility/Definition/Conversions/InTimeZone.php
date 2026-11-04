@@ -43,11 +43,6 @@ final readonly class InTimeZone implements Conversion
         return [$operator, $this->write($value)];
     }
 
-    public function order(string $direction): string
-    {
-        return strtolower($direction);
-    }
-
     public function type(null|string $type): string
     {
         return 'timestamp without time zone';
