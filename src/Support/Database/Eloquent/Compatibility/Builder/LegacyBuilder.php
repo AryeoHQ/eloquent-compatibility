@@ -585,6 +585,12 @@ final class LegacyBuilder extends Builder
             }
         }
 
+        if ($map->branches !== []) {
+            $onView();
+
+            return $this;
+        }
+
         $conditions = array_map(fn (array $condition) => [$condition[0], $this->sent($condition[1])], $conditions);
 
         foreach ($conditions as [$operator, $value]) {
@@ -616,6 +622,10 @@ final class LegacyBuilder extends Builder
             $successors->from($owner);
         } else {
             $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
+        }
+
+        if ($map->membership !== null) {
+            $successors->whereRaw($map->membership->of($map->primary->table));
         }
 
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
@@ -776,13 +786,18 @@ final class LegacyBuilder extends Builder
      */
     private function incrementOwn(Model $model, array $amounts, array $extra): int
     {
+        $named = [];
         $values = [];
+
+        foreach ($amounts as $name => $amount) {
+            $named[Str::afterLast((string) $name, '.')] = $amount;
+        }
 
         foreach ($this->addUpdatedAtColumn($extra) as $name => $value) {
             $values[Str::afterLast((string) $name, '.')] = $value;
         }
 
-        return $this->writer()->increment($model, $amounts, $values);
+        return $this->writer()->increment($model, $named, $values);
     }
 
     private function ownWrite(): null|Model

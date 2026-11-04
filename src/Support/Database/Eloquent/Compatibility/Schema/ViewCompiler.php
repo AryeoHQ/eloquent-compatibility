@@ -17,11 +17,14 @@ final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
-    public function create(ResolvedMap $map): string
+    /**
+     * @param  list<string>  $omitted
+     */
+    public function create(ResolvedMap $map, array $omitted = []): string
     {
-        $legacy = $this->columnCatalog->of($map->table);
+        $legacy = array_diff_key($this->columnCatalog->of($map->table), array_flip($omitted));
 
-        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $legacy, $map->table, $legacy);
+        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
     }
 
     public function replace(ResolvedMap $map): string
@@ -29,7 +32,7 @@ final readonly class ViewCompiler
         $shape = $this->columnCatalog->of($map->table);
         $retained = $this->columnCatalog->of(self::retainedTable($map));
 
-        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select($map, $shape, self::retainedTable($map), $retained);
+        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $shape, self::retainedTable($map), $retained);
     }
 
     /**
@@ -114,9 +117,12 @@ final readonly class ViewCompiler
     public static function primary(ResolvedMap $map): string
     {
         $table = SqlFragments::identifier($map->primary->table);
-        $hidden = array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map));
+        $conditions = [
+            ...($map->membership === null ? [] : [$map->membership->of($map->primary->table)]),
+            ...array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map)),
+        ];
 
-        return $hidden === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $hidden).') AS '.$table;
+        return $conditions === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $conditions).') AS '.$table;
     }
 
     /**
@@ -154,6 +160,15 @@ final readonly class ViewCompiler
         }
 
         return $conditions;
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @param  array<string, Column>  $retained
+     */
+    private function union(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    {
+        return implode("\nUNION ALL\n", array_map(fn (ResolvedMap $served) => $this->select($served, $shape, $defaultsOn, $retained), $map->branches === [] ? [$map] : array_values($map->branches)));
     }
 
     /**
@@ -206,10 +221,11 @@ final readonly class ViewCompiler
         }
 
         $primary = SqlFragments::identifier($map->primary->table);
+        $retainedBy = $map->branch ? (string) $map->identifiers[(new $map->model)->getKeyName()]->column() : $map->primary->key;
 
         return "SELECT\n  ".implode(",\n  ", $columns)
             ."\nFROM ".self::primary($map)
-            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($map->primary->key)
+            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($retainedBy)
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
     }
 
@@ -281,7 +297,7 @@ final readonly class ViewCompiler
             throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
         }
 
-        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
+        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...($map->membership === null ? [] : [$map->membership->column]), ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
 
         foreach ($map->related as $related) {
             $this->columnsOf($map, $related->parentTable, [$related->parentKey], 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');

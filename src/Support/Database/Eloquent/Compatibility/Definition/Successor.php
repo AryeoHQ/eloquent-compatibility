@@ -22,6 +22,8 @@ final class Successor
 
     private null|string $atMostOne = null;
 
+    private null|Closure $when = null;
+
     /**
      * @param  class-string<Model>  $model
      */
@@ -75,6 +77,19 @@ final class Successor
         return $this;
     }
 
+    public function when(Closure $scope): self
+    {
+        if ($this->when !== null) {
+            throw InvalidCompatibilityMap::because($this->map, 'when() on '.class_basename($this->model).' is declared twice');
+        }
+
+        ResolvedMap::refuseCaptures($this->map, 'the when() scope on '.class_basename($this->model), $scope);
+
+        $this->when = $scope;
+
+        return $this;
+    }
+
     /**
      * @return array<string, Attribute>
      */
@@ -94,5 +109,10 @@ final class Successor
     public function atMostOneBecause(): null|string
     {
         return $this->atMostOne;
+    }
+
+    public function membershipScope(): null|Closure
+    {
+        return $this->when;
     }
 }

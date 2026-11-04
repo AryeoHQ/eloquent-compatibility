@@ -93,8 +93,9 @@ final readonly class RetainedRows
         $legacyKey = $legacy.'.'.SqlFragments::identifier($key);
         $identifier = $primary.'.'.SqlFragments::identifier((string) $this->map->identifiers[$key]->column());
         $keyed = $primaryKey.' IN ('.$keys->toSql().')';
+        $member = $this->map->membership === null ? '' : ' AND '.$this->map->membership->of($this->map->primary->table);
         $source = $joined
-            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.'), '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
+            ? '(SELECT '.$primaryKey.' FROM '.$primary.' WHERE '.$identifier.' = '.$legacyKey.$member.'), '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN (SELECT '.$identifier.' FROM '.$primary.' WHERE '.$keyed.')'
             : implode(', ', [$primaryKey, ...$selects]).' FROM '.$primary.' WHERE '.$keyed;
         $retainedKey = SqlFragments::identifier((string) $this->map->retainedKey);
 

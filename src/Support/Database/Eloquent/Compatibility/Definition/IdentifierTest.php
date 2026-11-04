@@ -9,6 +9,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\TestCase;
 
@@ -42,6 +43,7 @@ final class IdentifierTest extends TestCase
         yield 'no type' => [fn (Identifier $identifier) => $identifier->from('legacy_id')->resolve(new Successor('listings', Job::class)), 'says neither integer() nor uuid()'];
         yield 'no column' => [fn (Identifier $identifier) => $identifier->integer()->resolve(new Successor('listings', Job::class)), 'says no from(), so it names no successor column'];
         yield 'the successor key' => [fn (Identifier $identifier) => $identifier->uuid()->from('id')->resolve(new Successor('listings', Job::class)), "reads jobs.id, the successor's own key; a legacy identifier lives in a column of its own"];
+        yield 'the discriminator' => [fn (Identifier $identifier) => $identifier->integer()->from('legacy_type')->resolve(new Successor('listings', File::class), 'legacy_type'), 'reads files.legacy_type, which discriminatedBy() names; a legacy identifier lives in a column of its own'];
     }
 
     /**

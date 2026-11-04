@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\Membership;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
@@ -22,13 +24,18 @@ final readonly class Statements
 
     public static function prepare(ResolvedMap $map, ConnectionInterface $connection): self
     {
-        return (new Preparer(new ColumnCatalog($connection)))->statements($map);
+        $preparer = new Preparer(new ColumnCatalog($connection));
+        $prepared = array_map($preparer->statements(...), $map->branches === [] ? [$map] : array_values($map->branches));
+
+        return new self('prepare', array_merge(...array_map(fn (self $statements) => $statements->transaction, $prepared)), array_merge(...array_map(fn (self $statements) => $statements->afterwards, $prepared)));
     }
 
     public static function install(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'install');
         $columnCatalog = new ColumnCatalog($connection);
-        $view = (new ViewCompiler($columnCatalog, $connection))->create($map);
+        $owned = self::ownedConstants($connection, $map);
+        $view = (new ViewCompiler($columnCatalog, $connection))->create($map, $owned);
 
         if (self::kind($connection, $map->table) !== 'r') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a plain table, so install() cannot serve it through a view; recompile() replaces an installed view");
@@ -43,7 +50,7 @@ final readonly class Statements
         $retainedKey = (string) $map->retainedKey;
         $primary = SqlFragments::identifier($map->primary->table);
         $primaryKey = SqlFragments::identifier($map->primary->key);
-        $legacy = $columnCatalog->of($map->table);
+        $legacy = array_diff_key($columnCatalog->of($map->table), array_flip($owned));
         $key = (new $map->model)->getKeyName();
 
         foreach ($map->attributes as $name => $attribute) {
@@ -56,9 +63,16 @@ final readonly class Statements
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} already has a column {$retainedKey}, which install() adds as the key of the retained table");
         }
 
+        $membership = $map->membership;
+
+        if ($membership !== null) {
+            self::refuseSharedAlias($connection, $map, $membership);
+        }
+
         $repoints = [];
         $validations = [];
         $moved = [];
+        $constants = [];
         $notValid = [];
 
         foreach (self::foreignKeysTo($connection, $map->table) as $foreignKey) {
@@ -67,14 +81,27 @@ final readonly class Statements
             }
 
             if (array_key_exists($foreignKey->referencedColumn, $map->identifiers)) {
-                $on = $foreignKey->qualifiedTable === $legacyTable ? $retainedTable : $foreignKey->qualifiedTable;
-                $repoints[] = self::repoint($map, $foreignKey, $foreignKey->qualifiedTable, $map->primary->table, (string) $map->identifiers[$foreignKey->referencedColumn]->column());
-                $moved[] = [$on, $foreignKey->name];
+                $identifier = $map->identifiers[$foreignKey->referencedColumn];
+                $installed = $foreignKey->qualifiedTable === $legacyTable ? $retainedTable : $foreignKey->qualifiedTable;
+                $composite = null;
+
+                if ($membership !== null) {
+                    $constant = SqlFragments::objectName($map->table, $membership->alias.'_'.$membership->column);
+                    $type = $columnCatalog->type($map->primary->table, $membership->column) ?? 'text';
+                    $composite = [$constant, $membership->column];
+                    $constants[$foreignKey->qualifiedTable.'.'.$constant] = [
+                        "ALTER TABLE {$foreignKey->qualifiedTable} ADD COLUMN ".SqlFragments::identifier($constant)." {$type} GENERATED ALWAYS AS (CAST(".SqlFragments::literal($membership->alias)." AS {$type})) STORED",
+                        [$installed, $constant],
+                    ];
+                }
+
+                $repoints[] = self::repoint($map, $foreignKey, $foreignKey->qualifiedTable, $map->primary->table, (string) $identifier->column(), composite: $composite);
+                $moved[] = [$installed, $foreignKey->name];
 
                 if ($foreignKey->validated) {
-                    $validations[] = self::validate($on, $foreignKey->name);
+                    $validations[] = self::validate($installed, $foreignKey->name);
                 } else {
-                    $notValid[] = [$on, $foreignKey->name];
+                    $notValid[] = [$installed, $foreignKey->name];
                 }
             }
         }
@@ -82,12 +109,24 @@ final readonly class Statements
         $sequences = [];
 
         foreach ($map->identifiers as $name => $identifier) {
+            if ($membership !== null && $identifier->isInteger()) {
+                if ($legacy[$name]->default !== Identifier::sharedDefault()) {
+                    throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} still defaults to ".($legacy[$name]->default ?? 'nothing').', and Compatibility::prepare() moves it onto the sequence '.Identifier::SHARED_SEQUENCE.' before install()');
+                }
+
+                $sequences[] = Preparer::advance($map->table, $name);
+
+                continue;
+            }
+
             $sequence = $identifier->isInteger() ? self::sequence($connection, $map->table, $name) : null;
 
             if ($sequence !== null) {
                 $sequences[] = "ALTER SEQUENCE {$sequence} OWNED BY {$primary}.".SqlFragments::identifier((string) $identifier->column());
             }
         }
+
+        [$refuseOutsiders, $check, $validateCheck] = $membership === null ? [[], [], []] : self::membershipCheck($map, $membership, 'install');
 
         $retainedPrimaryKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_pkey'));
         $retainedForeignKey = SqlFragments::identifier(SqlFragments::objectName($map->table, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'));
@@ -101,31 +140,43 @@ final readonly class Statements
             "LOCK TABLE {$legacyTable}, {$primary} IN SHARE ROW EXCLUSIVE MODE",
             ...(new Preparer($columnCatalog))->unfinished($map),
             self::refuseMissingPrimaries($map, $key),
+            ...$refuseOutsiders,
             ...($hidden === null ? [] : [$hidden]),
             "ALTER TABLE {$legacyTable} ADD COLUMN ".SqlFragments::identifier($retainedKey).' '.$columnCatalog->of($map->primary->table)[$map->primary->key]->type,
-            "UPDATE {$legacyTable} SET ".SqlFragments::identifier($retainedKey)." = {$primary}.{$primaryKey} FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $map->identifiers[$key]->column())." = {$legacyTable}.".SqlFragments::identifier($key),
+            "UPDATE {$legacyTable} SET ".SqlFragments::identifier($retainedKey)." = {$primary}.{$primaryKey} FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $map->identifiers[$key]->column())." = {$legacyTable}.".SqlFragments::identifier($key)
+                .($membership === null ? '' : ' AND '.$membership->of($map->primary->table)),
+            ...array_column($constants, 0),
             ...$repoints,
             ...$sequences,
             $readGrants,
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'DROP COLUMN '.SqlFragments::identifier($column), $mapped)),
             "ALTER TABLE {$legacyTable} RENAME TO {$retainedTable}",
             "ALTER TABLE {$retainedTable}\n  ADD CONSTRAINT {$retainedPrimaryKey} PRIMARY KEY (".SqlFragments::identifier($retainedKey)."),\n  ADD CONSTRAINT {$retainedForeignKey} FOREIGN KEY (".SqlFragments::identifier($retainedKey).") REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
-            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, $notValid)),
+            "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture($connection, $map, $legacy, $mapped, $moved, $notValid, array_column($constants, 1))),
             $view,
             ...array_map(fn (Column $column, string $name) => "ALTER VIEW {$legacyTable} ALTER COLUMN ".SqlFragments::identifier($name).' SET DEFAULT '.$column->default, $defaults, array_keys($defaults)),
             $grant,
+            ...$check,
         ], [
             ...$validations,
             self::validate($retainedTable, ViewCompiler::retainedTable($map).'_'.$retainedKey.'_foreign'),
+            ...$validateCheck,
         ]);
     }
 
     public static function recompile(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'recompile');
+
         if (self::kind($connection, $map->table) !== 'v') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so recompile() has nothing to replace; install() creates it");
         }
 
+        if ($map->membership !== null) {
+            self::refuseSharedAlias($connection, $map, $map->membership);
+        }
+
+        self::refuseChangedMembership($connection, $map);
         $view = (new ViewCompiler(new ColumnCatalog($connection), $connection))->replace($map);
         $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $identifiers = array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers));
@@ -140,11 +191,27 @@ final readonly class Statements
             }
         }
 
-        return new self('recompile', [$view], $validations);
+        $membership = $map->membership;
+
+        if ($membership === null) {
+            return new self('recompile', [$view], $validations);
+        }
+
+        $primary = SqlFragments::identifier($map->primary->table);
+        [$refuseOutsiders, $check, $validateCheck] = self::membershipCheck($map, $membership, 'recompile');
+
+        return new self('recompile', [
+            "LOCK TABLE {$primary} IN SHARE ROW EXCLUSIVE MODE",
+            ...$refuseOutsiders,
+            $view,
+            ...($check === [] ? ["ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint())] : $check),
+        ], [...$validations, ...$validateCheck]);
     }
 
     public static function uninstall(ResolvedMap $map, ConnectionInterface $connection): self
     {
+        self::refuseBranches($map, 'uninstall');
+
         if (self::kind($connection, $map->table) !== 'v') {
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} is not a view, so uninstall() has nothing to reverse");
         }
@@ -166,11 +233,15 @@ final readonly class Statements
         $locked = implode(', ', array_values(array_unique([$primary, ...array_map(fn ($related) => SqlFragments::identifier($related->table), $map->related)])));
         $collations = ViewCompiler::collations($connection, $map->table);
 
+        $membership = $map->membership;
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
+            ...($membership === null ? [] : [self::refuseReclassified($map, $membership, $key)]),
             "DROP VIEW {$legacyTable}",
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
-            "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
+            "INSERT INTO {$legacyTable} ({$retainedKey}) SELECT {$primary}.{$primaryKey} FROM {$primary} WHERE "
+                .($membership === null ? '' : $membership->of($map->primary->table).' AND ')
+                ."NOT EXISTS (SELECT FROM {$legacyTable} WHERE {$legacyTable}.{$retainedKey} = {$primary}.{$primaryKey})",
             "ALTER TABLE {$legacyTable}\n  ".implode(",\n  ", array_map(fn (string $column) => 'ADD COLUMN '.SqlFragments::identifier($column).' '.$shape[$column]->type.(($collations[$column]['declared'] ?? false) ? ' COLLATE '.$collations[$column]['name'] : ''), $columns)),
             "UPDATE {$legacyTable} AS {$retainedTable} SET\n  ".implode(",\n  ", array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$served[$column], $columns))
                 ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
@@ -211,15 +282,27 @@ final readonly class Statements
             $identifiers[(string) $identifier->column()] = $name;
         }
 
+        $constants = $captured === null ? [] : $captured['constants'];
+
         foreach (self::foreignKeysTo($connection, $map->primary->table) as $foreignKey) {
+            $composite = in_array([$foreignKey->qualifiedTable, $foreignKey->referencingColumns[0]], $constants, true);
+
             if (array_key_exists($foreignKey->referencedColumn, $identifiers) && ($captured === null || in_array([$foreignKey->qualifiedTable, $foreignKey->name], $captured['moved'], true))) {
                 $on = $foreignKey->qualifiedTable === $retainedTable ? $legacyTable : $foreignKey->qualifiedTable;
-                $statements[] = self::repoint($map, $foreignKey, $on, $map->table, $identifiers[$foreignKey->referencedColumn]);
+                $statements[] = self::repoint($map, $foreignKey, $on, $map->table, $identifiers[$foreignKey->referencedColumn], columns: $composite ? 2 : 1);
 
                 if ($captured === null || ! in_array([$foreignKey->qualifiedTable, $foreignKey->name], $captured['notValid'], true)) {
                     $repointed[] = self::validate($on, $foreignKey->name);
                 }
             }
+        }
+
+        foreach ($constants as [$table, $constant]) {
+            $statements[] = 'ALTER TABLE '.($table === $retainedTable ? $legacyTable : $table).' DROP COLUMN '.SqlFragments::identifier($constant);
+        }
+
+        if ($membership !== null) {
+            $statements[] = "ALTER TABLE {$primary} DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier($membership->constraint());
         }
 
         return new self('uninstall', $statements, [...$repointed, ...$validations]);
@@ -272,6 +355,13 @@ final readonly class Statements
         return [...$this->transaction, ...$this->afterwards];
     }
 
+    public static function refuseBranches(ResolvedMap $map, string $operation): void
+    {
+        if ($map->branches !== []) {
+            throw InvalidCompatibilityMap::cannot($map->table, $operation, 'it serves '.$map->table.' from '.implode(' and ', array_map(class_basename(...), array_keys($map->branches))).", and {$operation}() serves a map from one successor only");
+        }
+    }
+
     private static function refuseMissingPrimaries(ResolvedMap $map, string $key): string
     {
         $legacyTable = SqlFragments::identifier($map->table);
@@ -280,6 +370,10 @@ final readonly class Statements
 
         foreach ($map->identifiers as $name => $identifier) {
             $matches[] = "{$primary}.".SqlFragments::identifier((string) $identifier->column()).($name === $key ? ' = ' : ' IS NOT DISTINCT FROM ')."{$legacyTable}.".SqlFragments::identifier($name);
+        }
+
+        if ($map->membership !== null) {
+            $matches[] = $map->membership->of($map->primary->table);
         }
 
         $missing = "FROM {$legacyTable} WHERE NOT EXISTS (SELECT FROM {$primary} WHERE ".implode(' AND ', $matches).')';
@@ -308,7 +402,8 @@ final readonly class Statements
         $legacyTable = SqlFragments::identifier($map->table);
         $primary = SqlFragments::identifier($map->primary->table);
         $legacyKey = "{$legacyTable}.".SqlFragments::identifier($key);
-        $hidden = "FROM {$legacyTable} WHERE EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $map->identifiers[$key]->column())." = {$legacyKey} AND ("
+        $hidden = "FROM {$legacyTable} WHERE EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $map->identifiers[$key]->column())." = {$legacyKey} AND "
+            .($map->membership === null ? '' : $map->membership->of($map->primary->table).' AND ').'('
             .implode(' OR ', array_map(fn (string $condition) => 'COALESCE(('.$condition.'), false)', $conditions)).'))';
         $notice = SqlFragments::literal("Compatibility map '{$map->table}' install hides ")
             .' || hidden_rows || '.SqlFragments::literal(" {$map->table} rows, because a hide() rule matches their {$map->primary->table} row; the first are {$key} ")
@@ -322,13 +417,143 @@ final readonly class Statements
             ."  END IF;\nEND\n\$compatibility\$";
     }
 
+    private static function refuseSharedAlias(ConnectionInterface $connection, ResolvedMap $map, Membership $membership): void
+    {
+        $claim = self::claim($membership);
+
+        foreach (self::installed($connection) as $name => $captured) {
+            if ($name !== ViewCompiler::retainedTable($map) && ($captured['membership'] ?? null) === $claim) {
+                throw InvalidCompatibilityMap::because($map->table, "the installed map retained in {$name} already serves the {$membership->table} rows whose {$membership->column} is '{$membership->alias}', and two installed maps cannot share a morph alias");
+            }
+        }
+    }
+
+    private static function refuseChangedMembership(ConnectionInterface $connection, ResolvedMap $map): void
+    {
+        $retainedTable = ViewCompiler::retainedTable($map);
+        $captured = self::installed($connection)[$retainedTable] ?? null;
+        $recorded = is_array($captured['membership'] ?? null) ? $captured['membership'] : null;
+        $claim = $map->membership === null ? null : self::claim($map->membership);
+
+        if ($captured === null || $recorded === $claim) {
+            return;
+        }
+
+        $describe = fn (null|array $membership): string => $membership === null ? 'every row of its successor' : 'the '.$membership['table'].' rows whose '.$membership['column']." is '".$membership['alias']."'";
+
+        throw InvalidCompatibilityMap::because($map->table, 'install() recorded that it serves '.$describe($recorded).', and the map now serves '.$describe($claim)."; recompile() cannot move the generated columns of repointed foreign keys or the record in {$retainedTable}, so uninstall() and install() the map to change it");
+    }
+
+    private static function refuseReclassified(ResolvedMap $map, Membership $membership, string $key): string
+    {
+        $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($map));
+        $primary = SqlFragments::identifier($map->primary->table);
+        $legacyColumn = (string) $map->identifiers[$key]->column();
+        $legacyKey = "{$primary}.".SqlFragments::identifier($legacyColumn);
+        $reclassified = "FROM {$retainedTable} JOIN {$primary} ON {$primary}.".SqlFragments::identifier($map->primary->key)." = {$retainedTable}.".SqlFragments::identifier((string) $map->retainedKey)
+            ." WHERE {$primary}.".SqlFragments::identifier($membership->column).' IS DISTINCT FROM '.SqlFragments::literal($membership->alias);
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot uninstall: ")
+            .' || reclassified || '.SqlFragments::literal(' '.ViewCompiler::retainedTable($map)." rows belong to {$map->primary->table} rows whose {$membership->column} is no longer '{$membership->alias}'; the first are {$legacyColumn} ")
+            .' || first_keys || '.SqlFragments::literal(". Restore their {$membership->column}, or delete their ".ViewCompiler::retainedTable($map).' rows, before uninstall().');
+
+        return "DO \$compatibility\$\nDECLARE\n  reclassified bigint;\n  first_keys text;\nBEGIN\n"
+            ."  SELECT count(*) INTO reclassified {$reclassified};\n"
+            ."  IF reclassified > 0 THEN\n"
+            ."    SELECT string_agg(CAST(reclassified_key AS text), ', ' ORDER BY reclassified_key) INTO first_keys FROM (SELECT {$legacyKey} {$reclassified} ORDER BY {$legacyKey} LIMIT 5) AS first_reclassified (reclassified_key);\n"
+            ."    RAISE EXCEPTION '%', {$refusal};\n"
+            ."  END IF;\nEND\n\$compatibility\$";
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function ownedConstants(ConnectionInterface $connection, ResolvedMap $map): array
+    {
+        $owned = [];
+
+        foreach (self::installed($connection) as $captured) {
+            foreach (self::pairs($captured['constants'] ?? null) as [$table, $constant]) {
+                if ($table === SqlFragments::identifier($map->table)) {
+                    $owned[] = $constant;
+                }
+            }
+        }
+
+        return array_values(array_unique($owned));
+    }
+
+    /**
+     * @return array<string, array<array-key, mixed>>
+     */
+    private static function installed(ConnectionInterface $connection): array
+    {
+        $installed = [];
+
+        foreach ($connection->select(
+            "select relation.relname as name, obj_description(relation.oid, 'pg_class') as comment
+             from pg_class relation
+             where relation.relnamespace = (select oid from pg_namespace where nspname = current_schema()) and relation.relkind = 'r'
+               and obj_description(relation.oid, 'pg_class') like ?
+             order by relation.relname",
+            ['{"captured":"'.self::CAPTURED.'"%'],
+        ) as $row) {
+            $captured = json_decode((string) $row->comment, true);
+
+            if (is_array($captured)) {
+                $installed[(string) $row->name] = $captured;
+            }
+        }
+
+        return $installed;
+    }
+
+    /**
+     * @return array{table: string, column: string, alias: string}
+     */
+    private static function claim(Membership $membership): array
+    {
+        return ['table' => $membership->table, 'column' => $membership->column, 'alias' => $membership->alias];
+    }
+
+    /**
+     * @return array{list<string>, list<string>, list<string>}
+     */
+    private static function membershipCheck(ResolvedMap $map, Membership $membership, string $operation): array
+    {
+        $check = $membership->check();
+
+        if ($check === null) {
+            return [[], [], []];
+        }
+
+        $primary = SqlFragments::identifier($map->primary->table);
+        $primaryKey = SqlFragments::identifier($map->primary->key);
+        $constraint = SqlFragments::identifier($membership->constraint());
+        $outside = "FROM {$primary} WHERE NOT ({$check})";
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot {$operation}: ")
+            .' || outside || '.SqlFragments::literal(" {$map->primary->table} rows carry {$membership->column} '{$membership->alias}' and fail its when(); the first are {$map->primary->key} ")
+            .' || first_keys || '.SqlFragments::literal(". Correct their {$membership->column} before {$operation}().");
+
+        return [
+            ["DO \$compatibility\$\nDECLARE\n  outside bigint;\n  first_keys text;\nBEGIN\n"
+                ."  SELECT count(*) INTO outside {$outside};\n"
+                ."  IF outside > 0 THEN\n"
+                ."    SELECT string_agg(CAST(outside_key AS text), ', ' ORDER BY outside_key) INTO first_keys FROM (SELECT {$primary}.{$primaryKey} {$outside} ORDER BY {$primary}.{$primaryKey} LIMIT 5) AS first_outside (outside_key);\n"
+                ."    RAISE EXCEPTION '%', {$refusal};\n"
+                ."  END IF;\nEND\n\$compatibility\$"],
+            ["ALTER TABLE {$primary}\n  DROP CONSTRAINT IF EXISTS {$constraint},\n  ADD CONSTRAINT {$constraint} CHECK ({$check}) NOT VALID"],
+            [self::validate($primary, $membership->constraint())],
+        ];
+    }
+
     /**
      * @param  array<string, Column>  $legacy
      * @param  list<string>  $mapped
      * @param  list<array{string, string}>  $moved
      * @param  list<array{string, string}>  $notValid
+     * @param  list<array{string, string}>  $constants
      */
-    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $notValid): string
+    private static function capture(ConnectionInterface $connection, ResolvedMap $map, array $legacy, array $mapped, array $moved, array $notValid, array $constants): string
     {
         $table = SqlFragments::identifier($map->table);
         $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
@@ -379,11 +604,31 @@ final readonly class Statements
             'indexes' => array_values($indexes),
             'moved' => $moved,
             'notValid' => $notValid,
+            ...($map->membership === null ? [] : [
+                'constants' => $constants,
+                'membership' => self::claim($map->membership),
+            ]),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /**
-     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>}
+     * @return list<array{string, string}>
+     */
+    private static function pairs(mixed $pairs): array
+    {
+        $parsed = [];
+
+        foreach (is_array($pairs) ? $pairs : [] as $pair) {
+            if (is_array($pair) && is_string($pair[0] ?? null) && is_string($pair[1] ?? null)) {
+                $parsed[] = [$pair[0], $pair[1]];
+            }
+        }
+
+        return $parsed;
+    }
+
+    /**
+     * @return null|array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>}
      */
     private static function captured(ConnectionInterface $connection, string $table): null|array
     {
@@ -410,24 +655,20 @@ final readonly class Statements
             }
         }
 
-        [$moved, $notValid] = array_map(fn (string $list) => array_values(array_map(
-            fn (array $foreignKey) => [(string) $foreignKey[0], (string) $foreignKey[1]],
-            array_filter(is_array($captured[$list] ?? null) ? $captured[$list] : [], fn (mixed $foreignKey) => is_array($foreignKey) && is_string($foreignKey[0] ?? null) && is_string($foreignKey[1] ?? null)),
-        )), ['moved', 'notValid']);
-
         return [
             'comment' => is_string($captured['comment'] ?? null) ? $captured['comment'] : null,
             'notNull' => array_values(array_filter(is_array($captured['notNull'] ?? null) ? $captured['notNull'] : [], is_string(...))),
             'generated' => $generated,
             'constraints' => $constraints,
             'indexes' => array_values(array_filter(is_array($captured['indexes'] ?? null) ? $captured['indexes'] : [], is_string(...))),
-            'moved' => $moved,
-            'notValid' => $notValid,
+            'moved' => self::pairs($captured['moved'] ?? null),
+            'notValid' => self::pairs($captured['notValid'] ?? null),
+            'constants' => self::pairs($captured['constants'] ?? null),
         ];
     }
 
     /**
-     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>}  $captured
+     * @param  array{comment: null|string, notNull: list<string>, generated: array<string, string>, constraints: list<array{name: string, type: string, definition: string, validated: bool}>, indexes: list<string>, moved: list<array{string, string}>, notValid: list<array{string, string}>, constants: list<array{string, string}>}  $captured
      * @param  list<string>  $served
      * @return array{list<string>, list<string>}
      */
@@ -494,16 +735,27 @@ final readonly class Statements
         ];
     }
 
-    private static function repoint(ResolvedMap $map, object $foreignKey, string $on, string $table, string $column): string
+    /**
+     * @param  null|array{string, string}  $composite
+     */
+    private static function repoint(ResolvedMap $map, object $foreignKey, string $on, string $table, string $column, int $columns = 1, null|array $composite = null): string
     {
-        if ($foreignKey->columns !== 1) {
+        if ($foreignKey->columns !== $columns) {
             throw InvalidCompatibilityMap::because($map->table, "the foreign key {$foreignKey->name} on {$foreignKey->table} spans {$foreignKey->columns} columns, and the package repoints a foreign key on one identifier");
         }
 
-        $name = SqlFragments::identifier($foreignKey->name);
+        if ($composite !== null && (in_array($foreignKey->onUpdate, ['c', 'n', 'd'], true) || in_array($foreignKey->onDelete, ['n', 'd'], true))) {
+            $action = in_array($foreignKey->onUpdate, ['c', 'n', 'd'], true) ? 'ON UPDATE '.self::ACTIONS[$foreignKey->onUpdate] : 'ON DELETE '.self::ACTIONS[$foreignKey->onDelete];
 
-        return "ALTER TABLE {$on}\n  DROP CONSTRAINT {$name},\n  ADD CONSTRAINT {$name} FOREIGN KEY (".SqlFragments::identifier($foreignKey->column).') REFERENCES '.SqlFragments::identifier($table).' ('.SqlFragments::identifier($column).')'
-            .($foreignKey->matchType === 'f' ? ' MATCH FULL' : '')
+            throw InvalidCompatibilityMap::because($map->table, "the foreign key {$foreignKey->name} on {$foreignKey->table} takes {$action}, and install() repoints it onto ({$composite[1]}, {$column}) through the generated column {$composite[0]}, which no referential action may change");
+        }
+
+        $name = SqlFragments::identifier($foreignKey->name);
+        $referencing = array_map(SqlFragments::identifier(...), $composite === null ? [$foreignKey->column] : [$composite[0], $foreignKey->column]);
+        $referenced = array_map(SqlFragments::identifier(...), $composite === null ? [$column] : [$composite[1], $column]);
+
+        return "ALTER TABLE {$on}\n  DROP CONSTRAINT {$name},\n  ADD CONSTRAINT {$name} FOREIGN KEY (".implode(', ', $referencing).') REFERENCES '.SqlFragments::identifier($table).' ('.implode(', ', $referenced).')'
+            .($foreignKey->matchType === 'f' && $columns === 1 && $composite === null ? ' MATCH FULL' : '')
             .(array_key_exists($foreignKey->onUpdate, self::ACTIONS) ? ' ON UPDATE '.self::ACTIONS[$foreignKey->onUpdate] : '')
             .(array_key_exists($foreignKey->onDelete, self::ACTIONS) ? ' ON DELETE '.self::ACTIONS[$foreignKey->onDelete] : '')
             .($foreignKey->deferrable ? ' DEFERRABLE'.($foreignKey->deferred ? ' INITIALLY DEFERRED' : '') : '')
@@ -516,7 +768,7 @@ final readonly class Statements
     }
 
     /**
-     * @return list<object{name: string, table: string, qualifiedTable: string, column: string, referencedColumn: string, columns: int, onUpdate: string, onDelete: string, matchType: string, deferrable: bool, deferred: bool, validated: bool}>
+     * @return list<object{name: string, table: string, qualifiedTable: string, column: string, referencingColumns: list<string>, referencedColumn: string, columns: int, onUpdate: string, onDelete: string, matchType: string, deferrable: bool, deferred: bool, validated: bool}>
      */
     private static function foreignKeysTo(ConnectionInterface $connection, string $table): array
     {
@@ -525,6 +777,9 @@ final readonly class Statements
                     case when referencing_schema.nspname = current_schema() then null else referencing_schema.nspname end as schema,
                     referencing_table.relname as \"table\",
                     referencing_column.attname as \"column\",
+                    (select json_agg(attribute.attname order by key_column.position)
+                     from unnest(foreign_key.conkey) with ordinality as key_column (attnum, position)
+                     join pg_attribute attribute on attribute.attrelid = foreign_key.conrelid and attribute.attnum = key_column.attnum) as referencing_columns,
                     referenced_column.attname as referenced_column,
                     cardinality(foreign_key.conkey) as columns,
                     foreign_key.confupdtype::text as on_update,
@@ -536,8 +791,8 @@ final readonly class Statements
              from pg_constraint foreign_key
              join pg_class referencing_table on referencing_table.oid = foreign_key.conrelid
              join pg_namespace referencing_schema on referencing_schema.oid = referencing_table.relnamespace
-             join pg_attribute referencing_column on referencing_column.attrelid = foreign_key.conrelid and referencing_column.attnum = foreign_key.conkey[1]
-             join pg_attribute referenced_column on referenced_column.attrelid = foreign_key.confrelid and referenced_column.attnum = foreign_key.confkey[1]
+             join pg_attribute referencing_column on referencing_column.attrelid = foreign_key.conrelid and referencing_column.attnum = foreign_key.conkey[cardinality(foreign_key.conkey)]
+             join pg_attribute referenced_column on referenced_column.attrelid = foreign_key.confrelid and referenced_column.attnum = foreign_key.confkey[cardinality(foreign_key.confkey)]
              where foreign_key.contype = 'f' and foreign_key.conparentid = 0
                and foreign_key.confrelid = to_regclass(quote_ident(current_schema()) || '.' || ?)
              order by referencing_schema.nspname, referencing_table.relname, foreign_key.conname",
@@ -549,6 +804,7 @@ final readonly class Statements
             'table' => (string) $row->table,
             'qualifiedTable' => ($row->schema === null ? '' : SqlFragments::identifier((string) $row->schema).'.').SqlFragments::identifier((string) $row->table),
             'column' => (string) $row->column,
+            'referencingColumns' => array_values(array_map(strval(...), (array) json_decode((string) $row->referencing_columns, true))),
             'referencedColumn' => (string) $row->referenced_column,
             'columns' => (int) $row->columns,
             'onUpdate' => (string) $row->on_update,

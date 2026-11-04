@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -16,6 +17,10 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Files\FileTables;
+use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -39,8 +44,32 @@ final class PreparerTest extends TestCase
     protected function tearDown(): void
     {
         ListingTables::drop();
+        FileTables::drop();
 
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_prints_a_prepare_script_for_a_map_over_two_successors_that_prepares_each_successor_as_compatibility_prepare_does(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        Compatibility::prepare(Video::class);
+        $prepared = $this->preparedShape();
+        FileTables::create();
+        FileTables::seedMedia();
+
+        Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'prepare']);
+        $script = preg_replace('/^--.*$/m', '', Artisan::output()) ?? '';
+
+        foreach (explode("\n;\n", $script) as $statement) {
+            if (trim($statement) !== '') {
+                DB::unprepared(trim($statement));
+            }
+        }
+
+        $this->assertSame($prepared, $this->preparedShape());
+        $this->assertSame(['legacy_id', 'legacy_type', 'legacy_uuid'], array_keys($prepared['links']['columns']));
     }
 
     #[Test]
@@ -296,6 +325,117 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_adds_the_discriminator_one_shared_sequence_and_the_unique_indexes_for_a_discriminated_successor(): void
+    {
+        FileTables::create();
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::prepare(FloorPlan::class);
+        Compatibility::prepare(Photo::class);
+
+        $this->assertEquals(
+            ['legacy_type' => new Column('text', null, false), 'legacy_id' => new Column('integer', "nextval('compatibility_legacy_id_seq'::regclass)", true), 'legacy_uuid' => new Column('uuid', 'gen_random_uuid()', true)],
+            array_intersect_key((new ColumnCatalog(DB::connection()))->of('files'), ['legacy_type' => true, 'legacy_id' => true, 'legacy_uuid' => true]),
+        );
+        $this->assertSame(
+            ['files_legacy_type_legacy_id_unique' => 'UNIQUE (legacy_type, legacy_id)', 'files_legacy_type_legacy_uuid_unique' => 'UNIQUE (legacy_type, legacy_uuid)', 'files_legacy_uuid_unique' => 'UNIQUE (legacy_uuid)'],
+            array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = 'files'::regclass and contype = 'u' order by conname"), 'definition', 'conname'),
+        );
+        $this->assertSame(
+            ["nextval('compatibility_legacy_id_seq'::regclass)", "nextval('compatibility_legacy_id_seq'::regclass)"],
+            [(new ColumnCatalog(DB::connection()))->of('photos')['id']->default, (new ColumnCatalog(DB::connection()))->of('floorplans')['id']->default],
+        );
+    }
+
+    #[Test]
+    public function it_draws_every_legacy_id_written_after_prepare_from_one_sequence_above_every_existing_legacy_id(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        DB::table('files')->insert(['filename' => 'orphan.bin', 'mime_type' => 'application/octet-stream']);
+
+        Compatibility::prepare(Photo::class);
+        Compatibility::prepare(FloorPlan::class);
+        $photo = DB::table('photos')->insertGetId(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+        $floorPlan = DB::table('floorplans')->insertGetId(['file_name' => 'birch-plan.pdf', 'mime_type' => 'application/pdf']);
+        DB::table('files')->insert(['filename' => 'birch-extra.jpg', 'mime_type' => 'image/jpeg', 'legacy_type' => 'photo']);
+
+        $this->assertEquals((object) ['legacy_type' => null, 'legacy_id' => 4], DB::selectOne("select legacy_type, legacy_id from files where filename = 'orphan.bin'"));
+        $this->assertSame([5, 6, 7], [$photo, $floorPlan, DB::scalar("select legacy_id from files where filename = 'birch-extra.jpg'")]);
+    }
+
+    #[Test]
+    public function it_leaves_the_shared_sequence_unwritten_when_it_already_leads_every_legacy_id(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+
+        foreach (FileTables::MODELS as $model) {
+            Compatibility::prepare($model);
+        }
+
+        FileTables::backfill();
+        DB::select("select setval('compatibility_legacy_id_seq', 100)");
+
+        Compatibility::prepare(FloorPlan::class);
+        Compatibility::install(Photo::class);
+
+        $this->assertEquals((object) ['last_value' => 100, 'is_called' => true], DB::selectOne('select last_value, is_called from compatibility_legacy_id_seq'));
+    }
+
+    #[Test]
+    public function it_advances_the_shared_sequence_only_once_no_open_transaction_still_draws_from_it(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        Compatibility::prepare(Photo::class);
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $allocator = proc_open([PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).');'
+            .' $pdo->beginTransaction(); $pdo->query("select nextval(\'compatibility_legacy_id_seq\')"); echo $pdo->query("select pg_backend_pid()")->fetchColumn(), "\n"; fflush(STDOUT); sleep(2); $pdo->commit(); $pdo = null;'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if ($allocator === false) {
+            $this->fail('The allocating transaction did not start.');
+        }
+
+        try {
+            $pid = (int) fgets($pipes[1]);
+            Compatibility::prepare(FloorPlan::class);
+            $state = DB::scalar('select state from pg_stat_activity where pid = ?', [$pid]);
+        } finally {
+            $failure = (string) stream_get_contents($pipes[2]);
+            proc_close($allocator);
+        }
+
+        $this->assertNotSame(0, $pid);
+        $this->assertNotSame('idle in transaction', $state);
+        $this->assertSame('', $failure);
+    }
+
+    #[Test]
+    public function it_refuses_identifiers_of_two_types_that_share_one_successor_column(): void
+    {
+        FileTables::create();
+        Compatibility::prepare(Photo::class);
+        DB::statement('alter table floorplans alter column id type bigint');
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('floorplans', 'files.legacy_id is integer, and floorplans.id is bigint; identifiers that share a successor column take one type'));
+
+        Compatibility::prepare(FloorPlan::class);
+    }
+
+    #[Test]
+    public function it_refuses_a_discriminated_integer_identifier_whose_legacy_column_draws_from_no_sequence(): void
+    {
+        FileTables::create();
+        DB::statement('alter table photos alter column id drop default');
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::because('photos', 'photos.id draws from no sequence, and integer() on a discriminated successor moves it onto the sequence compatibility_legacy_id_seq'));
+
+        Compatibility::prepare(Photo::class);
+    }
+
+    #[Test]
     public function it_refuses_an_integer_identifier_whose_legacy_column_draws_from_no_sequence(): void
     {
         DB::statement('alter table listings alter column id drop default');
@@ -422,6 +562,47 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_move_a_legacy_identifier_onto_the_shared_sequence_while_a_legacy_writer_cannot_draw_from_it(): void
+    {
+        FileTables::create();
+        $role = 'compatibility_photo_writer_'.getmypid();
+        DB::statement("create role {$role}");
+
+        try {
+            DB::statement("grant insert on photos to {$role}");
+            DB::statement("grant usage on sequence photos_id_seq to {$role}");
+
+            try {
+                Compatibility::prepare(Photo::class);
+                $refusal = 'no refusal';
+            } catch (QueryException $exception) {
+                $refusal = strtok((string) ($exception->errorInfo[2] ?? ''), "\n");
+            }
+
+            $default = (new ColumnCatalog(DB::connection()))->of('photos')['id']->default;
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+            DB::statement('create sequence compatibility_legacy_id_seq');
+            DB::statement("grant usage on sequence compatibility_legacy_id_seq to {$role}");
+            Compatibility::prepare(Photo::class);
+            DB::statement("set role {$role}");
+            DB::table('photos')->insert(['file_name' => 'birch-back.jpg', 'mime_type' => 'image/jpeg']);
+            DB::statement('reset role');
+        } finally {
+            DB::statement('reset role');
+            DB::statement("drop owned by {$role}");
+            DB::statement("drop role {$role}");
+        }
+
+        $this->assertSame(
+            ["ERROR:  Compatibility map 'photos' cannot prepare: photos.id draws from compatibility_legacy_id_seq, and {$role} can insert into photos without USAGE on it. Grant USAGE ON SEQUENCE compatibility_legacy_id_seq to each of them, then prepare again.", "nextval('photos_id_seq'::regclass)"],
+            [$refusal, $default],
+        );
+        $this->assertSame(['birch.jpg', 'birch-back.jpg'], DB::table('photos')->orderBy('id')->pluck('file_name')->all());
+    }
+
+    #[Test]
     public function it_reads_the_sequence_grant_to_public_for_a_successor_that_public_can_insert_into(): void
     {
         try {
@@ -464,5 +645,29 @@ final class PreparerTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::because('listings_of_the_vendor_storefront_before_the_redesign', 'the compiled name places_listings_of_the_vendor_storefront_before_the_redesign_at_most_one has 72 characters, and PostgreSQL keeps 63'));
 
         Statements::prepare($map, DB::connection());
+    }
+
+    /**
+     * @return array<string, array{columns: array<string, list<null|string>>, constraints: array<string, string>, indexes: array<string, string>}>
+     */
+    private function preparedShape(): array
+    {
+        $shape = [];
+
+        foreach (['files', 'links'] as $table) {
+            $shape[$table] = [
+                'columns' => collect(DB::select("select column_name, column_default, is_nullable from information_schema.columns where table_schema = current_schema() and table_name = ? and column_name like 'legacy\\_%' order by column_name", [$table]))
+                    ->mapWithKeys(fn (object $column) => [(string) $column->column_name => [$column->column_default === null ? null : (string) $column->column_default, (string) $column->is_nullable]])
+                    ->all(),
+                'constraints' => collect(DB::select('select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = ?::regclass order by conname', [$table]))
+                    ->mapWithKeys(fn (object $constraint) => [(string) $constraint->conname => (string) $constraint->definition])
+                    ->all(),
+                'indexes' => collect(DB::select('select indexname, indexdef from pg_indexes where schemaname = current_schema() and tablename = ? order by indexname', [$table]))
+                    ->mapWithKeys(fn (object $index) => [(string) $index->indexname => (string) $index->indexdef])
+                    ->all(),
+            ];
+        }
+
+        return $shape;
     }
 }

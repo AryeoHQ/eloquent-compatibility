@@ -10,4 +10,9 @@ final class InvalidCompatibilityMap extends CompatibilityException
     {
         return new self("Compatibility map '{$map}' is declared wrongly: {$problem}.");
     }
+
+    public static function cannot(string $map, string $operation, string $because): self
+    {
+        return new self("Compatibility map '{$map}' cannot {$operation}: {$because}.");
+    }
 }
