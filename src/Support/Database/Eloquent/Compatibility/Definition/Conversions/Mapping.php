@@ -63,11 +63,6 @@ final readonly class Mapping implements Conversion
         return ['in', array_values(array_map(fn (int|string $key) => self::typed($key, $type), $others))];
     }
 
-    public function order(string $direction): null|string
-    {
-        return null;
-    }
-
     public function type(null|string $type): string
     {
         return array_filter($this->values, is_string(...)) === [] ? 'integer' : 'text';

@@ -390,25 +390,6 @@ final class Attribute
         return true;
     }
 
-    public function order(string $direction): null|string
-    {
-        if ($this->external !== null) {
-            return null;
-        }
-
-        $direction = strtolower($direction);
-
-        foreach (array_reverse($this->conversions()) as $conversion) {
-            $direction = $conversion->order($direction);
-
-            if ($direction === null) {
-                return null;
-            }
-        }
-
-        return $direction;
-    }
-
     /**
      * @return non-empty-list<null|string>
      */
