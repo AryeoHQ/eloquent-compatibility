@@ -12,11 +12,15 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
+use Tests\Fixtures\Support\Discovery\InheritedServed;
+use Tests\Fixtures\Support\Discovery\TraitServed;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversTrait(ServesCompatibility::class)]
 final class ServesCompatibilityTest extends TestCase
@@ -55,6 +59,29 @@ final class ServesCompatibilityTest extends TestCase
         $this->assertInstanceOf(LegacyBuilder::class, Listing::query());
         $this->assertInstanceOf(LegacyBuilder::class, $model->newQuery());
         $this->assertSame(Builder::class, Job::query()::class);
+    }
+
+    #[Test]
+    public function it_refuses_every_instance_of_a_named_served_model_that_discovery_did_not_find(): void
+    {
+        $refusals = [];
+
+        foreach ([1, 2] as $attempt) {
+            try {
+                new Unmapped;
+            } catch (Throwable $refusal) {
+                $refusals[] = [$refusal::class, $refusal->getMessage()];
+            }
+        }
+
+        $expected = UndiscoveredServedModel::named(Unmapped::class);
+        $this->assertSame([[$expected::class, $expected->getMessage()], [$expected::class, $expected->getMessage()]], $refusals);
+    }
+
+    #[Test]
+    public function it_boots_a_model_that_inherits_serving_compatibility_from_a_parent_or_a_trait(): void
+    {
+        $this->assertSame([true, true], [(new InheritedServed)->newQuery() instanceof LegacyBuilder, (new TraitServed)->newQuery() instanceof LegacyBuilder]);
     }
 
     #[Test]
@@ -97,5 +124,15 @@ final class ServesCompatibilityTest extends TestCase
 
         $this->assertSame([4, [[4, 'Birch Hall', false], [5, 'Ash', true]], 0], [$native, $tableRows, $nativeJobs]);
         $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('jobs', 'legacy_id', 'name')]);
+    }
+}
+
+final class Unmapped extends Model implements Compatible
+{
+    use ServesCompatibility;
+
+    public static function compatibility(Compatibility $compatibility): Compatibility
+    {
+        return $compatibility;
     }
 }

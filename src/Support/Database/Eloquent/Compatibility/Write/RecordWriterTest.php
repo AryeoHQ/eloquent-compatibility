@@ -724,7 +724,7 @@ final class RecordWriterTest extends TestCase
         $listing->update(['title' => 'Oak Manor', 'street' => '2 Oak St']);
         Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
 
-        $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Job', false]], $held);
+        $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Listing', false], ['Job', false]], $held);
     }
 
     private function aliasedListing(): Model

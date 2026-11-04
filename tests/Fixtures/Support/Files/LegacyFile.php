@@ -30,6 +30,11 @@ final class LegacyFile extends Model implements Compatible
 
     protected $guarded = [];
 
+    protected $dispatchesEvents = [
+        'saving' => LegacyFileSaving::class,
+        'updated' => LegacyFileUpdated::class,
+    ];
+
     protected static function booted(): void
     {
         Relation::morphMap(['legacy_file' => self::class]);
@@ -49,6 +54,7 @@ final class LegacyFile extends Model implements Compatible
             ->timestamps()
             ->servedFrom(File::class, fn (Successor $file) => $file
                 ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type')));
+                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type')))
+            ->withoutForwardingTo(ArchiveLegacyFile::class, because: 'The archive follows only edits made through the LegacyFile itself.');
     }
 }

@@ -258,6 +258,31 @@ final class Compatibility
         return $this;
     }
 
+    /**
+     * @return array<class-string<Model>, list<class-string<Model>>>
+     */
+    public function successors(): array
+    {
+        $served = [];
+
+        foreach ($this->branches === [] ? array_filter([$this->primary]) : array_map(fn (Branch $branch) => $branch->successor, $this->branches) as $primary) {
+            $models = [];
+
+            for ($pending = [$primary]; $pending !== [];) {
+                $successor = array_shift($pending);
+                $models[] = $successor->model;
+
+                foreach ($successor->relations() as $relation) {
+                    $pending[] = $relation->successor;
+                }
+            }
+
+            $served[$primary->model] = $models;
+        }
+
+        return $served;
+    }
+
     public function resolve(): ResolvedMap
     {
         return new ResolvedMap(

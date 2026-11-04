@@ -35,6 +35,8 @@ final readonly class RecordWriter
      */
     public function insert(Model $legacy, array $values): int|string
     {
+        Applying::unidentified($legacy);
+
         if ($this->map->branches !== []) {
             $this->refuseRaw($values);
             $writer = new MassWriter($this->map, $this->connection);
@@ -931,7 +933,13 @@ final readonly class RecordWriter
         $primary->setRawAttributes(array_replace($primary->getAttributes(), $identity), true);
         $key = $identity[$columns[$legacy->getKeyName()]] ?? null;
 
-        return is_int($key) || is_string($key) ? $key : throw new LogicException("{$this->map->primary->table}.{$columns[$legacy->getKeyName()]} read back no key for the new ".class_basename($legacy).'.');
+        if (! is_int($key) && ! is_string($key)) {
+            throw new LogicException("{$this->map->primary->table}.{$columns[$legacy->getKeyName()]} read back no key for the new ".class_basename($legacy).'.');
+        }
+
+        Applying::identified($legacy, $key);
+
+        return $key;
     }
 
     /**

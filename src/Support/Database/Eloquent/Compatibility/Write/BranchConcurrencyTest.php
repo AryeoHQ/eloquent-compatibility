@@ -188,6 +188,7 @@ final class BranchConcurrencyTest extends TestCase
     private function writeConcurrently(string $write): string
     {
         $concurrent = 'require '.var_export(dirname(__DIR__, 6).'/vendor/autoload.php', true).';'
+            .' Tests\\TestCase::optimizeClassmap();'
             .' Orchestra\Testbench\Foundation\Application::create();'
             .' Illuminate\Support\Facades\DB::transaction(function (): void { '.$write.' echo "written\n"; fflush(STDOUT); sleep(2); });'
             .' Illuminate\Support\Facades\DB::disconnect();';
@@ -206,7 +207,7 @@ final class BranchConcurrencyTest extends TestCase
 
     private function start(string $concurrent): string
     {
-        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['DB_DATABASE' => DB::connection()->getDatabaseName()] + getenv());
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['APP_ENV' => 'testing', 'DB_DATABASE' => DB::connection()->getDatabaseName()] + getenv());
 
         if ($process === false) {
             $this->fail('The concurrent writer did not start.');

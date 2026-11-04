@@ -17,6 +17,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -30,6 +31,7 @@ use Tests\TestCase;
 
 #[CoversClass(BranchMove::class)]
 #[CoversClass(RecordWriter::class)]
+#[CoversClass(Forwarder::class)]
 final class BranchMoveTest extends TestCase
 {
     /** @var list<string> */
@@ -101,6 +103,29 @@ final class BranchMoveTest extends TestCase
         Video::query()->findOrFail(3)->update(['youtube_embed_url' => 'https://youtu.be/drone']);
 
         $this->assertSame(['File deleting 3', 'File deleted 3', 'Link creating 3', 'Link created 3'], $events);
+    }
+
+    #[Test]
+    public function it_gives_video_listeners_the_update_of_a_move_once_and_never_a_delete_or_a_create(): void
+    {
+        $events = [];
+
+        foreach (['saving', 'creating', 'created', 'updating', 'updated', 'saved', 'deleting', 'deleted', 'forceDeleting', 'forceDeleted'] as $event) {
+            Event::listen("eloquent.{$event}: ".Video::class, function (Video $video) use (&$events, $event): void {
+                $events[] = "Video {$event} {$video->id}";
+            });
+        }
+
+        File::deleting(function (File $file) use (&$events): void {
+            $events[] = 'File deleting '.$file->legacy_id;
+        });
+        Link::created(function (Link $link) use (&$events): void {
+            $events[] = 'Link created '.$link->legacy_id;
+        });
+
+        Video::query()->findOrFail(3)->update(['youtube_embed_url' => 'https://youtu.be/drone']);
+
+        $this->assertSame(['Video saving 3', 'Video updating 3', 'File deleting 3', 'Link created 3', 'Video updated 3', 'Video saved 3'], $events);
     }
 
     #[Test]
