@@ -6,10 +6,9 @@ The package passed fixed sets as strings, such as operations, model event names 
 
 ## Decision
 
-Enums type each fixed set: `Operation`, `ModelEvent`, `DriftCheck`, `SqlState`, `TriggerFunction`, `Setting` and `RecordRole`. Readonly value objects type each fixed shape: `RecordSnapshot`, `Assignment`, `Column`, `AliasedTable`, `MirroredMap`, `MapMember` and `Exclusion`. The compiled SQL and the output of `compatibility:check` did not change.
+Enums type each fixed set. Readonly value objects type each fixed shape, such as `Column`.
 
 ## Consequences
 
-- `ExcludedListener::forEvent()`, `RecordMirrored::$events` and `InteractsWithCompatibilityMaps::assertMirrored()` take `ModelEvent` cases.
-- `ModelEvent` sits in Mapping beside `ExcludedListener`, which takes it as public API. It imports `Operation` from Bridge for `ModelEvent::operation()`.
+- Public API takes enum cases, not strings, for a fixed set.
 - Tests that register listeners keep Laravel's event names. See [0014](0014-tests-listen-by-laravel-event-names.md).

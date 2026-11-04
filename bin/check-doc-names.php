@@ -98,7 +98,7 @@ $problems = [];
 $names = 0;
 $links = 0;
 $invariants = 0;
-preg_match_all('/^## (INV-\d+):/m', (string) file_get_contents($root.'/docs/invariants.md'), $headings);
+preg_match_all('/^## (INV-\d+):/m', is_file($root.'/docs/invariants.md') ? (string) file_get_contents($root.'/docs/invariants.md') : '', $headings);
 $headings = array_flip($headings[1]);
 
 foreach ($external as $short => $class) {

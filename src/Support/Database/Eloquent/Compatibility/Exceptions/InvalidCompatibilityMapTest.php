@@ -14,9 +14,9 @@ final class InvalidCompatibilityMapTest extends TestCase
     #[Test]
     public function it_names_the_compatibility_map_and_the_problem(): void
     {
-        $invalid = InvalidCompatibilityMap::because('widgets', 'its event mirror is registered twice');
+        $invalid = InvalidCompatibilityMap::because('widgets', 'it names no successor');
 
-        $this->assertSame("Compatibility map 'widgets' is declared wrongly: its event mirror is registered twice.", $invalid->getMessage());
+        $this->assertSame("Compatibility map 'widgets' is declared wrongly: it names no successor.", $invalid->getMessage());
         $this->assertInstanceOf(CompatibilityException::class, $invalid);
     }
 }

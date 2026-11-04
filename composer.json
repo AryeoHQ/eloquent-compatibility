@@ -30,11 +30,8 @@
     },
     "require": {
         "php": "^8.4",
-        "ext-pdo": "*",
         "ext-pdo_pgsql": "*",
-        "laravel/framework": "12.x || ^13",
-        "nikic/php-parser": "^5.7",
-        "phpstan/phpstan": "^2.1"
+        "laravel/framework": "12.x || ^13"
     },
     "require-dev": {
         "aryeo/tooling-laravel": "0.0.41",
@@ -56,7 +53,6 @@
         },
         "tooling": {
             "phpstan": {
-                "rules": "tooling/phpstan/rules.neon",
                 "config": {
                     "paths": [
                         "src",
