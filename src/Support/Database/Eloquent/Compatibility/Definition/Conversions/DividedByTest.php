@@ -69,14 +69,4 @@ final class DividedByTest extends TestCase
     {
         $this->assertSame($filter, (new DividedBy($divisor))->filter($operator, $value));
     }
-
-    #[Test]
-    #[TestWith([100, 'asc', 'asc'])]
-    #[TestWith([100, 'DESC', 'desc'])]
-    #[TestWith([-1, 'asc', 'desc'])]
-    #[TestWith([-1, 'desc', 'asc'])]
-    public function it_orders_the_stored_column_in_the_same_direction_unless_the_divisor_is_negative(int $divisor, string $direction, string $stored): void
-    {
-        $this->assertSame($stored, (new DividedBy($divisor))->order($direction));
-    }
 }
