@@ -45,11 +45,12 @@ final class OrDefaultTest extends TestCase
     #[TestWith(['=', 'Seattle', ['=', 'Seattle']])]
     #[TestWith(['=', 'Unknown', null])]
     #[TestWith(['!=', 'Seattle', ['is distinct from', 'Seattle']])]
-    #[TestWith(['!=', 'Unknown', ['!=', 'Unknown']])]
+    #[TestWith(['!=', 'Unknown', null])]
+    #[TestWith(['<>', 'Unknown', null])]
     #[TestWith(['<', 'Seattle', null])]
     #[TestWith(['=', null, ['none', null]])]
     #[TestWith(['!=', null, ['all', null]])]
-    public function it_filters_equality_with_a_value_other_than_the_default_and_any_inequality(string $operator, null|string $value, null|array $filter): void
+    public function it_filters_equality_and_inequality_with_a_value_other_than_the_default(string $operator, null|string $value, null|array $filter): void
     {
         $this->assertSame($filter, (new OrDefault('Unknown'))->filter($operator, $value, 'text'));
     }
@@ -58,11 +59,5 @@ final class OrDefaultTest extends TestCase
     public function it_treats_a_number_written_as_text_as_the_default_it_equals(): void
     {
         $this->assertNull((new OrDefault(0))->filter('=', '0', 'integer'));
-    }
-
-    #[Test]
-    public function it_cannot_order_by_the_stored_column(): void
-    {
-        $this->assertNull((new OrDefault(0))->order('asc'));
     }
 }

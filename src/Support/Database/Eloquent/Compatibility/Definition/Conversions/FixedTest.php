@@ -59,8 +59,8 @@ final class FixedTest extends TestCase
     }
 
     #[Test]
-    public function it_cannot_filter_or_order_by_a_stored_column(): void
+    public function it_cannot_filter_by_a_stored_column(): void
     {
-        $this->assertSame([null, null], [(new Fixed(null))->filter('=', null), (new Fixed(null))->order('asc')]);
+        $this->assertNull((new Fixed(null))->filter('=', null));
     }
 }
