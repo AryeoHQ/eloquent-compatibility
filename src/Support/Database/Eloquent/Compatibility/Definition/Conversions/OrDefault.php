@@ -46,14 +46,9 @@ final readonly class OrDefault implements Conversion
 
         return match ($operator) {
             '=' => $value === $default ? null : ['=', $value],
-            '!=', '<>' => [$value === $default ? '!=' : 'is distinct from', $value],
+            '!=', '<>' => $value === $default ? null : ['is distinct from', $value],
             default => null,
         };
-    }
-
-    public function order(string $direction): null|string
-    {
-        return null;
     }
 
     public function type(null|string $type): null|string

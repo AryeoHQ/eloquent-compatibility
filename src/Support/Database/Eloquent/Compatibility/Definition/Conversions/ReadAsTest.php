@@ -37,10 +37,10 @@ final class ReadAsTest extends TestCase
     }
 
     #[Test]
-    public function it_cannot_filter_or_order_by_the_stored_column(): void
+    public function it_cannot_filter_by_the_stored_column(): void
     {
         $conversion = new ReadAs('upper("places"."city")', fn (mixed $value) => $value);
 
-        $this->assertSame([null, null], [$conversion->filter('=', 'SEATTLE'), $conversion->order('asc')]);
+        $this->assertNull($conversion->filter('=', 'SEATTLE'));
     }
 }

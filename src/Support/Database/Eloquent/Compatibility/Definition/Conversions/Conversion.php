@@ -15,8 +15,6 @@ interface Conversion
      */
     public function filter(string $operator, mixed $value, null|string $type = null): null|array;
 
-    public function order(string $direction): null|string;
-
     public function type(null|string $type): null|string;
 
     public function exact(null|string $type, string $served): bool;
