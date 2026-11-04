@@ -32,7 +32,9 @@
         "php": "^8.4",
         "ext-pdo_pgsql": "*",
         "laravel/framework": "12.x || ^13",
-        "ext-mbstring": "*"
+        "ext-mbstring": "*",
+        "phpstan/phpstan": "^2.1",
+        "nikic/php-parser": "^5.7"
     },
     "require-dev": {
         "aryeo/eloquent-state-machines": "0.0.34",
@@ -58,6 +60,7 @@
         },
         "tooling": {
             "phpstan": {
+                "rules": "tooling/phpstan/rules.neon",
                 "config": {
                     "paths": [
                         "src",

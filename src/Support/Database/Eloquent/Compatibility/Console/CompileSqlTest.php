@@ -330,6 +330,8 @@ final class CompileSqlTest extends TestCase
         ];
         $legacy = new class extends Model implements Compatible
         {
+            use ServesCompatibility;
+
             protected $table = 'listings';
 
             public static function compatibility(Compatibility $listing): Compatibility

@@ -165,6 +165,8 @@ final class CompatibilityTest extends TestCase
         self::$reporting = $reporting::class;
         $legacy = new class extends Model implements Contracts\Compatible
         {
+            use Provides\ServesCompatibility;
+
             protected $table = 'listings';
 
             public static function compatibility(Compatibility $listing): Compatibility
@@ -204,6 +206,8 @@ final class CompatibilityTest extends TestCase
         $legacies = [
             new class extends Model implements Contracts\Compatible
             {
+                use Provides\ServesCompatibility;
+
                 protected $table = 'videos';
 
                 public function getMorphClass()
@@ -225,6 +229,8 @@ final class CompatibilityTest extends TestCase
             },
             new class extends Model implements Contracts\Compatible
             {
+                use Provides\ServesCompatibility;
+
                 protected $table = 'videos';
 
                 public function getMorphClass()
@@ -299,6 +305,8 @@ final class CompatibilityTest extends TestCase
         self::$reporting = $reporting::class;
         $legacy = new class extends Model implements Contracts\Compatible
         {
+            use Provides\ServesCompatibility;
+
             protected $table = 'place_videos';
 
             public function getMorphClass()
@@ -348,6 +356,8 @@ final class CompatibilityTest extends TestCase
         self::$reporting = $reporting::class;
         $legacy = new class extends Model implements Contracts\Compatible
         {
+            use Provides\ServesCompatibility;
+
             protected $table = 'listings';
 
             public static function compatibility(Compatibility $listing): Compatibility
@@ -428,6 +438,8 @@ final class CompatibilityTest extends TestCase
         ];
         $legacy = new class extends Model implements Contracts\Compatible
         {
+            use Provides\ServesCompatibility;
+
             protected $table = 'listings';
 
             public static function compatibility(Compatibility $listing): Compatibility

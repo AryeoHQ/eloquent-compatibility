@@ -1,0 +1,17 @@
+services:
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\CompatibleMustUseServesCompatibility
+        tags:
+            - phpstan.rules.rule
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\ServesCompatibilityMustImplementCompatible
+        tags:
+            - phpstan.rules.rule
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\ServesCompatibilityMustOnlyBeOnModel
+        tags:
+            - phpstan.rules.rule
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\ServesCompatibilityMustNotRedeclareBuilders
+        tags:
+            - phpstan.rules.rule
