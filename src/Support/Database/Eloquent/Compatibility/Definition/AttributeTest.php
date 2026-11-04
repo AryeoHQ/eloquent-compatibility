@@ -27,16 +27,15 @@ use Tests\TestCase;
 final class AttributeTest extends TestCase
 {
     #[Test]
-    public function it_reads_a_plain_column_of_its_successor_and_filters_and_orders_it_unchanged(): void
+    public function it_reads_a_plain_column_of_its_successor_and_filters_it_unchanged(): void
     {
         $attribute = (new Attribute('listings', 'title'))->from('name');
 
-        $this->assertSame(['name', '"jobs"."name"', 'Oak Lane', ['like', 'Oak%'], 'desc'], [
+        $this->assertSame(['name', '"jobs"."name"', 'Oak Lane', ['like', 'Oak%']], [
             $attribute->column(),
             $attribute->read('jobs'),
             $attribute->write('Oak Lane'),
             $attribute->filter('like', 'Oak%'),
-            $attribute->order('DESC'),
         ]);
         $this->assertTrue($attribute->isWritable());
     }
@@ -52,20 +51,19 @@ final class AttributeTest extends TestCase
     }
 
     #[Test]
-    public function it_translates_a_filter_and_an_order_through_every_conversion_from_the_last_to_the_first(): void
+    public function it_translates_a_filter_through_every_conversion_from_the_last_to_the_first(): void
     {
         $attribute = (new Attribute('job_sites', 'area'))->from('area_m2')->multipliedBy(-2)->dividedBy(100);
 
         $this->assertSame(['<', -150], $attribute->filter('>', 3));
-        $this->assertSame('desc', $attribute->order('asc'));
     }
 
     #[Test]
-    public function it_cannot_filter_or_order_when_one_conversion_cannot(): void
+    public function it_cannot_filter_when_one_conversion_cannot(): void
     {
         $attribute = (new Attribute('listings', 'status'))->from('lifecycle_status')->mapping(['live' => ListingStatus::Active])->asType('text');
 
-        $this->assertSame([null, null, null], [$attribute->filter('=', 'Active'), $attribute->filter('>', 'Active'), $attribute->order('asc')]);
+        $this->assertSame([null, null], [$attribute->filter('=', 'Active'), $attribute->filter('>', 'Active')]);
     }
 
     #[Test]
@@ -137,7 +135,7 @@ final class AttributeTest extends TestCase
     {
         $attribute = (new Attribute('videos', 'mime_type'))->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)->resolve();
 
-        $this->assertSame([true, false, null, null], [$attribute->isExternal(), $attribute->isWritable(), $attribute->filter('=', 'video/mp4'), $attribute->order('asc')]);
+        $this->assertSame([true, false, null], [$attribute->isExternal(), $attribute->isWritable(), $attribute->filter('=', 'video/mp4')]);
 
         $this->expectExceptionObject(new LogicException("Attribute 'mime_type' is external, so no SQL reads it."));
 

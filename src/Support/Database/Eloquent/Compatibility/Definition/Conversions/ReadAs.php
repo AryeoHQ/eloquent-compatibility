@@ -33,11 +33,6 @@ final readonly class ReadAs implements Conversion
         return null;
     }
 
-    public function order(string $direction): null|string
-    {
-        return null;
-    }
-
     public function type(null|string $type): null|string
     {
         return null;

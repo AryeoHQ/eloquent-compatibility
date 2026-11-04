@@ -60,10 +60,4 @@ final class IsNotNullTest extends TestCase
     {
         $this->assertSame($filter, (new IsNotNull(fn () => null))->filter($operator, $value));
     }
-
-    #[Test]
-    public function it_cannot_order_by_the_stored_column(): void
-    {
-        $this->assertNull((new IsNotNull(fn () => null))->order('asc'));
-    }
 }

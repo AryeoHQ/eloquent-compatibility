@@ -38,10 +38,4 @@ final class AsTypeTest extends TestCase
         $this->assertNull((new AsType('text'))->filter($operator, '12'));
         $this->assertFalse((new AsType('text'))->exact('text', 'text'));
     }
-
-    #[Test]
-    public function it_cannot_order_by_the_stored_column(): void
-    {
-        $this->assertNull((new AsType('text'))->order('asc'));
-    }
 }
