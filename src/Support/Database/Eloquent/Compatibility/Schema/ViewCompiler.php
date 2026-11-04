@@ -37,11 +37,13 @@ final readonly class ViewCompiler
 
     /**
      * @param  array<string, Column>  $shape
+     * @param  list<string>  $external
      * @return array<string, string>
      */
-    public function served(ResolvedMap $map, array $shape, null|string $retainedFrom = null): array
+    public function served(ResolvedMap $map, array $shape, array $external = [], null|string $retainedFrom = null): array
     {
-        $this->check($map, $shape);
+        $external = [...$external, ...$map->externals()];
+        $this->check($map, $shape, $external);
         $reads = [];
 
         foreach ($map->identifiers as $name => $identifier) {
@@ -49,7 +51,7 @@ final readonly class ViewCompiler
         }
 
         foreach ($map->attributes as $name => $attribute) {
-            if (! $attribute->isExternal()) {
+            if (! in_array($name, $external, true)) {
                 $table = $map->owners[$name]->table;
                 $column = $attribute->column();
                 $stored = $column === null ? null : $this->baseType($table, $column);
@@ -168,16 +170,17 @@ final readonly class ViewCompiler
      */
     private function union(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
     {
-        return implode("\nUNION ALL\n", array_map(fn (ResolvedMap $served) => $this->select($served, $shape, $defaultsOn, $retained), $map->branches === [] ? [$map] : array_values($map->branches)));
+        return implode("\nUNION ALL\n", array_map(fn (ResolvedMap $served) => $this->select($served, $shape, $defaultsOn, $retained, $map->externals()), $map->branches === [] ? [$map] : array_values($map->branches)));
     }
 
     /**
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
+     * @param  list<string>  $external
      */
-    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, array $external): string
     {
-        $served = $this->served($map, $shape, $defaultsOn);
+        $served = $this->served($map, $shape, $external, $defaultsOn);
         $retainedTable = self::retainedTable($map);
         $legacyOnly = $map->legacyOnly(array_keys($shape));
         $volatile = $this->volatileDefaults($defaultsOn);
@@ -288,8 +291,9 @@ final readonly class ViewCompiler
 
     /**
      * @param  array<string, Column>  $shape
+     * @param  list<string>  $external
      */
-    private function check(ResolvedMap $map, array $shape): void
+    private function check(ResolvedMap $map, array $shape, array $external): void
     {
         self::retainedTable($map);
 
@@ -304,7 +308,7 @@ final readonly class ViewCompiler
             $this->columnsOf($map, $related->table, array_values(array_filter([$related->relatedKey, $related->deletedAt], fn (null|string $column) => $column !== null)), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' reads it');
         }
 
-        foreach ([...array_keys($map->identifiers), ...array_keys(array_filter($map->attributes, fn ($attribute) => ! $attribute->isExternal()))] as $name) {
+        foreach ([...array_keys($map->identifiers), ...array_diff(array_keys($map->attributes), $external)] as $name) {
             if (! array_key_exists($name, $shape)) {
                 throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so the view cannot serve it");
             }
@@ -313,7 +317,7 @@ final readonly class ViewCompiler
         foreach ($map->attributes as $name => $attribute) {
             $column = $attribute->column();
 
-            if ($column === null || $attribute->isExternal()) {
+            if ($column === null || in_array($name, $external, true)) {
                 continue;
             }
 

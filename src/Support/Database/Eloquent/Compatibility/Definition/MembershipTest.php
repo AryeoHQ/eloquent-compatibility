@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Definition;
 use Closure;
 use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -20,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\LegacyFile;
@@ -165,7 +167,9 @@ final class MembershipTest extends TestCase
                     ->servedFrom(File::class, fn (Successor $file) => $file
                         ->when(fn (Builder $files) => $files->where('mime_type', 'like', 'image/%')->orWhere('mime_type', 'application/pdf'))
                         ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
             }
         };
@@ -191,7 +195,9 @@ final class MembershipTest extends TestCase
                     ->servedFrom(File::class, fn (Successor $file) => $file
                         ->when(fn (Builder $files) => $files->where('mime_type', 'image/jpeg'))
                         ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
             }
         };

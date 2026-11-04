@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Definition;
 
+use ArgumentCountError;
 use Closure;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection as Values;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use LogicException;
@@ -15,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\TestCase;
 
@@ -138,6 +143,53 @@ final class AttributeTest extends TestCase
     }
 
     #[Test]
+    public function it_declines_an_external_write_with_the_reason_it_gives(): void
+    {
+        $attribute = (new Attribute('photos', 'mime_type'))->external(read: fn (mixed $files) => $files, write: Attribute::declined(because: 'The media library sets the type from the upload.'))->resolve();
+
+        $this->assertSame([true, 'The media library sets the type from the upload.', null], [
+            $attribute->isExternal(),
+            $attribute->declinedBecause(),
+            (new Attribute('photos', 'mime_type'))->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null)->resolve()->declinedBecause(),
+        ]);
+    }
+
+    #[Test]
+    public function it_takes_both_sides_of_an_external_attribute(): void
+    {
+        $this->expectException(ArgumentCountError::class);
+
+        (new Attribute('photos', 'mime_type'))->external(read: fn (mixed $files) => $files); // @phpstan-ignore argument.missing
+    }
+
+    #[Test]
+    public function it_reads_external_values_keyed_by_successor_key_and_writes_through_its_write(): void
+    {
+        $written = new Job(['name' => 'Oak Lane']);
+        $attribute = (new Attribute('listings', 'mls_number'))->external(
+            read: fn (Collection $jobs): Values => $jobs->toBase()->mapWithKeys(fn (Model $job) => [(string) $job->getKey() => 'MLS-'.$job->getKey()]),
+            write: fn (Job $job, mixed $value) => $job->setAttribute('name', $job->getAttribute('name').' '.$value),
+        );
+
+        $attribute->writeExternally($written, 'MLS-7');
+
+        $this->assertSame([[1 => 'MLS-1', 4 => 'MLS-4'], 'Oak Lane MLS-7'], [
+            $attribute->readExternally(new Collection([(new Job)->forceFill(['id' => 1]), (new Job)->forceFill(['id' => 4])])),
+            $written->getAttribute('name'),
+        ]);
+    }
+
+    #[Test]
+    public function it_refuses_an_external_read_that_returns_no_values_keyed_by_successor(): void
+    {
+        $attribute = (new Attribute('listings', 'mls_number'))->external(read: fn (Collection $jobs) => $jobs->count(), write: fn (Job $job, mixed $value) => null);
+
+        $this->expectExceptionObject(new LogicException("The external() read closure of attribute 'mls_number' on listings returns int, and it returns the values keyed by successor key."));
+
+        $attribute->readExternally(new Collection([new Job]));
+    }
+
+    #[Test]
     public function it_keeps_the_conversions_it_was_given(): void
     {
         $this->assertEquals([new DividedBy(100)], (new Attribute('listings', 'price'))->from('price_cents')->dividedBy(100)->conversions());
@@ -168,6 +220,9 @@ final class AttributeTest extends TestCase
         yield 'an inverse of nothing' => [fn (Attribute $attribute) => $attribute->from('name')->writeTo(fn (mixed $value) => $value)->resolve(), 'says writeTo(), which inverts readAs(), without readAs()'];
         yield 'an inverse without a column' => [fn (Attribute $attribute) => $attribute->readAs("'x'")->writeTo(fn (mixed $value) => $value)->resolve(), 'says writeTo() without from(), so its inverse has no column to store'];
         yield 'no column' => [fn (Attribute $attribute) => $attribute->dividedBy(100)->resolve(), 'names no column; give it from(), fixed(), readAs() or external()'];
+        yield 'external with a column' => [fn (Attribute $attribute) => $attribute->from('name')->external(read: fn (mixed $jobs) => $jobs, write: fn (mixed $job, mixed $value) => null)->resolve(), 'is external(), so it reads no column and takes no conversion, readOnly() or transitions(); decline its write with Attribute::declined()'];
+        yield 'external and read-only' => [fn (Attribute $attribute) => $attribute->external(read: fn (mixed $jobs) => $jobs, write: fn (mixed $job, mixed $value) => null)->readOnly('Assigned upstream.')->resolve(), 'is external(), so it reads no column and takes no conversion, readOnly() or transitions(); decline its write with Attribute::declined()'];
+        yield 'a decline without a reason' => [fn (Attribute $attribute) => $attribute->external(read: fn (mixed $jobs) => $jobs, write: Attribute::declined(because: ' '))->resolve(), 'declines its external() write without a reason; Attribute::declined() takes the reason a write is refused'];
     }
 
     /**

@@ -41,8 +41,12 @@ final readonly class Installer
                 throw new LogicException("Compatibility::{$statements->operation}() runs ".count($statements->afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
             }
 
-            foreach ($statements->transaction as $statement) {
+            foreach ($statements->transaction as $index => $statement) {
                 $this->connection->unprepared($statement);
+
+                foreach ($statements->steps[$index] ?? [] as $step) {
+                    $step($this->connection);
+                }
             }
 
             return $statements;

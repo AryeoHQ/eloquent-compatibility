@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Files;
 
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection as Values;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -55,7 +57,10 @@ final class Video extends Model implements Compatible
             ->servedFrom(fn (Video $video): string => $video->youtube_embed_url !== null ? Link::class : File::class)
             ->as(File::class, fn (Successor $file) => $file
                 ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                ->attribute('mime_type', fn (Attribute $attribute) => $attribute
+                    ->external(
+                        read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
+                        write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                 ->attribute('size_kb', fn (Attribute $attribute) => $attribute
                     ->from('size_bytes')
                     ->dividedBy(1000))

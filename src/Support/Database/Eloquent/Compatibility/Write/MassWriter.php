@@ -41,9 +41,14 @@ final readonly class MassWriter
 
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
+    public static function computesInSql(mixed $value): bool
+    {
+        return $value instanceof Expression || $value instanceof QueryBuilder || $value instanceof Builder || $value instanceof Relation || $value instanceof Closure;
+    }
+
     public static function refuseRaw(ResolvedMap $map, string $name, mixed $value): void
     {
-        if (! $value instanceof Expression && ! $value instanceof QueryBuilder && ! $value instanceof Builder && ! $value instanceof Relation && ! $value instanceof Closure) {
+        if (! self::computesInSql($value)) {
             return;
         }
 
@@ -450,6 +455,10 @@ final readonly class MassWriter
         [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
 
         foreach (self::named($mapped) as $name => $value) {
+            if ($this->map->isExternal($name)) {
+                throw CompatibilityWriteRefused::external($this->map->model, $name);
+            }
+
             self::refuseRaw($this->map, $name, $value);
         }
 

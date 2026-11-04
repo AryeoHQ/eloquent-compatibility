@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use ReflectionFunction;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
 final readonly class ResolvedMap
@@ -125,6 +126,25 @@ final readonly class ResolvedMap
         throw $this->invalid('the servedFrom() selector returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and as() declares only '.implode(' and ', array_keys($this->branches)));
     }
 
+    public function isExternal(string $name): bool
+    {
+        foreach ($this->branches === [] ? [$this] : $this->branches as $served) {
+            if (($served->attributes[$name] ?? null)?->isExternal() === true) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function externals(): array
+    {
+        return array_values(array_filter(array_keys($this->attributes), $this->isExternal(...)));
+    }
+
     /**
      * @return list<string>
      */
@@ -228,14 +248,14 @@ final readonly class ResolvedMap
         }
 
         foreach (array_keys($declaredIn) as $name) {
-            $served = [];
+            $external = array_filter($branches, fn (ResolvedMap $branch) => $branch->attributes[$name]->isExternal());
 
-            foreach ($branches as $successor => $branch) {
-                $served[$branch->attributes[$name]->isExternal() ? 'external' : 'sql'] ??= $successor;
-            }
+            foreach ($external === [] ? [] : $branches as $successor => $branch) {
+                $attribute = $branch->attributes[$name];
 
-            if (count($served) > 1) {
-                throw $this->invalid("attribute '{$name}' is external() in the ".class_basename($served['external']).' branch and served from SQL in the '.class_basename($served['sql']).' branch, and every branch of the view serves one set of columns; give it external() in every branch or in none');
+                if (! $attribute->isExternal() && ! ($attribute->column() === null && ($attribute->conversions()[0] ?? null) instanceof Fixed)) {
+                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external)).' branch and reads SQL in the '.class_basename($successor).' branch, and the view serves an external attribute from no branch; declare it external() or fixed() there');
+                }
             }
         }
     }
@@ -301,6 +321,10 @@ final readonly class ResolvedMap
 
             if (array_key_exists($name, $attributes)) {
                 throw $this->invalid("attribute '{$name}' is declared twice");
+            }
+
+            if ($attribute->isExternal() && $successor !== $successors[0]) {
+                throw $this->invalid("attribute '{$name}' is external() on ".class_basename($successor->model).', which related() reaches, and an external() read and write receive the servedFrom() successor '.class_basename($successors[0]->model).'; declare it on '.class_basename($successors[0]->model));
             }
 
             $attributes[$name] = $attribute->resolve();

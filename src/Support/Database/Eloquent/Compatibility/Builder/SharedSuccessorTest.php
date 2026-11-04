@@ -60,7 +60,8 @@ final class SharedSuccessorTest extends TestCase
     public function it_serves_each_legacy_model_the_rows_and_values_its_legacy_table_held(): void
     {
         $this->assertSame(['v', 'v', 'v'], array_map(fn (string $view) => DB::scalar('select relkind::text from pg_class where oid = to_regclass(?)', [$view]), ['photos', 'floorplans', 'legacy_files']));
-        $this->assertSame($this->before, $this->legacyRows());
+        $this->assertSame(['photos' => array_map(fn (array $row) => array_diff_key($row, ['mime_type' => true]), $this->before['photos'])] + $this->before, $this->legacyRows());
+        $this->assertSame(array_column($this->before['photos'], 'mime_type'), Photo::query()->orderBy('id')->get()->map(fn (Photo $photo) => $photo->mime_type)->all());
         $this->assertSame(
             ['oak-front.jpg', 'oak-plan.pdf', 'contract.pdf'],
             [Photo::query()->findOrFail(1)->file_name, FloorPlan::query()->findOrFail(1)->file_name, LegacyFile::query()->findOrFail(1)->file_name],

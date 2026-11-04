@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -26,6 +27,7 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Link;
@@ -70,7 +72,8 @@ final class TwoSuccessorsTest extends TestCase
     public function it_serves_each_video_from_whichever_successor_holds_it(): void
     {
         $this->assertSame('v', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
-        $this->assertSame($this->before, array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        $this->assertSame(array_map(fn (array $row) => array_diff_key($row, ['mime_type' => true]), $this->before), array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+        $this->assertSame(array_column($this->before, 'mime_type'), Video::query()->orderBy('id')->get()->map(fn (Video $video) => $video->mime_type)->all());
         $this->assertSame(
             [[1, 'tour.mp4', null], [2, null, 'https://youtu.be/oak'], [3, 'drone.mov', null]],
             Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all(),
@@ -1091,7 +1094,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('size_bytes')))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1129,7 +1134,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('original_file_name') === null ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1167,7 +1174,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('size_kb') === '2048.000' ? File::class : Link::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1205,7 +1214,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null || $video->getAttribute('size_kb') === '0.000' ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)->orDefault(0))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1243,7 +1254,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('views') > 4 ? File::class : Link::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1281,7 +1294,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('views') === 0 ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1319,7 +1334,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && ! in_array($video->getAttribute('title'), [null, 'Upload only'], true) ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -1357,7 +1374,9 @@ final class TwoSuccessorsTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null && $video->getAttribute('views') > 1 ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link

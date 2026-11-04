@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
+use Illuminate\Support\LazyCollection;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -22,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use WeakMap;
 
@@ -126,9 +128,56 @@ final class LegacyBuilder extends Builder
         return self::$maps[$model] ??= Compatibility::of($model)->resolve();
     }
 
+    public static function refuseExternal(string $model, string $attribute, string $operation): CompatibilityQueryRefused
+    {
+        return CompatibilityQueryRefused::untranslatable($model, $attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+    }
+
     public function writeOf(Model $model): void
     {
         $this->writeOf = $model;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $items
+     */
+    public function hydrate(array $items)
+    {
+        $models = parent::hydrate($items);
+        ExternalAttributes::gather($models->all(), $this->query->useWritePdo);
+
+        return $models;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $attributes
+     * @return TModel
+     */
+    public function newModelInstance($attributes = [])
+    {
+        $model = parent::newModelInstance($attributes);
+        ExternalAttributes::readFrom($model, $this->query->useWritePdo);
+
+        return $model;
+    }
+
+    /**
+     * @return LazyCollection<int, TModel>
+     */
+    public function cursor()
+    {
+        $scoped = $this->applyScopes();
+
+        return $scoped === $this ? parent::cursor() : $scoped->withoutGlobalScopes()->cursor();
+    }
+
+    /**
+     * @param  array<int, Expression|string>|Expression|string  $columns
+     * @return list<TModel>
+     */
+    public function getModels($columns = ['*'])
+    {
+        return array_values($this->hydrate($this->query->get($columns)->all())->all());
     }
 
     /**
@@ -468,10 +517,10 @@ final class LegacyBuilder extends Builder
         $this->query->orderBy($column, $direction);
         $attribute = is_string($column) ? $this->converted($column) : null;
 
-        if ($attribute !== null && $this->definition($attribute)->isExternal()) {
+        if ($attribute !== null && $this->map()->isExternal($attribute)) {
             $orders = $this->query->unions ? $this->query->unionOrders : $this->query->orders;
 
-            throw $this->refuse($attribute, 'orderBy '.end($orders)['direction'], 'it is stored outside the database, so no SQL reads it.');
+            throw self::refuseExternal($this->model::class, $attribute, 'orderBy '.end($orders)['direction']);
         }
 
         return $this;
@@ -558,8 +607,8 @@ final class LegacyBuilder extends Builder
     {
         $attribute = is_string($column) ? $this->attributeOf($column) : null;
 
-        if ($attribute !== null && $this->definition($attribute)->isExternal() && $this->relation()['view']) {
-            throw $this->refuse($attribute, "{$function}()", 'it is stored outside the database, so no SQL reads it.');
+        if ($attribute !== null && $this->map()->isExternal($attribute) && $this->relation()['view']) {
+            throw self::refuseExternal($this->model::class, $attribute, "{$function}()");
         }
 
         return $this->toBase()->{$function}($column);
@@ -575,8 +624,8 @@ final class LegacyBuilder extends Builder
         $map = $this->map();
         $definition = $this->definition($attribute);
 
-        if ($definition->isExternal()) {
-            throw $this->refuse($attribute, $operation, 'it is stored outside the database, so no SQL reads it.');
+        if ($map->isExternal($attribute)) {
+            throw self::refuseExternal($this->model::class, $attribute, $operation);
         }
 
         foreach ($conditions as [, $value]) {
@@ -759,13 +808,17 @@ final class LegacyBuilder extends Builder
         $attribute = $this->attributeOf($column);
         $definition = $attribute === null ? null : $this->definition($attribute);
 
-        return $definition !== null && ($definition->isExternal() || $definition->conversions() !== []) && $this->relation()['view'] ? $attribute : null;
+        return $definition !== null && ($this->map()->isExternal((string) $attribute) || $definition->conversions() !== []) && $this->relation()['view'] ? $attribute : null;
     }
 
     private function attributeOf(string $column): null|string
     {
         $table = $this->model->getTable();
         $attribute = str_contains($column, '.') ? (str_starts_with($column, $table.'.') ? substr($column, strlen($table) + 1) : null) : $column;
+
+        if ($attribute === $column && $this->map()->isExternal($column) && LegacyQueryBuilder::joinExposes($this->query, $column)) {
+            return null;
+        }
 
         return $attribute !== null && array_key_exists($attribute, $this->map()->attributes) ? $attribute : null;
     }

@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -23,6 +24,9 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Files\FakeMediaLibrary;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\LegacyFile;
@@ -505,36 +509,206 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_a_map_whose_external_attribute_names_a_legacy_column(): void
+    public function it_refuses_to_install_while_a_legacy_row_holds_an_external_value_its_read_does_not_return(): void
     {
-        $model = new class extends Model implements Compatible
+        $this->prepareFiles();
+        FakeMediaLibrary::bound()->put((string) DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->value('zml_asset_id'), new FileMetadata('image/png'));
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 3)->update(['zml_asset_id' => null]);
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_while_a_legacy_row_holds_null_where_the_read_returns_a_value(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photos alter column mime_type drop not null');
+        DB::table('photos')->where('id', 3)->update(['mime_type' => null]);
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('photos'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_while_the_read_returns_a_boolean_for_a_legacy_value_that_is_not_that_boolean(): void
+    {
+        $this->prepareFiles();
+        DB::table('photos')->where('id', 3)->update(['mime_type' => 'false']);
+        $truthful = new class extends Model implements Compatible
         {
             use ServesCompatibility;
 
-            protected $table = 'listings';
+            protected $table = 'photos';
 
-            public static function compatibility(Compatibility $listing): Compatibility
+            public function getMorphClass()
             {
-                return $listing
+                return 'photo';
+            }
+
+            public static function compatibility(Compatibility $photo): Compatibility
+            {
+                return $photo
+                    ->discriminatedBy('legacy_type')
                     ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
                     ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $number) => $number)));
+                    ->retainedIn('photos_retained')
+                    ->timestamps()
+                    ->servedFrom(File::class, fn (Successor $file) => $file
+                        ->when(fn (Builder $files) => $files->where('mime_type', 'like', 'image/%'))
+                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => $file->getAttribute('legacy_id') === 1 ? 'image/jpeg' : true])->all(),
+                            write: fn (File $file, mixed $value) => null))
+                        ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000)));
             }
         };
 
         try {
-            Compatibility::install($model::class);
+            Compatibility::install($truthful::class);
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame(InvalidCompatibilityMap::because('listings', "attribute 'mls_number' is external(), and this release neither reads nor restores an external attribute, so install() would drop listings.mls_number and its values")->getMessage(), $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
-        $this->assertSame('r', $this->kind('listings'));
-        $this->assertSame(['MLS-1', null, 'MLS-3'], array_column(DB::select('select mls_number from listings order by id'), 'mls_number'));
+        $this->assertSame('r', $this->kind('photos'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_generated_legacy_column(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photos drop column mime_type');
+        DB::statement("alter table photos add column mime_type varchar(255) generated always as ('image/' || 'jpeg') stored");
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 's'], [$this->kind('photos'), DB::scalar("select attgenerated::text from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'")]);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_an_external_attribute_over_a_legacy_column_that_owns_a_sequence(): void
+    {
+        $this->prepareFiles();
+        DB::statement('drop sequence if exists photos_mime_type_seq cascade');
+        DB::statement('create sequence photos_mime_type_seq owned by photos.mime_type');
+        DB::statement("alter table photos alter column mime_type set default 'image/' || nextval('photos_mime_type_seq')");
+        FakeMediaLibrary::bound()->calls = [];
+
+        try {
+            Compatibility::install(Photo::class);
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $refusal) {
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and uninstall() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+        }
+
+        $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);
+        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+
+        DB::statement('alter sequence photos_mime_type_seq owned by none');
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'image/1'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+
+        DB::statement('alter sequence photos_mime_type_seq owned by photos.mime_type');
+    }
+
+    #[Test]
+    public function it_restores_the_default_and_not_null_flag_of_an_external_column_once_its_values_are_back(): void
+    {
+        $this->prepareFiles();
+        DB::statement("alter table photos alter column mime_type set default 'application/octet-stream'");
+
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+        DB::table('photos')->insert(['file_name' => 'ash.jpg']);
+
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png', 'application/octet-stream'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+        $this->assertSame([true, "'application/octet-stream'::character varying"], [
+            DB::scalar("select attnotnull from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+            DB::scalar("select pg_get_expr(adbin, adrelid) from pg_attrdef join pg_attribute on attrelid = adrelid and attnum = adnum where adrelid = 'photos'::regclass and attname = 'mime_type'"),
+        ]);
+    }
+
+    #[Test]
+    public function it_restores_an_external_column_in_the_collation_the_legacy_column_declares(): void
+    {
+        $this->prepareFiles();
+        DB::statement('alter table photos alter column mime_type type varchar(255) collate "C"');
+        $collation = fn () => DB::scalar("select collname from pg_attribute join pg_collation on pg_collation.oid = attcollation where attrelid = 'photos'::regclass and attname = 'mime_type'");
+        $before = $collation();
+
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+
+        $this->assertSame(['C', 'C'], [$before, $collation()]);
+        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+    }
+
+    #[Test]
+    public function it_pages_install_verification_and_uninstall_restore_by_an_indexed_key_without_an_offset(): void
+    {
+        $this->prepareFiles();
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        Compatibility::install(Photo::class);
+        Compatibility::uninstall(Photo::class);
+
+        $paged = array_values(array_filter($statements, fn (string $sql) => str_contains($sql, ' limit 500')));
+
+        $this->assertCount(2, $paged);
+        $this->assertMatchesRegularExpression('/^select "id", "mime_type" from "photos" (where "id" is not null )?order by "id" asc limit 500$/', $paged[0]);
+        $this->assertMatchesRegularExpression('/^select "file_id", "id" from "photos" (where "file_id" is not null )?order by "file_id" asc limit 500$/', $paged[1]);
+        $this->assertStringEndsWith(' WHERE "photos"."file_id" = CAST(restored.key AS uuid)', array_values(array_filter($statements, fn (string $sql) => str_starts_with($sql, 'UPDATE "photos" SET "mime_type"')))[0] ?? '');
+    }
+
+    #[Test]
+    public function it_stores_no_external_value_once_installed_and_restores_each_through_its_read_on_uninstall(): void
+    {
+        $this->prepareFiles();
+        DB::table('photos')->where('id', 2)->update(['mime_type' => 'image/webp']);
+        DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->update(['mime_type' => 'image/webp']);
+        FakeMediaLibrary::bound()->put((string) DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 2)->value('zml_asset_id'), new FileMetadata('image/webp'));
+        $before = DB::select('select id, uuid, file_name, mime_type, caption, views, size_kb, created_at, updated_at from photos order by id');
+
+        Compatibility::install(Photo::class);
+        $installed = DB::select("select table_name from information_schema.columns where table_name in ('photos', 'photos_retained') and column_name = 'mime_type'");
+        Photo::query()->findOrFail(3)->update(['mime_type' => 'image/gif']);
+        Compatibility::uninstall(Photo::class);
+
+        $before[2]->mime_type = 'image/gif';
+        $before[2]->updated_at = DB::scalar('select updated_at from photos where id = 3');
+
+        $this->assertSame([], $installed);
+        $this->assertSame('r', $this->kind('photos'));
+        $this->assertEquals($before, DB::select('select id, uuid, file_name, mime_type, caption, views, size_kb, created_at, updated_at from photos order by id'));
+        $this->assertSame([true, 'character varying(255)'], [
+            DB::scalar("select attnotnull from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+            DB::scalar("select format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'"),
+        ]);
     }
 
     #[Test]
@@ -1279,7 +1453,7 @@ final class InstallerTest extends TestCase
                 Compatibility::uninstall($model);
             }
 
-            $this->assertEquals([$before[0], $before[1]], $served);
+            $this->assertEquals([array_map(fn (object $row) => (object) array_diff_key((array) $row, ['mime_type' => true]), $before[0]), $before[1]], $served);
             $this->assertSame(['23503', '23503'], $codes);
             $this->assertEquals($before, [DB::select('select * from photos order by id'), DB::select('select * from floorplans order by id'), $foreignKeys()]);
         }

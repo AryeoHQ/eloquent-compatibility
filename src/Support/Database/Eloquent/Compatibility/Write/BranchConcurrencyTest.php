@@ -154,10 +154,10 @@ final class BranchConcurrencyTest extends TestCase
     {
         $locked = $this->lockConcurrently("update videos_retained set title = 'Retitled' where id = 1");
 
-        $updated = Video::query()->where('title', 'Tour')->update(['mime_type' => 'video/webm']);
+        $updated = Video::query()->where('title', 'Tour')->update(['original_file_name' => 'other.mp4']);
 
         $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
-        $this->assertSame([0, 'Retitled', 'video/mp4'], [$updated, Video::query()->findOrFail(1)->title, Video::query()->findOrFail(1)->mime_type]);
+        $this->assertSame([0, 'Retitled', 'tour.mp4'], [$updated, Video::query()->findOrFail(1)->title, Video::query()->findOrFail(1)->original_file_name]);
     }
 
     /**

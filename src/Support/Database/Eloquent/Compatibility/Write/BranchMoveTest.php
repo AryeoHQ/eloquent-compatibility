@@ -22,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Video;
@@ -206,7 +207,7 @@ final class BranchMoveTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_move_that_writes_an_external_or_read_only_attribute_as_an_update_in_place_refuses_it(): void
+    public function it_treats_a_move_that_writes_an_external_or_read_only_attribute_as_an_update_in_place_treats_it(): void
     {
         $video = $this->restrictedVideo();
         $outcomes = [];
@@ -228,11 +229,11 @@ final class BranchMoveTest extends TestCase
         $this->assertSame([
             $video::class.' record 1 cannot change $original_file_name',
             $video::class.' record 2 cannot change $original_file_name',
-            $video::class.'::$thumbnail cannot take a write',
-            $video::class.'::$thumbnail cannot take a write',
+            'stored',
+            'stored',
         ], $outcomes);
-        $this->assertSame([[1, 'tour.mp4'], [3, 'drone.mov']], DB::table('files')->where('legacy_type', 'video')->orderBy('legacy_id')->get(['legacy_id', 'filename'])->map(fn (object $row) => [(int) $row->legacy_id, (string) $row->filename])->all());
-        $this->assertSame([[2, 'https://youtu.be/oak']], DB::table('links')->where('legacy_type', 'video')->orderBy('legacy_id')->get(['legacy_id', 'url'])->map(fn (object $row) => [(int) $row->legacy_id, (string) $row->url])->all());
+        $this->assertSame([[1, 'tour.mp4']], DB::table('files')->where('legacy_type', 'video')->orderBy('legacy_id')->get(['legacy_id', 'filename'])->map(fn (object $row) => [(int) $row->legacy_id, (string) $row->filename])->all());
+        $this->assertSame([[2, 'https://youtu.be/oak'], [3, 'https://youtu.be/drone']], DB::table('links')->where('legacy_type', 'video')->orderBy('legacy_id')->get(['legacy_id', 'url'])->map(fn (object $row) => [(int) $row->legacy_id, (string) $row->url])->all());
     }
 
     #[Test]
@@ -319,16 +320,18 @@ final class BranchMoveTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename')->readOnly('The upload names its own file.'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))
-                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $files) => $files, write: fn (File $file, mixed $value) => $value)))
+                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => null])->all(), write: fn (File $file, mixed $value) => $value)))
                     ->as(Link::class, fn (Successor $link) => $link
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
                         ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed(null))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url'))
-                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $links) => $links, write: fn (Link $link, mixed $value) => $value)));
+                        ->attribute('thumbnail', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $links): array => $links->mapWithKeys(fn (Model $link) => [$link->getKey() => null])->all(), write: fn (Link $link, mixed $value) => $value)));
             }
         };
     }
@@ -360,7 +363,9 @@ final class BranchMoveTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link
@@ -398,7 +403,9 @@ final class BranchMoveTest extends TestCase
                     ->servedFrom(fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class)
                     ->as(File::class, fn (Successor $file) => $file
                         ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type'))
+                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
+                            read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
                         ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
                     ->as(Link::class, fn (Successor $link) => $link

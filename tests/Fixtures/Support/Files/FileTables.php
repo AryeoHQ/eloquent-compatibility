@@ -26,6 +26,7 @@ final class FileTables
             $table->string('filename');
             $table->string('mime_type');
             $table->bigInteger('size_bytes')->nullable();
+            $table->string('zml_asset_id')->nullable();
             $table->timestampsTz();
         });
 
@@ -135,6 +136,7 @@ final class FileTables
     public static function backfillMedia(): void
     {
         DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select 'video', id, uuid, original_file_name, mime_type, round(size_kb * 1000), created_at, updated_at from videos where youtube_embed_url is null");
+        self::catalog('video');
         DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'video', id, uuid, youtube_embed_url, created_at, updated_at from videos where youtube_embed_url is not null");
         DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'interactive_content', id, uuid, url, created_at, updated_at from interactive_content");
     }
@@ -167,6 +169,17 @@ final class FileTables
         foreach (['photo' => ['photos', 'round(size_kb * 1000)'], 'floorplan' => ['floorplans', 'null'], 'legacy_file' => ['legacy_files', 'null']] as $type => [$table, $size]) {
             DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select '{$type}', id, uuid, file_name, mime_type, {$size}, created_at, updated_at from {$table}");
         }
+
+        self::catalog('photo');
+    }
+
+    public static function catalog(string $type): void
+    {
+        File::query()->where('legacy_type', $type)->whereNull('zml_asset_id')->orderBy('legacy_id')->each(function (File $file): void {
+            $file->metadata()->mimeType = $file->mime_type;
+            $file->timestamps = false;
+            $file->save();
+        });
     }
 
     public static function install(): void

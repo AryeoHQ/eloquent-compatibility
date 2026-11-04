@@ -28,7 +28,7 @@ final readonly class BranchMove
         $recreated = self::recreated($to, $before, $values);
         (new MassWriter($this->map, $this->connection))->claim($recreated, $to);
 
-        return (new RecordWriter($to, $this->connection))->insert($legacy, $recreated);
+        return (new RecordWriter($to, $this->connection, $this->map->externals()))->insert($legacy, $recreated);
     }
 
     /**
@@ -46,7 +46,7 @@ final readonly class BranchMove
         }
 
         foreach ($to->attributes as $name => $attribute) {
-            if (! $attribute->isExternal() && (array_key_exists($name, $values) || ($attribute->column() !== null && ! self::readsOnly($attribute)))) {
+            if (array_key_exists($name, $values) || (! $attribute->isExternal() && $attribute->column() !== null && ! self::readsOnly($attribute))) {
                 $recreated[$name] = $after[$name] ?? null;
             }
         }

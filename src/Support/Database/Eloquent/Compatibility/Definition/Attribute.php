@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Definition;
 use BackedEnum;
 use Closure;
 use DateTimeZone;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection as Values;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\AsType;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Conversion;
@@ -40,7 +43,7 @@ final class Attribute
 
     private bool $transitions = false;
 
-    /** @var null|array{Closure, Closure} */
+    /** @var null|array{Closure, Closure|Declined} */
     private null|array $external = null;
 
     public function __construct(private readonly string $map, public readonly string $name) {}
@@ -186,10 +189,18 @@ final class Attribute
         return $this;
     }
 
-    public function external(Closure $read, Closure $write): self
+    public static function declined(string $because): Declined
+    {
+        return new Declined($because);
+    }
+
+    public function external(Closure $read, Closure|Declined $write): self
     {
         ResolvedMap::refuseCaptures($this->map, "the external() read closure of attribute '{$this->name}'", $read);
-        ResolvedMap::refuseCaptures($this->map, "the external() write closure of attribute '{$this->name}'", $write);
+
+        if ($write instanceof Closure) {
+            ResolvedMap::refuseCaptures($this->map, "the external() write closure of attribute '{$this->name}'", $write);
+        }
 
         $this->external = [$read, $write];
 
@@ -228,6 +239,47 @@ final class Attribute
         return $this->external !== null;
     }
 
+    public function declinedBecause(): null|string
+    {
+        return ($this->external[1] ?? null) instanceof Declined ? $this->external[1]->because : null;
+    }
+
+    /**
+     * @param  Collection<array-key, covariant Model>  $successors
+     * @return array<array-key, mixed>
+     */
+    public function readExternally(Collection $successors): array
+    {
+        $read = $this->external[0] ?? throw new LogicException("Attribute '{$this->name}' is not external, so no external() read serves it.");
+        $values = $read($successors);
+        $values = match (true) {
+            $values instanceof Values => $values->all(),
+            is_array($values) => $values,
+            default => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns ".get_debug_type($values).', and it returns the values keyed by successor key.'),
+        };
+        $received = array_map(fn (Model $successor) => self::keyOf($successor->getKey()), $successors->all());
+        $returned = array_map(self::keyOf(...), array_keys($values));
+        $missing = array_diff($received, $returned);
+        $unexpected = array_diff($returned, $received);
+
+        return match (true) {
+            $missing !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns no value for successor key ".reset($missing).'; it returns one value, or null, for each successor it receives.'),
+            $unexpected !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns a value for successor key ".reset($unexpected).', which it did not receive; it returns one value, or null, for each successor it receives.'),
+            default => $values,
+        };
+    }
+
+    public function writeExternally(Model $successor, mixed $value): void
+    {
+        $write = $this->external[1] ?? null;
+
+        if (! $write instanceof Closure) {
+            throw new LogicException("Attribute '{$this->name}' has no external() write closure to call.");
+        }
+
+        $write($successor, $value);
+    }
+
     public function isWritable(): bool
     {
         return $this->readOnly === null && $this->column !== null && $this->fixed === null && $this->external === null;
@@ -237,6 +289,8 @@ final class Attribute
     {
         $problem = match (true) {
             $this->fixed !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->external !== null) => 'is fixed(), so it reads no column and takes no other conversion',
+            $this->external !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->readOnly !== null || $this->transitions) => 'is external(), so it reads no column and takes no conversion, readOnly() or transitions(); decline its write with Attribute::declined()',
+            $this->declinedBecause() !== null && trim($this->declinedBecause()) === '' => 'declines its external() write without a reason; Attribute::declined() takes the reason a write is refused',
             $this->readAs !== null && $this->conversions !== [] => 'reads as raw SQL with readAs(), so it takes no other conversion',
             $this->readAs !== null && $this->writeTo === null && $this->readOnly === null => 'reads as raw SQL with readAs(), and says neither writeTo() nor readOnly()',
             $this->writeTo !== null && $this->readAs === null => 'says writeTo(), which inverts readAs(), without readAs()',
@@ -371,6 +425,11 @@ final class Attribute
         }
 
         return ['in', $stored];
+    }
+
+    private static function keyOf(mixed $key): string
+    {
+        return is_int($key) || is_string($key) ? (string) $key : throw new LogicException('A successor handed to an external() read has no key, so the read cannot key its value.');
     }
 
     private function convert(Conversion $conversion): self
