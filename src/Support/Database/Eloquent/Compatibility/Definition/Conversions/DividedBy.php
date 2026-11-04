@@ -42,13 +42,6 @@ final readonly class DividedBy implements Conversion
         return $operator === null ? null : SqlFragments::bound($operator, $value, $this->divisor, 1, $type);
     }
 
-    public function order(string $direction): string
-    {
-        $direction = strtolower($direction);
-
-        return $this->divisor > 0 ? $direction : ($direction === 'asc' ? 'desc' : 'asc');
-    }
-
     public function type(null|string $type): string
     {
         return 'numeric';

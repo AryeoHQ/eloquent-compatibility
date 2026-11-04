@@ -735,9 +735,7 @@ final class LegacyBuilder extends Builder
         if ($negate) {
             $complements = $this->filters($attribute, array_map(fn (array $condition) => [self::COMPLEMENTS[$condition[0]] ?? '', $condition[1]], $conditions), $type);
 
-            if ($complements !== null) {
-                return [$complements, $combine === 'and' ? 'or' : 'and', false];
-            }
+            return $complements === null ? null : [$complements, $combine === 'and' ? 'or' : 'and', false];
         }
 
         $filters = $this->filters($attribute, $conditions, $type);
