@@ -140,6 +140,27 @@ final class ServedModelsTest extends TestCase
     }
 
     #[Test]
+    public function it_discovers_an_application_model_that_an_optimized_classmap_lists_through_the_vendor_directory(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Optimized{$suffix}");
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+        file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => []], JSON_THROW_ON_ERROR));
+        $loader = new ClassLoader($vendor);
+        $loader->addClassMap(["App\\Models\\Optimized{$suffix}" => "{$vendor}/composer/../../app/Models/src/Optimized{$suffix}.php"]);
+        $loader->register();
+
+        try {
+            $served = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertContains("App\\Models\\Optimized{$suffix}", $served);
+    }
+
+    #[Test]
     public function it_scans_on_every_boot_in_testing_and_ignores_a_cache(): void
     {
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return [];');

@@ -138,7 +138,7 @@ final class ServedModels
                     continue;
                 }
 
-                $vendored = str_starts_with($file, $vendor) || str_starts_with($real, $vendor);
+                $vendored = str_starts_with($real, $vendor);
                 $within = fn (array $packages): bool => array_filter($packages, fn (string $package) => str_starts_with($real, $package)) !== [];
 
                 if (! $vendored || $within($paths)) {
