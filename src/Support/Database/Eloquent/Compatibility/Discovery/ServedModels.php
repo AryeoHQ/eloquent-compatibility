@@ -19,6 +19,14 @@ final class ServedModels
     /** @var null|list<class-string<Model&Compatible>> */
     private null|array $models = null;
 
+    /**
+     * Scanning reads every application class file, and tests boot a fresh application for each test,
+     * so a scan is kept for the process until a registered classmap changes.
+     *
+     * @var array<string, list<class-string<Model&Compatible>>>
+     */
+    private static array $scanned = [];
+
     public function __construct(
         private readonly string $cache,
         private readonly bool $scans,
@@ -74,6 +82,17 @@ final class ServedModels
      * @return list<class-string<Model&Compatible>>
      */
     private function scan(): array
+    {
+        $loaders = ClassLoader::getRegisteredLoaders();
+        $classmaps = implode('|', array_map(fn (string $vendor, ClassLoader $loader) => $vendor.':'.count($loader->getClassMap()), array_keys($loaders), $loaders));
+
+        return self::$scanned[$classmaps] ??= $this->discover();
+    }
+
+    /**
+     * @return list<class-string<Model&Compatible>>
+     */
+    private function discover(): array
     {
         $files = $this->classmap();
         $models = [];

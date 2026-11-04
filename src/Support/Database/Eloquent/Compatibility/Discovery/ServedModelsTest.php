@@ -161,6 +161,37 @@ final class ServedModelsTest extends TestCase
     }
 
     #[Test]
+    public function it_reuses_a_scan_for_a_new_application_until_a_classmap_changes(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $first = $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Kept{$suffix}");
+        $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Added{$suffix}");
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+        file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => []], JSON_THROW_ON_ERROR));
+        $loader = new ClassLoader($vendor);
+        $loader->addClassMap(["App\\Models\\Kept{$suffix}" => $first]);
+        $loader->register();
+
+        try {
+            $scanned = $this->app->make(ServedModels::class)->all();
+            file_put_contents($first, "<?php\n\nnamespace App\\Models;\n\nfinal class Kept{$suffix} {}\n");
+            $this->app->forgetInstance(ServedModels::class);
+            $reused = $this->app->make(ServedModels::class)->all();
+            $loader->addClassMap(["App\\Models\\Added{$suffix}" => "{$this->bootstrap}/app/Models/src/Added{$suffix}.php"]);
+            $this->app->forgetInstance(ServedModels::class);
+            $rescanned = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertContains("App\\Models\\Kept{$suffix}", $scanned);
+        $this->assertSame($scanned, $reused);
+        $this->assertNotContains("App\\Models\\Kept{$suffix}", $rescanned);
+        $this->assertContains("App\\Models\\Added{$suffix}", $rescanned);
+    }
+
+    #[Test]
     public function it_scans_on_every_boot_in_testing_and_ignores_a_cache(): void
     {
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return [];');
