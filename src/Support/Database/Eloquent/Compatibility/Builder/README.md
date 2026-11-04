@@ -63,7 +63,7 @@ Eloquent forwards most query methods straight to the query builder, so an overri
 
 1. **`LegacyBuilder::translate()`** runs the pipeline. It refuses what cannot translate, then normalizes each value through `LegacyBuilder::sent()`. It falls back to the view where `## When a filter stays on the view` says. Otherwise it builds the subquery and adds the membership test.
 2. **`LegacyBuilder::served()`** decides whether comparing the stored column is exact. See `## Exactness`.
-3. **`LegacyBuilder::stored()`** handles negation. It tries each operator's complement from `LegacyBuilder::COMPLEMENTS` first.
+3. **`LegacyBuilder::stored()`** handles negation. A negated filter translates only through each operator's complement from `LegacyBuilder::COMPLEMENTS`. When any complement has no inverse, it returns null, and the filter stays on the view.
 4. **`LegacyBuilder::filters()`** inverts each condition through the attribute's conversions. One condition with no inverse returns null, and the filter stays on the view.
 5. **`LegacyBuilder::apply()`** writes the filters into the subquery. An `or` of equalities becomes one `whereIn`. The tokens `none`, `all` and `unknown` become `false`, `true` and `null`.
 
@@ -83,7 +83,7 @@ Each conversion inverts a filter through `Conversion::filter()`. `Attribute::fil
 | `dividedBy`, `multipliedBy` | `=`, `!=`, `<`, `>`, `<=`, `>=` |
 | `mapping` | `=` and `!=` against a mapped value; `!=` becomes `in` the other stored keys |
 | `isNotNull` | `=` and `!=` against a boolean or `null` |
-| `orDefault` | `=` and `!=` |
+| `orDefault` | `=` and `!=`, except against the default |
 | `inTimeZone` | `=`, `!=`, `<`, `>`, `<=`, `>=` against a date or a wall-clock string |
 | `readAs`, `fixed` | None |
 
@@ -94,12 +94,13 @@ Each conversion inverts a filter through `Conversion::filter()`. `Attribute::fil
 A filter stays on the view, which is correct but slow, in these cases:
 
 - **No inverse exists.** Examples are `like` on a mapping, a value no mapping declares, and any `readAs()` attribute.
-- **A range has a NULL bound.** SQL returns unknown for `price > null`, and the view keeps that result.
+- **A range has a NULL bound,** as in `whereBetween('price', [null, 100])`. SQL returns unknown for that comparison, and the view keeps that result.
+- **A negated filter's complement has no inverse.** Negating the stored filter instead would drop rows whose stored value is NULL, while the view can serve them as a value, for example through `orDefault()`.
 - **The role cannot read the successors.** It lacks `SELECT` on a successor, or row-level security is active there. The subquery would then fail, or filter different rows than the view.
 
 ## Exactness
 
-Comparing the stored column must return exactly what comparing the served value returns. `LegacyBuilder::served()` checks the stored and served types and both collations through `Conversion::exact()`. A conversion may round or cast, or a collation may compare case-insensitively. In that case the subquery filters on the view's expression, rebuilt over the successor table, with the caller's operator and value unchanged. The filter stays on the successor, but no plain index applies.
+Comparing the stored column must return exactly what comparing the served value returns. `LegacyBuilder::served()` checks the stored and served types through `Conversion::exact()`, and checks both collations itself. A conversion may round or cast, or a collation may compare case-insensitively. In that case the subquery filters on the view's expression, rebuilt over the successor table, with the caller's operator and value unchanged. The filter stays on the successor, but no plain index applies.
 
 `LegacyBuilder::sent()` normalizes values the way the view compares them. It formats a date in the grammar's format, and binds a float as a string, so no decimal place is lost.
 
@@ -107,7 +108,7 @@ Comparing the stored column must return exactly what comparing the served value 
 
 A negated filter must keep SQL's NULL semantics. `NOT (price > 100)` excludes a listing with no price.
 
-`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. A negated filter then uses each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. The outer membership test cancels the group's own `NOT`, because the legacy key is never NULL. The `status` filter in the example above shows the result.
+`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. On the stored column, a negated filter translates only through each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. A negated filter whose complement does not translate stays on the view. On the rebuilt expression, the subquery negates the caller's filter directly. That keeps the view's NULL semantics, because the expression is the view's own. The outer membership test cancels the group's own `NOT`, because the legacy key is never NULL. The `status` filter in the example above shows the result.
 
 ## Refusals
 
@@ -115,6 +116,7 @@ A negated filter must keep SQL's NULL semantics. `NOT (price > 100)` excludes a 
 
 - **A raw expression or a subquery as the value** of a converted attribute. No conversion can apply to a value the database computes.
 - **An attribute stored outside the database,** in a filter, a sort or an aggregate. No SQL can read it.
+- **`whereBetween()` bounds that are not an array,** such as a collection.
 
 ## Limits
 
