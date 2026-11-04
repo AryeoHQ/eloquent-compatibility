@@ -65,12 +65,4 @@ final class MultipliedByTest extends TestCase
     {
         $this->assertSame($filter, (new MultipliedBy($factor))->filter($operator, $value));
     }
-
-    #[Test]
-    #[TestWith([1000, 'desc', 'desc'])]
-    #[TestWith([-10, 'ASC', 'desc'])]
-    public function it_orders_the_stored_column_in_the_same_direction_unless_the_factor_is_negative(int $factor, string $direction, string $stored): void
-    {
-        $this->assertSame($stored, (new MultipliedBy($factor))->order($direction));
-    }
 }

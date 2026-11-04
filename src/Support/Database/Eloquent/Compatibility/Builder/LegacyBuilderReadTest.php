@@ -581,8 +581,52 @@ final class LegacyBuilderReadTest extends TestCase
             'zero as text' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '0'),
             'false as text' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', 'false'),
             'nested not false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('featured', false)),
+            'not equal to false' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '!=', false),
+            'not not equal to false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('featured', '!=', false),
+            'not angle not equal to false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('featured', '<>', false),
+            'nested not not equal to false' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('featured', '!=', false)),
         ]);
         $this->assertSameFailure(fn () => $model->newQuery()->where('featured', 'maybe')->get(), fn () => DB::table('listings')->where('featured', 'maybe')->get());
+    }
+
+    #[Test]
+    public function it_negates_a_filter_on_an_or_default_that_follows_another_conversion_as_the_view_serves_it(): void
+    {
+        DB::statement('alter table listings add column budget numeric, add column label text');
+        DB::statement('alter table jobs add column cents integer, add column code text');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('cents')->dividedBy(100)->orDefault(0))
+                        ->attribute('label', fn (Attribute $attribute) => $attribute->from('code')->mapping(['a' => 'Alpha', 'b' => 'Beta'])->orDefault('None')));
+            }
+        };
+        Compatibility::prepare($model::class);
+        ListingTables::backfill();
+        DB::update("update jobs set cents = 500, code = 'a' where legacy_id = 1");
+        DB::update('update jobs set cents = null, code = null where legacy_id = 2');
+        DB::update("update jobs set cents = 0, code = 'zzz' where legacy_id = 3");
+        Compatibility::install($model::class);
+
+        $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
+            'a budget' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', 5),
+            'not equal to a budget' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', '!=', 5),
+            'not a budget' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('budget', 5),
+            'budgets not in' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('budget', [5]),
+            'nested not a budget' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('budget', 5)),
+            'a label' => fn (Builder|QueryBuilder $listings) => $listings->where('label', 'Alpha'),
+            'not equal to a label' => fn (Builder|QueryBuilder $listings) => $listings->where('label', '!=', 'Alpha'),
+            'not a label' => fn (Builder|QueryBuilder $listings) => $listings->whereNot('label', 'Alpha'),
+            'labels not in' => fn (Builder|QueryBuilder $listings) => $listings->whereNotIn('label', ['Alpha']),
+            'nested not a label' => fn (Builder|QueryBuilder $listings) => $listings->whereNot(fn (Builder|QueryBuilder $nested) => $nested->where('label', 'Alpha')),
+        ]);
     }
 
     #[Test]

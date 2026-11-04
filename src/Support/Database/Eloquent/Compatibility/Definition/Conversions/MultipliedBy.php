@@ -42,13 +42,6 @@ final readonly class MultipliedBy implements Conversion
         return $operator === null ? null : SqlFragments::bound($operator, $value, 1, $this->factor, $type);
     }
 
-    public function order(string $direction): string
-    {
-        $direction = strtolower($direction);
-
-        return $this->factor > 0 ? $direction : ($direction === 'asc' ? 'desc' : 'asc');
-    }
-
     public function type(null|string $type): null|string
     {
         return match (true) {

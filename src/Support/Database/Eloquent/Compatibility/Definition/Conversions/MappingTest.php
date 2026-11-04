@@ -79,12 +79,6 @@ final class MappingTest extends TestCase
         $this->assertSame(['=', 'closed'], $this->statuses()->filter('=', ListingStatus::Sold, 'text'));
     }
 
-    #[Test]
-    public function it_cannot_order_by_the_stored_column(): void
-    {
-        $this->assertNull($this->statuses()->order('asc'));
-    }
-
     private function statuses(): Mapping
     {
         return new Mapping(['drafting' => ListingStatus::Draft, 'live' => ListingStatus::Active, 'closed' => 'Sold']);
