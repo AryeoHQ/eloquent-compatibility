@@ -129,6 +129,33 @@ final readonly class Preparer
         ];
     }
 
+    /**
+     * @return list<string>
+     */
+    public function updatedAtIndex(ResolvedMap $map): array
+    {
+        $legacy = new $map->model;
+        $column = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;
+
+        if ($column === null || ! array_key_exists($column, $this->columnCatalog->of($map->table)) || $this->columnCatalog->leadsAnIndex($map->table, $column)) {
+            return [];
+        }
+
+        $index = SqlFragments::objectName($map->table, $map->table.'_'.$column.'_index');
+        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($index)).')';
+        $refusal = InvalidCompatibilityMap::cannot($map->table, 'prepare', "{$index} already exists and is not a valid B-tree index on {$map->table} that leads with {$column} over every row, so the catch-up before install would scan {$map->table}. Rename or drop {$index}, then prepare again");
+
+        return [
+            "DO \$compatibility\$\nBEGIN\n"
+                ."  IF EXISTS (SELECT FROM pg_index WHERE indexrelid = {$relation} AND NOT indisvalid) THEN\n"
+                .'    DROP INDEX '.SqlFragments::identifier($index).";\n"
+                ."  ELSIF {$relation} IS NOT NULL THEN\n"
+                ."    RAISE EXCEPTION '%', ".SqlFragments::literal($refusal->getMessage()).";\n"
+                ."  END IF;\nEND\n\$compatibility\$",
+            'CREATE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($map->table).' ('.SqlFragments::identifier($column).')',
+        ];
+    }
+
     public static function advance(string $table, string $column): string
     {
         $next = 'CASE WHEN is_called THEN last_value + 1 ELSE last_value END';

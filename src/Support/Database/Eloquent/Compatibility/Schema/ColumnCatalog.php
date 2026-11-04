@@ -17,7 +17,10 @@ final class ColumnCatalog
     /** @var array<string, string> */
     private array $baseTypes = [];
 
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, private readonly bool $throughSearchPath = false) {}
+    /**
+     * @param  array<string, list<string>>  $hidden
+     */
+    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, public readonly bool $throughSearchPath = false, private readonly array $hidden = []) {}
 
     /**
      * @return array<string, Column>
@@ -32,6 +35,10 @@ final class ColumnCatalog
         $columns = [];
 
         foreach ($rows as $row) {
+            if (in_array((string) $row->name, $this->hidden[$table] ?? [], true)) {
+                continue;
+            }
+
             $columns[(string) $row->name] = new Column(
                 (string) $row->type,
                 $row->default === null ? null : (string) $row->default,
@@ -106,6 +113,20 @@ final class ColumnCatalog
     public function notNull(string $table, string $column): bool
     {
         return $this->of($table)[$column]->notNull ?? false;
+    }
+
+    public function leadsAnIndex(string $table, string $column): bool
+    {
+        return $this->connection->scalar(
+            "select exists (
+                 select from pg_index table_index
+                 join pg_attribute attribute on attribute.attrelid = table_index.indrelid and attribute.attnum = table_index.indkey[0]
+                 join pg_class index_relation on index_relation.oid = table_index.indexrelid
+                 join pg_am access_method on access_method.oid = index_relation.relam and access_method.amname = 'btree'
+                 where table_index.indrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and table_index.indisvalid and table_index.indpred is null and attribute.attname = ?
+             )",
+            [SqlFragments::identifier($table), $column],
+        ) === true;
     }
 
     public function baseType(null|string $type): null|string

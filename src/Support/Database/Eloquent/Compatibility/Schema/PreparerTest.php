@@ -92,6 +92,76 @@ final class PreparerTest extends TestCase
     }
 
     #[Test]
+    public function it_indexes_the_legacy_updated_at_when_only_a_partial_index_leads_with_it(): void
+    {
+        DB::statement('create index listings_live_updated_at on listings (updated_at) where deleted_at is null');
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(['listings_live_updated_at', 'listings_updated_at_index'], array_column(DB::select("select indexname from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'indexname'));
+    }
+
+    #[Test]
+    public function it_indexes_the_legacy_updated_at_when_only_a_hash_index_that_cannot_read_a_range_leads_with_it(): void
+    {
+        DB::statement('create index listings_updated_at_hash on listings using hash (updated_at)');
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(
+            ['listings_updated_at_hash' => 'hash', 'listings_updated_at_index' => 'btree'],
+            array_column(DB::select("select indexname, (select amname from pg_am join pg_class on pg_class.relam = pg_am.oid where pg_class.relname = indexname) as method from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'method', 'indexname'),
+        );
+    }
+
+    #[Test]
+    public function it_refuses_to_prepare_when_an_index_that_cannot_serve_the_catch_up_already_takes_the_name_of_the_updated_at_index(): void
+    {
+        DB::statement('create index listings_updated_at_index on listings (updated_at) where id > 1');
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' cannot prepare: listings_updated_at_index already exists and is not a valid B-tree index on listings that leads with updated_at over every row, so the catch-up before install would scan listings. Rename or drop listings_updated_at_index, then prepare again.", $refusal);
+        $this->assertSame(['listings_updated_at_index' => 'CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at) WHERE (id > 1)'], array_column(DB::select("select indexname, indexdef from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%'"), 'indexdef', 'indexname'));
+    }
+
+    #[Test]
+    public function it_indexes_the_legacy_updated_at_once_and_leaves_an_index_that_already_leads_with_it(): void
+    {
+        Compatibility::prepare(Listing::class);
+        Compatibility::prepare(Listing::class);
+        $built = array_column(DB::select("select indexname, indexdef from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%'"), 'indexdef', 'indexname');
+        DB::statement('drop index listings_updated_at_index');
+        DB::statement('create index listings_touched_after_id on listings (id, updated_at)');
+        Compatibility::prepare(Listing::class);
+        $trailing = array_column(DB::select("select indexname from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'indexname');
+        DB::statement('drop index listings_updated_at_index');
+        DB::statement('create index listings_touched on listings (updated_at, id)');
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertSame(['listings_updated_at_index' => 'CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)'], $built);
+        $this->assertSame(['listings_touched_after_id', 'listings_updated_at_index'], $trailing);
+        $this->assertSame(['listings_touched', 'listings_touched_after_id'], array_column(DB::select("select indexname from pg_indexes where tablename = 'listings' and indexdef like '%updated_at%' order by indexname"), 'indexname'));
+    }
+
+    #[Test]
+    public function it_rebuilds_the_updated_at_index_a_failed_concurrent_build_left_invalid(): void
+    {
+        Compatibility::prepare(Listing::class);
+        DB::update("update pg_index set indisvalid = false where indexrelid = 'listings_updated_at_index'::regclass");
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertTrue(DB::scalar("select indisvalid from pg_index where indexrelid = 'listings_updated_at_index'::regclass"));
+    }
+
+    #[Test]
     public function it_gives_a_job_created_before_install_a_legacy_id_from_the_legacy_sequence_and_a_fresh_legacy_uuid(): void
     {
         Compatibility::prepare(Listing::class);
@@ -319,7 +389,7 @@ final class PreparerTest extends TestCase
     #[Test]
     public function it_refuses_to_create_an_index_concurrently_inside_a_transaction(): void
     {
-        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 13 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
+        $this->expectExceptionObject(new LogicException('Compatibility::prepare() runs 15 statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.'));
 
         DB::transaction(fn () => Compatibility::prepare(Listing::class));
     }

@@ -340,7 +340,7 @@ final class ExternalAttributes
         return is_int($key) || is_string($key) ? $key : throw new LogicException('A legacy row has no key to resolve an external attribute by.');
     }
 
-    private static function same(mixed $stored, mixed $read): bool
+    public static function same(mixed $stored, mixed $read): bool
     {
         $read = $read instanceof BackedEnum ? $read->value : $read;
 

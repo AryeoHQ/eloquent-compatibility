@@ -17,10 +17,10 @@ use Illuminate\Support\LazyCollection;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
@@ -51,9 +51,6 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $restores = null;
 
-    /** @var array<string, true> */
-    private static array $tables = [];
-
     /** @var array<string, array<string, array{name: string, deterministic: bool, declared: bool}>> */
     private static array $collations = [];
 
@@ -61,13 +58,15 @@ final class LegacyBuilder extends Builder
 
     private null|Model $writeOf = null;
 
-    /** @var null|array{schema: string, view: bool, readable: bool} */
+    private bool $operating = false;
+
+    /** @var null|array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool} */
     private null|array $relation = null;
 
     public static function forgetViews(): void
     {
         self::$catalogs = [];
-        self::$tables = [];
+        ServedTable::forget();
         self::$collations = [];
     }
 
@@ -117,7 +116,15 @@ final class LegacyBuilder extends Builder
 
     public static function serves(Model $model): bool
     {
-        return $model->getConnection()->scalar('select relkind::text from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($model->getTable())], false) === 'v';
+        return ServedTable::serves($model);
+    }
+
+    /**
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
+     */
+    public static function relationOf(Model $model, bool $fresh = false): array
+    {
+        return ServedTable::reading($model, ServedTable::successorsOf(self::mapOf($model::class)), $fresh);
     }
 
     /**
@@ -185,15 +192,15 @@ final class LegacyBuilder extends Builder
      */
     public function insert(array $values): bool
     {
-        $model = $this->ownInsert();
-
-        if ($model === null) {
+        if (! self::takeInsertOf($this->model)) {
             return $this->toBase()->insert($values);
         }
 
-        $this->writer()->insert($model, $values);
+        return ServedTable::write($this->model, $this->map(), fn (): bool => $this->natively(fn (): bool => $this->toBase()->insert($values)), function () use ($values): bool {
+            $this->writer()->insert($this->model, $values);
 
-        return true;
+            return true;
+        });
     }
 
     /**
@@ -202,9 +209,11 @@ final class LegacyBuilder extends Builder
      */
     public function insertGetId(array $values, $sequence = null): int|string
     {
-        $model = $this->ownInsert();
+        if (! self::takeInsertOf($this->model)) {
+            return $this->toBase()->insertGetId($values, $sequence);
+        }
 
-        return $model === null ? $this->toBase()->insertGetId($values, $sequence) : $this->writer()->insert($model, $values);
+        return ServedTable::write($this->model, $this->map(), fn () => $this->natively(fn () => $this->toBase()->insertGetId($values, $sequence)), fn (): int|string => $this->writer()->insert($this->model, $values));
     }
 
     /**
@@ -212,30 +221,31 @@ final class LegacyBuilder extends Builder
      */
     public function update(array $values): int
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
         if ($model === null) {
             return parent::update($values);
         }
 
+        $deleting = self::$deletes?->offsetExists($model) ?? false;
         $restoring = self::$restores?->offsetExists($model) ?? false;
         self::forgetRestoreOf($model);
 
-        return $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false, $restoring);
+        return $this->own(fn (): int => parent::update($values), fn (): int => $this->writer()->update($model, $values, $deleting, $restoring));
     }
 
     public function delete(): mixed
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null ? parent::delete() : $this->writer()->delete($model);
+        return $model === null ? parent::delete() : $this->own(fn (): mixed => parent::delete(), fn (): int => $this->writer()->delete($model));
     }
 
     public function forceDelete(): mixed
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null ? parent::forceDelete() : $this->writer()->delete($model);
+        return $model === null ? parent::forceDelete() : $this->own(fn (): mixed => parent::forceDelete(), fn (): int => $this->writer()->delete($model));
     }
 
     /**
@@ -245,9 +255,9 @@ final class LegacyBuilder extends Builder
      */
     public function increment($column, $amount = 1, array $extra = []): int
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null || ! is_string($column) ? parent::increment($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount], $extra);
+        return $model === null || ! is_string($column) ? parent::increment($column, $amount, $extra) : $this->own(fn (): int => parent::increment($column, $amount, $extra), fn (): int => $this->incrementOwn($model, [$column => $amount], $extra));
     }
 
     /**
@@ -257,9 +267,9 @@ final class LegacyBuilder extends Builder
      */
     public function decrement($column, $amount = 1, array $extra = []): int
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null || ! is_string($column) ? parent::decrement($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount * -1], $extra);
+        return $model === null || ! is_string($column) ? parent::decrement($column, $amount, $extra) : $this->own(fn (): int => parent::decrement($column, $amount, $extra), fn (): int => $this->incrementOwn($model, [$column => $amount * -1], $extra));
     }
 
     /**
@@ -268,9 +278,9 @@ final class LegacyBuilder extends Builder
      */
     public function incrementEach(array $columns, array $extra = []): int
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null ? $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, $columns, $extra);
+        return $model === null ? $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->own(fn (): int => $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)), fn (): int => $this->incrementOwn($model, $columns, $extra));
     }
 
     /**
@@ -279,9 +289,9 @@ final class LegacyBuilder extends Builder
      */
     public function decrementEach(array $columns, array $extra = []): int
     {
-        $model = $this->ownWrite();
+        $model = $this->writeOf;
 
-        return $model === null ? $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
+        return $model === null ? $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->own(fn (): int => $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)), fn (): int => $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra));
     }
 
     /**
@@ -293,11 +303,18 @@ final class LegacyBuilder extends Builder
      */
     public function where($column, $operator = null, $value = null, $boolean = 'and')
     {
+        if (! $this->operating) {
+            $arguments = func_get_args();
+
+            return $this->operation(fn () => $this->where(...$arguments));
+        }
+
         if ($column instanceof Closure && $operator === null) {
             $nested = $this->model->newQueryWithoutRelationships();
 
             if ($nested instanceof self) {
                 $nested->negations = $this->negations + (self::negates($boolean) ? 1 : 0);
+                $nested->operating = true;
                 $nested->relation = $this->relation;
             }
 
@@ -348,6 +365,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereIn($column, $values, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereIn($column, $values, $boolean, $not));
+        }
+
         $attribute = is_string($column) ? $this->converted($column) : null;
         $values = $values instanceof Arrayable ? $values->toArray() : $values;
 
@@ -406,6 +427,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereBetween($column, iterable $values, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereBetween($column, $values, $boolean, $not));
+        }
+
         $attribute = is_string($column) ? $this->converted($column) : null;
 
         if ($attribute === null) {
@@ -464,6 +489,10 @@ final class LegacyBuilder extends Builder
      */
     public function whereNull($columns, $boolean = 'and', $not = false)
     {
+        if (! $this->operating) {
+            return $this->operation(fn () => $this->whereNull($columns, $boolean, $not));
+        }
+
         foreach (Arr::wrap($columns) as $column) {
             $attribute = is_string($column) ? $this->converted($column) : null;
 
@@ -679,6 +708,11 @@ final class LegacyBuilder extends Builder
 
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
         $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
+        $view = $this->relation()['oid'];
+
+        if ($view !== 0 && $this->query instanceof LegacyQueryBuilder) {
+            $this->query->translatedFor($view);
+        }
 
         return $this;
     }
@@ -762,7 +796,7 @@ final class LegacyBuilder extends Builder
     private function served(string $attribute, string $owner): array
     {
         $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$connection->getName().'.'.$this->relation()['schema']] ??= new ColumnCatalog($connection);
+        $catalog = self::$catalogs[$this->servedKey()] ??= new ColumnCatalog($connection, throughSearchPath: true);
         $definition = $this->definition($attribute);
         $column = $definition->column();
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
@@ -784,7 +818,14 @@ final class LegacyBuilder extends Builder
     {
         $connection = $this->model->getConnection();
 
-        return self::$collations[$connection->getName().'.'.$this->relation()['schema'].'.'.$table] ??= ViewCompiler::collations($connection, $table);
+        return self::$collations[$this->servedKey().'.'.$table] ??= ViewCompiler::collations($connection, $table, throughSearchPath: true);
+    }
+
+    private function servedKey(): string
+    {
+        $relation = $this->relation();
+
+        return $this->model->getConnection()->getName().'.'.$relation['path'].'.'.$relation['oid'];
     }
 
     /**
@@ -828,11 +869,6 @@ final class LegacyBuilder extends Builder
         return $this->map()->attributes[$attribute];
     }
 
-    private function ownInsert(): null|Model
-    {
-        return self::takeInsertOf($this->model) && $this->servesTheView() ? $this->model : null;
-    }
-
     /**
      * @param  array<string, float|int|numeric-string>  $amounts
      * @param  array<string, mixed>  $extra
@@ -853,9 +889,27 @@ final class LegacyBuilder extends Builder
         return $this->writer()->increment($model, $named, $values);
     }
 
-    private function ownWrite(): null|Model
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $native
+     * @param  Closure(): TResult  $translated
+     * @return TResult
+     */
+    private function own(Closure $native, Closure $translated): mixed
     {
-        return $this->writeOf !== null && $this->servesTheView() ? $this->writeOf : null;
+        return ServedTable::write($this->model, $this->map(), fn (): mixed => $this->natively($native), $translated);
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $write
+     * @return TResult
+     */
+    private function natively(Closure $write): mixed
+    {
+        return $this->query instanceof LegacyQueryBuilder ? $this->query->natively($write) : $write();
     }
 
     private function writer(): RecordWriter
@@ -863,38 +917,38 @@ final class LegacyBuilder extends Builder
         return new RecordWriter($this->map(), $this->model->getConnection());
     }
 
-    private function servesTheView(): bool
+    /**
+     * @param  Closure(): $this  $operation
+     * @return $this
+     */
+    private function operation(Closure $operation): self
     {
-        return self::serves($this->model);
+        $this->operating = true;
+
+        try {
+            return $operation();
+        } finally {
+            $this->operating = false;
+            $this->relation = null;
+        }
     }
 
     /**
-     * @return array{schema: string, view: bool, readable: bool}
+     * @return array{path: string, view: bool, oid: int, unbound: list<string>, readable: bool}
      */
     private function relation(): array
     {
-        $connection = $this->model->getConnection();
-        $table = $connection->getName().'.'.$this->model->getTable();
-
-        if ($this->relation !== null || array_key_exists($table, self::$tables)) {
-            return $this->relation ?? ['schema' => '', 'view' => false, 'readable' => true];
+        if ($this->relation !== null) {
+            return $this->relation;
         }
 
-        $map = $this->map();
-        $row = (array) $connection->selectOne(
-            "select current_schema() as schema,
-                    coalesce((select relkind = 'v' from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)), false) as view,
-                    coalesce((select bool_and(coalesce(has_table_privilege(successor_table, 'SELECT') and not row_security_active(successor_table), false)) from jsonb_array_elements_text(cast(? as jsonb)) as successor cross join lateral to_regclass(quote_ident(current_schema()) || '.' || quote_ident(successor)) as successor_table), false) as readable",
-            [SqlFragments::identifier($this->model->getTable()), json_encode([$map->primary->table, ...array_map(fn (Related $related) => $related->table, $map->related)], JSON_THROW_ON_ERROR)],
-        );
+        $relation = self::relationOf($this->model);
 
-        $this->relation = ['schema' => (string) ($row['schema'] ?? ''), 'view' => ($row['view'] ?? null) === true, 'readable' => ($row['readable'] ?? null) === true];
-
-        if (! $this->relation['view']) {
-            self::$tables[$table] = true;
+        if ($this->operating) {
+            $this->relation = $relation;
         }
 
-        return $this->relation;
+        return $relation;
     }
 
     private function map(): ResolvedMap

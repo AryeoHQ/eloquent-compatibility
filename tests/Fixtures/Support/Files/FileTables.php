@@ -10,8 +10,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
-use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
-use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final class FileTables
 {
@@ -147,21 +145,7 @@ final class FileTables
         Compatibility::prepare(InteractiveContent::class);
         self::backfillMedia();
         Compatibility::install(InteractiveContent::class);
-
-        $connection = DB::connection();
-        $catalog = new ColumnCatalog($connection);
-        $map = Compatibility::of(Video::class)->resolve();
-        $view = (new ViewCompiler($catalog, $connection))->create($map);
-        $legacy = array_keys($catalog->of('videos'));
-        $served = array_values(array_diff($legacy, $map->legacyOnly($legacy), [(string) $map->retainedKey]));
-
-        DB::transaction(function () use ($view, $served): void {
-            DB::statement('alter table videos '.implode(', ', array_map(fn (string $column) => "drop column {$column}", $served)));
-            DB::statement('alter table videos rename to videos_retained');
-            DB::statement($view);
-        });
-
-        LegacyBuilder::forgetViews();
+        Compatibility::install(Video::class);
     }
 
     public static function backfill(): void
@@ -205,7 +189,7 @@ final class FileTables
             }
         }
 
-        DB::statement('drop table if exists photos, photos_retained, floorplans, floorplans_retained, legacy_files, legacy_files_retained, videos, videos_retained, interactive_content, interactive_content_retained, files, links cascade');
+        DB::statement('drop table if exists photos, photos_retained, photos_backfilled, floorplans, floorplans_retained, floorplans_backfilled, legacy_files, legacy_files_retained, legacy_files_backfilled, videos, videos_retained, videos_backfilled, interactive_content, interactive_content_retained, interactive_content_backfilled, files, links cascade');
         DB::statement('drop sequence if exists compatibility_legacy_id_seq');
         LegacyBuilder::forgetViews();
     }

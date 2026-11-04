@@ -60,7 +60,7 @@ final readonly class ViewCompiler
         }
 
         $served = [];
-        $collations = self::collations($this->connection, $map->table);
+        $collations = self::collations($this->connection, $map->table, $this->columnCatalog->throughSearchPath);
 
         foreach ($shape as $name => $column) {
             if (! array_key_exists($name, $reads)) {
@@ -91,7 +91,7 @@ final readonly class ViewCompiler
     /**
      * @return array<string, array{name: string, deterministic: bool, declared: bool}>
      */
-    public static function collations(ConnectionInterface $connection, string $table): array
+    public static function collations(ConnectionInterface $connection, string $table, bool $throughSearchPath = false): array
     {
         $collations = [];
 
@@ -102,7 +102,7 @@ final readonly class ViewCompiler
              join pg_type column_type on column_type.oid = attribute.atttypid
              join pg_collation column_collation on column_collation.oid = attribute.attcollation
              join pg_namespace collation_schema on collation_schema.oid = column_collation.collnamespace
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped",
+             where attribute.attrelid = ".($throughSearchPath ? 'to_regclass(?)' : "to_regclass(quote_ident(current_schema()) || '.' || ?)").' and attribute.attnum > 0 and not attribute.attisdropped',
             [SqlFragments::identifier($table)],
         ) as $row) {
             $collations[(string) $row->name] = ['name' => (string) $row->collation, 'deterministic' => $row->deterministic === true, 'declared' => $row->declared === true];

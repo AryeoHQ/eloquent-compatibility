@@ -85,17 +85,24 @@ final class Compatibility
 
     public static function install(string $model): void
     {
-        self::run($model, Statements::install(...), 'install');
+        $map = self::of($model)->resolve();
+        $connection = self::connection($map);
+
+        try {
+            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection, catchingUp: true));
+        } finally {
+            LegacyBuilder::forgetViews();
+        }
     }
 
     public static function recompile(string $model): void
     {
-        self::run($model, Statements::recompile(...), 'recompile');
+        self::run($model, Statements::recompile(...));
     }
 
     public static function uninstall(string $model): void
     {
-        self::run($model, Statements::uninstall(...), 'uninstall');
+        self::run($model, Statements::uninstall(...));
     }
 
     /**
@@ -375,15 +382,11 @@ final class Compatibility
     /**
      * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
      */
-    private static function run(string $model, Closure $statements, null|string $singleSuccessor = null): void
+    private static function run(string $model, Closure $statements): void
     {
         $map = self::of($model)->resolve();
-
-        if ($singleSuccessor !== null) {
-            Statements::refuseBranches($map, $singleSuccessor);
-        }
-
         $connection = self::connection($map);
+
         try {
             (new Installer($connection))->compileAndRun($map->tables(), fn () => $statements($map, $connection));
         } finally {

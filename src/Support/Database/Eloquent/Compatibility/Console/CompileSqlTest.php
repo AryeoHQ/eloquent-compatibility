@@ -19,8 +19,10 @@ use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -72,6 +74,27 @@ final class CompileSqlTest extends TestCase
             $printed[3],
         );
         $this->assertStringContainsString("ALTER TABLE \"listing_photos\"\n  DROP CONSTRAINT \"listing_photos_listing_id_foreign\",\n  ADD CONSTRAINT \"listing_photos_listing_id_foreign\" FOREIGN KEY (\"listing_id\") REFERENCES \"jobs\" (\"legacy_id\") ON DELETE CASCADE NOT VALID\n;", $printed[3]);
+        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
+    }
+
+    #[Test]
+    public function it_prints_the_retained_primary_key_install_adds_after_commit_in_a_transaction_of_its_own(): void
+    {
+        DB::statement('alter table listings add column job_id uuid');
+        DB::statement("comment on column listings.job_id is 'compatibility retained key'");
+        DB::statement('update listings set job_id = jobs.id from jobs where jobs.legacy_id = listings.id');
+        DB::statement('create unique index listings_retained_pkey on listings (job_id)');
+
+        Artisan::call('compatibility:sql', ['model' => Listing::class]);
+        $printed = Artisan::output();
+
+        $this->assertStringEndsWith(
+            "\n-- Then in one transaction of their own\n\nBEGIN;\n\n"
+            ."ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_pkey\" PRIMARY KEY USING INDEX \"listings_retained_pkey\"\n;\n\n"
+            ."ALTER TABLE \"listings_retained\" DROP CONSTRAINT \"listings_retained_job_id_not_null\"\n;\n\nCOMMIT;\n",
+            $printed,
+        );
+        $this->assertStringContainsString("ALTER TABLE \"listings_retained\" VALIDATE CONSTRAINT \"listings_retained_job_id_not_null\"\n;", $printed);
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
     }
 
@@ -143,6 +166,32 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_runs_a_printed_recompile_of_a_map_over_two_successors_only_while_neither_successor_changed(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        FileTables::installMedia();
+        $file = (string) tempnam(sys_get_temp_dir(), 'compatibility');
+        $refusal = null;
+
+        try {
+            Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile', '--output' => $file]);
+            DB::statement('alter table links add column notes text');
+
+            try {
+                DB::unprepared((string) file_get_contents($file));
+            } catch (QueryException $exception) {
+                DB::unprepared('ROLLBACK');
+                $refusal = $exception->getMessage();
+            }
+        } finally {
+            unlink($file);
+        }
+
+        $this->assertStringContainsString("Compatibility map 'videos' cannot recompile: videos, videos_retained, files or links changed after compatibility:sql read them. Print the statements again.", (string) $refusal);
+    }
+
+    #[Test]
     public function it_writes_the_statements_to_a_file(): void
     {
         $file = tempnam(sys_get_temp_dir(), 'compatibility');
@@ -154,6 +203,24 @@ final class CompileSqlTest extends TestCase
         } finally {
             unlink((string) $file);
         }
+    }
+
+    #[Test]
+    public function it_prints_the_union_view_a_map_over_two_successors_recompiles_to(): void
+    {
+        FileTables::create();
+        FileTables::seedMedia();
+        FileTables::installMedia();
+
+        $exit = Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile']);
+        $printed = Artisan::output();
+
+        $this->assertSame(0, $exit);
+        $this->assertStringContainsString("COMMIT;\n", $printed);
+        $this->assertStringContainsString('CREATE OR REPLACE VIEW "videos" AS', $printed);
+        $this->assertSame(1, substr_count($printed, "\nUNION ALL\n"));
+        $this->assertStringContainsString("FROM (SELECT * FROM \"files\" WHERE \"files\".\"legacy_type\" = 'video') AS \"files\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"files\".\"legacy_id\"", $printed);
+        $this->assertStringContainsString("FROM (SELECT * FROM \"links\" WHERE \"links\".\"legacy_type\" = 'video') AS \"links\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"links\".\"legacy_id\"", $printed);
     }
 
     #[Test]
@@ -186,6 +253,28 @@ final class CompileSqlTest extends TestCase
             ->expectsOutputToContain('Compatibility::uninstall() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::uninstall() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
+    }
+
+    #[Test]
+    public function it_refuses_to_print_an_install_that_catches_up_a_backfill_and_deletes_the_successor_rows_of_hard_deleted_legacy_rows(): void
+    {
+        $refusal = "Compatibility map 'listings' cannot install: the last compatibility:backfill of listings left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead.";
+        (new Backfiller(Compatibility::of(Listing::class)->resolve(), DB::connection()))->run();
+        DB::delete('delete from listings where id = 3');
+
+        $this->artisan('compatibility:sql', ['model' => Listing::class])
+            ->expectsOutputToContain($refusal)
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
+
+        Compatibility::install(Listing::class);
+        Compatibility::uninstall(Listing::class);
+
+        $this->artisan('compatibility:sql', ['model' => Listing::class])
+            ->expectsOutputToContain($refusal)
+            ->doesntExpectOutputToContain('BEGIN;')
+            ->assertFailed();
+        $this->assertSame([1, 2], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
     }
 
     #[Test]

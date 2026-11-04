@@ -21,9 +21,11 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\File;
@@ -79,6 +81,125 @@ final class TwoSuccessorsTest extends TestCase
             Video::query()->orderBy('id')->get()->map(fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url])->all(),
         );
         $this->assertSame([['files', 1], ['links', 2], ['files', 3]], $this->holders([1, 2, 3]));
+    }
+
+    #[Test]
+    public function it_uninstalls_a_map_over_two_successors_into_the_rows_each_successor_holds_and_installs_it_again(): void
+    {
+        $created = Link::query()->create(['legacy_type' => 'video', 'url' => 'https://youtu.be/elm', 'created_at' => '2026-03-01 10:00:00', 'updated_at' => '2026-03-01 10:00:00'])->refresh();
+
+        Compatibility::uninstall(Video::class);
+        $restored = array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id'));
+        $constraints = $this->constraintsOf('videos');
+        Compatibility::install(Video::class);
+
+        $this->assertSame(array_map($this->sorted(...), [...$this->before, ['id' => $created->legacy_id, 'uuid' => $created->legacy_uuid, 'original_file_name' => null, 'mime_type' => null, 'size_kb' => null, 'youtube_embed_url' => 'https://youtu.be/elm', 'title' => null, 'views' => 0, 'created_at' => '2026-03-01 10:00:00', 'updated_at' => '2026-03-01 10:00:00']]), array_map($this->sorted(...), $restored));
+        $this->assertSame([['videos_pkey' => 'PRIMARY KEY (id)', 'videos_uuid_unique' => 'UNIQUE (uuid)'], ['videos_pkey' => 'PRIMARY KEY (id)']], [$constraints, $this->constraintsOf('videos_retained')]);
+        $this->assertSame(array_map(fn (array $row) => $this->sorted(array_diff_key($row, ['mime_type' => true])), $restored), array_map(fn (object $row) => $this->sorted((array) $row), DB::select('select * from videos order by id')));
+    }
+
+    #[Test]
+    public function it_restores_each_column_of_a_map_over_two_successors_in_the_collation_the_legacy_column_declares(): void
+    {
+        Compatibility::uninstall(Video::class);
+        DB::statement('alter table videos alter column original_file_name type varchar(255) collate "C", alter column mime_type type varchar(255) collate "C"');
+        $collations = fn () => DB::table('pg_attribute')->join('pg_collation', 'pg_collation.oid', '=', 'pg_attribute.attcollation')
+            ->whereRaw("attrelid = 'videos'::regclass")->whereIn('attname', ['original_file_name', 'mime_type', 'title'])->orderBy('attname')->pluck('collname', 'attname')->all();
+        $rows = fn () => array_map(fn (object $row) => (array) $row, DB::select('select id, original_file_name, mime_type, youtube_embed_url from videos order by id'));
+        $before = [$collations(), $rows()];
+
+        Compatibility::install(Video::class);
+        $installed = $collations();
+        Compatibility::uninstall(Video::class);
+
+        $this->assertSame(
+            [[['mime_type' => 'C', 'original_file_name' => 'C', 'title' => 'default'], $before[1]], ['original_file_name' => 'C', 'title' => 'default'], [$before[0], $rows()]],
+            [$before, $installed, [$collations(), $rows()]],
+        );
+    }
+
+    #[Test]
+    public function it_uninstalls_a_map_over_two_successors_after_a_raw_write_deletes_a_row_one_successor_held(): void
+    {
+        DB::delete("delete from links where legacy_type = 'video' and legacy_id = 2");
+
+        Compatibility::uninstall(Video::class);
+
+        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
+        $this->assertSame([1, 3], array_map(intval(...), array_column(DB::select('select id from videos order by id'), 'id')));
+    }
+
+    #[Test]
+    public function it_deletes_at_install_the_row_whichever_successor_holds_for_a_video_hard_deleted_after_the_backfill(): void
+    {
+        Compatibility::uninstall(Video::class);
+        (new Backfiller(Compatibility::of(Video::class)->resolve(), DB::connection()))->run();
+        DB::delete('delete from videos where id in (2, 3)');
+
+        Compatibility::install(Video::class);
+
+        $this->assertSame([1], array_map(intval(...), array_column(DB::select('select id from videos order by id'), 'id')));
+        $this->assertSame([['files', 1]], $this->holders([1, 2, 3]));
+    }
+
+    #[Test]
+    public function it_recompiles_the_view_over_both_successors_in_place(): void
+    {
+        $view = DB::scalar("select oid from pg_class where oid = to_regclass('videos')");
+
+        Compatibility::recompile(Video::class);
+
+        $this->assertSame([$view, 'v'], [DB::scalar("select oid from pg_class where oid = to_regclass('videos')"), DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')")]);
+        $this->assertSame(array_map(fn (array $row) => array_diff_key($row, ['mime_type' => true]), $this->before), array_map(fn (object $row) => (array) $row, DB::select('select * from videos order by id')));
+    }
+
+    #[Test]
+    public function it_refuses_to_recompile_a_map_over_two_successors_onto_a_morph_alias_install_did_not_record(): void
+    {
+        $view = DB::scalar("select pg_get_viewdef('videos'::regclass)");
+        $renamed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'videos';
+
+            public function getMorphClass()
+            {
+                return 'clip';
+            }
+
+            public static function compatibility(Compatibility $video): Compatibility
+            {
+                return Video::compatibility($video);
+            }
+        };
+
+        try {
+            Compatibility::recompile($renamed::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(InvalidCompatibilityMap::because('videos', "install() recorded that it serves the files rows whose legacy_type is 'video' and the links rows whose legacy_type is 'video', and the map now serves the files rows whose legacy_type is 'clip' and the links rows whose legacy_type is 'clip'; recompile() cannot move the generated columns of repointed foreign keys or the record in videos_retained, so uninstall() and install() the map to change it")->getMessage(), $refusal);
+        $this->assertSame($view, DB::scalar("select pg_get_viewdef('videos'::regclass)"));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_map_over_two_successors_while_the_preparation_of_either_has_not_finished(): void
+    {
+        Compatibility::uninstall(Video::class);
+        DB::statement('alter table links alter column legacy_id drop not null');
+
+        try {
+            Compatibility::install(Video::class);
+            $refusal = 'no refusal';
+        } catch (QueryException $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("Compatibility map 'videos' cannot install: links.legacy_id is not yet NOT NULL with a unique index on (legacy_type, legacy_id), so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $refusal);
+        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('videos')"));
     }
 
     #[Test]
@@ -1386,6 +1507,25 @@ final class TwoSuccessorsTest extends TestCase
                         ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')));
             }
         };
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private function sorted(array $row): array
+    {
+        ksort($row);
+
+        return $row;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function constraintsOf(string $table): array
+    {
+        return array_column(DB::select("select conname, pg_get_constraintdef(oid) as definition from pg_constraint where conrelid = to_regclass(?) and contype <> 'n' order by conname", [$table]), 'definition', 'conname');
     }
 
     /**
