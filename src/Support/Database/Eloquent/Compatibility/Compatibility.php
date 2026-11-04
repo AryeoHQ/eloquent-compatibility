@@ -1,0 +1,312 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Support\Database\Eloquent\Compatibility;
+
+use Closure;
+use Illuminate\Database\Connection;
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\ConfigurationUrlParser;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\DB;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Guard;
+use Support\Database\Eloquent\Compatibility\Definition\Hide;
+use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
+
+final class Compatibility
+{
+    /** @var class-string<Model> */
+    private readonly string $model;
+
+    private readonly string $map;
+
+    /** @var array<string, Identifier> */
+    private array $identifiers = [];
+
+    private null|string $retainedTable = null;
+
+    private null|string $retainedKey = null;
+
+    private bool $timestamps = false;
+
+    private null|Successor $primary = null;
+
+    /** @var list<Hide> */
+    private array $hides = [];
+
+    /** @var array<string, Guard> */
+    private array $guards = [];
+
+    /** @var array<class-string, string> */
+    private array $withoutForwarding = [];
+
+    public function __construct(string $model)
+    {
+        if (! is_subclass_of($model, Model::class)) {
+            throw InvalidCompatibilityMap::because($model, 'it names no Eloquent model');
+        }
+
+        $this->model = $model;
+        $this->map = (new $model)->getTable();
+    }
+
+    public static function of(string $model): self
+    {
+        $compatibility = new self($model);
+
+        if (! is_subclass_of($model, Compatible::class)) {
+            throw InvalidCompatibilityMap::because($compatibility->map, class_basename($model).' does not implement '.Compatible::class.', so it declares no map');
+        }
+
+        return $model::compatibility($compatibility);
+    }
+
+    public static function prepare(string $model): void
+    {
+        self::run($model, Statements::prepare(...));
+    }
+
+    public static function install(string $model): void
+    {
+        self::run($model, Statements::install(...));
+    }
+
+    public static function recompile(string $model): void
+    {
+        self::run($model, Statements::recompile(...));
+    }
+
+    public static function uninstall(string $model): void
+    {
+        self::run($model, Statements::uninstall(...));
+    }
+
+    /**
+     * @param  Closure(Identifier): mixed  $identifier
+     */
+    public function identifiedBy(string $attribute, Closure $identifier): self
+    {
+        if (array_key_exists($attribute, $this->identifiers)) {
+            throw $this->invalid("identifier '{$attribute}' is declared twice");
+        }
+
+        ResolvedMap::refuseCaptures($this->map, "the closure of identifier '{$attribute}'", $identifier);
+
+        $declared = new Identifier($this->map, $attribute);
+        $identifier($declared);
+        $this->identifiers[$attribute] = $declared;
+
+        return $this;
+    }
+
+    public function retainedIn(string $table, null|string $key = null): self
+    {
+        if ($this->retainedTable !== null) {
+            throw $this->invalid('retainedIn() is declared twice');
+        }
+
+        if ($table === '' || $key === '') {
+            throw $this->invalid('retainedIn() names an empty table or key');
+        }
+
+        $this->retainedTable = $table;
+        $this->retainedKey = $key;
+
+        return $this;
+    }
+
+    public function timestamps(): self
+    {
+        $this->timestamps = true;
+
+        return $this;
+    }
+
+    /**
+     * @param  Closure(Successor): mixed  $definition
+     */
+    public function servedFrom(string $successor, Closure $definition): self
+    {
+        if ($this->primary !== null) {
+            throw $this->invalid('servedFrom() is declared twice');
+        }
+
+        if (! is_subclass_of($successor, Model::class)) {
+            throw $this->invalid("servedFrom() names {$successor}, which is not an Eloquent model");
+        }
+
+        ResolvedMap::refuseCaptures($this->map, 'the servedFrom() closure', $definition);
+
+        $this->primary = new Successor($this->map, $successor);
+        $definition($this->primary);
+
+        return $this;
+    }
+
+    public function hide(Closure $scope, string $because): self
+    {
+        ResolvedMap::refuseCaptures($this->map, 'a hide() scope', $scope);
+
+        if (trim($because) === '') {
+            throw $this->invalid('hide() gives no reason; it takes the reason the legacy model never shows these records');
+        }
+
+        $this->hides[] = new Hide($scope, $because);
+
+        return $this;
+    }
+
+    public function guard(string $name, Closure $when, string $because, string $instead): self
+    {
+        ResolvedMap::refuseCaptures($this->map, "guard '{$name}'", $when);
+
+        if (trim($name) === '' || trim($because) === '' || trim($instead) === '') {
+            throw $this->invalid("guard '{$name}' needs a name, a reason and what to do instead");
+        }
+
+        if (array_key_exists($name, $this->guards)) {
+            throw $this->invalid("guard '{$name}' is declared twice");
+        }
+
+        $this->guards[$name] = new Guard($name, $when, $because, $instead);
+
+        return $this;
+    }
+
+    public function withoutForwardingTo(string $listener, string $because): self
+    {
+        if (! class_exists($listener)) {
+            throw $this->invalid("withoutForwardingTo() names {$listener}, which is not a class");
+        }
+
+        if (trim($because) === '') {
+            throw $this->invalid("withoutForwardingTo({$listener}) gives no reason");
+        }
+
+        if (array_key_exists($listener, $this->withoutForwarding)) {
+            throw $this->invalid("withoutForwardingTo({$listener}) is declared twice");
+        }
+
+        $this->withoutForwarding[$listener] = $because;
+
+        return $this;
+    }
+
+    public function resolve(): ResolvedMap
+    {
+        return new ResolvedMap(
+            $this->model,
+            $this->map,
+            $this->identifiers,
+            $this->retainedTable,
+            $this->retainedKey,
+            $this->timestamps,
+            $this->primary,
+            $this->hides,
+            $this->guards,
+            $this->withoutForwarding,
+        );
+    }
+
+    public static function connection(ResolvedMap $map): ConnectionInterface
+    {
+        $legacy = new $map->model;
+        $connection = $legacy->getConnection();
+        $successors = [$map->primary->model => [(new $map->primary->model)->getConnectionName(), 'the successor '.class_basename($map->primary->model)]];
+
+        foreach ($map->related as $related) {
+            $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
+        }
+
+        self::refusePrefix($map, $connection, class_basename($legacy));
+
+        foreach ($successors as [$name, $successor]) {
+            $name ??= DB::getDefaultConnection();
+
+            if ($name === $connection->getName()) {
+                continue;
+            }
+
+            if (! is_array(Config::get("database.connections.{$name}"))) {
+                throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which config/database.php does not declare");
+            }
+
+            self::refusePrefix($map, DB::connection($name), $successor);
+
+            if (self::database(DB::connection($name)) !== self::database($connection)) {
+                throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, which reaches another database than the connection {$connection->getName()} of ".class_basename($legacy).'; the view and its filters read every successor through the connection of '.class_basename($legacy).', so a map reads one database');
+            }
+
+            foreach (self::readTargets($name) as $target) {
+                if ($target !== array_map($connection->getConfig(...), ['driver' => 'driver', 'database' => 'database', 'search_path' => 'search_path'])) {
+                    throw InvalidCompatibilityMap::because($map->table, "{$successor} reads the connection {$name}, whose read configuration reaches another database or search_path than the connection {$connection->getName()} of ".class_basename($legacy).'; the view joins the successors the connection of '.class_basename($legacy).' writes, so the successor model would read other rows than the view serves');
+                }
+            }
+        }
+
+        return $connection;
+    }
+
+    private static function refusePrefix(ResolvedMap $map, Connection $connection, string $reader): void
+    {
+        if ($connection->getTablePrefix() !== '') {
+            throw InvalidCompatibilityMap::because($map->table, "{$reader} reads the connection {$connection->getName()}, which adds the table prefix {$connection->getTablePrefix()}, and the package reads and compiles every table by its unprefixed name; use a connection without a prefix");
+        }
+    }
+
+    /**
+     * @return list<array{driver: mixed, database: mixed, search_path: mixed}>
+     */
+    private static function readTargets(string $name): array
+    {
+        $config = (new ConfigurationUrlParser)->parseConfiguration((array) Config::get("database.connections.{$name}"));
+        $reads = $config['read'] ?? null;
+        $sections = match (true) {
+            ! is_array($reads) => [[]],
+            array_is_list($reads) && $reads !== [] => $reads,
+            default => [$reads],
+        };
+        $base = array_diff_key($config, ['read' => true, 'write' => true]);
+
+        return array_values(array_map(fn (mixed $section) => array_map(
+            fn (string $key) => [...$base, ...(is_array($section) ? $section : [])][$key] ?? null,
+            ['driver' => 'driver', 'database' => 'database', 'search_path' => 'search_path'],
+        ), $sections));
+    }
+
+    /**
+     * @param  Closure(ResolvedMap, ConnectionInterface): Statements  $statements
+     */
+    private static function run(string $model, Closure $statements): void
+    {
+        $map = self::of($model)->resolve();
+        $connection = self::connection($map);
+        try {
+            (new Installer($connection))->compileAndRun($map->tables(), fn () => $statements($map, $connection));
+        } finally {
+            LegacyBuilder::forgetViews();
+        }
+    }
+
+    /**
+     * @return list<mixed>
+     */
+    private static function database(Connection $connection): array
+    {
+        return array_map($connection->getConfig(...), ['driver', 'host', 'port', 'database', 'search_path', 'prefix']);
+    }
+
+    private function invalid(string $problem): InvalidCompatibilityMap
+    {
+        return InvalidCompatibilityMap::because($this->map, $problem);
+    }
+}

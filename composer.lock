@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "91750a1e063a226b0a6e733a3f5cefc3",
+    "content-hash": "cdfcf2efe00c54385932b5e66415c1c3",
     "packages": [
         {
             "name": "brick/math",
@@ -6015,6 +6015,9 @@
                     "php ./vendor/bin/testbench tooling:discover"
                 ]
             },
+            "license": [
+                "MIT"
+            ],
             "authors": [
                 {
                     "name": "Justin Seliga",
@@ -11290,7 +11293,8 @@
     "prefer-lowest": false,
     "platform": {
         "php": "^8.4",
-        "ext-pdo_pgsql": "*"
+        "ext-pdo_pgsql": "*",
+        "ext-mbstring": "*"
     },
     "platform-dev": {},
     "plugin-api-version": "2.9.0"
