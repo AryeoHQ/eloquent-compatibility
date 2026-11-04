@@ -20,6 +20,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Conversions\OrDefault;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\StateMachines\Contracts\StateMachineable;
 
 final class Attribute
 {
@@ -241,6 +242,7 @@ final class Attribute
             $this->writeTo !== null && $this->readAs === null => 'says writeTo(), which inverts readAs(), without readAs()',
             $this->writeTo !== null && $this->column === null => 'says writeTo() without from(), so its inverse has no column to store',
             $this->column === null && $this->fixed === null && $this->readAs === null && $this->external === null => 'names no column; give it from(), fixed(), readAs() or external()',
+            $this->transitions && ! interface_exists(StateMachineable::class) => 'is declared transitions(), which runs a state-machine trigger, and aryeo/eloquent-state-machines is not installed',
             default => null,
         };
 

@@ -7,6 +7,7 @@ namespace Tests\Fixtures\Support\Listings;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Carbon;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -18,8 +19,17 @@ use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
  * @property int $id
  * @property string $uuid
  * @property string $title
+ * @property string $company_id
  * @property null|string $price
  * @property ListingStatus $status
+ * @property null|string $street
+ * @property null|string $city
+ * @property null|float $latitude
+ * @property null|string $mls_number
+ * @property bool $featured
+ * @property null|Carbon $created_at
+ * @property null|Carbon $updated_at
+ * @property null|Carbon $deleted_at
  */
 final class Listing extends Model implements Compatible
 {

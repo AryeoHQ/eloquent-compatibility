@@ -74,4 +74,28 @@ final class ServesCompatibilityTest extends TestCase
         $this->assertSame(['1250.50', ListingStatus::Active, 47.6062, '1 Oak St', true], [$listing->price, $listing->status, $listing->getAttribute('latitude'), $listing->getAttribute('street'), $listing->getAttribute('featured')]);
         $this->assertSame([1, 3], Listing::query()->orderBy('id')->pluck('id')->all());
     }
+
+    #[Test]
+    public function it_writes_the_instance_s_own_insert_update_and_delete_natively_before_install_and_through_the_successor_once_installed(): void
+    {
+        $rows = fn (string $table, string $id, string $title) => DB::table($table)->where($id, '>', 3)->orderBy($id)->get([$id, $title, 'deleted_at'])->map(fn (object $row) => [$row->{$id}, $row->{$title}, $row->deleted_at !== null])->all();
+        $writes = function (string $first, string $second): int {
+            $listing = Listing::query()->create(['title' => $first, 'company_id' => ListingTables::COMPANY]);
+            $listing->update(['title' => "{$first} Hall"]);
+            Listing::query()->create(['title' => $second, 'company_id' => ListingTables::COMPANY])->delete();
+
+            return $listing->id;
+        };
+
+        $native = $writes('Birch', 'Ash');
+        $tableRows = $rows('listings', 'id', 'title');
+        $nativeJobs = DB::table('jobs')->count();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(Listing::class);
+        $translated = $writes('Cedar', 'Fir');
+
+        $this->assertSame([4, [[4, 'Birch Hall', false], [5, 'Ash', true]], 0], [$native, $tableRows, $nativeJobs]);
+        $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('jobs', 'legacy_id', 'name')]);
+    }
 }

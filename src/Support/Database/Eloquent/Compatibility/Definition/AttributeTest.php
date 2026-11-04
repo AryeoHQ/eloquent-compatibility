@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Definition;
 
 use Closure;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -97,6 +98,31 @@ final class AttributeTest extends TestCase
             (new Attribute('listings', 'status'))->from('lifecycle_status')->runsTransitions(),
             (new Attribute('listings', 'status'))->from('lifecycle_status')->transitions()->runsTransitions(),
         ]);
+    }
+
+    #[Test]
+    public function it_refuses_transitions_when_the_state_machine_package_is_absent(): void
+    {
+        $resolve = <<<'PHP'
+            $loader = require $argv[1];
+            $empty = tempnam(sys_get_temp_dir(), 'absent');
+            $loader->addClassMap([Support\Database\Eloquent\StateMachines\Contracts\StateMachineable::class => $empty]);
+
+            try {
+                (new Support\Database\Eloquent\Compatibility\Definition\Attribute('listings', 'status'))->from('lifecycle_status')->transitions()->resolve();
+                echo 'resolved';
+            } catch (Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap $invalid) {
+                echo $invalid->getMessage();
+            } finally {
+                unlink($empty);
+            }
+            PHP;
+
+        $result = Process::run([PHP_BINARY, '-d', 'display_errors=stderr', '-r', $resolve, dirname(__DIR__, 6).'/vendor/autoload.php']);
+
+        $this->assertSame('', $result->errorOutput());
+        $this->assertStringEndsWith("attribute 'status' is declared transitions(), which runs a state-machine trigger, and aryeo/eloquent-state-machines is not installed.", $result->output());
+        $this->assertTrue((new Attribute('listings', 'status'))->from('lifecycle_status')->transitions()->resolve()->runsTransitions());
     }
 
     #[Test]

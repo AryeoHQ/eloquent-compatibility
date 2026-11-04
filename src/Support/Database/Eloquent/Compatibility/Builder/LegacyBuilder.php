@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
@@ -21,6 +22,8 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
+use WeakMap;
 
 /**
  * @template TModel of Model
@@ -37,6 +40,15 @@ final class LegacyBuilder extends Builder
     /** @var array<string, ColumnCatalog> */
     private static array $catalogs = [];
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $inserts = null;
+
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $deletes = null;
+
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $restores = null;
+
     /** @var array<string, true> */
     private static array $tables = [];
 
@@ -44,6 +56,8 @@ final class LegacyBuilder extends Builder
     private static array $collations = [];
 
     private int $negations = 0;
+
+    private null|Model $writeOf = null;
 
     /** @var null|array{schema: string, view: bool, readable: bool} */
     private null|array $relation = null;
@@ -53,6 +67,172 @@ final class LegacyBuilder extends Builder
         self::$catalogs = [];
         self::$tables = [];
         self::$collations = [];
+    }
+
+    public static function insertOf(Model $model): void
+    {
+        $inserts = self::$inserts ??= new WeakMap;
+        $inserts[$model] = true;
+    }
+
+    public static function takeInsertOf(Model $model): bool
+    {
+        $inserts = self::$inserts ??= new WeakMap;
+        $inserting = $inserts->offsetExists($model);
+        $inserts->offsetUnset($model);
+
+        return $inserting;
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $delete
+     * @return TResult
+     */
+    public static function deleting(Model $model, Closure $delete): mixed
+    {
+        $deletes = self::$deletes ??= new WeakMap;
+        $deletes[$model] = true;
+
+        try {
+            return $delete();
+        } finally {
+            $deletes->offsetUnset($model);
+        }
+    }
+
+    public static function restoreOf(Model $model): void
+    {
+        $restores = self::$restores ??= new WeakMap;
+        $restores[$model] = true;
+    }
+
+    public static function forgetRestoreOf(Model $model): void
+    {
+        self::$restores?->offsetUnset($model);
+    }
+
+    public static function serves(Model $model): bool
+    {
+        return $model->getConnection()->scalar('select relkind::text from pg_class where oid = to_regclass(?)', [SqlFragments::identifier($model->getTable())], false) === 'v';
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function mapOf(string $model): ResolvedMap
+    {
+        return self::$maps[$model] ??= Compatibility::of($model)->resolve();
+    }
+
+    public function writeOf(Model $model): void
+    {
+        $this->writeOf = $model;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     */
+    public function insert(array $values): bool
+    {
+        $model = $this->ownInsert();
+
+        if ($model === null) {
+            return $this->toBase()->insert($values);
+        }
+
+        $this->writer()->insert($model, $values);
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @param  null|string  $sequence
+     */
+    public function insertGetId(array $values, $sequence = null): int|string
+    {
+        $model = $this->ownInsert();
+
+        return $model === null ? $this->toBase()->insertGetId($values, $sequence) : $this->writer()->insert($model, $values);
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     */
+    public function update(array $values): int
+    {
+        $model = $this->ownWrite();
+
+        if ($model === null) {
+            return parent::update($values);
+        }
+
+        $restoring = self::$restores?->offsetExists($model) ?? false;
+        self::forgetRestoreOf($model);
+
+        return $this->writer()->update($model, $values, self::$deletes?->offsetExists($model) ?? false, $restoring);
+    }
+
+    public function delete(): mixed
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::delete() : $this->writer()->delete($model);
+    }
+
+    public function forceDelete(): mixed
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? parent::forceDelete() : $this->writer()->delete($model);
+    }
+
+    /**
+     * @param  Expression|string  $column
+     * @param  float|int  $amount
+     * @param  array<string, mixed>  $extra
+     */
+    public function increment($column, $amount = 1, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null || ! is_string($column) ? parent::increment($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount], $extra);
+    }
+
+    /**
+     * @param  Expression|string  $column
+     * @param  float|int  $amount
+     * @param  array<string, mixed>  $extra
+     */
+    public function decrement($column, $amount = 1, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null || ! is_string($column) ? parent::decrement($column, $amount, $extra) : $this->incrementOwn($model, [$column => $amount * -1], $extra);
+    }
+
+    /**
+     * @param  array<string, float|int|numeric-string>  $columns
+     * @param  array<string, mixed>  $extra
+     */
+    public function incrementEach(array $columns, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? $this->toBase()->incrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, $columns, $extra);
+    }
+
+    /**
+     * @param  array<string, float|int|numeric-string>  $columns
+     * @param  array<string, mixed>  $extra
+     */
+    public function decrementEach(array $columns, array $extra = []): int
+    {
+        $model = $this->ownWrite();
+
+        return $model === null ? $this->toBase()->decrementEach($columns, $this->addUpdatedAtColumn($extra)) : $this->incrementOwn($model, array_map(fn (float|int|string $amount) => $amount * -1, $columns), $extra);
     }
 
     /**
@@ -585,6 +765,41 @@ final class LegacyBuilder extends Builder
         return $this->map()->attributes[$attribute];
     }
 
+    private function ownInsert(): null|Model
+    {
+        return self::takeInsertOf($this->model) && $this->servesTheView() ? $this->model : null;
+    }
+
+    /**
+     * @param  array<string, float|int|numeric-string>  $amounts
+     * @param  array<string, mixed>  $extra
+     */
+    private function incrementOwn(Model $model, array $amounts, array $extra): int
+    {
+        $values = [];
+
+        foreach ($this->addUpdatedAtColumn($extra) as $name => $value) {
+            $values[Str::afterLast((string) $name, '.')] = $value;
+        }
+
+        return $this->writer()->increment($model, $amounts, $values);
+    }
+
+    private function ownWrite(): null|Model
+    {
+        return $this->writeOf !== null && $this->servesTheView() ? $this->writeOf : null;
+    }
+
+    private function writer(): RecordWriter
+    {
+        return new RecordWriter($this->map(), $this->model->getConnection());
+    }
+
+    private function servesTheView(): bool
+    {
+        return self::serves($this->model);
+    }
+
     /**
      * @return array{schema: string, view: bool, readable: bool}
      */
@@ -616,7 +831,7 @@ final class LegacyBuilder extends Builder
 
     private function map(): ResolvedMap
     {
-        return self::$maps[$this->model::class] ??= Compatibility::of($this->model::class)->resolve();
+        return self::mapOf($this->model::class);
     }
 
     private function refuse(string $attribute, string $operation, string $because): CompatibilityQueryRefused
