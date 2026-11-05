@@ -46,11 +46,19 @@ Under its lock, after the final pass, the NULL-key probe and the insert of retai
 ALTER TABLE listings_retained ADD CONSTRAINT listings_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
 ```
 
-The check needs no scan, and it checks every later insert and update. Install runs no `SET NOT NULL`, which would scan the whole table under the lock. Prepare does not add the check: a `NOT VALID` check still applies to new rows, and before install the legacy model inserts natively with a NULL key that a pass fills later. Every such insert would fail with `23514`. This differs from the page's earlier recommendation, which left the key nullable and relied on the probe alone.
+The check needs no scan, and it checks every later insert and update. Install runs no `SET NOT NULL`, which would scan the whole table under the lock. Prepare does not add the check: a `NOT VALID` check still applies to new rows, and before install the legacy model inserts natively with a NULL key that a pass fills later. Every such insert would fail with `23514`. Declined: a nullable key that relies on the probe alone.
 
 Rollback mirrors install. Before it renames the retained table back, it drops the check, because native legacy inserts with a NULL key resume after a rollback.
 
 `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key.
+
+## The updated-at index
+
+`prepare()` creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today. Each pass then finds the rows at or after its lower bound without a scan.
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "listings_updated_at_index" ON "listings" ("updated_at");
+```
 
 ## The position index
 

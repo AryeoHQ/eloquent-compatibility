@@ -2,7 +2,7 @@
 
 ## Context
 
-The m4 milestone shipped two-primary maps. `servedFrom()` took a chooser and a builder of several successors, and BranchMove moved a record from one primary successor to the other.
+An earlier release shipped two-primary maps. `servedFrom()` took a chooser and a builder of several successors, and BranchMove moved a record from one primary successor to the other.
 
 Legacy identity now stays on the legacy table, and the retained table holds the key of one root ([0018](0018-legacy-identity-stays-on-the-legacy-table.md)).
 

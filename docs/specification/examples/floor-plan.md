@@ -29,11 +29,11 @@ final class FloorPlanMap
             ->retainedIn('floorplans_retained')
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'type', operator: '=', value: 'floorplan'))
-                ->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
-                ->attribute(name: 'updated_at', definition: fn (Attribute $a) => $a->from('updated_at')->inTimeZone('UTC'))
-                ->attribute(name: 'deleted_at', definition: fn (Attribute $a) => $a->from('deleted_at')->inTimeZone('UTC'))
-                ->attribute(name: 'index', definition: fn (Attribute $a) => $a->position(legacyWithin: 'listing_id'))
-                ->attribute(name: 'display_type', definition: fn (Attribute $a) => $a
+                ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
+                ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at')->inTimeZone('UTC'))
+                ->attribute(name: 'deleted_at', definition: fn (Attribute $attribute) => $attribute->from('deleted_at')->inTimeZone('UTC'))
+                ->attribute(name: 'index', definition: fn (Attribute $attribute) => $attribute->position(legacyWithin: 'listing_id'))
+                ->attribute(name: 'display_type', definition: fn (Attribute $attribute) => $attribute
                     ->readAs('CASE WHEN "asset_files"."displays_on_property_websites" THEN "asset_files"."display_type" ELSE \'none\' END')
                     ->writtenBy(WriteDisplayType::class))
                 ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
@@ -63,18 +63,26 @@ After install, a `position()` attribute reads the successor's position, not the 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
 
-Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install.
+Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install. A trashed row reads a NULL `index` after install, because a trashed record has no position.
 
 ## The operations
 
-`WriteDisplayType` writes one legacy value into two successor columns. `'none'` means the File is not displayed, and v2 has no `'none'` display type.
+`WriteDisplayType` writes one legacy value into two columns of the File. `'none'` means the File is not displayed, and v2 has no `'none'` display type. The operation branches on the morph target `choose:` picks. A Link has no display type, so a Link floor plan accepts only `'none'`, and refuses any other value. A File target may not exist yet on a create, so the operation reaches it with `relatedOrNew()`.
 
 ```php
 final class WriteDisplayType implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $file = $successors->related(File::class);
+        if ($change->record->url !== null) {
+            if ($value === 'none') {
+                return;
+            }
+
+            throw Refusal::because('A Link floor plan has no display type.');
+        }
+
+        $file = $successors->relatedOrNew(File::class);
         $file->displays_on_property_websites = $value !== 'none';
 
         if ($value !== 'none') {
@@ -100,32 +108,46 @@ final class InitializeFloorPlanAsset implements InitializesSuccessors
 }
 ```
 
-`InitializeLegacyFloorPlan` runs the other way. It derives the legacy-only NOT NULL `listing_id` from the successor graph: the asset's Place, that Place's Job, and the listing whose `job_id` is that Job, as decision 5 states. It never reads the stored `listings.place_id`, which goes stale when v2 moves a Job to another Place.
+`InitializeLegacyFloorPlan` runs the other way. It derives the legacy-only NOT NULL `listing_id` from the successor graph: the asset's Place, that Place's Job, and the listing whose `job_id` is that Job. It resolves each one with `withTrashed()`, so a trashed Place, Job or listing still answers. When one is missing, it refuses and names the asset's key. It never reads the stored `listings.place_id`, which goes stale when v2 moves a Job to another Place.
 
 ```php
 final class InitializeLegacyFloorPlan implements InitializesLegacy
 {
     public function initialize(Successors $successors, Creation $creation): void
     {
-        $job = $successors->root()->place->job;
-        $creation->record->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
+        $asset = $successors->root();
+        $place = $asset->place()->withTrashed()->first()
+            ?? throw Refusal::because("Floor plan asset {$asset->getKey()} has no Place.");
+        $job = $place->job()->withTrashed()->first()
+            ?? throw Refusal::because("Floor plan asset {$asset->getKey()} has no Job.");
+        $creation->record->listing_id = Listing::withTrashed()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id')
+            ?? throw Refusal::because("Floor plan asset {$asset->getKey()} has no listing.");
     }
 }
 ```
+
+Under install's lock, install catches nothing from an initializer. A `Refusal` from `legacyInitializedBy()` there aborts install, and names the asset's key and the reason ([Operations: native successors before install](../operations.md#native-successors-before-install)).
+
+FloorPlan and Photo install after Listing. Before Listing installs, a Job created natively has no listing row, so a media install would find no listing for that Job's assets and abort.
 
 ## Photos
 
 `Photo` is served from `PlaceAsset` the same way, with the membership `type = 'photo'`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
 
-`InitializeLegacyPhoto` derives `photos.listing_id` through the asset's Place, that Place's Job, and `listings.job_id`, as decision 5 states.
+`InitializeLegacyPhoto` derives `photos.listing_id` through the asset's Place, that Place's Job, and `listings.job_id`. It resolves each one with `withTrashed()`, and refuses with the asset's key when one is missing.
 
 ```php
 final class InitializeLegacyPhoto implements InitializesLegacy
 {
     public function initialize(Successors $successors, Creation $creation): void
     {
-        $job = $successors->root()->place->job;
-        $creation->record->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
+        $asset = $successors->root();
+        $place = $asset->place()->withTrashed()->first()
+            ?? throw Refusal::because("Photo asset {$asset->getKey()} has no Place.");
+        $job = $place->job()->withTrashed()->first()
+            ?? throw Refusal::because("Photo asset {$asset->getKey()} has no Job.");
+        $creation->record->listing_id = Listing::withTrashed()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id')
+            ?? throw Refusal::because("Photo asset {$asset->getKey()} has no listing.");
     }
 }
 ```

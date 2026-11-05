@@ -6,7 +6,7 @@ Status: Proposed
 
 ## The tables
 
-`listings` has `id integer` and `uuid uuid NOT NULL`. The uuid has no default: Aryeo generates it with `Listing::makeUuid()`. The package fills it on a native create through `Listing::newUniqueId()` when `Listing` defines it. Otherwise `InitializeLegacyListing` must set it, or the map does not compile.
+`listings` has `id integer` and `uuid uuid NOT NULL`. The uuid has no default: Aryeo generates it with `Listing::makeUuid()`. `Listing` does not override `newUniqueId()`, so the package allocates no uuid, and `InitializeLegacyListing` sets it. An initializer that omits `uuid` still compiles, because declaring `legacyInitializedBy()` counts as initializing the column. `assertServesCompatibility()` runs a native create, which catches the omission with a NOT NULL violation.
 
 `listings` also has `job_id`, `place_id` and `job_site_id`, all `uuid`, and `address_id bigint`. `job_id` already references `jobs.id`, so it becomes the successor key. `place_id`, `job_site_id` and `address_id` are mapped attributes, read from the related rows. After install, the table is `listings_retained`.
 
@@ -38,26 +38,26 @@ final class ListingMap
         return $listing
             ->retainedIn('listings_retained')
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
-                ->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
-                ->attribute(name: 'updated_at', definition: fn (Attribute $a) => $a->from('updated_at')->inTimeZone('UTC'))
-                ->attribute(name: 'deleted_at', definition: fn (Attribute $a) => $a->from('deleted_at')->inTimeZone('UTC'))
-                ->attribute(name: 'company_id', definition: fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.'))
-                ->attribute(name: 'is_draft', definition: fn (Attribute $a) => $a
+                ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
+                ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at')->inTimeZone('UTC'))
+                ->attribute(name: 'deleted_at', definition: fn (Attribute $attribute) => $attribute->from('deleted_at')->inTimeZone('UTC'))
+                ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.'))
+                ->attribute(name: 'is_draft', definition: fn (Attribute $attribute) => $attribute
                     ->readAs('"jobs"."lifecycle_status" = \'draft\'')
                     ->writtenBy(PublishOrDraftJob::class))
-                ->attribute(name: 'downloads_enabled', definition: fn (Attribute $a) => $a
+                ->attribute(name: 'downloads_enabled', definition: fn (Attribute $attribute) => $attribute
                     ->from(column: 'are_customer_downloads_enabled')
                     ->orFrom(successor: ListingCompatibilityState::class, column: 'downloads_enabled_fallback')
                     ->writtenBy(SetDownloadsPermission::class))
                 ->related(fn (Job $job) => $job->listingCompatibilityState())
                 ->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-                    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
+                    ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
                     ->related(relation: fn (Place $place) => $place->address()->withTrashed(), successor: fn (Successor $address) => $address
-                        ->attribute(name: 'address_id', definition: fn (Attribute $a) => $a
+                        ->attribute(name: 'address_id', definition: fn (Attribute $attribute) => $attribute
                             ->from(column: 'id')
                             ->writtenBy(ChangeListingAddress::class))))
                 ->related(relation: fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
-                    ->attribute(name: 'job_site_id', definition: fn (Attribute $a) => $a->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.'))))
+                    ->attribute(name: 'job_site_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.'))))
             ->successorsInitializedBy(InitializeListingJob::class)
             ->legacyInitializedBy(InitializeLegacyListing::class)
             ->writesWithin(ListingWriteScope::class)
@@ -108,7 +108,7 @@ final class SetDownloadsPermission implements WritesAttribute
 }
 ```
 
-`ChangeListingAddress` is a compound change. It stages assignments on related successors, which it references by class. A NULL address deletes the Place and the JobSite. An address without valid coordinates deletes the JobSite.
+`ChangeListingAddress` is a compound change. It stages assignments on related successors, which it references by class. A listing keeps its address, so a NULL address refuses. An address without valid coordinates deletes the JobSite.
 
 ```php
 final class ChangeListingAddress implements WritesAttribute
@@ -116,10 +116,7 @@ final class ChangeListingAddress implements WritesAttribute
     public function write(Successors $successors, mixed $value, Change $change): void
     {
         if ($value === null) {
-            $successors->deleteRelated(Place::class);
-            $successors->deleteRelated(JobSite::class);
-
-            return;
+            throw Refusal::because('A listing keeps its address.');
         }
 
         $address = Address::withTrashed()->findOrFail($value);
@@ -151,13 +148,14 @@ final class InitializeListingJob implements InitializesSuccessors
 }
 ```
 
-`InitializeLegacyListing` runs the other way. `Job` carries `Provides\CarriesLegacy`, so from install onward a Job created natively becomes a listing. `Creation::$record` is the new listing. The package allocates `listings.id` from the listing sequence and the uuid through `Listing::newUniqueId()`, and sets `job_id`. The class sets the title.
+`InitializeLegacyListing` runs the other way. `Job` carries `Provides\CarriesLegacy`, so from install onward a Job created natively becomes a listing. `Creation::$record` is the new listing. The package allocates `listings.id` from the listing sequence, and sets `job_id`. The class sets the uuid through `Listing::makeUuid()`, and the title. An initializer that omits `uuid` compiles, and `assertServesCompatibility()`'s native create catches it with a NOT NULL violation.
 
 ```php
 final class InitializeLegacyListing implements InitializesLegacy
 {
     public function initialize(Successors $successors, Creation $creation): void
     {
+        $creation->record->uuid = Listing::makeUuid();
         $creation->record->title = $successors->root()->name;
     }
 }

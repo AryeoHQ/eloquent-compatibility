@@ -28,7 +28,7 @@ The worked examples keep the map in its own class, `ListingMap`, beside the oper
 
 ```php
 ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
-    ->attribute(name: 'company_id', definition: fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.')))
+    ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.')))
 ```
 
 Listing adopts its existing `job_id` column as the successor key. FloorPlan names `place_asset_id`, a column that `prepare()` adds and the backfill fills.
@@ -42,11 +42,11 @@ Only the root has a successor key. A related successor is reached through the ro
 Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
 
 - `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
-- `position(legacyWithin:)` reads the row's one-based position through eloquent-ordering's published position expression for the successor. `legacyWithin` names the legacy parent column, such as `floorplans.listing_id`. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. The plan's work item "Serve reads from the retained table with plain joins" implements both. [Operations: positions](operations.md#positions) states the conversion.
+- `position(legacyWithin:)` reads the row's one-based position through eloquent-ordering's published position expression for the successor. `legacyWithin` names the legacy parent column, such as `floorplans.listing_id`. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. [Operations: positions](operations.md#positions) states the conversion.
 
 ```php
-->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
-->attribute(name: 'downloads_enabled', definition: fn (Attribute $a) => $a
+->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
+->attribute(name: 'downloads_enabled', definition: fn (Attribute $attribute) => $attribute
     ->from(column: 'are_customer_downloads_enabled')
     ->orFrom(successor: ListingCompatibilityState::class, column: 'downloads_enabled_fallback')
     ->writtenBy(SetDownloadsPermission::class))
@@ -63,7 +63,7 @@ The conversions stay the package's own. An application cannot add one, because t
 ```php
 ->related(fn (Job $job) => $job->listingCompatibilityState())
 ->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id'))
+    ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id'))
     ->related(fn (Place $place) => $place->address()->withTrashed()))
 ```
 
@@ -107,7 +107,7 @@ Every hook is optional, and a map declares each hook at most once. Without `writ
 
 The other closures a map holds stay closures. They are `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`. Each one selects rows, picks a class or computes a value, and none of them writes. The five hooks are the places where application behavior runs inside the package's transaction.
 
-The classes live in the consumer's entity namespace plus `\Compatibility`. This is a documented convention, and no tool checks it. Aryeo's is `App\Entities\<Plural>\Compatibility`, whether or not the model itself lives there. The worked examples therefore place the classes of `App\Entities\Listings\Listing` under `App\Entities\Listings\Compatibility`. This amends decision 5 of the plan, which said `<model namespace>\Compatibility`. It differs from the page's earlier recommendation, which replaced a final `Models` segment with `Compatibility`.
+The classes live in the consumer's entity namespace plus `\Compatibility`. This is a documented convention, and no tool checks it. Aryeo's is `App\Entities\<Plural>\Compatibility`, whether or not the model itself lives there. The worked examples therefore place the classes of `App\Entities\Listings\Listing` under `App\Entities\Listings\Compatibility`. Declined: the model's own namespace plus `\Compatibility`.
 
 ## Hide, guard and forwarding
 

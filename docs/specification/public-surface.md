@@ -4,9 +4,9 @@ Status: Proposed
 
 A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
-Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow the plan's declared layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, and `Targets` in `Definition\`. A different namespace is a deviation from the plan, and it needs a plan edit before this page changes.
+Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, and `Targets` in `Definition\`. A different namespace is a deviation under [Deviations](README.md#deviations).
 
-Every parameter of a public constructor, function or method on this page is public, named and stable. A release may not rename one. The worked examples name every argument of a call that takes more than one value, and a variadic unpack stays positional. This differs from the page's earlier recommendation, which published only the names the examples used.
+Every parameter of a public constructor, function or method on this page is public, named and stable. A release may not rename one. The worked examples name every argument of a call that takes more than one value, and a variadic unpack stays positional.
 
 ## Classes
 
@@ -88,8 +88,8 @@ Every method returns the `Compatibility` it was called on.
 - `retainedIn(key:)`: the successor key moves to `servedFrom(key:)`.
 - `writeTo()`, `transitions()` and the write closure of `external()`: `writtenBy()` replaces them.
 - `servedFrom(choose:, successors:)`: two-primary maps are retired.
-- `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. The plan's work item "Keep legacy identity on the legacy table" settles this. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
-- `timestamps()`: every worked map declares `created_at` and `updated_at` as plain attributes. This differs from the page's earlier recommendation, which kept `timestamps()` as a shortcut.
+- `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
+- `timestamps()`: every worked map declares `created_at` and `updated_at` as plain attributes. Declined: keeping `timestamps()` as a shortcut.
 - `Definition\Successors` and the `successors:` parameter: `Definition\Targets` and `targets:` replace them.
 
 ## Operations
@@ -97,26 +97,26 @@ Every method returns the `Compatibility` it was called on.
 | Method | Does |
 | :-- | :-- |
 | `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's constraints, creates the backfill tables, and lists the objects that depend on the legacy table |
-| `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, ?CarbonInterval $margin = null): void` | runs passes until one walks fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; a null `$margin` means 5 minutes |
+| `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, null\|CarbonInterval $margin = null): void` | runs passes until one changes the outcome of fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; `$statementTimeout` sets `statement_timeout` for every statement under install's lock, and is the total budget for the lock hold, after which install rolls back and refuses, naming the step it reached; a null `$margin` means 5 minutes |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
 | `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers; refuses while any object depends on either |
 | `Compatibility::update(class-string<Model> $model): void` | rebuilds an installed view after a map change |
 | `Compatibility::serves(class-string<Model> $model): bool` | answers whether the legacy name is the installed view on the model's connection |
 
-`prepare()`, `install()`, `rollback()` and `retire()` are idempotent, as the plan's work item "Keep legacy identity on the legacy table" settles. [Lifecycle](lifecycle.md) states what each one runs.
+`prepare()`, `install()`, `rollback()` and `retire()` are idempotent. [Lifecycle](lifecycle.md) states what each one runs.
 
 `Compatibility::rollback()` replaces `Compatibility::uninstall()`. The package has no public `Compatibility::state()`.
 
-`Compatibility::update()` replaces `recompile()` under a new name, and stays public. A migration that ships a map change after install calls it. The page's earlier recommendation kept the name `recompile()`.
+`Compatibility::update()` replaces `recompile()` under a new name, and stays public. A migration that ships a map change after install calls it.
 
-`Compatibility::serves()` is for transitional application code that bypasses the legacy model. It takes a class string and constructs the model internally to resolve its connection and table, as every other operation does. A connection or table set on one instance at runtime is not supported, as for every other operation. This differs from the page's earlier recommendation, which took a model instance. Its answer can change around an install. It is stable only inside a transaction, so never cache it across requests.
+`Compatibility::serves()` is for transitional application code that bypasses the legacy model. It takes a class string and constructs the model internally to resolve its connection and table, as every other operation does. A connection or table set on one instance at runtime is not supported, as for every other operation. Declined: taking a model instance. Its answer can change around an install. It is stable only inside a transaction, so never cache it across requests.
 
 ## Commands
 
 | Command | Does |
 | :-- | :-- |
-| `compatibility:backfill {model} {--chunk=} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
-| `compatibility:check {--model=*} {--limit=}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, and trashed rows separately |
+| `compatibility:backfill {model} {--chunk=1000} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
+| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, and trashed rows separately |
 | `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
 | `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names; a backfilling model also shows its pass count, its watermark, and its refused and failed counts |
 | `compatibility:cache` | discovers the served models and caches the list |
@@ -124,9 +124,9 @@ Every method returns the `Compatibility` it was called on.
 
 `compatibility:backfill` takes no `--since`, because `compatibility_backfills` stores the watermark. `--margin` is in seconds. The command takes no pass size, because a pass size only sets `install()`'s stop condition, and the command runs one pass.
 
-The package has no configuration of its own. Each tuning value is a named argument of the operation that uses it. `install()` requires `statementTimeout:`, because the hold budget depends on each application's tolerance. This differs from the lifecycle page's earlier recommendation, which kept the values in package configuration keys.
+The package has no configuration of its own. Each tuning value is a named argument of the operation that uses it. `install()` requires `statementTimeout:`, because the hold budget depends on each application's tolerance. Declined: package-wide configuration keys.
 
-`compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed. This differs from the page's earlier recommendation, which kept `--for=` and the name `recompile`.
+`compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed.
 
 `compatibility:sql install` also prints each lock install takes, with its mode and table. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
 

@@ -8,7 +8,7 @@ This specification states the public interface of the redesigned package, before
 
 `Status: Proposed` means that the code does not implement this design yet. `bin/check-doc-names.php` skips every document whose first non-empty line is `Status: Proposed`. These pages can therefore name classes and methods that do not exist yet, such as `Compatibility::rollback()` and `Contracts\WritesAttribute`.
 
-The last implementation change flips every page to `Status: Accepted`. From then on, the checker verifies every name the specification cites.
+The last implementation change flips every page to `Status: Accepted`. From then on, the checker verifies the class names and `Class::member` names in inline code spans outside fenced blocks. The flip to Accepted must reword or allowlist each span that names a removed or external symbol.
 
 ## Deviations
 

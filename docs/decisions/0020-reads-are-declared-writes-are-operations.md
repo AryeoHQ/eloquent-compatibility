@@ -24,21 +24,21 @@ The map's read half declares each attribute's projection. Every legacy write int
 
 The package runs a write as a unit of work. It opens its own transaction, calls the write scope inside it, locks the record's successors parents first, and runs every changed attribute's operation in declaration order. It saves each changed successor once, applies deletions, and runs the queued after-save actions. It then reads the record back through the view and forwards one legacy event.
 
-This is the order decision 5 of the plan names. The scope runs inside the package's transaction, so its parent locks hold until the package's work commits, and a scope needs no transaction of its own.
+The scope runs inside the package's transaction, so its parent locks hold until the package's work commits, and a scope needs no transaction of its own.
 
 After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it.
 
 A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only.
 
-A mass write makes one unlocked read of every record's successors, then one scope call with all their keys. It then locks and re-checks once, and runs the remaining steps once per record. It forwards no legacy event, and successor events still fire. This amends decision 5 of the plan, which forwarded one legacy event sequence per record on the mass path. Declined: per-record legacy events on a mass write, which Eloquent's own mass writes never fire.
+A mass write makes one unlocked read of every record's successors, then one scope call with all their keys. It then locks and re-checks once, and runs the remaining steps once per record. It forwards no legacy event, and successor events still fire. This amends the earlier design, which forwarded one legacy event sequence per record on the mass path. Declined: per-record legacy events on a mass write, which Eloquent's own mass writes never fire.
 
 `successorsInitializedBy()` sets only successor-only values set once at birth, and values derived from history. `legacyInitializedBy()` covers the reverse: a native successor create. Both are optional.
 
 An operation receives the change context: the record after the write, the original, the attribute and the origin. The original is a legacy model instance, empty on a create. During catch-up, the original is the record as the successors serve it before the pass writes, read through the view's compiled `SELECT`. An initializer receives a creation context instead, Write\Creation, with the record and the origin. On a native create, its record is the new legacy model, so the legacy initializer takes no separate legacy parameter. Declined: the change context with a null attribute and an empty original.
 
-Two projection helpers cover the common reads, as decision 13 of the plan states. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position(legacyWithin:)` reads eloquent-ordering's published position expression, and its default operation moves the row. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
+Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position(legacyWithin:)` reads eloquent-ordering's published position expression, and its default operation moves the row. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
 
-A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. The plan's work item "Serve reads from the retained table with plain joins" implements both, as decision 13 of the plan states.
+A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row.
 
 `prepare()` refuses a `position()` attribute without its position index on the legacy table.
 
@@ -46,9 +46,9 @@ When `choose:` picks another target class for a record, the package moves the mo
 
 The backfill's round-trip check reads through the view's compiled `SELECT`, filtered to the record's key, because no view exists before install. Declined: skipping the check before install.
 
-The root's soft-delete column and a successor's updated-at column have default operations of their own, as decision 16 of the plan states. A change of the soft-delete column queues `delete()` or `restore()` after the saves. A legacy record delete runs the root's `forceDelete()` as its own step, after the lock and in place of the assignments, the saves, the actions and the round-trip check. An assigned updated-at column survives the after-save actions, because the package runs them under `Model::withoutTimestampsOn()` for that successor. Declined: plain assignment of the soft-delete column.
+The root's soft-delete column and a successor's updated-at column have default operations of their own. A change of the soft-delete column queues `delete()` or `restore()` after the saves. A legacy record delete runs the root's `forceDelete()` as its own step, after the lock and in place of the assignments, the saves, the actions and the round-trip check. An assigned updated-at column survives the after-save actions, because the package runs them under `Model::withoutTimestampsOn()` for that successor. Declined: plain assignment of the soft-delete column.
 
-`delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to decision 2 of the plan, because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
+`delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to the rule that every package path writes a successor through its model ([0017](0017-successors-are-written-through-their-models.md)), because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
 
 Declined: a complete column specification, and one adapter class per legacy model.
 
@@ -61,5 +61,5 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
 - A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live rows of its legacy parent.
-- A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so decision 2 of the plan holds on the delete path, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
+- A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

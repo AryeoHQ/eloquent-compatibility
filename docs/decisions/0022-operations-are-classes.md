@@ -12,7 +12,7 @@ The map already accepts closures for its declarations, and refuses a closure tha
 
 The package resolves each operation and hook class from the container, so a constructor can take dependencies. Declined: `new` with no arguments.
 
-The classes live in the consumer's entity namespace plus a final Compatibility segment, as a documented convention that no tool checks. Aryeo's is App\Entities\<Plural>\Compatibility. This amends decision 5 of the plan, which said `<model namespace>\Compatibility`.
+The classes live in the consumer's entity namespace plus a final Compatibility segment, as a documented convention that no tool checks. Aryeo's is App\Entities\<Plural>\Compatibility. This amends the earlier design, which placed the classes in the model's own namespace plus a final Compatibility segment.
 
 The other closures in a map stay closures: `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`. Each one selects rows, picks a class or computes a value, and none of them writes.
 

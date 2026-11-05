@@ -12,7 +12,7 @@ The view reads from the retained table, and joins the root on the successor key:
 
 - A related successor is a plain `LEFT JOIN` where the database proves at most one row: a BelongsTo, or a HasOne over a unique index.
 - Only a degrade HasOne keeps `LATERAL ... LIMIT 1`.
-- A `readOnly()` attribute's default operation refuses on an update. On a create, it assigns the inverse, but only into a successor row this create creates, such as a new Job's `company_id`. This amends decision 10 of the plan, which said that no path ever writes it. Declined: dropping `readOnly()` for a `writtenBy()` operation that assigns on a create and refuses on an update.
+- A `readOnly()` attribute's default operation refuses on an update. On a create, it assigns the inverse, but only into a successor row this create creates, such as a new Job's `company_id`. This amends the earlier design, which said that no path ever writes it. Declined: dropping `readOnly()` for a `writtenBy()` operation that assigns on a create and refuses on an update.
 - The view serves an added successor key, such as `place_asset_id`, as it serves `job_id`, so the legacy model's attributes stay the same across install.
 - `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
 
