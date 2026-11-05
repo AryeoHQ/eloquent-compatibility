@@ -29,7 +29,7 @@ Every parameter of a public constructor, function or method on this page is publ
 | `Write\Creation` | class | the context an initializer receives |
 | `Write\Origin` | enum | whether a write is live or comes from the backfill |
 | `Write\Refusal` | exception | refuses one write or one backfill row, and extends `Exceptions\CompatibilityException` |
-| `Events\WriteIgnored` | event | a discarded non-NULL write to a `readOnly()` attribute declared with `ignoreWrites: true`; it carries `record`, the legacy model, and `attribute`, `value` and `origin` |
+| `Events\WriteIgnored` | event | a discarded non-NULL write to a `readOnly()` attribute declared with `ignoreWrites: true`; its constructor is `__construct(Change $change, mixed $value)` |
 | `Exceptions\CompatibilityException` | abstract class | the one public base of every package exception |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
 
@@ -63,7 +63,7 @@ Every method returns the `Compatibility` it was called on.
 | `related(Closure $relation, null\|Closure $successor = null)` | a related successor: the closure returns its Eloquent relation, and `successor:` defines it |
 | `relatedMorph(Closure $relation, Closure $choose, Closure $targets)` | a `MorphTo`, the closure that picks its target class, and the targets over a `Definition\Targets` |
 | `atMostOne(string $because)` | a write refuses a second related row, with the reason; the view still uses a lateral join unless a unique index proves the relation |
-| `when(Closure $scope)` | membership: which successor rows the legacy model serves |
+| `when(Closure $scope)` | membership: which natively created successor rows gain a legacy row |
 
 ### `Definition\Attribute`
 
@@ -72,13 +72,11 @@ Every method returns the `Compatibility` it was called on.
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
 | `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
-| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](operations.md#positions)) |
+| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order ([Operations: positions](operations.md#positions)) |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
-| `readOnly(string $because, bool $ignoreWrites)` | an attribute no write changes, and the reason; `$ignoreWrites` has no default. With `false`, an update refuses, and on a create the default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, a backfill pass never writes it, and the round trip never compares it. With `true`, every path accepts and discards a write, and never compares the attribute; a create still assigns the inverse into a row it creates; each discarded non-NULL write dispatches `Events\WriteIgnored` ([Operations: read-only attributes](operations.md#read-only-attributes)) |
-| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor; it cannot be filtered or sorted in SQL; it has no inverse, so `writtenBy()` or `readOnly()` must name its operation |
-
-An attribute with no inverse that declares neither `writtenBy()` nor `readOnly()` fails map compilation.
+| `readOnly(string $because, bool $ignoreWrites)` | an attribute no write changes, and the reason; `$ignoreWrites` has no default: `false` refuses an update, and `true` discards the write and dispatches `Events\WriteIgnored` ([Operations: read-only attributes](operations.md#read-only-attributes)) |
+| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor. `$read` is `Closure(Collection<array-key, Model>): array<array-key, mixed>`: it receives the successors the attribute sits under, once per query, and returns their values keyed by successor key. The value cannot be filtered or sorted in SQL. It has no inverse, so `writtenBy()` or `readOnly()` must name its operation |
 
 Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: counting writes since `prepare()` to gate install, because the legacy column is live storage until install, so that count never reaches zero ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 
@@ -102,7 +100,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 
 | Method | Does |
 | :-- | :-- |
-| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's unique constraint, creates the backfill tables, and lists the objects that depend on the legacy table |
+| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's unique constraint, creates the backfill tables, inserts the model's `compatibility_backfills` row, and lists the objects that depend on the legacy table |
 | `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, null\|CarbonInterval $margin = null): void` | runs passes until one changes the outcome of fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; `$statementTimeout` sets `statement_timeout` for every statement under install's lock, and is the total budget for the lock hold, after which install rolls back and refuses, naming the step it reached; a null `$margin` means 5 minutes |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
 | `Compatibility::retire(class-string<Model> $model): void` | drops the view, the retained table and `<legacy>_backfill` once a legacy model has no readers; refuses while any object depends on either |
@@ -140,13 +138,16 @@ The commands are public by name. Their classes are internal.
 
 ## Testing
 
-`AssertsServedCompatibility::assertServesCompatibility(class-string<Model> $model)` fails a test when:
+`AssertsServedCompatibility::assertServesCompatibility(class-string<Model> $model, Closure $nativeCreate)` fails a test when:
 
 - discovery does not find the model,
 - the map does not compile,
 - the installed view differs from the view the map compiles, and the message tells the developer to run `Compatibility::update()`,
-- a native create of the root successor fails, or
+- `$nativeCreate` fails, inserts no retained row of `$model`, or creates a root that also matches the `when()` of another discovered map with the same root class,
+- a membership query of `compatibility:check` finds a row: a served root outside its map's `when()`, or a shared successor that serves two legacy records, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.
+
+`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row and runs one `compatibility:backfill` pass catches an initializer that leaves the discriminator unset.
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A test that uses `RefreshDatabase` can therefore install a served model.
 

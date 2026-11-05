@@ -8,7 +8,7 @@ Status: Proposed
 
 `floorplans` keeps `id bigint` and `uuid`. It has no reference to its `PlaceAsset`, so `prepare()` adds `place_asset_id uuid` as the successor key, and the backfill fills it.
 
-`legacy_type` is a column Aryeo adds to `place_assets`, holding the media's morph alias: the alias of the legacy model a `PlaceAsset` serves, one of `photo`, `video`, `floorplan`, `legacy_file` or `interactive_content`. Aryeo's `place_assets` today has `asset_type` for the File/Link morph, and no `type` column. `place_assets` also holds the display columns, `displays_on_property_websites` and `display_type`.
+`legacy_type` is a column Aryeo adds to `place_assets`, holding the media's morph alias: `getMorphClass()` of the legacy model a `PlaceAsset` serves, one of `photo`, `video`, `floorplan`, `legacy_file` or `interactive_content`. Aryeo's morph map registers each alias, and the alias can differ from the class name: `Image` is `photo`. Aryeo's `place_assets` today has `asset_type` for the File/Link morph. `place_assets` also holds the display columns, `displays_on_property_websites` and `display_type`.
 
 `photos.id` is `integer`, and every other media key is `bigint`. Each table keeps its own key and sequence, so the widths never meet. `photos.listing_id integer NOT NULL` stays on `photos_retained`, with its foreign key to `listings`.
 
@@ -24,7 +24,7 @@ final class FloorPlanMap
         return $floorPlan
             ->retainedIn('floorplans_retained')
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
-                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'floorplan'))
+                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: (new FloorPlan)->getMorphClass()))
                 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
                 ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at')->inTimeZone('UTC'))
                 ->attribute(name: 'deleted_at', definition: fn (Attribute $attribute) => $attribute->from('deleted_at')->inTimeZone('UTC'))
@@ -44,11 +44,11 @@ final class FloorPlanMap
 }
 ```
 
-`when()` declares membership: a `PlaceAsset` is a floor plan when its `legacy_type` is `floorplan`. `legacy_type` never changes after the `PlaceAsset` is created, so membership is exclusive across the media maps and stable from creation. `InitializeFloorPlanAsset` sets it for a `PlaceAsset` the package creates, and Aryeo's `Creating` listener on `PlaceAsset` sets it for a native create ([The map: membership](../the-map.md#membership)). The example elides the mapped attributes of the File and the Link. The File's include the intrinsic metadata and the Mux ids, which the File owns as columns and the map reads with `from()`. They also include the media URLs, which the map reads with `computedAs()` and writes with a `writtenBy()` operation ([The map: media values](../the-map.md#media-values)).
+`when()` declares membership: a `PlaceAsset` is a floor plan when its `legacy_type` is FloorPlan's morph alias, `floorplan`. `legacy_type` never changes after the `PlaceAsset` is created, so membership is exclusive across the media maps and stable from creation. `InitializeFloorPlanAsset` sets it for a `PlaceAsset` the package creates, and Aryeo's `Creating` listener on `PlaceAsset` sets it for a native create ([The map: membership](../the-map.md#membership)). The example elides the mapped attributes of the File and the Link. The File's include the intrinsic metadata and the Mux ids, which the File owns as columns and the map reads with `from()`. They also include the media URLs, which the map reads with `computedAs()` and writes with a `writtenBy()` operation ([The map: media values](../the-map.md#media-values)).
 
 `floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
-`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](../operations.md#positions)).
+`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent, so the parent's floor plans end in legacy order ([Operations: positions](../operations.md#positions)).
 
 Positions number within each eloquent-ordering parent, so a legacy reader that needs one sequence per listing must read `readAs()` with an operation instead.
 
@@ -65,6 +65,8 @@ Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a num
 ## The operations
 
 `WriteDisplayType` writes one legacy value into two columns of the root `PlaceAsset`, whatever the morph target. `'none'` means the asset is not displayed, and v2 has no `'none'` display type. `'none'` therefore sets `displays_on_property_websites` to false. Any other value sets it to true and sets `display_type`. The operation never touches the File or the Link.
+
+`'none'` leaves `display_type` unassigned. The column is NOT NULL with no database default. On a create, `PlaceAsset`'s model default, `'both'`, fills it, because the package creates the `PlaceAsset` through its model. On an update, the column keeps its stored value.
 
 ```php
 final class WriteDisplayType implements WritesAttribute
@@ -83,7 +85,7 @@ final class WriteDisplayType implements WritesAttribute
 
 ## The initializers
 
-`InitializeFloorPlanAsset` sets the membership discriminator, `legacy_type = 'floorplan'`, and the successor-only parent keys. `rank_key` needs nothing, because eloquent-ordering's `IsOrdered` assigns it when the `PlaceAsset` is created.
+`InitializeFloorPlanAsset` sets the membership discriminator from the legacy model's `getMorphClass()`, and the successor-only parent keys. `rank_key` needs nothing, because eloquent-ordering's `IsOrdered` assigns it when the `PlaceAsset` is created.
 
 ```php
 final class InitializeFloorPlanAsset implements InitializesSuccessors
@@ -91,7 +93,7 @@ final class InitializeFloorPlanAsset implements InitializesSuccessors
     public function initialize(Successors $successors, Creation $creation): void
     {
         $asset = $successors->root();
-        $asset->legacy_type = 'floorplan';
+        $asset->legacy_type = $creation->record->getMorphClass();
         $asset->place_id = Listing::query()->whereKey($creation->record->listing_id)->value('place_id');
         $asset->subsection_id = DefaultSection::for(type: 'floorplan', place: $asset->place_id);
     }
@@ -122,7 +124,7 @@ FloorPlan and Photo install after Listing. Before Listing installs, a Job create
 
 ## Photos
 
-`Photo` is served from `PlaceAsset` the same way, with the membership `legacy_type = 'photo'`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
+`Photo` is served from `PlaceAsset` the same way. Its `when()` compares `legacy_type` with Photo's `getMorphClass()`, which is `photo`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
 
 `InitializeLegacyPhoto` derives `photos.listing_id` through the asset's Place, that Place's Job, and `listings.job_id`. It resolves each one with `withTrashed()`, and refuses with the asset's key when one is missing.
 

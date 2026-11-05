@@ -26,9 +26,9 @@ The package runs a write as a unit of work. It opens its own transaction, calls 
 
 The scope runs inside the package's transaction, so its parent locks hold until the package's work commits, and a scope needs no transaction of its own.
 
-After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it. A computed value is not in the view, so for a `computedAs()` attribute with a `writtenBy()` operation, the check evaluates the read closure against the reloaded successors.
+After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it. A computed value is not in the view, so under the Live origin, for a `computedAs()` attribute with a `writtenBy()` operation, the check calls the read closure with the reloaded successor. Under the Backfill origin, no comparison checks a `computedAs()` attribute, and none checks a `readOnly()` attribute declared with `ignoreWrites: true` or one with no stored column ([Operations: what the comparisons skip](../specification/operations.md#what-the-comparisons-skip)).
 
-A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only.
+A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only. The `writtenBy()` operation of a `computedAs()` attribute is the exception: a pass runs it on every row it walks ([Operations: computed attributes under the backfill](../specification/operations.md#computed-attributes-under-the-backfill)).
 
 A mass write makes one unlocked read of every record's successors, then one scope call with all their keys. It then locks and re-checks once, and runs the remaining steps once per record. It forwards no legacy event, and successor events still fire. This amends the earlier design, which forwarded one legacy event sequence per record on the mass path. Declined: per-record legacy events on a mass write, which Eloquent's own mass writes never fire.
 
@@ -38,7 +38,7 @@ An operation receives the change context: the record after the write, the origin
 
 Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position()` reads eloquent-ordering's published position expression, and its default operation moves the row. It takes no arguments: positions number within the successor's eloquent-ordering parent ([0030](0030-positions-number-within-the-ordering-parent.md)). This amends the earlier design, which named a legacy parent column as its argument. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
 
-A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row.
+A legacy `orderBy('index')` on a `position()` attribute sorts by the position expression, because `rank_key` values from two parents share no order. A query that pins one parent sorts by `rank_key`. A `where('index', N)` across parents compiles without a count per candidate row.
 
 When `choose:` picks another target class for a record, the package moves the morph target. It deletes the old target through its model and creates the new one, in one unit of work. Declined: an operation that moves it.
 
@@ -62,6 +62,6 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - The map's membership decides which native successor creates insert a legacy row. It decides nothing after that row exists.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
-- A position() attribute reads eloquent-ordering's published position expression. After install, a write moves the row with Placement::at(). A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](../specification/operations.md#positions)): after or before its nearest live legacy neighbour whose successor already belongs to the successor's eloquent-ordering parent. The package therefore requires eloquent-ordering.
+- A position() attribute reads eloquent-ordering's published position expression. After install, a write moves the row with Placement::at(). A backfill row or catch-up row re-sequences its eloquent-ordering parent, so the parent's legacy rows end in legacy order ([Operations: positions](../specification/operations.md#positions)). The package therefore requires eloquent-ordering.
 - A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

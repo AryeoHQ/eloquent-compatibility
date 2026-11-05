@@ -42,7 +42,7 @@ Only the root has a successor key. A related successor is reached through the ro
 Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
 
 - `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
-- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. The attribute needs no `writtenBy()`, because its default operation places the row. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours. [Operations: positions](operations.md#positions) states the placement.
+- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. The attribute needs no `writtenBy()`, because its default operation places the row. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` sorts by the position expression, because `rank_key` values from two parents share no order. A query that pins one parent sorts by `rank_key` instead. A `where('index', N)` across parents compiles without a count per candidate row. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order. [Operations: positions](operations.md#positions) states the re-sequence.
 
 ```php
 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
@@ -62,9 +62,9 @@ An attribute with no inverse must declare `writtenBy()` or `readOnly()`, or the 
 
 ## Read-only attributes
 
-`readOnly(because:, ignoreWrites:)` marks an attribute that no write changes, and states the reason. `ignoreWrites:` has no default, so every declaration states it. With `false`, an update of the attribute refuses. A create assigns the inverse into a successor row it creates. For an attribute with no stored column, a live create that supplies a non-NULL value refuses. With `true`, every path accepts and discards the write, and each discarded non-NULL write dispatches `Events\WriteIgnored`. [Operations: read-only attributes](operations.md#read-only-attributes) states what each value runs.
+`readOnly(because:, ignoreWrites:)` marks an attribute that no write changes, and states the reason. `ignoreWrites:` has no default, so every declaration states it. With `false`, an update of the attribute refuses. A create assigns the inverse into a successor row it creates. For an attribute with no stored column, a live create that supplies a non-NULL value refuses. With `true`, every path accepts and discards the write, and a discarded non-NULL write dispatches `Events\WriteIgnored`, except on catch-up. [Operations: read-only attributes](operations.md#read-only-attributes) states what each value runs.
 
-A map adopts with `ignoreWrites: true`. A listener on `Events\WriteIgnored` then finds the writers that still send the attribute, and no write refuses while the application still has them. After install, the map flips the flag to `false`, once the `WriteIgnored` events from `Origin::Live` show no writer. After install the ledger keeps only its `deleted` rows, so only those events show that the writers are gone. Events from `Origin::Backfill` replay history, so they show no live writer. The flip changes only the map: no schema and no data change. The guidance holds for an attribute with a stored column and for one without.
+A map adopts with `ignoreWrites: true`. A listener on `Events\WriteIgnored` then finds the writers that still send the attribute, and no write refuses while the application still has them. After install, the map flips the flag to `false`, once the `WriteIgnored` events from `Origin::Live` show no writer. Before install, a v1 write lands in the legacy column, and catch-up discards it without an event. A backfill create dispatches only for a value it does not assign, so `Origin::Backfill` events show what the backfill dropped, not a live writer. The flip changes only the map: no schema and no data change. The guidance holds for an attribute with a stored column and for one without.
 
 ```php
 ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.', ignoreWrites: true))
@@ -97,18 +97,17 @@ A legacy media record carries values of two kinds, and each kind takes its own p
 - **`Origin::Backfill`.** It writes the v1 URL onto a File that is not in ZML, and does nothing for a File in ZML.
 - **`Origin::Live`.** It writes the v1 URL onto a File that is not in ZML, and refuses for a File in ZML.
 
-Under `Origin::Backfill`, the comparisons skip a `computedAs()` attribute, and a pass runs its operation on every row it walks ([Operations: computed attributes under the backfill](operations.md#computed-attributes-under-the-backfill)). A v1 URL edit made before install therefore still reaches a non-ZML File, and an asset the ZML migration moved never refuses.
+Under `Origin::Backfill`, the comparisons skip a `computedAs()` attribute. A pass runs its operation on every row it walks whose chosen target declares the attribute, and the operation must change nothing when it runs again with an unchanged value ([Operations: computed attributes under the backfill](operations.md#computed-attributes-under-the-backfill)). A v1 URL edit made before install therefore reaches a non-ZML File when a pass walks the row: when the edit sets `updated_at`, or when a pass walks the row for another reason. An edit that leaves `updated_at` alone is lost ([Lifecycle: the writer boundary](lifecycle.md#the-writer-boundary)). An asset the ZML migration moved never refuses.
+
+The map declares the metadata and the delivery values under the File target. A `computedAs()` read closure receives a collection of the successors the attribute sits under, once per query, and returns their values keyed by successor key.
 
 ```php
 ->as(target: File::class, successor: fn (Successor $file) => $file
     ->attribute(name: 'width', definition: fn (Attribute $attribute) => $attribute->from('width'))
-    ->attribute(name: 'mux_id', definition: fn (Attribute $attribute) => $attribute->from('mux_id')))
-```
-
-```php
-->attribute(name: 'original_url', definition: fn (Attribute $attribute) => $attribute
-    ->computedAs(read: fn (Successors $successors) => $successors->related(File::class)?->originalUrl())
-    ->writtenBy(StoreLegacyUrl::class))
+    ->attribute(name: 'mux_id', definition: fn (Attribute $attribute) => $attribute->from('mux_id'))
+    ->attribute(name: 'original_url', definition: fn (Attribute $attribute) => $attribute
+        ->computedAs(read: fn (Collection $files) => $files->mapWithKeys(fn (File $file) => [$file->getKey() => $file->originalUrl()]))
+        ->writtenBy(StoreLegacyUrl::class)))
 ```
 
 ```php
@@ -131,7 +130,7 @@ final class StoreLegacyUrl implements WritesAttribute
 }
 ```
 
-Each variant URL follows the same pattern. Under `Origin::Live`, the round trip evaluates the read closure against the reloaded successors, because a computed value is not in the view ([Operations: the round trip](operations.md#the-round-trip)). A `computedAs()` value cannot be filtered or sorted in SQL.
+Each variant URL follows the same pattern. Under `Origin::Live`, the round trip calls the read closure with the reloaded File, because a computed value is not in the view ([Operations: what the comparisons skip](operations.md#what-the-comparisons-skip)).
 
 The alternative for a delivery value is a stable redirect URL that the consumer controls, read with `readAs()`. That value can be filtered in SQL.
 
@@ -168,9 +167,9 @@ When `choose:` picks another class for a record, the package moves the target in
 
 ### Membership
 
-`when()` on the root scopes the successor rows the legacy model serves. FloorPlan serves only the `PlaceAsset` rows whose `legacy_type` is `floorplan`. A native successor create inserts a legacy row only for a successor inside that scope.
+`when()` on the root decides which roots gain a legacy row when they are created natively. A native `PlaceAsset` create gains a FloorPlan row only when its `legacy_type` is FloorPlan's morph alias.
 
-The package evaluates `when()` only when it creates a legacy row: at a native successor create after install, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the legacy row to its root, and the package never evaluates `when()` for that row again ([Storage: the view](storage.md#the-view)).
+The package evaluates `when()` only when it creates a legacy row: at a native successor create after install, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the legacy row to its root, and the package never evaluates `when()` to decide what that row serves ([Storage: the view](storage.md#the-view)).
 
 Membership must therefore be exclusive across the maps that share a root, and stable from creation. A root that two maps' `when()` both match gets a legacy row in each. A root that leaves its map's scope stays served by the legacy row it already has.
 
@@ -182,7 +181,7 @@ A change of membership after creation is a consumer reclassification: delete the
 
 | Method | Interface | The package calls it |
 | :-- | :-- | :-- |
-| `writtenBy()`, on an attribute | `Contracts\WritesAttribute` | when a write changes that attribute, including a create |
+| `writtenBy()`, on an attribute | `Contracts\WritesAttribute` | when a write changes that attribute, including a create; for a `computedAs()` attribute, also on every row a pass walks ([Operations: computed attributes under the backfill](operations.md#computed-attributes-under-the-backfill)) |
 | `successorsInitializedBy()` | `Contracts\InitializesSuccessors` | when the package creates the root, after the attribute operations |
 | `legacyInitializedBy()` | `Contracts\InitializesLegacy` | when an application creates a member successor natively |
 | `writesWithin()` | `Contracts\ScopesWrites` | before every lock the package takes, on every path except install's final catch-up and rollback's refill |
@@ -218,7 +217,7 @@ These three declarations keep today's behavior.
 | target | one class a `relatedMorph()` can point to; `targets:` declares them, and `choose:` picks one |
 | successor key | the legacy table's column that holds the root's key, declared with `servedFrom(key:)`; it replaces "retained key" |
 | retained table | the legacy table after install, under the name `retainedIn()` gives it |
-| membership | the successor rows a legacy model serves, scoped by `when()` |
+| membership | the roots that gain a legacy row at creation, scoped by `when()`; the successor key binds the row from then on |
 | operation | a class that turns a write of one attribute into successor changes |
 | `Successors` | the unit of work an operation receives, generic over the root class |
 | the round trip | after a write, every written attribute reads back its new value |
