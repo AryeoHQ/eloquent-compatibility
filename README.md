@@ -6,6 +6,8 @@ The package is under redesign. This release serves a legacy model's reads throug
 
 The new design writes compatibly in the application, and the database holds no function for it. Later releases add it one part at a time.
 
+A redesign of the public interface is specified, with the status Proposed, before any of its code ships. The [interface specification](docs/specification/README.md) states it, and a later 0.x minor release implements it.
+
 ## Installation
 ```bash
 composer require aryeo/eloquent-compatibility

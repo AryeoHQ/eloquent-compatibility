@@ -95,6 +95,7 @@ $checkMember = function (string $class, string $member, bool $called): void {
 };
 
 $problems = [];
+$proposed = 0;
 $names = 0;
 $links = 0;
 $invariants = 0;
@@ -112,8 +113,16 @@ $documents = [$root.'/README.md', ...$files($root.'/docs', '*.md'), ...$files($r
 foreach ($documents as $document) {
     $relative = substr($document, strlen($root) + 1);
     $fence = null;
+    $lines = explode("\n", (string) file_get_contents($document));
+    $first = array_values(array_filter($lines, fn (string $line): bool => trim($line) !== ''))[0] ?? '';
 
-    foreach (explode("\n", (string) file_get_contents($document)) as $index => $line) {
+    if (trim($first) === 'Status: Proposed') {
+        $proposed++;
+
+        continue;
+    }
+
+    foreach ($lines as $index => $line) {
         $at = $relative.':'.($index + 1).': ';
 
         if (preg_match('/[A-Za-z0-9_\/.-]*[A-Za-z0-9_](?:\.php:\d+|\.[A-Za-z0-9]+#L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?)/', $line, $citation) === 1) {
@@ -201,13 +210,15 @@ foreach ($problems as $problem) {
 }
 
 fwrite($problems === [] ? STDOUT : STDERR, sprintf(
-    '%d %s in %d documents: %d names, %d relative links and %d invariant references checked.'.PHP_EOL,
+    '%d %s in %d documents: %d names, %d relative links and %d invariant references checked. %d proposed %s skipped.'.PHP_EOL,
     count($problems),
     count($problems) === 1 ? 'problem' : 'problems',
-    count($documents),
+    count($documents) - $proposed,
     $names,
     $links,
     $invariants,
+    $proposed,
+    $proposed === 1 ? 'document' : 'documents',
 ));
 
 exit($problems === [] ? 0 : 1);
