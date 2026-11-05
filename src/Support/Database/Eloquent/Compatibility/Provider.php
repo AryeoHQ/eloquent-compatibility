@@ -47,7 +47,7 @@ class Provider extends ServiceProvider
         $this->forwarding = true;
         $events = $this->app->make(Dispatcher::class);
 
-        foreach ($this->servedModels()->all() as $model) {
+        foreach ($this->app->make(ServedModels::class)->all() as $model) {
             Forwarder::register($events, $model);
         }
     }

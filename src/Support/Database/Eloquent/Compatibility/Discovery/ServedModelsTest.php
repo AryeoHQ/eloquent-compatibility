@@ -157,6 +157,28 @@ final class ServedModelsTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_the_application_files_once_per_process_while_the_registered_classmaps_keep_their_size(): void
+    {
+        $suffix = bin2hex(random_bytes(4));
+        $file = $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Scanned{$suffix}");
+        $loader = new ClassLoader("{$this->bootstrap}/vendor");
+        $loader->addClassMap(["App\\Models\\Scanned{$suffix}" => $file]);
+        $loader->register();
+
+        try {
+            $first = $this->app->make(ServedModels::class)->all();
+            unlink($file);
+            $this->app->forgetInstance(ServedModels::class);
+            $second = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertContains("App\\Models\\Scanned{$suffix}", $first);
+        $this->assertSame($first, $second);
+    }
+
+    #[Test]
     public function it_scans_on_every_boot_in_testing_and_ignores_a_cache(): void
     {
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return [];');

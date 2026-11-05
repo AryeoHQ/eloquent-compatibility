@@ -16,6 +16,9 @@ final class ServedModels
 {
     private const string PACKAGE = 'aryeo/eloquent-compatibility';
 
+    /** @var array<string, list<class-string<Model&Compatible>>> */
+    private static array $scanned = [];
+
     /** @var null|list<class-string<Model&Compatible>> */
     private null|array $models = null;
 
@@ -31,7 +34,7 @@ final class ServedModels
      */
     public function all(): array
     {
-        return $this->models ??= $this->scans ? $this->scan() : $this->cached();
+        return $this->models ??= $this->scans ? (self::$scanned[self::loaders()] ??= $this->scan()) : $this->cached();
     }
 
     public function contains(string $model): bool
@@ -46,8 +49,10 @@ final class ServedModels
 
     public function cache(): void
     {
+        $models = self::$scanned[self::loaders()] = $this->scan();
+
         $this->files->ensureDirectoryExists(dirname($this->cache));
-        $this->files->replace($this->cache, '<?php return '.var_export($this->scan(), true).';'.PHP_EOL);
+        $this->files->replace($this->cache, '<?php return '.var_export($models, true).';'.PHP_EOL);
     }
 
     public function clear(): void
@@ -75,20 +80,22 @@ final class ServedModels
      */
     private function scan(): array
     {
-        $files = $this->classmap();
+        $pending = $this->classmap();
+        $contents = [];
         $models = [];
-        $checked = [];
         $mentions = '/ServesCompatibility/';
 
         while ($mentions !== null) {
             $inherited = [];
 
-            foreach ($files as $class => [$file, $listed]) {
-                if (array_key_exists($class, $checked) || preg_match($mentions, (string) file_get_contents($file)) !== 1) {
+            foreach ($pending as $class => [$file, $listed]) {
+                $contents[$class] ??= (string) file_get_contents($file);
+
+                if (preg_match($mentions, $contents[$class]) !== 1) {
                     continue;
                 }
 
-                $checked[$class] = true;
+                unset($pending[$class], $contents[$class]);
 
                 if (! (class_exists($class) || trait_exists($class)) || ! in_array(ServesCompatibility::class, class_uses_recursive($class), true)) {
                     continue;
@@ -117,6 +124,17 @@ final class ServedModels
         sort($models);
 
         return $models;
+    }
+
+    private static function loaders(): string
+    {
+        $loaders = [];
+
+        foreach (ClassLoader::getRegisteredLoaders() as $vendor => $loader) {
+            $loaders[] = $vendor.':'.count($loader->getClassMap());
+        }
+
+        return implode(PHP_EOL, $loaders);
     }
 
     /**
