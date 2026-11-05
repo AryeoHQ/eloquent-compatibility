@@ -14,8 +14,9 @@ The research proposed that the package depend on eloquent-concurrency's parent-l
 
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
-- A mass write resolves the touched successors with an unlocked read, calls the scope with their keys, and locks inside it. It then checks the selection again, and retries a bounded number of times.
-- The package retries nothing inside its writers. The application's outermost transaction is the retry point. Install keeps its own retries.
+- Every path resolves the touched successors with an unlocked read, calls the scope with their keys, and locks inside it. Right after its locks, it checks that the locked keys equal the keys the scope received. A difference refuses with a retryable error.
+- The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point. Install keeps its own retries.
+- This amends decision 9 of the plan, which gave the mass write alone a re-check and a retry of its own. A related key can move between the unlocked read and the lock on any path. The package would then lock a row the scope never ordered.
 - The package targets eloquent-concurrency 0.1.0 and the eloquent-ordering release after #13, never the 0.0.x triggers.
 
 Declined: a dependency on eloquent-concurrency or eloquent-ordering.

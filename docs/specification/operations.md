@@ -14,6 +14,8 @@ Each attribute has exactly one operation:
 
 `writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of `external()`, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
 
+Every hook is a class string. The package resolves each operation and hook class from the container, so a constructor can take dependencies. The plan's work item "Turn legacy writes into successor operations" settles this.
+
 ```php
 final class SetDownloadsPermission implements WritesAttribute
 {
@@ -36,7 +38,7 @@ An operation makes in-memory assignments only. The package saves. A domain actio
 
 ## Successors
 
-`Operations\Successors` is the unit of work an operation receives. It is generic over the root class, so `Successors<Job>::root()` returns a `Job`. Related successors are addressed by model class, and each method is generic: `class-string<T>` in, `T` out.
+`Write\Successors` is the unit of work an operation receives. It is generic over the root class, so `Successors<Job>::root()` returns a `Job`. Related successors are addressed by model class, and each method is generic: `class-string<T>` in, `T` out.
 
 | Method | Returns or does |
 | :-- | :-- |
@@ -50,7 +52,7 @@ A companion, such as Listing's compatibility state row, is a declared relation. 
 
 ## The change context
 
-`Operations\Change` carries the context of one write.
+`Write\Change` carries the context of one write.
 
 | Property | Holds |
 | :-- | :-- |
@@ -65,8 +67,8 @@ A write through the legacy model runs with `Origin::Live`. Every backfill pass r
 
 One legacy write runs these steps, in this order:
 
-1. **Scope.** The package calls the write scope with the keys of the successors the write touches. It takes no lock before this step.
-2. **Lock.** Inside the scope, the package opens its transaction and loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first.
+1. **Scope.** The package resolves the successors the write touches with an unlocked read. It calls the write scope with their keys, and takes no lock before this step.
+2. **Lock.** Inside the scope, the package opens its transaction and loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
 5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or `moveTo()` saves on its own, with its own events.
@@ -87,6 +89,8 @@ One legacy write runs these steps, in this order:
 
 The legacy model's listeners receive one event sequence for the write, such as one `updating` and one `updated` for an update. The package forwards none of the successor events above as legacy events.
 
+A mass write runs the unit of work once per record, so it forwards one legacy event sequence per record. Eloquent's own mass writes fire no model events, and a served legacy model differs from them here. Decision 5 settles this.
+
 ## The round trip
 
 After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back.
@@ -97,11 +101,13 @@ The round trip binds an operation to its attribute's read. `address_id` reads `"
 
 A create is a write of every supplied attribute against an empty original. The attribute operations run first, in declaration order. `successorsInitializedBy()` then runs once on the new root.
 
+A create's default operation for a related row's key assigns that key to the new related row. A Listing created with a reserved `place_id` therefore creates its Place with that id. Decision 10 states this rule.
+
 A create through the legacy model runs with `Origin::Live`. The backfill creates with `Origin::Backfill`.
 
 ## Mass writes, the backfill and catch-up
 
-- **A mass write** runs the unit of work once per record. The package resolves the touched successors with an unlocked read, calls the write scope with their keys, and locks inside it. It then checks the selection again, and retries a bounded number of times when the selection moved.
+- **A mass write** runs the unit of work once per record. Each record's lock step checks its locked keys, as every path does. A mass write has no retry of its own.
 - **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`.
 - **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently.
 
@@ -174,20 +180,31 @@ final class ListingWriteScope implements ScopesWrites
 - `$successors` holds the keys of the successors the write touches, by class. The scope calls `$write` and returns its result.
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
-- The package retries nothing inside its writers. The application's outermost transaction is the retry point.
+- Every path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
+- A difference refuses with a retryable error. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
+- The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.
 
 ## Open questions
 
-### 1. `readOnly()` on a create
+### 1. `company_id` on a create, and an update of `place_id`
 
-Decision 10 says no path writes a `readOnly()` attribute. Decision 10 also says that on a create, `place_id`'s default operation assigns the new Place's key, so a reserved id is honored. The worked Listing map marks `place_id` and `company_id` read-only, and a new Job needs `company_id`.
+Decision 10 settles `place_id` and `job_site_id` on a create, as [creates](#creates) states. Two questions remain.
 
-- **A.** `readOnly()` refuses on every path, including a create. `company_id` and a reserved `place_id` then need another route at birth.
-- **B.** `readOnly()` refuses on an update. On a create, its default operation assigns the inverse, but only into a successor row this create creates.
+**`company_id` on a create.** Decision 10 says no path writes a `readOnly()` attribute. The worked Listing map marks `company_id` read-only, and a new Job needs `company_id`.
 
-**Recommendation: B.** It honors both parts of decision 10, and it never writes into a row the record does not create.
+- **A.** `company_id` drops `readOnly()`, and `writtenBy()` names an operation that assigns it on a create and refuses on an update.
+- **B.** `company_id` stays read-only, and `successorsInitializedBy()` sets `Job.company_id` at birth. Decision 5 limits that initializer to successor-only values, so B amends decision 5.
+
+**Recommendation: A.** It stays inside decisions 5 and 10, and the refusal on an update keeps the reason the map states.
+
+**An update of `place_id`.** `place_id`'s default operation assigns the inverse, so an update would assign a new key to the existing Place.
+
+- **A.** The default operation of a related row's key refuses on an update. A map that supports the change names a `writtenBy()` operation, such as one that moves the Job to another Place.
+- **B.** The default operation re-points the root's `BelongsTo` relation at the row with the new key, and refuses for any other relation.
+
+**Recommendation: A.** Moving a Job to another Place is a v2 domain action with its own rules, so the map names it. The package never re-keys a related row.
 
 ### 2. An attribute with no inverse and no `writtenBy()`
 
@@ -214,23 +231,7 @@ A `readAs()` attribute has no inverse. Without `writtenBy()` or `readOnly()`, it
 - **`record` on a native create.** **Recommendation:** the new legacy model, which `InitializesLegacy::initialize()` also receives as `$legacy`.
 - **`original` during catch-up.** **Recommendation:** the record as the view serves it before the pass writes.
 
-### 5. How the package builds an operation class
-
-- **A.** It resolves each class from the container, so a constructor can take dependencies.
-- **B.** It constructs each class with `new` and no arguments.
-
-**Recommendation: A.** It is how Laravel builds every other application class.
-
-### 6. Legacy events on a mass write
-
-Eloquent fires no model events for a mass write.
-
-- **A.** A mass write forwards no legacy events.
-- **B.** It forwards one event sequence per record.
-
-**Recommendation: A.** The legacy model then behaves as Eloquent does. Successor events still fire, because every save goes through the model.
-
-### 7. What the write scope receives for a successor the write creates
+### 5. What the write scope receives for a successor the write creates
 
 A created successor has no key until the package saves it.
 
@@ -239,7 +240,7 @@ A created successor has no key until the package saves it.
 
 **Recommendation: B.** A scope that must lock a parent before a create then knows the create happens. The worked scopes handle both forms with `?? []`.
 
-### 8. A change of morph target
+### 6. A change of morph target
 
 A FloorPlan whose `url` becomes non-null moves from a File to a Link.
 
@@ -248,7 +249,7 @@ A FloorPlan whose `url` becomes non-null moves from a File to a Link.
 
 **Recommendation: A.** The map already declares the choice, and today's package performs morph moves.
 
-### 9. The round-trip check before install
+### 7. The round-trip check before install
 
 Before install, no view exists to read back through.
 
@@ -257,14 +258,14 @@ Before install, no view exists to read back through.
 
 **Recommendation: A.** An operation that loses a value then refuses its row at once. The cost is one read per backfill row.
 
-### 10. What counts as an initializer for the NOT NULL refusal
+### 8. What counts as an initializer for the NOT NULL refusal
 
 - **A.** A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key and a `newUniqueId()` column.
 - **B.** The map lists the columns its initializer sets.
 
 **Recommendation: A.** The native create in `assertServesCompatibility()` proves the class sets the column, and no second declaration can drift.
 
-### 11. A native create outside a transaction
+### 9. A native create outside a transaction
 
 The session put the legacy insert inside the successor's transaction. An application can call `Job::create()` outside any transaction.
 
@@ -273,7 +274,7 @@ The session put the legacy insert inside the successor's transaction. An applica
 
 **Recommendation: A.** With B, a failed insert leaves a successor that no legacy reader sees, and nothing reports it. The cost is that every native create of a member successor runs in a transaction.
 
-### 12. Native successors before install
+### 10. Native successors before install
 
 The session settled native creates for the retained row. It did not settle two cases before install:
 
@@ -284,3 +285,12 @@ The session settled native creates for the retained row. It did not settle two c
 - **B.** The trait acts only after install. Member successors without a legacy row stay unserved, and `compatibility:check` reports them.
 
 **Recommendation: A.** A legacy reader then sees every member successor after install. Catch-up finds the filled values equal and skips them. The cost is a second walk in the backfill.
+
+### 11. The error for moved successor keys
+
+The lock step refuses with a retryable error when the locked keys differ from the keys the scope received. The spec names no class for it. `Write\Refusal` is the refusal an operation or initializer throws, and nothing marks it retryable.
+
+- **A.** A new exception under `Exceptions\`, which [the public surface](public-surface.md#2-exceptions-on-the-surface) decides whether to publish.
+- **B.** `Write\Refusal`, with a flag that marks it retryable.
+
+The session did not settle this. Public surface open question 2 decides whether a caller can catch either one by a supported type.

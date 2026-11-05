@@ -53,10 +53,10 @@ final class ListingMap
                     ->writtenBy(ChangeListingAddress::class))
                 ->related(fn (Job $job) => $job->listingCompatibilityState())
                 ->related(fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-                    ->attribute('place_id', fn (Attribute $a) => $a->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
+                    ->attribute('place_id', fn (Attribute $a) => $a->from('id'))
                     ->related(fn (Place $place) => $place->address()->withTrashed()))
                 ->related(fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
-                    ->attribute('job_site_id', fn (Attribute $a) => $a->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.'))))
+                    ->attribute('job_site_id', fn (Attribute $a) => $a->from('id'))))
             ->successorsInitializedBy(InitializeListingJob::class)
             ->legacyInitializedBy(InitializeLegacyListing::class)
             ->writesWithin(ListingWriteScope::class)
@@ -66,7 +66,7 @@ final class ListingMap
 }
 ```
 
-`address_id` reads the `id` of the Address the Place points at. That read is what `ChangeListingAddress` must satisfy for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads it in `readAs()`.
+`place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, their default operations assign those keys to the new rows, so a reserved id is honored ([Operations: creates](../operations.md#creates)). `address_id` reads the `id` of the Address the Place points at. That read is what `ChangeListingAddress` must satisfy for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads it in `readAs()`.
 
 ## The operations
 
@@ -170,7 +170,9 @@ final class ListingWriteScope implements ScopesWrites
 
 ## Dependent schema
 
-`job_sites_view` reads `listings`. `ListingDependents` drops it before the swap and redefines it over the served listings after the swap, inside the install transaction. The example leaves the rollback mirrors empty.
+`job_sites_view` reads `listings`. `ListingDependents` drops it before the swap and redefines it over the served listings after the swap, inside the install transaction.
+
+The rollback mirrors reverse that, inside the rollback transaction. `beforeRollback()` drops `job_sites_view` before rollback drops the view it reads. `afterRollback()` recreates it over the restored `listings` table, after the refill.
 
 ```php
 final class ListingDependents implements ManagesDependents
@@ -185,9 +187,15 @@ final class ListingDependents implements ManagesDependents
         $connection->statement(JobSiteViewSql::overServedListings());
     }
 
-    public function beforeRollback(Connection $connection): void {}
+    public function beforeRollback(Connection $connection): void
+    {
+        $connection->statement('DROP VIEW job_sites_view');
+    }
 
-    public function afterRollback(Connection $connection): void {}
+    public function afterRollback(Connection $connection): void
+    {
+        $connection->statement(JobSiteViewSql::overLegacyListings());
+    }
 }
 ```
 

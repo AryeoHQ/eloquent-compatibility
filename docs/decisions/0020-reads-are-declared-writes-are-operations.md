@@ -9,7 +9,7 @@ A legacy attribute write could only become one value in one column of one succes
 - A media position is a move through eloquent-ordering, not a column value.
 - One legacy `display_type` splits into two successor columns.
 
-The map had two partial escapes, `transitions()` and the write closure of `external()`. Neither one composed with a read.
+The map had two partial escapes, transitions() and the write closure of `external()`. Neither one composed with a read.
 
 ## Decision
 
@@ -19,7 +19,7 @@ The map's read half declares each attribute's projection. Every legacy write int
 - `writtenBy()` names an operation class for any other write.
 - A `readOnly()` attribute's default operation refuses.
 
-`writtenBy()` replaces `writeTo()`, `transitions()`, the external write closure, and the consumer's use of `Applying::run()`.
+`writtenBy()` replaces writeTo(), transitions(), the external write closure, and the consumer's use of `Applying::run()`.
 
 The package runs a write as a unit of work. It opens the write scope and its transaction, locks the record's successors parents first, and runs every changed attribute's operation in declaration order. It saves each changed successor once, applies deletions, and runs the queued after-save actions. It then reads the record back through the view and forwards one legacy event.
 

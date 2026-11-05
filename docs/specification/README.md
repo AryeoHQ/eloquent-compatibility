@@ -62,12 +62,12 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 | L5. Generic materialization cannot build the successor graph | [Operations: initializers](operations.md#initializers) and [Lifecycle: the backfill](lifecycle.md#the-backfill) |
 | L6. Compound operations need a forwarding boundary | [Operations: the unit of work](operations.md#the-unit-of-work) |
 | L7. The creation hook breaks the package's own PHPStan rule | [Operations: creates](operations.md#creates) and [initializers](operations.md#initializers) |
-| L8. The retained key cannot reuse an existing bridge | [Storage: the successor key](storage.md#the-successor-key) |
+| L8. Retained storage requires a redundant identity column and internal staging integration | The identity column: [Storage: the successor key](storage.md#the-successor-key). The staging: [Lifecycle: install](lifecycle.md#install) and [0024](../decisions/0024-install-is-one-transaction.md) |
 | L9. Discovery misclassifies Composer `..` paths | [Public surface: discovery](public-surface.md#discovery) |
 | M1. Install needs a successor for every legacy row | [Lifecycle: per-row outcomes](lifecycle.md#per-row-outcomes), [the install gate](lifecycle.md#the-install-gate) and [Not in this design](#not-in-this-design) |
 | M2. Package writes bypass successor invariants | [Operations: every write is an operation](operations.md#every-write-is-an-operation) and [the write scope](operations.md#the-write-scope) |
 | M3. Conversions are closed and write one column | [Operations: every write is an operation](operations.md#every-write-is-an-operation) |
-| M4. Successor-only columns cannot be declared | [Operations: initializers](operations.md#initializers) |
+| M4. Successor-only columns cannot be declared, and lifecycle varies by write path | The successor-only columns: [Operations: initializers](operations.md#initializers). The write paths: [Operations: every write is an operation](operations.md#every-write-is-an-operation) and [0017](../decisions/0017-successors-are-written-through-their-models.md) |
 | M5. Dependent views surface only as an install failure | [Lifecycle: dependent schema](lifecycle.md#dependent-schema) |
 | M6. No supported install-state check | [Public surface: operations](public-surface.md#operations) |
 | M7. Related and expression filters cannot use indexes | [Storage: the view](storage.md#the-view) and [Public surface: commands](public-surface.md#commands) |

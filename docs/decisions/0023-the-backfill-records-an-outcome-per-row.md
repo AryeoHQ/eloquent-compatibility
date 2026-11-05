@@ -19,7 +19,7 @@ Aryeo's Listing team rebuilt the lifecycle for its own writer: a run table, a re
 - Trashed rows follow the same rules, and `compatibility:check` reports them separately.
 - Install refuses while any row of this legacy model is refused or failed, and names the reasons and the first keys. Before its lock, install also proves existence and values, and refuses on any difference.
 - Each legacy model installs independently, even on a shared successor.
-- `compatibility_backfills` holds one row per legacy model, and `<legacy>_backfill` holds one row per legacy row. Install removes the legacy model's row and its ledger when it finishes.
+- `compatibility_backfills` holds one row per legacy model, and `<legacy>_backfill` holds one row per legacy row. When install finishes, it deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills`, because dropping the shared table would erase other models' watermarks and break their independent installs. This amends the "both dropped" wording of the plan's decision 7.
 
 Declined: a declared row scope, and a partial install that serves rows without a successor.
 

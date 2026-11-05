@@ -15,7 +15,7 @@ The map declares each relation with a closure that returns the Eloquent relation
 - Attribute names and column names stay strings.
 - A companion, such as the state row, is a declared relation. An operation reaches it with `relatedOrNew()`.
 
-Declined: string names, an `add()` method for undeclared rows, and disambiguation of two relations of one class before a real case needs it.
+Declined: string names, an add() method for undeclared rows, and disambiguation of two relations of one class before a real case needs it.
 
 ## Consequences
 

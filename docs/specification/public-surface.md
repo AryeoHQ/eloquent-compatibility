@@ -4,7 +4,7 @@ Status: Proposed
 
 A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
-Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The namespaces of the new classes follow the recommendation in [open question 1](#1-namespaces-of-the-new-classes).
+Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The namespaces of the new classes follow the plan's declared layout, which [open question 1](#1-namespaces-of-the-new-classes) records.
 
 ## Classes
 
@@ -23,10 +23,10 @@ Every class name below is relative to `Support\Database\Eloquent\Compatibility\`
 | `Contracts\ScopesWrites` | interface | the write scope |
 | `Contracts\ManagesDependents` | interface | dependent schema around install and rollback |
 | `Contracts\ReportsChanges` | interface | a change source for catch-up |
-| `Operations\Successors` | class | the unit of work an operation receives |
-| `Operations\Change` | class | the context of one write |
-| `Operations\Origin` | enum | whether a write is live or comes from the backfill |
-| `Operations\Refusal` | exception | refuses one write or one backfill row |
+| `Write\Successors` | class | the unit of work an operation receives |
+| `Write\Change` | class | the context of one write |
+| `Write\Origin` | enum | whether a write is live or comes from the backfill |
+| `Write\Refusal` | exception | refuses one write or one backfill row |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
 
 `Definition\Targets` replaces today's `Definition\Successors` builder. `Provides\CarriesLegacy` and `Contracts\ReportsChanges` take their names from the worked examples.
@@ -80,6 +80,7 @@ Every method returns the `Compatibility` it was called on.
 - `retainedIn(key:)`: the successor key moves to `servedFrom(key:)`.
 - `writeTo()`, `transitions()` and the write closure of `external()`: `writtenBy()` replaces them.
 - `servedFrom(choose:, successors:)`: two-primary maps are retired.
+- `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. The plan's work item "Keep legacy identity on the legacy table" settles this. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
 - `Definition\Successors` and the `successors:` parameter: `Definition\Targets` and `targets:` replace them.
 
 [Open question 3](#3-map-methods-the-session-did-not-name) covers the map methods the session did not name.
@@ -94,7 +95,7 @@ Every method returns the `Compatibility` it was called on.
 | `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers |
 | `Compatibility::serves(Model $model): bool` | answers whether the legacy name is the installed view on the model's connection |
 
-`prepare()`, `install()` and `rollback()` are idempotent. [Lifecycle](lifecycle.md) states what each one runs.
+`prepare()`, `install()`, `rollback()` and `retire()` are idempotent, as the plan's work item "Keep legacy identity on the legacy table" settles. [Lifecycle](lifecycle.md) states what each one runs.
 
 `Compatibility::rollback()` replaces `Compatibility::uninstall()`. The package has no public `Compatibility::state()`.
 
@@ -167,12 +168,12 @@ interface ReportsChanges
 }
 ```
 
-- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. It returns what `$write` returns.
+- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. It returns what `$write` returns. The package reads those keys without a lock. Inside `$write`, it locks the successors and checks that their keys equal the keys `run()` received. A difference refuses the write with a retryable error, and the application's outermost transaction retries. [Operations](operations.md#the-write-scope) states the check.
 - `ReportsChanges::since()` returns the legacy keys whose served values changed through other tables since the watermark.
-- `Operations\Successors` is generic over the root class, so `Successors<Job>::root()` returns a `Job`. [Operations](operations.md#successors) states its methods.
-- `Operations\Change` carries `record`, `original`, `attribute` and `origin`. [Operations](operations.md#the-change-context) states each one.
-- `Operations\Origin` has two cases, `Origin::Live` and `Origin::Backfill`.
-- `Operations\Refusal::because(string $reason)` builds a refusal that an operation or initializer throws.
+- `Write\Successors` is generic over the root class, so `Successors<Job>::root()` returns a `Job`. [Operations](operations.md#successors) states its methods.
+- `Write\Change` carries `record`, `original`, `attribute` and `origin`. [Operations](operations.md#the-change-context) states each one.
+- `Write\Origin` has two cases, `Origin::Live` and `Origin::Backfill`.
+- `Write\Refusal::because(string $reason)` builds a refusal that an operation or initializer throws.
 
 ## Discovery
 
@@ -188,28 +189,23 @@ On `Compatibility`, the methods outside the tables above carry `@internal`: `of(
 
 ### 1. Namespaces of the new classes
 
-The session named the new types but not their namespaces.
+The plan settled this layout. Its work item "Turn legacy writes into successor operations" declares the operation arguments as `Write\Successors`, `Write\Change`, `Write\Origin` and `Write\Refusal`, beside the writers. The same work item puts the interfaces in `Contracts\`, and the successor trait in `Provides\`. The work item "Keep legacy identity on the legacy table" puts `Targets` in `Definition\`.
 
-- **A.** Interfaces in `Contracts\`, beside `Contracts\Compatible`. The operation arguments in a new `Operations\`. The successor trait in `Provides\`, beside `Provides\ServesCompatibility`. `Targets` in `Definition\`.
-- **B.** Every new type in the root namespace.
-- **C.** The operation arguments in `Write\`, beside the writers.
-
-**Recommendation: A.** It follows the existing namespaces, and it keeps public types out of `Write\`, whose classes all become internal.
+A different namespace is a deviation from the plan. It needs a plan edit before this page changes.
 
 ### 2. Exceptions on the surface
 
 Decision 11 names no exception class. A caller that wants to catch a refusal then has no supported type.
 
 - **A.** Keep every exception internal. A caller catches `RuntimeException`.
-- **B.** Publish `Exceptions\CompatibilityException` as the one public base. `Operations\Refusal` and every package refusal extend it. The concrete classes stay internal.
+- **B.** Publish `Exceptions\CompatibilityException` as the one public base. `Write\Refusal` and every package refusal extend it. The concrete classes stay internal.
 
 **Recommendation: B.** It gives a caller one supported type to catch, and it publishes one class.
 
 ### 3. Map methods the session did not name
 
-Five methods of today's map appear in no decision.
+Three methods of today's map appear in no decision. The plan removes `identifiedBy()` and `discriminatedBy()`, as [removed from today's map](#removed-from-todays-map) states.
 
-- `identifiedBy()` and `discriminatedBy()` declare successor columns. Decision 3 adds no column to a successor. Identity comes from the legacy table, and membership comes from the successor key. **Recommendation:** remove both.
 - `timestamps()` declares `created_at` and `updated_at` as attributes of the root. The worked Listing map declares them as plain attributes. **Recommendation:** keep it as a shortcut for those two attributes.
 - `atMostOne(because:)` refuses a second related row on a write. Decision 10 compiles a plain join only where the database proves uniqueness. **Recommendation:** keep it for writes. The view still uses a lateral join unless a unique index proves the relation.
 - `external()` reads a value stored outside the database. Decision 5 replaces only its write closure. **Recommendation:** keep `external()` with its read closure alone.

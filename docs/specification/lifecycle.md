@@ -149,7 +149,7 @@ These whole-table proofs never run under the lock.
 
 A configurable `statement_timeout` bounds how long install holds its locks. `compatibility:sql --for=install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
 
-When install finishes, the package deletes this legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`.
+When install finishes, the package deletes this legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills` itself, because the table holds the watermarks of other legacy models. Dropping it would erase them, and those models could no longer install independently.
 
 ### Inside a caller's transaction
 
@@ -174,21 +174,30 @@ final class ListingDependents implements ManagesDependents
         $connection->statement(JobSiteViewSql::overServedListings());
     }
 
-    public function beforeRollback(Connection $connection): void {}
+    public function beforeRollback(Connection $connection): void
+    {
+        $connection->statement('DROP VIEW job_sites_view');
+    }
 
-    public function afterRollback(Connection $connection): void {}
+    public function afterRollback(Connection $connection): void
+    {
+        $connection->statement(JobSiteViewSql::overLegacyListings());
+    }
 }
 ```
 
 ## Rollback
 
-`Compatibility::rollback()` is the emergency reversal, and it replaces `uninstall()` ([0025](../decisions/0025-rollback-and-retire-are-separate-operations.md)):
+`Compatibility::rollback()` is the emergency reversal, and it replaces `uninstall()` ([0025](../decisions/0025-rollback-and-retire-are-separate-operations.md)). It runs these steps in one transaction:
 
-1. It drops the view.
-2. It renames the retained table back to the legacy name.
-3. It restores the mapped columns, and refills them from the successors through the successor key. The refill runs inside the write scope.
-4. It carries the view's grants back to the restored table.
-5. It runs the dependents' rollback hooks.
+1. It runs `ManagesDependents::beforeRollback()`, which removes every object that depends on the view.
+2. It drops the view.
+3. It renames the retained table back to the legacy name.
+4. It restores the mapped columns, and refills them from the successors through the successor key. The refill runs inside the write scope.
+5. It carries the view's grants back to the restored table.
+6. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
+
+`beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterSwap()` recreates it.
 
 The legacy model is then the source of truth again. Install had dropped the ledger, so a later install starts with a first pass.
 
@@ -203,7 +212,7 @@ The legacy model is then the source of truth again. Install had dropped the ledg
 
 ## Status and idempotence
 
-`compatibility:status` prints each legacy model's stage. `prepare()`, `install()` and `rollback()` are idempotent: a second run changes nothing. The package has no public `Compatibility::state()`.
+`compatibility:status` prints each legacy model's stage. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The plan's work item "Keep legacy identity on the legacy table" settles all four. The package has no public `Compatibility::state()`.
 
 ## The writer boundary
 
@@ -223,7 +232,7 @@ The view is not automatically updatable, and the package creates no trigger and 
 
 ### 1. Configuration values
 
-The session named four values without settling them. They are the clock-skew margin, the pass size at which install proceeds, the `statement_timeout` budget, and a mass write's retry bound.
+The session named three values without settling them. They are the clock-skew margin, the pass size at which install proceeds, and the `statement_timeout` budget.
 
 - **A.** Package configuration keys, with defaults: 1,000 rows for the pass size, as today, and 5 minutes for the margin. The `statement_timeout` budget has no default, and install refuses until it is set.
 - **B.** Arguments to `install()` and `compatibility:backfill`.
@@ -248,9 +257,9 @@ The timeline repeats passes until one is small, then installs. The session did n
 
 ### 4. Retire and its report
 
-The session did not say how `retire()` treats dependent objects, where its report goes, or whether it is idempotent.
+The session did not say how `retire()` treats dependent objects, or where its report goes. Its idempotence is settled: [status and idempotence](#status-and-idempotence) states it.
 
-- **A.** `retire()` refuses while any object depends on the view or the retained table, and lists each one. `compatibility:sql --for=retire` prints the data it would discard. A second `retire()` changes nothing.
+- **A.** `retire()` refuses while any object depends on the view or the retained table, and lists each one. `compatibility:sql --for=retire` prints the data it would discard.
 - **B.** `retire()` prints its report and asks for confirmation.
 
 **Recommendation: A.** `retire()` runs in a migration, where nobody can confirm. The refusal follows the rule for inbound foreign keys.

@@ -4,7 +4,7 @@
 
 Two Aryeo teams adopted the package at `a1a2bc1`, one for `Listing` and one for the media models. They reported eighteen findings. Many of them had one cause: the package gave the application's policy no supported place.
 
-Aryeo therefore rebuilt parts of the lifecycle around the package. It wrote its own reconciliation, run ledger and cutover, and it moved dependent views by hand. It also called internals, such as `Applying::run()`, `Statements::retain()`, `Installer::run()` and `LegacyBuilder::serves()`.
+Aryeo therefore rebuilt parts of the lifecycle around the package. It wrote its own reconciliation, run ledger and cutover, and it moved dependent views by hand. It also called internals, such as `Applying::run()`, Statements::retain(), `Installer::run()` and LegacyBuilder::serves().
 
 Two premises of the original design no longer hold. The design assumed that the package was a successor's only writer before install, but Aryeo's Job is live with its own writers. The design also assumed that successor invariants live in the database. eloquent-concurrency #8 and the eloquent-ordering stack removed every trigger and moved those invariants into model listeners.
 

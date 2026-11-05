@@ -57,7 +57,7 @@ The conversions stay the package's own. An application cannot add one, because t
 ```php
 ->related(fn (Job $job) => $job->listingCompatibilityState())
 ->related(fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-    ->attribute('place_id', fn (Attribute $a) => $a->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
+    ->attribute('place_id', fn (Attribute $a) => $a->from('id'))
     ->related(fn (Place $place) => $place->address()->withTrashed()))
 ```
 

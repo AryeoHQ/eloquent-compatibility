@@ -2,7 +2,7 @@
 
 ## Context
 
-The research proposed a closure for each new hook. They were a write handler such as `writeUsing(fn ...)`, a `creating()` callback on each successor, a write scope, and an extra catch-up condition. Each of those closures would run application behavior inside the package's transaction.
+The research proposed a closure for each new hook. They were a write handler such as writeUsing(fn ...), a creating() callback on each successor, a write scope, and an extra catch-up condition. Each of those closures would run application behavior inside the package's transaction.
 
 The map already accepts closures for its declarations, and refuses a closure that captures variables.
 

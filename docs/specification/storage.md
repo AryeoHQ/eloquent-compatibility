@@ -119,7 +119,7 @@ CREATE INDEX ON listings_backfill (status) WHERE status IN ('refused', 'failed')
 
 The partial index lets every pass find the `refused` and `failed` rows without a scan. The table's name obeys the identifier limit ([0009](../decisions/0009-map-names-fit-the-object-name-limit.md)).
 
-When install finishes, the package deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. `rollback()` needs neither, because it refills the legacy table from the successors through the successor key.
+When install finishes, the package deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It never drops `compatibility_backfills`. The table holds one row per legacy model, so dropping it would erase the watermarks of models not yet installed. Each legacy model installs independently, and that rule needs those watermarks. `rollback()` needs neither, because it refills the legacy table from the successors through the successor key.
 
 ## Open questions
 

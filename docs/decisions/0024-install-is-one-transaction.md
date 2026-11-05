@@ -15,7 +15,7 @@ With legacy identity on the legacy table, install needs no foreign key repointin
 - `compatibility:sql --for=install` prints each lock with its mode and table. A configurable `statement_timeout` bounds the hold.
 - Prepare, install, rollback and `compatibility:sql` list every object that depends on the legacy table. Install refuses before any work when one exists and the map declares no `dependents()`.
 - The dependents class runs inside the install transaction, before and after the swap, and mirrors both for rollback.
-- The package has no public `state()`. `compatibility:status` prints each legacy model's stage, and `prepare()`, `install()` and `rollback()` are idempotent.
+- The package has no public state() method. `compatibility:status` prints each legacy model's stage, and `prepare()`, `install()` and `rollback()` are idempotent.
 - The writer boundary is documented, not enforced. After install, a raw write to the legacy name fails loudly with a database error, and so does a model class from before the release. Eloquent writes through the legacy model and `toBase()` writes are translated, and reads keep working.
 
 Declined: package-managed rebinding of dependent views, until a second adopter needs plain rebinds.

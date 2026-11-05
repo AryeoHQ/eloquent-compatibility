@@ -90,14 +90,32 @@ final class InitializeFloorPlanAsset implements InitializesSuccessors
 }
 ```
 
-`InitializeLegacyFloorPlan` runs the other way. It derives the legacy-only NOT NULL `listing_id` from the successor graph.
+`InitializeLegacyFloorPlan` runs the other way. It derives the legacy-only NOT NULL `listing_id` from the successor graph: the asset's Place, that Place's Job, and the listing whose `job_id` is that Job, as decision 5 states. It never reads the stored `listings.place_id`, which goes stale when v2 moves a Job to another Place.
 
 ```php
 final class InitializeLegacyFloorPlan implements InitializesLegacy
 {
     public function initialize(Model $legacy, Successors $successors, Change $change): void
     {
-        $legacy->listing_id = Listing::query()->where('place_id', $successors->root()->place_id)->value('id');
+        $job = $successors->root()->place->job;
+        $legacy->listing_id = Listing::query()->where('job_id', $job->getKey())->value('id');
+    }
+}
+```
+
+## Photos
+
+`Photo` is served from `PlaceAsset` the same way, with the membership `type = 'photo'`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
+
+`InitializeLegacyPhoto` derives `photos.listing_id` through the asset's Place, that Place's Job, and `listings.job_id`, as decision 5 states.
+
+```php
+final class InitializeLegacyPhoto implements InitializesLegacy
+{
+    public function initialize(Model $legacy, Successors $successors, Change $change): void
+    {
+        $job = $successors->root()->place->job;
+        $legacy->listing_id = Listing::query()->where('job_id', $job->getKey())->value('id');
     }
 }
 ```
