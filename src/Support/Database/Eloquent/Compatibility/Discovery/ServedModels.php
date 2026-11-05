@@ -129,7 +129,7 @@ final class ServedModels
         foreach (ClassLoader::getRegisteredLoaders() as $vendor => $loader) {
             $real = realpath($vendor);
             $vendor = ($real === false ? $vendor : $real).DIRECTORY_SEPARATOR;
-            [$paths, $dependents] = $this->packages($vendor);
+            [$paths, $dependents, $installs] = $this->packages($vendor);
 
             foreach ($loader->getClassMap() as $class => $file) {
                 $real = realpath($file);
@@ -138,8 +138,8 @@ final class ServedModels
                     continue;
                 }
 
-                $vendored = str_starts_with($real, $vendor);
                 $within = fn (array $packages): bool => array_filter($packages, fn (string $package) => str_starts_with($real, $package)) !== [];
+                $vendored = str_starts_with($real, $vendor) || $within($installs);
 
                 if (! $vendored || $within($paths)) {
                     $files[$class] ??= [$real, true];
@@ -153,14 +153,14 @@ final class ServedModels
     }
 
     /**
-     * @return array{list<string>, list<string>}
+     * @return array{list<string>, list<string>, list<string>}
      */
     private function packages(string $vendor): array
     {
         $installed = "{$vendor}composer/installed.json";
 
         if (! $this->files->isFile($installed)) {
-            return [[], []];
+            return [[], [], []];
         }
 
         $decoded = json_decode($this->files->get($installed), true);
@@ -179,6 +179,7 @@ final class ServedModels
 
         $paths = [];
         $dependents = [];
+        $installs = [];
 
         foreach ($packages as $package) {
             $path = is_string($package['install-path'] ?? null) ? realpath("{$vendor}composer/{$package['install-path']}") : false;
@@ -189,11 +190,17 @@ final class ServedModels
 
             if (($package['dist']['type'] ?? null) === 'path') {
                 $paths[] = $path.DIRECTORY_SEPARATOR;
-            } elseif ($package['name'] !== self::PACKAGE && array_key_exists($package['name'], $depends)) {
+
+                continue;
+            }
+
+            $installs[] = $path.DIRECTORY_SEPARATOR;
+
+            if ($package['name'] !== self::PACKAGE && array_key_exists($package['name'], $depends)) {
                 $dependents[] = $path.DIRECTORY_SEPARATOR;
             }
         }
 
-        return [$paths, $dependents];
+        return [$paths, $dependents, $installs];
     }
 }
