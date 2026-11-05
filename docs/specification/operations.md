@@ -10,8 +10,8 @@ Each attribute has exactly one operation:
 
 - **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
-- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). An attribute with no stored column has no inverse, and [Creates](#creates) states its rule.
-- **A `position()` attribute's default operation.** It runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a trashed record, it does nothing.
+- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). An attribute with no stored column has no inverse, and [Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column) states its rule.
+- **A `position()` attribute's default operation.** On a live write after install, it runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a backfill row and a catch-up row, it places the row relative to its legacy neighbours instead ([Positions](#positions)). On a trashed record, it does nothing.
 - **The default operations of Eloquent-managed columns.** The root's soft-delete column and a successor's updated-at column keep the record writer's current behavior. [Eloquent-managed columns](#eloquent-managed-columns) states them.
 
 A `readAs()` attribute has no inverse. When it declares neither `writtenBy()` nor `readOnly()`, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
@@ -128,7 +128,7 @@ A mass write forwards no legacy event, as Eloquent's own mass writes fire no mod
 
 ## The round trip
 
-After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. The check skips a `position()` attribute on a trashed row, because a trashed record has no position.
+After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. The check skips a `position()` attribute on a trashed row, because a trashed record has no position. Before install, it compares a `position()` attribute by order, and after install by the raw value ([Positions](#positions)). Under `Origin::Backfill`, it also skips a `readOnly()` attribute with no stored column ([Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column)).
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
@@ -170,14 +170,20 @@ A create is a write of every supplied attribute against an empty original. The a
 
 A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. An update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
 
-A `readOnly()` attribute with no stored column has no inverse: a `computedAs()` value, or a `readOnly()` `readAs()` expression. On a create, its default operation depends on the origin:
-
-- **`Origin::Live`.** A create that supplies a non-NULL value for the attribute refuses, as an update does.
-- **`Origin::Backfill`.** The create ignores the supplied value. The round trip and install's value proof skip the attribute. A backfill row's value is history that the successor supersedes.
-
-Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
+A `readOnly()` attribute with no stored column has no inverse, and [Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column) states its rule.
 
 A create through the legacy model runs with `Origin::Live`. The backfill creates with `Origin::Backfill`.
+
+## Read-only attributes with no stored column
+
+A `readOnly()` attribute with no stored column has no inverse: a `computedAs()` value, or a `readOnly()` `readAs()` expression. Its rule depends on the origin:
+
+- **`Origin::Live`.** A create that supplies a non-NULL value for the attribute refuses. An update of the attribute refuses, as it does for every `readOnly()` attribute.
+- **`Origin::Backfill`.** A pass never writes or compares the attribute. A backfill create and a catch-up row ignore its legacy value. The `unchanged` test, the round trip, the drift check and install's value proof skip it. A backfill row's value is history that the successor supersedes.
+
+A catch-up row that differs only in such an attribute therefore runs no operation, and its outcome is `unchanged`. A map whose successors already exist, such as Listing, takes the update path on its first pass, and the rule holds there too.
+
+Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
 
 ## Morph targets
 
@@ -187,21 +193,34 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 - **A mass write** makes one unlocked read of every record's successors. It calls the write scope once, with the keys of all of them. Inside the scope, it locks every record's successors, parents first, and re-checks the keys once. It then runs steps 3 to 6 of [the unit of work](#the-unit-of-work) once per record, and forwards no legacy event. A mass write has no retry of its own.
 - **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`. Each pass holds the legacy model's advisory lock, so a second pass of the same model refuses with a named error instead of waiting ([Lifecycle: a pass](lifecycle.md#a-pass)). Inside a row's savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates.
-- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently.
+- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently. For a `position()` attribute, the equality check compares order, not the raw value ([Positions](#positions)). It never writes or compares a `readOnly()` attribute with no stored column ([Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column)).
 
 ## Positions
 
-A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. Its default operation moves the successor with `Placement::at()`.
+A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. On a live write after install, its default operation moves the successor with `Placement::at()`, because the legacy value is then a served position. On a backfill row and a catch-up row, the default operation places the successor relative to its legacy neighbours.
 
 Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor.
 
-The rank conversion runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. The legacy value becomes its rank among the legacy rows whose successors already belong to the successor's eloquent-ordering parent. The rows are ordered by the value with NULLs last, then by key. The default operation then moves the successor to that rank. Each create therefore inserts at a valid position, which `Placement::at()` accepts, and each parent's final order matches v1's relative order.
+The relative placement runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. At step 3, Assign, the default operation queues an `afterSave()` action and assigns nothing. At step 5, Act, the parent is set, because step 4 saved the root and `successorsInitializedBy()` has run. The action then reads the successor's parent, and places the row:
 
-The rank walks eloquent-ordering's `(parent, rank_key)` index and the legacy table's successor-key index. It needs no index of the consumer's on the legacy table.
+1. The candidates are the other live legacy rows whose successors already belong to that parent. They are ordered by the legacy value with NULLs last, then by key.
+2. When a candidate precedes the row, the action runs `move(Placement::after(<the nearest previous candidate's successor key>), expected: null)`.
+3. Otherwise, when a candidate follows the row, it runs `move(Placement::before(<the nearest next candidate's successor key>), expected: null)`.
+4. Otherwise, the successor keeps the create's default placement.
+
+Native members of the parent keep their places. Each parent's legacy rows therefore end in v1's relative order, and that relative order is what install's order proof checks ([Lifecycle: the install gate](lifecycle.md#the-install-gate)).
+
+Declined: moving the successor to its rank among the legacy rows with `Placement::at()`. Before install, a parent also holds native members with no legacy row. A rank counted among legacy rows alone then puts a row between the wrong neighbours. A parent of N, A and B that receives C at rank 3 reads N, A, C, B, and install's order proof refuses.
+
+The neighbour lookup walks eloquent-ordering's `(parent, rank_key)` index and the legacy table's successor-key index. It needs no index of the consumer's on the legacy table.
+
+eloquent-ordering ships `Placement::after()` and `Placement::before()` today. `Placement::at()` and the published parent key columns remain requests in https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 
 Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Such a caller reads `readAs()` with an operation instead.
 
-A trashed record has no position. The default operation does nothing on a trashed record, and the rank conversion counts live rows only. The round trip and install's value proof skip a `position()` attribute on a trashed row. After install, a trashed row reads a NULL position.
+A trashed record has no position. The default operation does nothing on a trashed record, and the relative placement takes live rows only as candidates. The round trip and install's value proof skip a `position()` attribute on a trashed row. After install, a trashed row reads a NULL position.
+
+Before install, the round trip and catch-up's equality check compare a `position()` attribute by order. The row's successor must sit after the successor of its previous live legacy neighbour in the same parent, and before the next one's. A side with no such neighbour sets no bound. This is install's order proof for one row.
 
 After install, a write compares the raw value with the position. A written `index` of 3 moves the row to position 3, and the round trip reads 3 back. [Lifecycle: positions after install](lifecycle.md#positions-after-install) states what consumers then read.
 

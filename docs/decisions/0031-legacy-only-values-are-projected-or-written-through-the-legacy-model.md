@@ -10,6 +10,7 @@ The package adds no hook.
 
 - **A value derived from a successor is projected, not stored.** It cannot go stale.
   - Where a successor owns a column for it, the map reads it with `from()` or `orFrom()`. A legacy media URL, the original and its resized variants, and the media facts, such as size, dimensions and Mux ids, are columns the File owns. The map reads them with `from()` on the File target of `relatedMorph()`. They are ordinary mapped attributes: the backfill copies them, the round trip holds, v1 filters keep working, and rollback refills them from the File.
+  - A File that v2 creates gets its stable URL from Aryeo. Aryeo's ingest path writes the stable URL onto the File at creation. Alternatively, the map reads a stable redirect URL over the File with `readAs()`. The choice is Aryeo's, and either way the package needs no change.
   - Where no column holds it anywhere, the map reads it with `computedAs()` and a read closure that computes it from the successor model, marked `readOnly()`. A ZML URL signed on each read is such a value.
 - **A genuine legacy-only value** is one that no successor can supply. The application refreshes it through the legacy model.
 

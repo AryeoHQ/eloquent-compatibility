@@ -58,6 +58,6 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - The map's membership decides which native successor creates insert a legacy row.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
-- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live legacy rows whose successors already belong to the successor's eloquent-ordering parent.
+- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass places each row after or before its nearest live legacy neighbour whose successor already belongs to the successor's eloquent-ordering parent.
 - A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

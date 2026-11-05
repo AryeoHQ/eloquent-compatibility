@@ -94,7 +94,7 @@ Declined: a declared change source that reports rows another table changed, so t
 
 ### Positions
 
-A pass converts a `position()` attribute's legacy value to a rank on each backfill row and each catch-up row. The rank is the value's place among the live legacy rows whose successors already belong to the successor's eloquent-ordering parent, ordered by the value with NULLs last, then by key. A trashed row has no rank, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the conversion.
+A pass places a `position()` attribute's successor relative to its legacy neighbours on each backfill row and each catch-up row. The placement runs in the default operation's `afterSave()` action, at step 5 of the unit of work, when the successor's eloquent-ordering parent is set. The row goes after its nearest previous live legacy neighbour whose successor already belongs to that parent, in legacy order: the value with NULLs last, then the key. Without one, it goes before the nearest next such neighbour. Without either, it keeps the create's default placement. Native members keep their places. A trashed row is not placed, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the placement.
 
 ### Trashed rows
 
@@ -120,7 +120,7 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
 - **Existence.** No legacy row lacks both a ledger row and a successor key.
-- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row.
+- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row. The proof also skips a `readOnly()` attribute with no stored column ([Operations: read-only attributes with no stored column](operations.md#read-only-attributes-with-no-stored-column)).
 
 The proofs read only, and write no ledger row. When the value proof flags keys, install catches up those keys and proves them again. It refuses only when they still differ. A row whose write left `updated_at` alone is therefore caught up before the lock. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 

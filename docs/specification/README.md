@@ -95,5 +95,5 @@ Four external dependencies on eloquent-ordering remain:
 
 - It publishes its position expression as public API, which `position()` reads.
 - It adds `Placement::at(int $position)`, which the default operation of `position()` uses.
-- It publishes an ordered item's parent key columns, which the rank conversion and install's order proof partition by. This is Requirement 3 of https://github.com/AryeoHQ/eloquent-ordering/issues/14.
+- It publishes an ordered item's parent key columns, which the relative placement and install's order proof partition by. This is Requirement 3 of https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 - It publishes a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media write scope needs it.

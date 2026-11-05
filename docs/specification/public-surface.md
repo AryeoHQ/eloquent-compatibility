@@ -74,7 +74,7 @@ Every method returns the `Compatibility` it was called on.
 | `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression; the default operation moves the row with `Placement::at()` |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
-| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, and ignores the value on a backfill create |
+| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, and a backfill pass never writes or compares it |
 | `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor; it cannot be filtered or sorted in SQL; `writtenBy()` names its operation |
 
 ### `Definition\Targets`
