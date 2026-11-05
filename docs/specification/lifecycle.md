@@ -24,6 +24,8 @@ The legacy model is the source of truth until install. The successor is the sour
 
 This is documented, not enforced, because Aryeo's v2 writes Jobs live before install. `compatibility:check` reports each served value that disagrees with its legacy value, which shows what the next pass would overwrite.
 
+`compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` only when it creates a legacy row, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
+
 ## Prepare
 
 `Compatibility::prepare()` runs on the live legacy table, before the first pass:
@@ -32,7 +34,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 - It adds a unique constraint on the successor key, and no other constraint. The key is an identity that may name no root yet, and install adds the rest under its lock ([Storage: the successor key](storage.md#the-successor-key)).
 - It creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today, so a pass finds the rows at or after its lower bound without a scan.
 - It lists every object that depends on the legacy table.
-- It creates `compatibility_backfills` when the table does not exist, and this legacy model's `<legacy>_backfill`. `compatibility:sql prepare` therefore prints every statement the package runs before install.
+- It creates `compatibility_backfills` when the table does not exist. It creates this legacy model's `<legacy>_backfill` when that table does not exist, and otherwise reuses the one an earlier install kept. `compatibility:sql prepare` therefore prints every statement the package runs before install.
 
 It allocates nothing on the successors. Running it again changes nothing. [Storage](storage.md#the-successor-key) shows its statements.
 
@@ -89,7 +91,7 @@ The pass calls the successor model's `delete()`. For a model that uses `SoftDele
 
 The two paths differ because of when they run. The installed delete runs synchronously inside the caller's write, so a foreign key from native history refuses in front of the caller. A pass finds the deletion later, when native history may have attached to the successor, and no caller is present.
 
-The trashed roots a pass leaves stay excluded from install's native-root inserts, because a `deleted` ledger row names each one ([Install: under the lock](#under-the-lock)). Purging them is the consumer's job.
+The trashed roots a pass leaves stay excluded from install's native-root inserts, because a `deleted` ledger row names each one ([Install: under the lock](#under-the-lock)). Install keeps the `deleted` rows, so a re-install after a rollback excludes those roots too ([Re-install after rollback](#re-install-after-rollback)). Purging them is the consumer's job.
 
 ### Changes outside the legacy row
 
@@ -128,10 +130,10 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
 
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
-- **Existence.** No legacy row lacks both a ledger row and a successor key whose root row exists. A non-NULL key is not enough: the proof checks that the key names an existing root.
+- **Existence.** Every legacy row has a ledger row or a successor key. Every non-NULL successor key names an existing root row, whatever the row's ledger state. A row whose ledger status is `created`, `updated` or `unchanged` therefore still fails the proof when its key names no root. The ledger gate refuses `refused` and `failed` rows on its own. When the proof still fails after install's catch-up, the refusal names the first keys.
 - **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row. The proof also skips a `readOnly()` attribute declared with `ignoreWrites: true`, and a `readOnly()` attribute with no stored column ([Operations: read-only attributes](operations.md#read-only-attributes)).
 
-The proofs read only, and write no ledger row. When the value proof flags keys, install catches up those keys and proves them again. It refuses only when they still differ. A row whose write left `updated_at` alone is therefore caught up before the lock. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
+The proofs read only, and write no ledger row. When either proof flags keys, install catches up those keys and proves them again. It refuses only when they still fail. For a key the existence proof flags, the catch-up takes the create path, and creates the root with the key value, so the identity holds ([Storage: the successor key](storage.md#the-successor-key)). A row whose write left `updated_at` alone is therefore caught up before the lock. So is a row whose root was hard-deleted, which no pass walks. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 
 The package has no partial install. A legacy row without a successor cannot be served, so install waits until every row has one. Unblocking is the consumer's work: complete the prerequisite, widen the successor to represent the state, retire rows, split the legacy table, or order the installs.
 
@@ -145,7 +147,7 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 2. It takes the advisory lock that every pass takes, and holds it until install ends. Install's own passes run under it, and any other pass of this model refuses.
 3. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them.
 4. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
-5. It proves the install gate: the ledger, existence and values. It catches up the keys the value proof flags, proves those keys again, and refuses only when they still differ.
+5. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail.
 
 These whole-table proofs never run under the lock.
 
@@ -168,7 +170,9 @@ Declined: a per-statement timeout only. Nothing would then bound the hold, and P
 
 `Provides\CarriesLegacy` does nothing before install, so a natively created root has no legacy row until install inserts one under its lock. The trait takes an `ACCESS SHARE` lock on the legacy table before it checks whether the model is installed. A native create therefore waits for install's `ACCESS EXCLUSIVE` lock, and afterward it sees the installed state. No pass walks that row, and install's pause grows with the number of such roots. After install, the trait inserts the legacy row on create. Legacy readers do not see a v2-created listing until install ([Operations: native successors before install](operations.md#native-successors-before-install)).
 
-When install finishes, the package deletes this legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills` itself, because the table holds the watermarks of other legacy models. Dropping it would erase them, and those models could no longer install independently.
+When install finishes, the package deletes this legacy model's row from `compatibility_backfills`. It also deletes every `<legacy>_backfill` row whose status is not `deleted`, and keeps the table. It keeps `compatibility_backfills` itself, because the table holds the watermarks of other legacy models. Dropping it would erase them, and those models could no longer install independently. The `deleted` rows name the roots a pass trashed, so a re-install after a rollback still excludes them from its native-root inserts.
+
+Declined: dropping `<legacy>_backfill` at install. A re-install would then insert a retained row for every root a pass trashed, and revive records whose legacy rows were hard-deleted.
 
 ### Positions after install
 
@@ -233,20 +237,21 @@ final class ListingDependents implements ManagesDependents
 
 `beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterInstall()` recreates it.
 
-The legacy model is then the source of truth again.
+The legacy model is then the source of truth again. Rollback leaves `<legacy>_backfill` and its `deleted` rows in place.
 
 ### Re-install after rollback
 
-Install had dropped `<legacy>_backfill`, so a re-install runs `prepare()` again. `prepare()` is idempotent, and it recreates the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger is missing, and the refusal names `prepare()`.
+Install deleted this model's watermark and every ledger row other than the `deleted` ones. A re-install therefore runs `prepare()` again. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. The `deleted` rows still name the roots a pass trashed, so install excludes those roots from its native-root inserts. Install refuses when the ledger is missing, and the refusal names `prepare()`.
 
 ## Retire
 
 `Compatibility::retire()` deprecates a legacy model that has no readers left:
 
 - It drops the view and the retained table.
+- It drops `<legacy>_backfill`, and deletes the model's row from `compatibility_backfills` when one remains. Retire rules out the re-install that the ledger's `deleted` rows serve ([Re-install after rollback](#re-install-after-rollback)).
 - It leaves every successor untouched.
 - It refuses while any object depends on the view or the retained table, and lists each one. An inbound foreign key is one such object.
-- `compatibility:sql retire` prints the legacy-only data it would discard. `retire()` runs in a migration, where nobody can confirm, so it asks nothing.
+- `compatibility:sql retire` prints the legacy-only data it would discard, and lists `<legacy>_backfill` and the model's `compatibility_backfills` row among that data. `retire()` runs in a migration, where nobody can confirm, so it asks nothing.
 - A second `retire()` changes nothing.
 
 ## Status and idempotence

@@ -62,9 +62,9 @@ An attribute with no inverse must declare `writtenBy()` or `readOnly()`, or the 
 
 ## Read-only attributes
 
-`readOnly(because:, ignoreWrites:)` marks an attribute that no write changes, and states the reason. `ignoreWrites:` has no default, so every declaration states it. With `false`, a write to the attribute refuses. With `true`, every path accepts and discards the write, and each discarded non-NULL write dispatches `Events\WriteIgnored`. [Operations: read-only attributes](operations.md#read-only-attributes) states what each value runs.
+`readOnly(because:, ignoreWrites:)` marks an attribute that no write changes, and states the reason. `ignoreWrites:` has no default, so every declaration states it. With `false`, an update of the attribute refuses. A create assigns the inverse into a successor row it creates. For an attribute with no stored column, a live create that supplies a non-NULL value refuses. With `true`, every path accepts and discards the write, and each discarded non-NULL write dispatches `Events\WriteIgnored`. [Operations: read-only attributes](operations.md#read-only-attributes) states what each value runs.
 
-A map adopts with `ignoreWrites: true`. A listener on `Events\WriteIgnored` then finds the writers that still send the attribute, and no write refuses while the application still has them. After install, the map flips the flag to `false`, once the `WriteIgnored` events from `Origin::Live` show no writer. Install drops the ledger, so after install only those events show that the writers are gone. Events from `Origin::Backfill` replay history, so they show no live writer. The flip changes only the map: no schema and no data change. The guidance holds for an attribute with a stored column and for one without.
+A map adopts with `ignoreWrites: true`. A listener on `Events\WriteIgnored` then finds the writers that still send the attribute, and no write refuses while the application still has them. After install, the map flips the flag to `false`, once the `WriteIgnored` events from `Origin::Live` show no writer. After install the ledger keeps only its `deleted` rows, so only those events show that the writers are gone. Events from `Origin::Backfill` replay history, so they show no live writer. The flip changes only the map: no schema and no data change. The guidance holds for an attribute with a stored column and for one without.
 
 ```php
 ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.', ignoreWrites: true))
@@ -117,6 +117,14 @@ When `choose:` picks another class for a record, the package moves the target in
 ### Membership
 
 `when()` on the root scopes the successor rows the legacy model serves. FloorPlan serves only the `PlaceAsset` rows whose `legacy_type` is `floorplan`. A native successor create inserts a legacy row only for a successor inside that scope.
+
+The package evaluates `when()` only when it creates a legacy row: at a native successor create after install, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the legacy row to its root, and the package never evaluates `when()` for that row again ([Storage: the view](storage.md#the-view)).
+
+Membership must therefore be exclusive across the maps that share a root, and stable from creation. A root that two maps' `when()` both match gets a legacy row in each. A root that leaves its map's scope stays served by the legacy row it already has.
+
+For a root that several legacy models share, declare membership on an immutable discriminator column, such as Aryeo's `place_assets.legacy_type`. `successorsInitializedBy()` sets it for a root the package creates. A `Creating` listener on the successor sets it for a native create.
+
+A change of membership after creation is a consumer reclassification: delete the record through one legacy model, then create it through the other. The package never reclassifies a record. `compatibility:check` reports a served record whose root no longer matches its map's `when()` ([Public surface: commands](public-surface.md#commands)).
 
 ## Hooks
 

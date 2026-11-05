@@ -50,6 +50,8 @@ The root's soft-delete column and a successor's updated-at column have default o
 
 The floor plan example matches Aryeo's schema. `display_type` and `displays_on_property_websites` are `place_assets` columns. WriteDisplayType therefore writes the PlaceAsset whatever the morph target, and no longer refuses a Link. FloorPlan's membership filters `place_assets.legacy_type`, a column Aryeo adds to hold the media's morph alias ([AryeoHQ/aryeo#12349](https://github.com/AryeoHQ/aryeo/issues/12349)).
 
+The package evaluates `when()` only when it creates a legacy row: at a native successor create, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the row to its root. Membership must therefore be exclusive across the maps that share a root, and stable from creation. For a root that several legacy models share, the specification recommends an immutable discriminator column, such as `place_assets.legacy_type`. `successorsInitializedBy()` sets it for a root the package creates, and a creating listener on the successor sets it for a native create. A change of membership after creation is a consumer reclassification: delete through one legacy model, then create through the other. It is never a package action ([AryeoHQ/aryeo#12360](https://github.com/AryeoHQ/aryeo/issues/12360)). `compatibility:check` reports a served record whose root no longer matches its map's `when()`.
+
 Declined: a complete column specification, and one adapter class per legacy model.
 
 ## Consequences
@@ -57,7 +59,7 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - Each changed successor produces one `UPDATE` and one each of `saving`, `updating`, `updated` and `saved`. A domain action queued after the save saves again, with its own events.
 - An operation's write must agree with its attribute's read, or the write refuses.
 - The map refuses to compile a legacy-only NOT NULL column with neither a default nor an initializer. `assertServesCompatibility()` exercises a native create.
-- The map's membership decides which native successor creates insert a legacy row.
+- The map's membership decides which native successor creates insert a legacy row. It decides nothing after that row exists.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
 - A position() attribute reads eloquent-ordering's published position expression. After install, a write moves the row with Placement::at(). A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](../specification/operations.md#positions)): after or before its nearest live legacy neighbour whose successor already belongs to the successor's eloquent-ordering parent. The package therefore requires eloquent-ordering.

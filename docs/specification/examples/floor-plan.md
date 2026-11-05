@@ -44,7 +44,7 @@ final class FloorPlanMap
 }
 ```
 
-`when()` declares membership: a `PlaceAsset` is a floor plan when its `legacy_type` is `floorplan`. The example elides the mapped attributes of the File and the Link. The File's include the media URLs and the media facts, which the File owns as columns and the map reads with `from()` ([The map: legacy-only columns](../the-map.md#legacy-only-columns)).
+`when()` declares membership: a `PlaceAsset` is a floor plan when its `legacy_type` is `floorplan`. `legacy_type` never changes after the `PlaceAsset` is created, so membership is exclusive across the media maps and stable from creation. `InitializeFloorPlanAsset` sets it for a `PlaceAsset` the package creates, and Aryeo's `Creating` listener on `PlaceAsset` sets it for a native create ([The map: membership](../the-map.md#membership)). The example elides the mapped attributes of the File and the Link. The File's include the media URLs and the media facts, which the File owns as columns and the map reads with `from()` ([The map: legacy-only columns](../the-map.md#legacy-only-columns)).
 
 `floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
@@ -83,7 +83,7 @@ final class WriteDisplayType implements WritesAttribute
 
 ## The initializers
 
-`InitializeFloorPlanAsset` sets the successor-only parent keys. `rank_key` needs nothing, because eloquent-ordering's `IsOrdered` assigns it when the `PlaceAsset` is created.
+`InitializeFloorPlanAsset` sets the membership discriminator, `legacy_type = 'floorplan'`, and the successor-only parent keys. `rank_key` needs nothing, because eloquent-ordering's `IsOrdered` assigns it when the `PlaceAsset` is created.
 
 ```php
 final class InitializeFloorPlanAsset implements InitializesSuccessors
@@ -91,6 +91,7 @@ final class InitializeFloorPlanAsset implements InitializesSuccessors
     public function initialize(Successors $successors, Creation $creation): void
     {
         $asset = $successors->root();
+        $asset->legacy_type = 'floorplan';
         $asset->place_id = Listing::query()->whereKey($creation->record->listing_id)->value('place_id');
         $asset->subsection_id = DefaultSection::for(type: 'floorplan', place: $asset->place_id);
     }

@@ -105,7 +105,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 | `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's unique constraint, creates the backfill tables, and lists the objects that depend on the legacy table |
 | `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, null\|CarbonInterval $margin = null): void` | runs passes until one changes the outcome of fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; `$statementTimeout` sets `statement_timeout` for every statement under install's lock, and is the total budget for the lock hold, after which install rolls back and refuses, naming the step it reached; a null `$margin` means 5 minutes |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
-| `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers; refuses while any object depends on either |
+| `Compatibility::retire(class-string<Model> $model): void` | drops the view, the retained table and `<legacy>_backfill` once a legacy model has no readers; refuses while any object depends on either |
 | `Compatibility::update(class-string<Model> $model): void` | rebuilds an installed view after a map change |
 | `Compatibility::serves(class-string<Model> $model): bool` | answers whether the legacy name is the installed view on the model's connection |
 
@@ -122,7 +122,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 | Command | Does |
 | :-- | :-- |
 | `compatibility:backfill {model} {--chunk=1000} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
-| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, and trashed rows separately |
+| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, served records whose root no longer matches the map's `when()`, and trashed rows separately |
 | `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
 | `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names; a backfilling model also shows its pass count, its watermark, and its refused and failed counts |
 | `compatibility:cache` | discovers the served models and caches the list |
