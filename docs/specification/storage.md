@@ -60,14 +60,6 @@ Rollback mirrors install. Before it renames the retained table back, it drops th
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "listings_updated_at_index" ON "listings" ("updated_at");
 ```
 
-## The position index
-
-Each `position()` attribute needs an index on the legacy table: `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL`. The consumer creates it `CONCURRENTLY` before prepare. `prepare()` refuses without it, and `compatibility:sql prepare` prints the statement.
-
-```sql
-CREATE INDEX CONCURRENTLY floorplans_listing_id_index_id ON floorplans (listing_id, "index", id) WHERE deleted_at IS NULL;
-```
-
 ## The view
 
 At install, the legacy name becomes a view. The view reads from the retained table, joins the root on the successor key, and reaches every related successor through the root's relations ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).

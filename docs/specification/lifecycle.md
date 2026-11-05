@@ -34,7 +34,6 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 - It creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today, so a pass finds the rows at or after its lower bound without a scan.
 - It lists every object that depends on the legacy table.
 - It creates `compatibility_backfills` when the table does not exist, and this legacy model's `<legacy>_backfill`. `compatibility:sql prepare` therefore prints every statement the package runs before install.
-- For each `position()` attribute, it refuses unless the index `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL` exists. The consumer creates that index `CONCURRENTLY` before prepare. `compatibility:sql prepare` prints the statement.
 
 It allocates nothing on the successors. Running it again changes nothing. [Storage](storage.md#the-successor-key) shows its statements.
 
@@ -95,7 +94,7 @@ Declined: a declared change source that reports rows another table changed, so t
 
 ### Positions
 
-A pass converts a `position()` attribute's legacy value to a rank on each backfill row and each catch-up row. The rank is the value's place among the live rows of the same legacy parent, ordered by the value with NULLs last, then by key. A trashed row has no rank, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the conversion.
+A pass converts a `position()` attribute's legacy value to a rank on each backfill row and each catch-up row. The rank is the value's place among the live legacy rows whose successors already belong to the successor's eloquent-ordering parent, ordered by the value with NULLs last, then by key. A trashed row has no rank, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the conversion.
 
 ### Trashed rows
 
@@ -121,7 +120,7 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
 - **Existence.** No legacy row lacks both a ledger row and a successor key.
-- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. Each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof skips the attribute on a trashed row.
+- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row.
 
 The proofs read only, and write no ledger row. When the value proof flags keys, install catches up those keys and proves them again. It refuses only when they still differ. A row whose write left `updated_at` alone is therefore caught up before the lock. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 
@@ -164,10 +163,11 @@ When install finishes, the package deletes this legacy model's row from `compati
 
 ### Positions after install
 
-After install, a `position()` attribute reads the successor's position, not the stored legacy value. The order of the rows does not change, but two kinds of value do:
+After install, a `position()` attribute reads the successor's position, not the stored legacy value. The order of the rows within each eloquent-ordering parent does not change, but three kinds of value do:
 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
+- Positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
 
 Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install.
 

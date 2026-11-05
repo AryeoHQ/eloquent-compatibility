@@ -8,11 +8,7 @@ Status: Proposed
 
 `floorplans` keeps `id bigint` and `uuid`. It has no reference to its `PlaceAsset`, so `prepare()` adds `place_asset_id uuid` as the successor key, and the backfill fills it.
 
-Before prepare, a migration of the consumer's creates the position index concurrently:
-
-```sql
-CREATE INDEX CONCURRENTLY floorplans_listing_id_index_id ON floorplans (listing_id, "index", id) WHERE deleted_at IS NULL;
-```
+`place_assets.legacy_type` holds the morph alias of the legacy model a `PlaceAsset` serves: `photo`, `video`, `floorplan`, `legacy_file` or `interactive_content`. It replaces the `type` column. `place_assets` also holds the display columns, `displays_on_property_websites` and `display_type`.
 
 `photos.id` is `integer`, and every other media key is `bigint`. Each table keeps its own key and sequence, so the widths never meet. `photos.listing_id integer NOT NULL` stays on `photos_retained`, with its foreign key to `listings`.
 
@@ -28,13 +24,13 @@ final class FloorPlanMap
         return $floorPlan
             ->retainedIn('floorplans_retained')
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
-                ->when(fn (Builder $assets) => $assets->where(column: 'type', operator: '=', value: 'floorplan'))
+                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'floorplan'))
                 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
                 ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at')->inTimeZone('UTC'))
                 ->attribute(name: 'deleted_at', definition: fn (Attribute $attribute) => $attribute->from('deleted_at')->inTimeZone('UTC'))
-                ->attribute(name: 'index', definition: fn (Attribute $attribute) => $attribute->position(legacyWithin: 'listing_id'))
+                ->attribute(name: 'index', definition: fn (Attribute $attribute) => $attribute->position())
                 ->attribute(name: 'display_type', definition: fn (Attribute $attribute) => $attribute
-                    ->readAs('CASE WHEN "asset_files"."displays_on_property_websites" THEN "asset_files"."display_type" ELSE \'none\' END')
+                    ->readAs('CASE WHEN "place_assets"."displays_on_property_websites" THEN "place_assets"."display_type" ELSE \'none\' END')
                     ->writtenBy(WriteDisplayType::class))
                 ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                     choose: fn (FloorPlan $plan): string => $plan->url !== null ? Link::class : File::class,
@@ -48,45 +44,38 @@ final class FloorPlanMap
 }
 ```
 
-`when()` declares membership: a `PlaceAsset` is a floor plan when its `type` is `floorplan`. The example elides the mapped attributes of the File and the Link.
+`when()` declares membership: a `PlaceAsset` is a floor plan when its `legacy_type` is `floorplan`. The example elides the mapped attributes of the File and the Link. The File's include the media URLs and the media facts, which the File owns as columns and the map reads with `from()` ([The map: legacy-only columns](../the-map.md#legacy-only-columns)).
 
 `floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
-`index` reads its one-based position through eloquent-ordering's published position expression, and `legacyWithin:` names the legacy parent column, `listing_id`. It needs no `writtenBy()`: its default operation moves the `PlaceAsset` with `Placement::at($value)` ([Operations: positions](../operations.md#positions)).
+`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`: its default operation moves the `PlaceAsset` with `Placement::at($value)` ([Operations: positions](../operations.md#positions)).
 
-One fact stays open, to verify during implementation. A listing's floor plans must be exactly the members of one eloquent-ordering parent. Otherwise the position the successor serves is not the legacy rank.
+Positions number within each eloquent-ordering parent, so a legacy reader that needs one sequence per listing must read `readAs()` with an operation instead.
 
 ### What `index` reads after install
 
-After install, a `position()` attribute reads the successor's position, not the stored legacy value. The order of the rows does not change, but two kinds of value do:
+After install, a `position()` attribute reads the successor's position, not the stored legacy value. The order of the rows within each eloquent-ordering parent does not change, but three kinds of value do:
 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
+- Positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
 
 Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install. A trashed row reads a NULL `index` after install, because a trashed record has no position.
 
 ## The operations
 
-`WriteDisplayType` writes one legacy value into two columns of the File. `'none'` means the File is not displayed, and v2 has no `'none'` display type. The operation branches on the morph target `choose:` picks. A Link has no display type, so a Link floor plan accepts only `'none'`, and refuses any other value. A File target may not exist yet on a create, so the operation reaches it with `relatedOrNew()`.
+`WriteDisplayType` writes one legacy value into two columns of the root `PlaceAsset`, whatever the morph target. `'none'` means the asset is not displayed, and v2 has no `'none'` display type. `'none'` therefore sets `displays_on_property_websites` to false. Any other value sets it to true and sets `display_type`. The operation never touches the File or the Link.
 
 ```php
 final class WriteDisplayType implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        if ($change->record->url !== null) {
-            if ($value === 'none') {
-                return;
-            }
-
-            throw Refusal::because('A Link floor plan has no display type.');
-        }
-
-        $file = $successors->relatedOrNew(File::class);
-        $file->displays_on_property_websites = $value !== 'none';
+        $asset = $successors->root();
+        $asset->displays_on_property_websites = $value !== 'none';
 
         if ($value !== 'none') {
-            $file->display_type = $value;
+            $asset->display_type = $value;
         }
     }
 }
@@ -132,7 +121,7 @@ FloorPlan and Photo install after Listing. Before Listing installs, a Job create
 
 ## Photos
 
-`Photo` is served from `PlaceAsset` the same way, with the membership `type = 'photo'`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
+`Photo` is served from `PlaceAsset` the same way, with the membership `legacy_type = 'photo'`. Its map names `InitializeLegacyPhoto` in `legacyInitializedBy()`. `photos.listing_id integer NOT NULL` stays on `photos_retained`, so a native `PlaceAsset` create needs it.
 
 `InitializeLegacyPhoto` derives `photos.listing_id` through the asset's Place, that Place's Job, and `listings.job_id`. It resolves each one with `withTrashed()`, and refuses with the asset's key when one is missing.
 

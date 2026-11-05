@@ -26,7 +26,8 @@ The documentation lists exactly that surface. Every parameter of a public constr
 - `compatibility:sql` takes the operation as its first positional argument: `compatibility:sql {operation} {model}`, with the operation one of prepare, install, update, rollback and retire. Its `--for=` option is removed. Declined: keeping `--for=`.
 - `compatibility:backfill` drops `--since`, because the package stores the watermark. Declined: keeping `--since`.
 - The map loses identifiedBy(), discriminatedBy() and timestamps(). Identity comes from the legacy table, and every map declares `created_at` and `updated_at` as plain attributes. Declined: keeping identifiedBy() and discriminatedBy(), and keeping timestamps() as a shortcut.
-- The map keeps `atMostOne(because:)` for writes, and `external()` with its read closure only. Declined: removing either one.
+- The map keeps `atMostOne(because:)` for writes, and `computedAs()` with its read closure only. Declined: removing either one.
+- `external()` is renamed `computedAs()`. It holds a value computed in PHP after the query, from an outside store or from a successor model method, so it cannot be filtered or sorted in SQL. `readAs()` keeps its name. Declined: `computed()`, which reads as a SQL computed column; `fromRaw()` with `fromApplication()`, which renames `readAs()` too; and `projected()`, which names every read.
 - The [interface specification](../specification/README.md) ships first. Every later change is checked against it, and a deliberate deviation updates it in the same pull request.
 
 Declined: a public state() reader, because `compatibility:status` and idempotent operations cover its uses.

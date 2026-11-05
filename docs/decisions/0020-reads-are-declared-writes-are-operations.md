@@ -9,7 +9,7 @@ A legacy attribute write could only become one value in one column of one succes
 - A media position is a move through eloquent-ordering, not a column value.
 - One legacy `display_type` splits into two successor columns.
 
-The map had two partial escapes, transitions() and the write closure of `external()`. Neither one composed with a read.
+The map had two partial escapes, transitions() and the write closure of an external attribute. Neither one composed with a read.
 
 ## Decision
 
@@ -36,11 +36,9 @@ A mass write makes one unlocked read of every record's successors, then one scop
 
 An operation receives the change context: the record after the write, the original, the attribute and the origin. The original is a legacy model instance, empty on a create. During catch-up, the original is the record as the successors serve it before the pass writes, read through the view's compiled `SELECT`. An initializer receives a creation context instead, Write\Creation, with the record and the origin. On a native create, its record is the new legacy model, so the legacy initializer takes no separate legacy parameter. Declined: the change context with a null attribute and an empty original.
 
-Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position(legacyWithin:)` reads eloquent-ordering's published position expression, and its default operation moves the row. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
+Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position()` reads eloquent-ordering's published position expression, and its default operation moves the row. It takes no arguments: positions number within the successor's eloquent-ordering parent ([0030](0030-positions-number-within-the-ordering-parent.md)). This amends the earlier design, which named a legacy parent column as its argument. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
 
 A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row.
-
-`prepare()` refuses a `position()` attribute without its position index on the legacy table.
 
 When `choose:` picks another target class for a record, the package moves the morph target. It deletes the old target through its model and creates the new one, in one unit of work. Declined: an operation that moves it.
 
@@ -60,6 +58,6 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - The map's membership decides which native successor creates insert a legacy row.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
-- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live rows of its legacy parent.
+- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live legacy rows whose successors already belong to the successor's eloquent-ordering parent.
 - A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

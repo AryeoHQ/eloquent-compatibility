@@ -10,13 +10,13 @@ Each attribute has exactly one operation:
 
 - **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
-- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
+- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). An attribute with no stored column has no inverse, and [Creates](#creates) states its rule.
 - **A `position()` attribute's default operation.** It runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a trashed record, it does nothing.
 - **The default operations of Eloquent-managed columns.** The root's soft-delete column and a successor's updated-at column keep the record writer's current behavior. [Eloquent-managed columns](#eloquent-managed-columns) states them.
 
 A `readAs()` attribute has no inverse. When it declares neither `writtenBy()` nor `readOnly()`, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
 
-`writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of `external()`, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
+`writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of an external attribute, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
 
 Every hook is a class string. The package resolves each operation and hook class from the container, so a constructor can take dependencies.
 
@@ -134,6 +134,19 @@ The round trip binds an operation to its attribute's read. `address_id` reads th
 
 Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
 
+## Legacy-only writes
+
+A legacy-only column holds a value that no successor can supply ([The map: legacy-only columns](the-map.md#legacy-only-columns)). The application refreshes it through the legacy model. A legacy write that changes only legacy-only columns:
+
+- writes the retained row;
+- runs no operation and saves no successor, so no successor event fires;
+- fires one legacy event sequence, as any Eloquent update does;
+- fires nothing under `saveQuietly()`, which suppresses that legacy event sequence as it does in Eloquent.
+
+In [the unit of work](#the-unit-of-work), steps 3 to 6 do nothing for these columns. The package writes the retained row, and step 7 forwards the legacy event sequence.
+
+A value derived from a successor is never a legacy-only value. The map projects it, so it cannot go stale. Declined: a refresh hook driven by successor saves ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
+
 ## Eloquent-managed columns
 
 Eloquent manages a successor's soft-delete and updated-at columns itself. Their default operations therefore keep the record writer's current behavior ([0020](../decisions/0020-reads-are-declared-writes-are-operations.md)).
@@ -157,6 +170,13 @@ A create is a write of every supplied attribute against an empty original. The a
 
 A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. An update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
 
+A `readOnly()` attribute with no stored column has no inverse: a `computedAs()` value, or a `readOnly()` `readAs()` expression. On a create, its default operation depends on the origin:
+
+- **`Origin::Live`.** A create that supplies a non-NULL value for the attribute refuses, as an update does.
+- **`Origin::Backfill`.** The create ignores the supplied value. The round trip and install's value proof skip the attribute. A backfill row's value is history that the successor supersedes.
+
+Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
+
 A create through the legacy model runs with `Origin::Live`. The backfill creates with `Origin::Backfill`.
 
 ## Morph targets
@@ -173,7 +193,13 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. Its default operation moves the successor with `Placement::at()`.
 
-The rank conversion runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. The legacy value becomes its rank among the live rows of the same legacy parent, the column `legacyWithin` names. The rows are ordered by the value with NULLs last, then by key. The default operation then moves the successor to that rank.
+Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor.
+
+The rank conversion runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. The legacy value becomes its rank among the legacy rows whose successors already belong to the successor's eloquent-ordering parent. The rows are ordered by the value with NULLs last, then by key. The default operation then moves the successor to that rank. Each create therefore inserts at a valid position, which `Placement::at()` accepts, and each parent's final order matches v1's relative order.
+
+The rank walks eloquent-ordering's `(parent, rank_key)` index and the legacy table's successor-key index. It needs no index of the consumer's on the legacy table.
+
+Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Such a caller reads `readAs()` with an operation instead.
 
 A trashed record has no position. The default operation does nothing on a trashed record, and the rank conversion counts live rows only. The round trip and install's value proof skip a `position()` attribute on a trashed row. After install, a trashed row reads a NULL position.
 

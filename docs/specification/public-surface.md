@@ -71,11 +71,11 @@ Every method returns the `Compatibility` it was called on.
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
 | `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
-| `position(string $legacyWithin)` | reads the row's one-based position through eloquent-ordering's published position expression for the successor; `legacyWithin` names the legacy parent column, and the default operation moves the row with `Placement::at()` |
+| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression; the default operation moves the row with `Placement::at()` |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
-| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates |
-| `external(Closure $read)` | a value stored outside the database, which the closure reads; `writtenBy()` names its operation |
+| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, and ignores the value on a backfill create |
+| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor; it cannot be filtered or sorted in SQL; `writtenBy()` names its operation |
 
 ### `Definition\Targets`
 
@@ -86,7 +86,8 @@ Every method returns the `Compatibility` it was called on.
 ### Removed from today's map
 
 - `retainedIn(key:)`: the successor key moves to `servedFrom(key:)`.
-- `writeTo()`, `transitions()` and the write closure of `external()`: `writtenBy()` replaces them.
+- `writeTo()`, `transitions()` and the write closure of an external attribute: `writtenBy()` replaces them.
+- The external attribute's read: `computedAs()` replaces it, with the same `read` closure ([0028](../decisions/0028-the-public-surface-is-declared.md)).
 - `servedFrom(choose:, successors:)`: two-primary maps are retired.
 - `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
 - `timestamps()`: every worked map declares `created_at` and `updated_at` as plain attributes. Declined: keeping `timestamps()` as a shortcut.

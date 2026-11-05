@@ -42,7 +42,7 @@ Only the root has a successor key. A related successor is reached through the ro
 Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
 
 - `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
-- `position(legacyWithin:)` reads the row's one-based position through eloquent-ordering's published position expression for the successor. `legacyWithin` names the legacy parent column, such as `floorplans.listing_id`. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. [Operations: positions](operations.md#positions) states the conversion.
+- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. [Operations: positions](operations.md#positions) states the conversion.
 
 ```php
 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
@@ -54,7 +54,22 @@ Each attribute declares how the view reads it, and nothing else about its storag
 
 `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. A `readAs()` expression names the view's join aliases, which are internal and may change. A helper names the successor by class instead.
 
+`readAs()` is computed by SQL inside the view, so it can be filtered and sorted, and `computedAs()` is computed in PHP after the query, so it cannot.
+
 The conversions stay the package's own. An application cannot add one, because the `Conversion` interface stays closed. A conversion's inverse becomes the attribute's default operation. [Operations](operations.md) states how every write runs.
+
+## Legacy-only columns
+
+A legacy-only column is a column of the retained table that no attribute maps, other than the legacy identity and the successor key ([Storage: the retained table](storage.md#the-retained-table)). The view reads it from the retained table.
+
+Project a value where a successor can supply it. A value derived from a successor is projected, not stored. A projected value cannot go stale, because every read resolves it from the successor.
+
+- **A successor column.** The map reads it with `from()` or `orFrom()`. A legacy media URL, meaning the original and its resized variants, is a column the File owns. So are the media facts, such as size, dimensions and Mux ids. The map reads each one with `from()` on the File target of `relatedMorph()`. They are ordinary mapped attributes: the backfill copies them, the round trip holds, v1 filters keep working, and rollback refills them from the File.
+- **A value with no column anywhere.** The map reads it with `computedAs()` and a read closure that computes it from the successor model, marked `readOnly()`. A ZML URL signed on each read is such a value.
+
+A genuine legacy-only value is one that no successor can supply. The application refreshes it through the legacy model, and the package never refreshes it. [Operations: legacy-only writes](operations.md#legacy-only-writes) states what such a write runs ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
+
+Declined: a refresh hook driven by successor saves. It needs a listener on every related successor class, and it misses mass and raw writes to `files`, such as the completion of the ZML migration.
 
 ## Related successors
 
@@ -87,7 +102,7 @@ When `choose:` picks another class for a record, the package moves the target in
 
 ### Membership
 
-`when()` on the root scopes the successor rows the legacy model serves. FloorPlan serves only the `PlaceAsset` rows whose `type` is `floorplan`. A native successor create inserts a legacy row only for a successor inside that scope.
+`when()` on the root scopes the successor rows the legacy model serves. FloorPlan serves only the `PlaceAsset` rows whose `legacy_type` is `floorplan`. A native successor create inserts a legacy row only for a successor inside that scope.
 
 ## Hooks
 
@@ -105,7 +120,7 @@ Every hook is optional, and a map declares each hook at most once. Without `writ
 
 `writtenBy()`, `successorsInitializedBy()`, `legacyInitializedBy()`, `writesWithin()` and `dependents()` take a class-string of their interface. A closure is a type error ([0022](../decisions/0022-operations-are-classes.md)).
 
-The other closures a map holds stay closures. They are `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`. Each one selects rows, picks a class or computes a value, and none of them writes. The five hooks are the places where application behavior runs inside the package's transaction.
+The other closures a map holds stay closures. They are `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `computedAs()`. Each one selects rows, picks a class or computes a value, and none of them writes. The five hooks are the places where application behavior runs inside the package's transaction.
 
 The classes live in the consumer's entity namespace plus `\Compatibility`. This is a documented convention, and no tool checks it. Aryeo's is `App\Entities\<Plural>\Compatibility`, whether or not the model itself lives there. The worked examples therefore place the classes of `App\Entities\Listings\Listing` under `App\Entities\Listings\Compatibility`. Declined: the model's own namespace plus `\Compatibility`.
 

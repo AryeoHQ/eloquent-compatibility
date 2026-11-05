@@ -48,6 +48,8 @@ Each settled decision has one record. Records 0009 to 0015 stay in force, and no
 | [0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md) | the view is driven from the retained table |
 | [0028](../decisions/0028-the-public-surface-is-declared.md) | the public surface is declared |
 | [0029](../decisions/0029-two-primary-maps-are-retired.md) | two-primary maps are retired |
+| [0030](../decisions/0030-positions-number-within-the-ordering-parent.md) | positions number within the successor's ordering parent |
+| [0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md) | legacy-only values are projected, or written through the legacy model |
 
 ## Adoption findings
 
@@ -89,8 +91,9 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No two-primary maps.** A retained table may still hold two nullable root keys if a real split appears.
 - **Out of scope:** the audit findings not named here, `Event::fake()` suppressing forwarding, and guards on insert. Database-enforced exclusivity on shared successors and every change inside Aryeo are out of scope too.
 
-Three external dependencies on eloquent-ordering remain:
+Four external dependencies on eloquent-ordering remain:
 
 - It publishes its position expression as public API, which `position()` reads.
 - It adds `Placement::at(int $position)`, which the default operation of `position()` uses.
+- It publishes an ordered item's parent key columns, which the rank conversion and install's order proof partition by. This is Requirement 3 of https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 - It publishes a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media write scope needs it.
