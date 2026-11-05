@@ -128,7 +128,7 @@ A mass write forwards no legacy event, as Eloquent's own mass writes fire no mod
 
 ## The round trip
 
-After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. The check skips a `position()` attribute on a trashed row, because a trashed record has no position. Before install, it compares a `position()` attribute by order, and after install by the raw value ([Positions](#positions)). On every origin, it also skips a `readOnly()` attribute declared with `ignoreWrites: true`, and a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)).
+After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. A `computedAs()` attribute that declares `writtenBy()` has no value in the view, because PHP computes it after the query. For such an attribute under `Origin::Live`, the check evaluates the read closure against the reloaded successors and compares that value. Under `Origin::Backfill`, the check skips every `computedAs()` attribute ([Computed attributes under the backfill](#computed-attributes-under-the-backfill)). The check skips a `position()` attribute on a trashed row, because a trashed record has no position. Before install, it compares a `position()` attribute by order, and after install by the raw value ([Positions](#positions)). On every origin, it also skips a `readOnly()` attribute declared with `ignoreWrites: true`, and a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)).
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
@@ -198,6 +198,18 @@ A catch-up row that differs only in such an attribute therefore runs no operatio
 
 Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. `ignoreWrites: true` ignores a write and dispatches `Events\WriteIgnored`, so the trace remains. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
 
+### Computed attributes under the backfill
+
+A `computedAs()` attribute has no stored column, whatever its write declaration. Under `Origin::Backfill`, catch-up's equality check, the `unchanged` test, the drift check, the round trip and install's value proof skip it. This extends the rule above to every `computedAs()` attribute, including one that declares `writtenBy()`.
+
+A pass still runs the attribute's `writtenBy()` operation on every row it walks, because no comparison tells whether the value changed. A walked row whose other legacy values are unchanged therefore runs that operation too. The operation decides what to do with the value. The row's outcome is `unchanged` unless the operation changes a successor.
+
+A media URL is such an attribute. Its operation writes the v1 URL onto a File that is not in ZML, and does nothing under `Origin::Backfill` for a File in ZML ([The map: media values](the-map.md#media-values)). A v1 URL edit made before install still reaches a non-ZML File, and an asset the ZML migration moved never refuses.
+
+Under `Origin::Live`, the attribute is compared as every written attribute is: the round trip evaluates its read closure against the reloaded successors.
+
+Declined: an operation signal that its value is superseded, which would be new API. Declined: a resolver that depends on the install state.
+
 ## Morph targets
 
 When `choose:` picks another target class for a record, the package moves the target. It deletes the old target through its model, and creates the new one, in the same unit of work. A FloorPlan whose `url` becomes non-null therefore moves from a File to a Link.
@@ -206,7 +218,7 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 - **A mass write** makes one unlocked read of every record's successors. It calls the write scope once, with the keys of all of them. Inside the scope, it locks every record's successors, parents first, and re-checks the keys once. It then runs steps 3 to 6 of [the unit of work](#the-unit-of-work) once per record, and forwards no legacy event. A mass write has no retry of its own.
 - **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`. Each pass holds the legacy model's advisory lock, so a second pass of the same model refuses with a named error instead of waiting ([Lifecycle: a pass](lifecycle.md#a-pass)). Inside a row's savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. A key that names no row creates the root with that key value ([Storage: the successor key](storage.md#the-successor-key)).
-- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently. For a `position()` attribute, the equality check compares order, not the raw value ([Positions](#positions)). It never writes or compares a `readOnly()` attribute declared with `ignoreWrites: true`, or a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)).
+- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently. For a `position()` attribute, the equality check compares order, not the raw value ([Positions](#positions)). It never writes or compares a `readOnly()` attribute declared with `ignoreWrites: true`, or a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)). It never compares a `computedAs()` attribute, and runs its `writtenBy()` operation on every walked row ([Computed attributes under the backfill](#computed-attributes-under-the-backfill)).
 
 ## Positions
 

@@ -78,12 +78,64 @@ A legacy-only column is a column of the retained table that no attribute maps, o
 
 Project a value that a successor column holds, or that a read can compute each time. Such a value is projected, not stored. A projected value cannot go stale, because every read resolves it from the successor.
 
-- **A successor column.** The map reads it with `from()` or `orFrom()`. A legacy media URL, meaning the original and its resized variants, is a column the File owns. So are the media facts, such as size, dimensions and Mux ids. The map reads each one with `from()` on the File target of `relatedMorph()`. They are ordinary mapped attributes: the backfill copies them, the round trip holds, v1 filters keep working, and rollback refills them from the File.
+- **A successor column.** The map reads it with `from()` or `orFrom()`. A media asset's intrinsic metadata and its third-party ids are columns the File owns, and the map reads each one with `from()` on the File target of `relatedMorph()` ([Media values](#media-values)).
 - **A value with no column anywhere.** The map reads it with `computedAs()` and a read closure that computes it from the successor model, marked `readOnly()`. A ZML URL signed on each read is such a value.
+- **A value that resolves by a successor's state.** The map reads it with `computedAs()` and pairs it with a `writtenBy()` operation. A media URL resolves by the File's storage state, and [Media values](#media-values) shows the pattern.
 
 A genuine legacy-only value is one that no successor column holds and no read computes. A value that `legacyInitializedBy()` derives once from the successor graph is one. `listings.title`, copied from `Job.name` at birth, is such a value. So is `photos.listing_id`, derived through Place, Job and `listings.job_id`. The application refreshes a legacy-only value through the legacy model, and the package never refreshes it. [Operations: legacy-only writes](operations.md#legacy-only-writes) states what such a write runs ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
 
 Declined: a refresh hook driven by successor saves. It needs a listener on every related successor class, and it misses mass and raw writes to `files`, such as the completion of the ZML migration.
+
+### Media values
+
+A legacy media record carries values of two kinds, and each kind takes its own projection.
+
+**Intrinsic metadata and third-party ids.** Width, height, size, format, duration and orientation are intrinsic metadata. A Mux id is a third-party id. Each one is a File column, which the map reads with `from()` on the File target of `relatedMorph()`. Every creation path writes these columns once. The backfill copies v1's values, a v1 create writes v1's values, and the consumer's ZML ingest writes ZML's metadata. The ZML migration does not change them. They are ordinary mapped attributes: the round trip holds, v1 filters keep working, and rollback refills them from the File.
+
+**Delivery values.** The original URL and the variant URLs resolve by the File's storage state. The map reads each one with `computedAs()`, through the consumer's File resolver, which prefers ZML when `zml_asset_id` is set. A `writtenBy()` operation stores a v1 legacy URL, and its behavior depends on the origin:
+
+- **`Origin::Backfill`.** It writes the v1 URL onto a File that is not in ZML, and does nothing for a File in ZML.
+- **`Origin::Live`.** It writes the v1 URL onto a File that is not in ZML, and refuses for a File in ZML.
+
+Under `Origin::Backfill`, the comparisons skip a `computedAs()` attribute, and a pass runs its operation on every row it walks ([Operations: computed attributes under the backfill](operations.md#computed-attributes-under-the-backfill)). A v1 URL edit made before install therefore still reaches a non-ZML File, and an asset the ZML migration moved never refuses.
+
+```php
+->as(target: File::class, successor: fn (Successor $file) => $file
+    ->attribute(name: 'width', definition: fn (Attribute $attribute) => $attribute->from('width'))
+    ->attribute(name: 'mux_id', definition: fn (Attribute $attribute) => $attribute->from('mux_id')))
+```
+
+```php
+->attribute(name: 'original_url', definition: fn (Attribute $attribute) => $attribute
+    ->computedAs(read: fn (Successors $successors) => $successors->related(File::class)?->originalUrl())
+    ->writtenBy(StoreLegacyUrl::class))
+```
+
+```php
+final class StoreLegacyUrl implements WritesAttribute
+{
+    public function write(Successors $successors, mixed $value, Change $change): void
+    {
+        $file = $successors->relatedOrNew(File::class);
+
+        if ($file->zml_asset_id === null) {
+            $file->legacy_url = $value;
+
+            return;
+        }
+
+        if ($change->origin === Origin::Live) {
+            throw Refusal::because("File {$file->getKey()} is in ZML, so its URL is not writable.");
+        }
+    }
+}
+```
+
+Each variant URL follows the same pattern. Under `Origin::Live`, the round trip evaluates the read closure against the reloaded successors, because a computed value is not in the view ([Operations: the round trip](operations.md#the-round-trip)). A `computedAs()` value cannot be filtered or sorted in SQL.
+
+The alternative for a delivery value is a stable redirect URL that the consumer controls, read with `readAs()`. That value can be filtered in SQL.
+
+Declined: reading metadata live from an outside store on each read. That costs one call per asset, loses SQL filters, and fetches a value that does not change. Declined: choosing the source by the legacy record.
 
 ## Related successors
 

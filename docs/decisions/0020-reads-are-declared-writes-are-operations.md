@@ -26,7 +26,7 @@ The package runs a write as a unit of work. It opens its own transaction, calls 
 
 The scope runs inside the package's transaction, so its parent locks hold until the package's work commits, and a scope needs no transaction of its own.
 
-After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it.
+After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it. A computed value is not in the view, so for a `computedAs()` attribute with a `writtenBy()` operation, the check evaluates the read closure against the reloaded successors.
 
 A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only.
 

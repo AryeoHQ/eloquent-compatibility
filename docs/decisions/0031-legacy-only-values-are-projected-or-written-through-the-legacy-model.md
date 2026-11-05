@@ -9,16 +9,20 @@ A retained table keeps its legacy-only columns. Some of them hold a value derive
 The package adds no hook.
 
 - **A value that a successor column holds, or that a read computes each time, is projected, not stored.** It cannot go stale.
-  - Where a successor owns a column for it, the map reads it with `from()` or `orFrom()`. A legacy media URL, the original and its resized variants, and the media facts, such as size, dimensions and Mux ids, are columns the File owns. The map reads them with `from()` on the File target of `relatedMorph()`. They are ordinary mapped attributes: the backfill copies them, the round trip holds, v1 filters keep working, and rollback refills them from the File.
-  - A File that v2 creates gets its stable URL from Aryeo. Aryeo's ingest path writes the stable URL onto the File at creation. Alternatively, the map reads a stable redirect URL over the File with `readAs()`. The choice is Aryeo's, and either way the package needs no change.
+  - Where a successor owns a column for it, the map reads it with `from()` or `orFrom()`.
   - Where no column holds it anywhere, the map reads it with `computedAs()` and a read closure that computes it from the successor model, marked `readOnly()`. A ZML URL signed on each read is such a value.
+- **Media values separate by kind.**
+  - Intrinsic metadata, such as width, height, size, format, duration and orientation, and third-party ids, such as Mux ids, are File columns. The map reads them with `from()` on the File target of `relatedMorph()`. Every creation path writes them once: the backfill copies v1's values, a v1 create writes v1's values, and the consumer's ZML ingest writes ZML's metadata. The ZML migration does not change them. They are ordinary mapped attributes: the round trip holds, v1 filters keep working, and rollback refills them from the File.
+  - Delivery values, the original URL and the variant URLs, resolve by the File's storage state. The map reads each one with `computedAs()` through the consumer's File resolver, which prefers ZML when `zml_asset_id` is set. A `writtenBy()` operation writes a v1 legacy URL onto a File that is not in ZML. For a File in ZML, it does nothing under the Backfill origin and refuses under the Live origin. Under the Backfill origin, the comparisons skip a `computedAs()` attribute, and a pass runs its operation on every row it walks ([0027](0027-the-view-is-driven-from-the-retained-table.md)). A v1 URL edit made before install therefore still reaches a non-ZML File, and an asset the ZML migration moved never refuses. Under the Live origin, the round trip evaluates the read closure against the reloaded successors, because a computed value is not in the view.
+  - The alternative for a delivery value is a stable redirect URL that the consumer controls, read with `readAs()`. That value can be filtered in SQL.
+  - This amends the earlier design, which stored the media URLs as File columns read with `from()`, and declined `computedAs()` for them.
 - **A genuine legacy-only value** is one that no successor column holds and no read computes. A value that `legacyInitializedBy()` derives once from the successor graph is one: `listings.title`, copied from `Job.name` at birth, and `photos.listing_id`, derived through Place, Job and `listings.job_id`. The application refreshes it through the legacy model.
 
 A legacy write that changes only legacy-only columns writes the retained row. It runs no operation and saves no successor, so no successor event fires. It fires one legacy event sequence, as any Eloquent update does. Under `saveQuietly()` it fires nothing, as in Eloquent. In the unit of work, steps 3 to 6 do nothing for these columns, the package writes the retained row, and step 7 forwards.
 
 Declined: a refresh hook driven by successor saves. It needs a listener on every related successor class, and it misses mass and raw writes to `files`, such as the completion of the ZML migration.
 
-Declined for media URLs: `computedAs()` values, which change at install and cannot round-trip a stored v1 URL. Also declined: legacy-only retained columns, which are copies the application must refresh.
+Declined for media values: reading metadata live from an outside store on each read, which costs one call per asset, loses SQL filters, and fetches a value that does not change. Also declined: choosing the source by the legacy record, and legacy-only retained columns, which are copies the application must refresh.
 
 ## Consequences
 
