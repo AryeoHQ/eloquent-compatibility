@@ -17,8 +17,8 @@ The map's read half declares each attribute's projection. Every legacy write int
 
 - An invertible attribute has a default operation that assigns the inverse.
 - `writtenBy()` names an operation class for any other write.
-- A `readOnly()` attribute's default operation refuses on an update. On a create, it assigns the inverse into a successor row the create creates ([0027](0027-the-view-is-driven-from-the-retained-table.md)).
-- A `readAs()` attribute with neither `writtenBy()` nor `readOnly()` fails map compilation.
+- A `readOnly()` attribute declared with `ignoreWrites: false` refuses an update. On a create, its default operation assigns the inverse into a successor row the create creates. With `ignoreWrites: true`, every path discards a write to it and reports the write ([0027](0027-the-view-is-driven-from-the-retained-table.md)).
+- An attribute with no inverse, such as a `readAs()` or `computedAs()` attribute, with neither `writtenBy()` nor `readOnly()` fails map compilation.
 
 `writtenBy()` replaces writeTo(), transitions(), the external write closure, and the consumer's use of `Applying::run()`.
 
@@ -48,6 +48,8 @@ The root's soft-delete column and a successor's updated-at column have default o
 
 `delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to the rule that every package path writes a successor through its model ([0017](0017-successors-are-written-through-their-models.md)), because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
 
+The floor plan example matches Aryeo's schema. `display_type` and `displays_on_property_websites` are `place_assets` columns. WriteDisplayType therefore writes the PlaceAsset whatever the morph target, and no longer refuses a Link. FloorPlan's membership filters `place_assets.legacy_type`, a column Aryeo adds to hold the media's morph alias ([AryeoHQ/aryeo#12349](https://github.com/AryeoHQ/aryeo/issues/12349)).
+
 Declined: a complete column specification, and one adapter class per legacy model.
 
 ## Consequences
@@ -58,6 +60,6 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - The map's membership decides which native successor creates insert a legacy row.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
-- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass places each row after or before its nearest live legacy neighbour whose successor already belongs to the successor's eloquent-ordering parent.
+- A position() attribute reads eloquent-ordering's published position expression. After install, a write moves the row with Placement::at(). A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](../specification/operations.md#positions)): after or before its nearest live legacy neighbour whose successor already belongs to the successor's eloquent-ordering parent. The package therefore requires eloquent-ordering.
 - A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

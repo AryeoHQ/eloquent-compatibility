@@ -28,7 +28,7 @@ The worked examples keep the map in its own class, `ListingMap`, beside the oper
 
 ```php
 ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
-    ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.')))
+    ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.', ignoreWrites: false)))
 ```
 
 Listing adopts its existing `job_id` column as the successor key. FloorPlan names `place_asset_id`, a column that `prepare()` adds and the backfill fills.
@@ -42,7 +42,7 @@ Only the root has a successor key. A related successor is reached through the ro
 Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
 
 - `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
-- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. [Operations: positions](operations.md#positions) states the conversion.
+- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. The attribute needs no `writtenBy()`, because its default operation places the row. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours. [Operations: positions](operations.md#positions) states the placement.
 
 ```php
 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
@@ -58,16 +58,30 @@ Each attribute declares how the view reads it, and nothing else about its storag
 
 The conversions stay the package's own. An application cannot add one, because the `Conversion` interface stays closed. A conversion's inverse becomes the attribute's default operation. [Operations](operations.md) states how every write runs.
 
+An attribute with no inverse must declare `writtenBy()` or `readOnly()`, or the map does not compile. A `readAs()` attribute and a `computedAs()` attribute have no inverse.
+
+## Read-only attributes
+
+`readOnly(because:, ignoreWrites:)` marks an attribute that no write changes, and states the reason. `ignoreWrites:` has no default, so every declaration states it. With `false`, a write to the attribute refuses. With `true`, every path accepts and discards the write, and each discarded non-NULL write dispatches `Events\WriteIgnored`. [Operations: read-only attributes](operations.md#read-only-attributes) states what each value runs.
+
+A map adopts with `ignoreWrites: true`. A listener on `Events\WriteIgnored` then finds the writers that still send the attribute, and no write refuses while the application still has them. After install, the map flips the flag to `false`, once the `WriteIgnored` events from `Origin::Live` show no writer. Install drops the ledger, so after install only those events show that the writers are gone. Events from `Origin::Backfill` replay history, so they show no live writer. The flip changes only the map: no schema and no data change. The guidance holds for an attribute with a stored column and for one without.
+
+```php
+->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.', ignoreWrites: true))
+```
+
+The worked examples declare `ignoreWrites: false`, the state after the flip.
+
 ## Legacy-only columns
 
 A legacy-only column is a column of the retained table that no attribute maps, other than the legacy identity and the successor key ([Storage: the retained table](storage.md#the-retained-table)). The view reads it from the retained table.
 
-Project a value where a successor can supply it. A value derived from a successor is projected, not stored. A projected value cannot go stale, because every read resolves it from the successor.
+Project a value that a successor column holds, or that a read can compute each time. Such a value is projected, not stored. A projected value cannot go stale, because every read resolves it from the successor.
 
 - **A successor column.** The map reads it with `from()` or `orFrom()`. A legacy media URL, meaning the original and its resized variants, is a column the File owns. So are the media facts, such as size, dimensions and Mux ids. The map reads each one with `from()` on the File target of `relatedMorph()`. They are ordinary mapped attributes: the backfill copies them, the round trip holds, v1 filters keep working, and rollback refills them from the File.
 - **A value with no column anywhere.** The map reads it with `computedAs()` and a read closure that computes it from the successor model, marked `readOnly()`. A ZML URL signed on each read is such a value.
 
-A genuine legacy-only value is one that no successor can supply. The application refreshes it through the legacy model, and the package never refreshes it. [Operations: legacy-only writes](operations.md#legacy-only-writes) states what such a write runs ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
+A genuine legacy-only value is one that no successor column holds and no read computes. A value that `legacyInitializedBy()` derives once from the successor graph is one. `listings.title`, copied from `Job.name` at birth, is such a value. So is `photos.listing_id`, derived through Place, Job and `listings.job_id`. The application refreshes a legacy-only value through the legacy model, and the package never refreshes it. [Operations: legacy-only writes](operations.md#legacy-only-writes) states what such a write runs ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
 
 Declined: a refresh hook driven by successor saves. It needs a listener on every related successor class, and it misses mass and raw writes to `files`, such as the completion of the ZML migration.
 

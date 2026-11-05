@@ -4,7 +4,7 @@ Status: Proposed
 
 A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
-Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, and `Targets` in `Definition\`. A different namespace is a deviation under [Deviations](README.md#deviations).
+Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, `Targets` in `Definition\`, and the event `WriteIgnored` in `Events\`. A different namespace is a deviation under [Deviations](README.md#deviations).
 
 Every parameter of a public constructor, function or method on this page is public, named and stable. A release may not rename one. The worked examples name every argument of a call that takes more than one value, and a variadic unpack stays positional.
 
@@ -29,6 +29,7 @@ Every parameter of a public constructor, function or method on this page is publ
 | `Write\Creation` | class | the context an initializer receives |
 | `Write\Origin` | enum | whether a write is live or comes from the backfill |
 | `Write\Refusal` | exception | refuses one write or one backfill row, and extends `Exceptions\CompatibilityException` |
+| `Events\WriteIgnored` | event | a discarded non-NULL write to a `readOnly()` attribute declared with `ignoreWrites: true`; it carries `record`, the legacy model, and `attribute`, `value` and `origin` |
 | `Exceptions\CompatibilityException` | abstract class | the one public base of every package exception |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
 
@@ -71,11 +72,15 @@ Every method returns the `Compatibility` it was called on.
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
 | `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
-| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression; the default operation moves the row with `Placement::at()` |
+| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](operations.md#positions)) |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
-| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, and a backfill pass never writes or compares it |
-| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor; it cannot be filtered or sorted in SQL; `writtenBy()` names its operation |
+| `readOnly(string $because, bool $ignoreWrites)` | an attribute no write changes, and the reason; `$ignoreWrites` has no default. With `false`, an update refuses, and on a create the default operation assigns the inverse into a successor row the create creates; an attribute with no stored column refuses a non-NULL value on a live create, a backfill pass never writes it, and the round trip never compares it. With `true`, every path accepts and discards a write, and never compares the attribute; a create still assigns the inverse into a row it creates; each discarded non-NULL write dispatches `Events\WriteIgnored` ([Operations: read-only attributes](operations.md#read-only-attributes)) |
+| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor; it cannot be filtered or sorted in SQL; it has no inverse, so `writtenBy()` or `readOnly()` must name its operation |
+
+An attribute with no inverse that declares neither `writtenBy()` nor `readOnly()` fails map compilation.
+
+Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: counting writes since `prepare()` to gate install, because the legacy column is live storage until install, so that count never reaches zero ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 
 ### `Definition\Targets`
 
@@ -97,7 +102,7 @@ Every method returns the `Compatibility` it was called on.
 
 | Method | Does |
 | :-- | :-- |
-| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's constraints, creates the backfill tables, and lists the objects that depend on the legacy table |
+| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's unique constraint, creates the backfill tables, and lists the objects that depend on the legacy table |
 | `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, null\|CarbonInterval $margin = null): void` | runs passes until one changes the outcome of fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; `$statementTimeout` sets `statement_timeout` for every statement under install's lock, and is the total budget for the lock hold, after which install rolls back and refuses, naming the step it reached; a null `$margin` means 5 minutes |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
 | `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers; refuses while any object depends on either |

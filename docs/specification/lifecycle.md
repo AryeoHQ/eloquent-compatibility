@@ -7,7 +7,7 @@ Each legacy model moves through the same stages, independently of every other le
 | Stage | Operation | What changes |
 | :-- | :-- | :-- |
 | discovered | none | the map compiles, and nothing exists in the database |
-| prepared | `Compatibility::prepare()` | the successor key gains its constraints |
+| prepared | `Compatibility::prepare()` | the successor key gains its unique constraint |
 | backfilling | `compatibility:backfill`, one run per pass | every legacy row gains its successors, and each pass catches up |
 | installed | `Compatibility::install()` | the legacy name becomes a view over the retained table and its successors |
 | rolled back | `Compatibility::rollback()` | the legacy table returns, and is the source of truth again |
@@ -29,8 +29,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 `Compatibility::prepare()` runs on the live legacy table, before the first pass:
 
 - It adopts the successor key column `servedFrom(key:)` names, or adds it when the column does not exist.
-- It adds a unique constraint on the successor key.
-- It adds the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`.
+- It adds a unique constraint on the successor key, and no other constraint. The key is an identity that may name no root yet, and install adds the rest under its lock ([Storage: the successor key](storage.md#the-successor-key)).
 - It creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today, so a pass finds the rows at or after its lower bound without a scan.
 - It lists every object that depends on the legacy table.
 - It creates `compatibility_backfills` when the table does not exist, and this legacy model's `<legacy>_backfill`. `compatibility:sql prepare` therefore prints every statement the package runs before install.
@@ -49,7 +48,7 @@ It allocates nothing on the successors. Running it again changes nothing. [Stora
    - rows whose `updated_at` is at or after the watermark minus the margin,
    - rows whose `updated_at` is NULL,
    - rows whose ledger status is `refused` or `failed`.
-4. Each row is written in its own savepoint, through the operations, and its ledger row is upserted. Inside the savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. When the key is no longer NULL, the row takes the update path.
+4. Each row is written in its own savepoint, through the operations, and its ledger row is upserted. Inside the savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. When the key names an existing root, the row takes the update path. When the key is NULL, the create path creates a root and fills the key. When the key names no row, the create path creates the root with that key value, so the identity holds ([Storage: the successor key](storage.md#the-successor-key)).
 5. The pass handles deletions: ledger rows whose legacy row is gone.
 6. The pass sets the watermark to its recorded start.
 
@@ -86,11 +85,21 @@ A ledger row whose legacy row is gone names a deletion. The pass deletes that ro
 
 One rule covers every origin. The pass deletes the successor of a deleted legacy row, whether the backfill created it or not. A soft delete keeps it recoverable. A foreign key, and the per-row outcome, refuse loudly when native history depends on it.
 
+The pass calls the successor model's `delete()`. For a model that uses `SoftDeletes`, that is a soft delete: it fires `deleting` and `deleted`, keeps the rows that depend on the successor, and stays recoverable. A legacy delete after install calls `forceDelete()` instead ([Operations: Eloquent-managed columns](operations.md#eloquent-managed-columns)).
+
+The two paths differ because of when they run. The installed delete runs synchronously inside the caller's write, so a foreign key from native history refuses in front of the caller. A pass finds the deletion later, when native history may have attached to the successor, and no caller is present.
+
+The trashed roots a pass leaves stay excluded from install's native-root inserts, because a `deleted` ledger row names each one ([Install: under the lock](#under-the-lock)). Purging them is the consumer's job.
+
 ### Changes outside the legacy row
 
 A pass walks only the rows above. A walked row whose legacy values are unchanged runs no operation. A served value can still change through another table, as when an Address edit changes the coordinates a JobSite copies. That copy between successor tables is the consumer's own consistency rule, and it must hold after install too. The package runs nothing for it.
 
 Declined: a declared change source that reports rows another table changed, so that a pass re-runs their operations without the equality skip.
+
+Creating and linking related records is the consumer's work too. Examples are setting `orders.job_id` from the listing, memberships derived from sharing, and PlaceEngagements derived from ShowingTime+ requests. The consumer writes each as a set-based backfill keyed on the related table, and makes it idempotent. It re-runs that backfill after the package's passes create the roots, and again before install. The package's passes never run it, because they walk the legacy row's changes. The consumer gates its install migration on its own readiness check. `successorsInitializedBy()` keeps only the per-root values a successor needs at birth.
+
+Declined: related-record work in `successorsInitializedBy()`. It runs once at a root's birth, so it misses existing roots and later related rows. It also writes set-sized work row by row under the package's locks.
 
 ### Positions
 
@@ -112,15 +121,15 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
        A pass that changes no row always stops the loop. Install then proves
        existence and values before its lock. Under the lock it runs the final small pass, the
        NULL-key probe, the rename, the drop of mapped columns, the native-root inserts, the
-       check, the view and the dependent hooks.
+       check, the view, the dependent hooks and, last, the foreign key.
 ```
 
 ## The install gate
 
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
-- **Existence.** No legacy row lacks both a ledger row and a successor key.
-- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row. The proof also skips a `readOnly()` attribute with no stored column ([Operations: read-only attributes with no stored column](operations.md#read-only-attributes-with-no-stored-column)).
+- **Existence.** No legacy row lacks both a ledger row and a successor key whose root row exists. A non-NULL key is not enough: the proof checks that the key names an existing root.
+- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. It partitions the rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents, and it skips the attribute on a trashed row. The proof also skips a `readOnly()` attribute declared with `ignoreWrites: true`, and a `readOnly()` attribute with no stored column ([Operations: read-only attributes](operations.md#read-only-attributes)).
 
 The proofs read only, and write no ledger row. When the value proof flags keys, install catches up those keys and proves them again. It refuses only when they still differ. A row whose write left `updated_at` alone is therefore caught up before the lock. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 
@@ -137,7 +146,6 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 3. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them.
 4. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
 5. It proves the install gate: the ledger, existence and values. It catches up the keys the value proof flags, proves those keys again, and refuses only when they still differ.
-6. It validates the successor key's foreign key.
 
 These whole-table proofs never run under the lock.
 
@@ -152,6 +160,7 @@ These whole-table proofs never run under the lock.
 7. The addition of `CHECK (<key> IS NOT NULL) NOT VALID` on the successor key. It needs no scan, and it checks every later insert and update ([Storage](storage.md#the-successor-key)).
 8. The creation of the view.
 9. `ManagesDependents::afterInstall()`.
+10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, so install holds the root's table for this one statement plus the commit ([Storage](storage.md#the-successor-key)).
 
 Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
 
@@ -216,7 +225,7 @@ final class ListingDependents implements ManagesDependents
 
 1. It runs `ManagesDependents::beforeRollback()`, which removes every object that depends on the view.
 2. It drops the view.
-3. It drops `CHECK (<key> IS NOT NULL)` from the successor key, because native legacy inserts with a NULL key resume after a rollback ([Storage](storage.md#the-successor-key)).
+3. It drops the successor key's foreign key and `CHECK (<key> IS NOT NULL)`. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback ([Storage](storage.md#the-successor-key)).
 4. It renames the retained table back to the legacy name.
 5. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
 6. It carries the view's grants back to the restored table.
@@ -257,5 +266,7 @@ The package documents this boundary and does not enforce it.
 | reads of any kind | read the table | read the view |
 
 A later incremental pass is not guaranteed to select a row whose write left `updated_at` alone. A pass selects that row on the first pass, and whenever its `updated_at` is NULL. Install's value proof flags that row's key, and install catches it up before its lock, as [the install gate](#the-install-gate) states. A write that leaves `updated_at` alone after the value proof and before the lock is lost when install drops the mapped columns.
+
+A root deletion leaves a second window. A root hard-deleted after the existence proof and before install adds the foreign key leaves a successor key with no row. The `NOT VALID` foreign key does not check existing rows, so it does not catch that key, and the view's inner join hides that record. Declined: an anti-join probe under the lock, which is a whole-table scan under the lock.
 
 The view is not automatically updatable, and the package creates no trigger and no rule. A consumer therefore searches for raw writes to the legacy name before install. It ships the model that carries `Provides\ServesCompatibility` at least one release before install.

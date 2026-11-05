@@ -31,14 +31,15 @@ Only the root has a successor key: the retained table's column that holds the ro
 - **An existing column is adopted.** Listing's `job_id` already references `jobs.id`, so `prepare()` adopts it.
 - **A missing column is added.** `floorplans` has no reference to its `PlaceAsset`, so `prepare()` adds `place_asset_id uuid`, and the backfill fills it.
 
-`prepare()` gives the successor key two constraints on the live legacy table:
+`prepare()` gives the successor key one constraint on the live legacy table:
 
 ```sql
 ALTER TABLE listings ADD CONSTRAINT listings_job_id_unique UNIQUE (job_id);
-ALTER TABLE listings ADD FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE NOT VALID;
 ```
 
-The unique constraint can also come from a unique index built `CONCURRENTLY`. The foreign key starts `NOT VALID`, and install validates it before it takes its lock.
+The unique constraint can also come from a unique index built `CONCURRENTLY`.
+
+The successor key is an identity. It names the root a legacy row maps to, and before install that root may not exist yet. A key that names no row means "no successor yet". The backfill then takes the create path, and creates the root with that key value, so the identity holds ([Lifecycle: a pass](lifecycle.md#a-pass)). Install's existence proof checks that each key's root row exists, not only that the key is non-NULL ([Lifecycle: the install gate](lifecycle.md#the-install-gate)).
 
 Under its lock, after the final pass, the NULL-key probe and the insert of retained rows for natively created roots, install adds the database's guarantee of a non-NULL key:
 
@@ -46,11 +47,23 @@ Under its lock, after the final pass, the NULL-key probe and the insert of retai
 ALTER TABLE listings_retained ADD CONSTRAINT listings_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
 ```
 
-The check needs no scan, and it checks every later insert and update. Install runs no `SET NOT NULL`, which would scan the whole table under the lock. Prepare does not add the check: a `NOT VALID` check still applies to new rows, and before install the legacy model inserts natively with a NULL key that a pass fills later. Every such insert would fail with `23514`. Declined: a nullable key that relies on the probe alone.
+Install's last statement under the lock, after `ManagesDependents::afterInstall()`, adds the foreign key to the root:
 
-Rollback mirrors install. Before it renames the retained table back, it drops the check, because native legacy inserts with a NULL key resume after a rollback.
+```sql
+ALTER TABLE listings_retained ADD CONSTRAINT listings_job_id_foreign FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE NOT VALID;
+```
 
-`ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key.
+Neither constraint needs a scan, and both check every later insert and update. Install runs no `SET NOT NULL` and no `VALIDATE CONSTRAINT`, because each would scan the whole table under the lock. The existence proof before the lock stands in for the validation, and [the writer boundary](lifecycle.md#the-writer-boundary) states the window it leaves.
+
+Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. The statement is last, so install holds the root's table for that one statement plus the commit. For a shared successor such as `place_assets`, every legacy model's writes to it pause for that time only. `compatibility:sql install` prints that lock.
+
+Prepare adds neither constraint. A `NOT VALID` constraint still applies to new rows. Before install, the legacy model inserts natively with a NULL key that a pass fills later, and with a key whose root the backfill creates later. The check would fail every NULL-key insert with `23514`, and the foreign key would fail every insert whose root does not exist yet with `23503`. A foreign key at prepare would also cascade a successor delete into the live legacy row, which is still the source of truth. Placing the foreign key at install removes that cascade.
+
+Declined: a nullable key that relies on the probe alone. Declined: requiring a backfill, or the creation of every physical Job, before `prepare()`. Declined: keeping the foreign key at prepare as `NO ACTION`, which still rejects the same inserts ([0018](../decisions/0018-legacy-identity-stays-on-the-legacy-table.md)).
+
+Rollback mirrors install. Before it renames the retained table back, it drops the check and the foreign key. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback.
+
+From install onward, `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key. Before install, a successor delete leaves the legacy row in place. Its key then names no row, and the backfill treats the row as having no successor yet.
 
 ## The updated-at index
 

@@ -74,7 +74,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 | M6. No supported install-state check | [Public surface: operations](public-surface.md#operations) |
 | M7. Related and expression filters cannot use indexes | [Storage: the view](storage.md#the-view) and [Public surface: commands](public-surface.md#commands) |
 | M8. Identifiers of different widths cannot share a successor | [Storage: the retained table](storage.md#the-retained-table) |
-| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install) |
+| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install). A shared successor's writes pause only for install's last statement, which adds the successor key's foreign key, plus the commit |
 
 ## Not in this design
 

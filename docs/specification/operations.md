@@ -10,11 +10,11 @@ Each attribute has exactly one operation:
 
 - **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
-- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). An attribute with no stored column has no inverse, and [Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column) states its rule.
+- **`readOnly(because:, ignoreWrites:)`.** With `ignoreWrites: false`, the default operation refuses on an update. On a create, it assigns the inverse, but only into a successor row this create creates. With `ignoreWrites: true`, it accepts and discards every write, and dispatches `Events\WriteIgnored` ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). [Read-only attributes](#read-only-attributes) states both, and the rule for an attribute with no stored column.
 - **A `position()` attribute's default operation.** On a live write after install, it runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a backfill row and a catch-up row, it places the row relative to its legacy neighbours instead ([Positions](#positions)). On a trashed record, it does nothing.
 - **The default operations of Eloquent-managed columns.** The root's soft-delete column and a successor's updated-at column keep the record writer's current behavior. [Eloquent-managed columns](#eloquent-managed-columns) states them.
 
-A `readAs()` attribute has no inverse. When it declares neither `writtenBy()` nor `readOnly()`, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
+An attribute with no inverse, such as a `readAs()` or `computedAs()` attribute, must declare `writtenBy()` or `readOnly()`. When it declares neither, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
 
 `writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of an external attribute, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
 
@@ -128,7 +128,7 @@ A mass write forwards no legacy event, as Eloquent's own mass writes fire no mod
 
 ## The round trip
 
-After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. The check skips a `position()` attribute on a trashed row, because a trashed record has no position. Before install, it compares a `position()` attribute by order, and after install by the raw value ([Positions](#positions)). Under `Origin::Backfill`, it also skips a `readOnly()` attribute with no stored column ([Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column)).
+After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back. The check skips a `position()` attribute on a trashed row, because a trashed record has no position. Before install, it compares a `position()` attribute by order, and after install by the raw value ([Positions](#positions)). On every origin, it also skips a `readOnly()` attribute declared with `ignoreWrites: true`, and a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)).
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
@@ -136,7 +136,7 @@ Before install, no view exists. The check then reads the record through the view
 
 ## Legacy-only writes
 
-A legacy-only column holds a value that no successor can supply ([The map: legacy-only columns](the-map.md#legacy-only-columns)). The application refreshes it through the legacy model. A legacy write that changes only legacy-only columns:
+A legacy-only column holds a value that no successor column holds and no read computes ([The map: legacy-only columns](the-map.md#legacy-only-columns)). The application refreshes it through the legacy model. A legacy write that changes only legacy-only columns:
 
 - writes the retained row;
 - runs no operation and saves no successor, so no successor event fires;
@@ -145,7 +145,7 @@ A legacy-only column holds a value that no successor can supply ([The map: legac
 
 In [the unit of work](#the-unit-of-work), steps 3 to 6 do nothing for these columns. The package writes the retained row, and step 7 forwards the legacy event sequence.
 
-A value derived from a successor is never a legacy-only value. The map projects it, so it cannot go stale. Declined: a refresh hook driven by successor saves ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
+A value that a successor column holds, or that a read computes each time, is never a legacy-only value. The map projects it with `from()`, `orFrom()` or `computedAs()`, so it cannot go stale. A value that `legacyInitializedBy()` derives once from the successor graph stays a legacy-only value. `listings.title`, copied from `Job.name` at birth, is one. `photos.listing_id`, derived through Place, Job and `listings.job_id`, is another. The application refreshes such a value through the legacy model, as this section states. Declined: a refresh hook driven by successor saves ([0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md)).
 
 ## Eloquent-managed columns
 
@@ -154,7 +154,7 @@ Eloquent manages a successor's soft-delete and updated-at columns itself. Their 
 - **Soft delete.** A mapped change of the root's soft-delete column does not assign the column. A non-NULL value queues the root's `delete()` as an `afterSave()` action, and NULL queues its `restore()`. When the root's trashed state already matches the value, the operation assigns the value instead.
 - **The deletion date.** `delete()` always stamps the current time. After `delete()`, the package therefore writes the legacy `deleted_at` and `updated_at` onto the root's row with a base-query `UPDATE`, which fires no further events. A backfilled trashed row keeps its original deletion date, and the round trip holds.
 - **Updated-at.** An assigned updated-at column keeps the legacy value through step 4, Save, even when that value equals the stored one. The package runs step 5, Act, under `Model::withoutTimestampsOn([...])` for that successor. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, therefore keeps the legacy value, and the round trip holds.
-- **Hard delete.** From install onward, a legacy record delete runs the root's `forceDelete()` as its own step. The step runs after step 2, Lock, and replaces steps 3 to 6, because a delete writes no attribute. Step 7 then forwards the legacy delete's events. The successor key's `ON DELETE CASCADE` carries the delete through the retained row ([Storage](storage.md)).
+- **Hard delete.** From install onward, a legacy record delete runs the root's `forceDelete()` as its own step. The step runs after step 2, Lock, and replaces steps 3 to 6, because a delete writes no attribute. Step 7 then forwards the legacy delete's events. The successor key's `ON DELETE CASCADE`, which install adds, carries the delete through the retained row ([Storage](storage.md#the-successor-key)).
 
 The successor's `deleting`, `deleted`, `restoring` and `restored` events therefore fire on the delete path. The rule that every package path writes a successor through its model ([0017](../decisions/0017-successors-are-written-through-their-models.md)) holds there too. The deletion date's `UPDATE` is the one named exception to that rule. It runs after the model's `deleting` and `deleted` events have fired, and it writes only the two timestamps.
 
@@ -168,22 +168,35 @@ Declined: plain assignment of the soft-delete column. The successor would then f
 
 A create is a write of every supplied attribute against an empty original. The attribute operations run first, in declaration order. `successorsInitializedBy()` then runs once on the new root.
 
-A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. An update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
+A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. Listing declares the three attributes with `ignoreWrites: false`, so an update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
 
 A `readOnly()` attribute with no stored column has no inverse, and [Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column) states its rule.
 
+The successor key is an identity ([Storage: the successor key](storage.md#the-successor-key)). After install, a create that supplies the successor key uses it as the root's key, and refuses when the key names an existing root. Before install, a create through the legacy model writes the legacy table only. The backfill then creates the root with the supplied key, when that key names no row.
+
 A create through the legacy model runs with `Origin::Live`. The backfill creates with `Origin::Backfill`.
 
-## Read-only attributes with no stored column
+## Read-only attributes
 
-A `readOnly()` attribute with no stored column has no inverse: a `computedAs()` value, or a `readOnly()` `readAs()` expression. Its rule depends on the origin:
+`readOnly(because:, ignoreWrites:)` gives `ignoreWrites:` no default, so every declaration states it. The flag applies to an attribute with a stored column and to one without ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 
-- **`Origin::Live`.** A create that supplies a non-NULL value for the attribute refuses. An update of the attribute refuses, as it does for every `readOnly()` attribute.
-- **`Origin::Backfill`.** A pass never writes or compares the attribute. A backfill create and a catch-up row ignore its legacy value. The `unchanged` test, the round trip, the drift check and install's value proof skip it. A backfill row's value is history that the successor supersedes.
+- **`ignoreWrites: false`.** The attribute refuses writes. An update of the attribute refuses. On a create, the default operation assigns the inverse into a successor row this create creates. An attribute with no stored column follows [the rule below](#read-only-attributes-with-no-stored-column).
+- **`ignoreWrites: true`.** Every path accepts a write to the attribute and discards it: a live create, a live update, a mass write, a backfill create and a catch-up row. No path compares the attribute. The round trip, catch-up's equality check, the `unchanged` test, the drift check and install's value proof skip it. A create still assigns the inverse into a successor row it creates, where the attribute has an inverse.
+
+Each discarded non-NULL write dispatches `Events\WriteIgnored`. The event carries the legacy model, the attribute, the value and the `Origin`. A discarded NULL dispatches nothing, so a create whose `$attributes` defaults hold NULL stays silent. [The map: read-only attributes](the-map.md#read-only-attributes) states when a map flips the flag.
+
+### Read-only attributes with no stored column
+
+A `readOnly()` attribute with no stored column has no inverse: a `computedAs()` value, or a `readOnly()` `readAs()` expression. With `ignoreWrites: false`, its rule depends on the origin:
+
+- **`Origin::Live`.** A create that supplies a non-NULL value for the attribute refuses. An update of the attribute refuses, as it does for every `readOnly()` attribute declared with `ignoreWrites: false`.
+- **`Origin::Backfill`.** A pass never writes or compares the attribute. A backfill create and a catch-up row ignore its legacy value. The `unchanged` test, the drift check and install's value proof skip it. A backfill row's value is history that the successor supersedes.
+
+The round trip never compares the attribute, on any origin. A live create that supplies NULL, for example from the model's `$attributes` defaults, therefore passes step 3 and the round trip. The one `Origin::Live` check is the refusal of a non-NULL value at step 3.
 
 A catch-up row that differs only in such an attribute therefore runs no operation, and its outcome is `unchanged`. A map whose successors already exist, such as Listing, takes the update path on its first pass, and the rule holds there too.
 
-Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
+Declined: refusing always, because the backfill could not proceed. Declined: ignoring always, because a live caller's value would be discarded without a trace. `ignoreWrites: true` ignores a write and dispatches `Events\WriteIgnored`, so the trace remains. Declined: comparing, because a value that legitimately differs, such as a re-signed URL, would block install.
 
 ## Morph targets
 
@@ -192,8 +205,8 @@ When `choose:` picks another target class for a record, the package moves the ta
 ## Mass writes, the backfill and catch-up
 
 - **A mass write** makes one unlocked read of every record's successors. It calls the write scope once, with the keys of all of them. Inside the scope, it locks every record's successors, parents first, and re-checks the keys once. It then runs steps 3 to 6 of [the unit of work](#the-unit-of-work) once per record, and forwards no legacy event. A mass write has no retry of its own.
-- **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`. Each pass holds the legacy model's advisory lock, so a second pass of the same model refuses with a named error instead of waiting ([Lifecycle: a pass](lifecycle.md#a-pass)). Inside a row's savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates.
-- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently. For a `position()` attribute, the equality check compares order, not the raw value ([Positions](#positions)). It never writes or compares a `readOnly()` attribute with no stored column ([Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column)).
+- **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`. Each pass holds the legacy model's advisory lock, so a second pass of the same model refuses with a named error instead of waiting ([Lifecycle: a pass](lifecycle.md#a-pass)). Inside a row's savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. A key that names no row creates the root with that key value ([Storage: the successor key](storage.md#the-successor-key)).
+- **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently. For a `position()` attribute, the equality check compares order, not the raw value ([Positions](#positions)). It never writes or compares a `readOnly()` attribute declared with `ignoreWrites: true`, or a `readOnly()` attribute with no stored column ([Read-only attributes](#read-only-attributes)).
 
 ## Positions
 

@@ -8,7 +8,7 @@ Status: Proposed
 
 `floorplans` keeps `id bigint` and `uuid`. It has no reference to its `PlaceAsset`, so `prepare()` adds `place_asset_id uuid` as the successor key, and the backfill fills it.
 
-`place_assets.legacy_type` holds the morph alias of the legacy model a `PlaceAsset` serves: `photo`, `video`, `floorplan`, `legacy_file` or `interactive_content`. It replaces the `type` column. `place_assets` also holds the display columns, `displays_on_property_websites` and `display_type`.
+`legacy_type` is a column Aryeo adds to `place_assets`, holding the media's morph alias: the alias of the legacy model a `PlaceAsset` serves, one of `photo`, `video`, `floorplan`, `legacy_file` or `interactive_content`. Aryeo's `place_assets` today has `asset_type` for the File/Link morph, and no `type` column. `place_assets` also holds the display columns, `displays_on_property_websites` and `display_type`.
 
 `photos.id` is `integer`, and every other media key is `bigint`. Each table keeps its own key and sequence, so the widths never meet. `photos.listing_id integer NOT NULL` stays on `photos_retained`, with its foreign key to `listings`.
 
@@ -48,7 +48,7 @@ final class FloorPlanMap
 
 `floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
-`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`: its default operation moves the `PlaceAsset` with `Placement::at($value)` ([Operations: positions](../operations.md#positions)).
+`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row is placed relative to its legacy neighbours ([Operations: positions](../operations.md#positions)).
 
 Positions number within each eloquent-ordering parent, so a legacy reader that needs one sequence per listing must read `readAs()` with an operation instead.
 
