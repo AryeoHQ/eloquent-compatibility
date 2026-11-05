@@ -15,7 +15,7 @@ Declined: one operation that serves both reversal and deprecation.
 ## Consequences
 
 - Rollback needs no ledger, so install can drop the ledger.
-- Rollback's refill runs inside the write scope, like every package write.
+- Rollback's refill calls no write scope and runs no key re-check. Its table lock waits for in-flight writes to commit, so the refill reads only committed successors. A scope there would deadlock with a live write that holds its scope lock and reads through the view.
 - An install after a rollback starts with a first pass.
 - Retire never deletes a successor.
 - [Lifecycle](../specification/lifecycle.md#rollback) states both operations.

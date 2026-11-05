@@ -14,9 +14,10 @@ Everything is internal except:
 - the `Compatibility` operations,
 - the commands,
 - the testing trait, and
-- the operation and hook interfaces, with their arguments: the unit of work, the change context, the origin and the refusal.
+- the operation and hook interfaces, with their arguments: the unit of work, the change context, the origin and the refusal, and
+- one exception base, `Exceptions\CompatibilityException`, which the refusal and every package refusal extend.
 
-The documentation lists exactly that surface. `serves()` on `Compatibility` is documented API, for transitional application code that bypasses the legacy model. Its answer can change around an install. It is stable only inside a transaction, and is never cached across requests.
+The documentation lists exactly that surface. Every parameter of a public constructor, function or method on it is public, named and stable. `serves()` on `Compatibility` is documented API, for transitional application code that bypasses the legacy model. It takes a class string, as every other operation does. Its answer can change around an install. It is stable only inside a transaction, and is never cached across requests.
 
 - Discovery lands commit `6ec7755`, which classifies a classmap entry by its real path, with a test over an optimized classmap.
 - `install()` may run inside a caller's transaction when no catch-up is pending.
@@ -27,7 +28,7 @@ Declined: a public state() reader, because `compatibility:status` and idempotent
 
 ## Consequences
 
-- Every class outside the surface carries `@internal`, and any release may change it.
+- Every class outside the surface carries `@internal`, and any release may change it. So does every public method of a published class that the surface does not list.
 - Aryeo deletes its classmap rewrite, and its tests can install a served model.
 - Aryeo reworks its drafts against the new surface.
 - [Public surface](../specification/public-surface.md) lists every class and method.

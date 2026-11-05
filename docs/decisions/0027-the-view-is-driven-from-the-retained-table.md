@@ -21,6 +21,6 @@ Declined: rewriting related filters into semi-joins in the builder.
 
 - PostgreSQL can use a related table's index for a filter through a proven relation.
 - The view holds no membership constant: a retained row with a root key is a served record.
-- No production install exists yet, so the new shape costs only a recompile.
+- No production install exists yet, so the new shape costs only a rebuild of each view.
 - A consumer knows before production whether a filter uses an index.
 - [Storage](../specification/storage.md#the-view) states the shape.

@@ -27,8 +27,8 @@ The worked examples keep the map in its own class, `ListingMap`, beside the oper
 `servedFrom()` names the root: the successor a legacy record is served from. Its `key:` names the successor key, the legacy table's column that holds the root's primary key.
 
 ```php
-->servedFrom(Job::class, key: 'job_id', successor: fn (Successor $job) => $job
-    ->attribute('company_id', fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.')))
+->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+    ->attribute(name: 'company_id', definition: fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.')))
 ```
 
 Listing adopts its existing `job_id` column as the successor key. FloorPlan names `place_asset_id`, a column that `prepare()` adds and the backfill fills.
@@ -39,14 +39,20 @@ Only the root has a successor key. A related successor is reached through the ro
 
 ## Reads are projections
 
-Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. It reads an SQL expression with `readAs()`.
+Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
+
+- `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
+- `position(legacyWithin:)` reads the row's one-based position through eloquent-ordering's published position expression for the successor. `legacyWithin` names the legacy parent column, such as `floorplans.listing_id`. Its default operation moves the row with eloquent-ordering's `Placement::at()`, so the attribute needs no `writtenBy()`. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. [Operations: positions](operations.md#positions) states the conversion.
 
 ```php
-->attribute('created_at', fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
-->attribute('downloads_enabled', fn (Attribute $a) => $a
-    ->readAs('COALESCE("jobs"."are_customer_downloads_enabled", "listing_compatibility_states"."downloads_enabled_fallback")')
+->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
+->attribute(name: 'downloads_enabled', definition: fn (Attribute $a) => $a
+    ->from(column: 'are_customer_downloads_enabled')
+    ->orFrom(successor: ListingCompatibilityState::class, column: 'downloads_enabled_fallback')
     ->writtenBy(SetDownloadsPermission::class))
 ```
+
+`readAs()` stays public as the escape hatch, for any projection the helpers do not cover. A `readAs()` expression names the view's join aliases, which are internal and may change. A helper names the successor by class instead.
 
 The conversions stay the package's own. An application cannot add one, because the `Conversion` interface stays closed. A conversion's inverse becomes the attribute's default operation. [Operations](operations.md) states how every write runs.
 
@@ -56,12 +62,12 @@ The conversions stay the package's own. An application cannot add one, because t
 
 ```php
 ->related(fn (Job $job) => $job->listingCompatibilityState())
-->related(fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-    ->attribute('place_id', fn (Attribute $a) => $a->from('id'))
+->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
+    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id'))
     ->related(fn (Place $place) => $place->address()->withTrashed()))
 ```
 
-A related successor without a `successor:` closure is a companion. The map reads it in `readAs()` expressions, and an operation creates it with `relatedOrNew()`.
+A related successor without a `successor:` closure is a companion. The map reads it through `orFrom()` or in `readAs()` expressions, and an operation creates it with `relatedOrNew()`.
 
 An operation references a related successor by its model class, such as `$successors->relatedOrNew(Place::class)`. Attribute names and column names stay strings. When the map compiles, it refuses two related successors of one class under one root. A PHPStan rule reports an operation that references a class the map does not relate ([0021](../decisions/0021-related-successors-are-referenced-by-class.md)).
 
@@ -70,11 +76,11 @@ An operation references a related successor by its model class, such as `$succes
 `relatedMorph()` declares a `MorphTo` relation and its targets. Its `choose:` closure picks the target class for a legacy record. Its `targets:` closure declares each target over `Definition\Targets`.
 
 ```php
-->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
     choose: fn (FloorPlan $plan): string => $plan->url !== null ? Link::class : File::class,
     targets: fn (Targets $targets) => $targets
-        ->as(File::class, fn (Successor $file) => $file)
-        ->as(Link::class, fn (Successor $link) => $link))
+        ->as(target: File::class, successor: fn (Successor $file) => $file)
+        ->as(target: Link::class, successor: fn (Successor $link) => $link))
 ```
 
 ### Membership
@@ -88,7 +94,7 @@ An operation references a related successor by its model class, such as `$succes
 | `writtenBy()`, on an attribute | `Contracts\WritesAttribute` | when a write changes that attribute, including a create |
 | `successorsInitializedBy()` | `Contracts\InitializesSuccessors` | when the package creates the root, after the attribute operations |
 | `legacyInitializedBy()` | `Contracts\InitializesLegacy` | when an application creates a member successor natively |
-| `writesWithin()` | `Contracts\ScopesWrites` | before every lock the package takes, on every path |
+| `writesWithin()` | `Contracts\ScopesWrites` | before every lock the package takes, on every path except install's final catch-up and rollback's refill |
 | `dependents()` | `Contracts\ManagesDependents` | inside the install and rollback transactions |
 | `catchUpAlso()` | `Contracts\ReportsChanges` | on every backfill pass that has a watermark |
 

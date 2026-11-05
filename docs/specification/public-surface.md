@@ -4,7 +4,9 @@ Status: Proposed
 
 A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
-Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The namespaces of the new classes follow the plan's declared layout, which [open question 1](#1-namespaces-of-the-new-classes) records.
+Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow the plan's declared layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, and `Targets` in `Definition\`. A different namespace is a deviation from the plan, and it needs a plan edit before this page changes.
+
+Every parameter of a public constructor, function or method on this page is public, named and stable. A release may not rename one. The worked examples name every argument of a call that takes more than one value, and a variadic unpack stays positional. This differs from the page's earlier recommendation, which published only the names the examples used.
 
 ## Classes
 
@@ -26,8 +28,11 @@ Every class name below is relative to `Support\Database\Eloquent\Compatibility\`
 | `Write\Successors` | class | the unit of work an operation receives |
 | `Write\Change` | class | the context of one write |
 | `Write\Origin` | enum | whether a write is live or comes from the backfill |
-| `Write\Refusal` | exception | refuses one write or one backfill row |
+| `Write\Refusal` | exception | refuses one write or one backfill row, and extends `Exceptions\CompatibilityException` |
+| `Exceptions\CompatibilityException` | abstract class | the one public base of every package exception |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
+
+`Exceptions\CompatibilityException` exists today as `abstract class CompatibilityException extends RuntimeException`. `Write\Refusal` and every package refusal extend it, so a caller catches every package exception by one supported type. The concrete exception classes stay `@internal`.
 
 `Definition\Targets` replaces today's `Definition\Successors` builder. `Provides\CarriesLegacy` and `Contracts\ReportsChanges` take their names from the worked examples.
 
@@ -57,6 +62,7 @@ Every method returns the `Compatibility` it was called on.
 | `attribute(string $name, Closure $definition)` | one attribute, over a `Definition\Attribute` |
 | `related(Closure $relation, null\|Closure $successor = null)` | a related successor: the closure returns its Eloquent relation, and `successor:` defines it |
 | `relatedMorph(Closure $relation, Closure $choose, Closure $targets)` | a `MorphTo`, the closure that picks its target class, and the targets over a `Definition\Targets` |
+| `atMostOne(string $because)` | a write refuses a second related row, with the reason; the view still uses a lateral join unless a unique index proves the relation |
 | `when(Closure $scope)` | membership: which successor rows the legacy model serves |
 
 ### `Definition\Attribute`
@@ -65,9 +71,12 @@ Every method returns the `Compatibility` it was called on.
 | :-- | :-- |
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
-| `readAs(string $sql)` | an SQL expression the view reads |
+| `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
+| `position(string $legacyWithin)` | reads the row's one-based position through eloquent-ordering's published position expression for the successor; `legacyWithin` names the legacy parent column, and the default operation moves the row with `Placement::at()` |
+| `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
 | `readOnly(string $because)` | an attribute no path writes, and the reason |
+| `external(Closure $read)` | a value stored outside the database, which the closure reads; `writtenBy()` names its operation |
 
 ### `Definition\Targets`
 
@@ -81,9 +90,8 @@ Every method returns the `Compatibility` it was called on.
 - `writeTo()`, `transitions()` and the write closure of `external()`: `writtenBy()` replaces them.
 - `servedFrom(choose:, successors:)`: two-primary maps are retired.
 - `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. The plan's work item "Keep legacy identity on the legacy table" settles this. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
+- `timestamps()`: every worked map declares `created_at` and `updated_at` as plain attributes. This differs from the page's earlier recommendation, which kept `timestamps()` as a shortcut.
 - `Definition\Successors` and the `successors:` parameter: `Definition\Targets` and `targets:` replace them.
-
-[Open question 3](#3-map-methods-the-session-did-not-name) covers the map methods the session did not name.
 
 ## Operations
 
@@ -93,13 +101,16 @@ Every method returns the `Compatibility` it was called on.
 | `Compatibility::install(class-string<Model> $model): void` | proves the install gate, then swaps the table for the view in one transaction |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
 | `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers |
-| `Compatibility::serves(Model $model): bool` | answers whether the legacy name is the installed view on the model's connection |
+| `Compatibility::update(class-string<Model> $model): void` | rebuilds an installed view after a map change |
+| `Compatibility::serves(class-string<Model> $model): bool` | answers whether the legacy name is the installed view on the model's connection |
 
 `prepare()`, `install()`, `rollback()` and `retire()` are idempotent, as the plan's work item "Keep legacy identity on the legacy table" settles. [Lifecycle](lifecycle.md) states what each one runs.
 
 `Compatibility::rollback()` replaces `Compatibility::uninstall()`. The package has no public `Compatibility::state()`.
 
-`Compatibility::serves()` is for transitional application code that bypasses the legacy model. Its answer can change around an install. It is stable only inside a transaction, so never cache it across requests.
+`Compatibility::update()` replaces `recompile()` under a new name, and stays public. A migration that ships a map change after install calls it. The page's earlier recommendation kept the name `recompile()`.
+
+`Compatibility::serves()` is for transitional application code that bypasses the legacy model. It takes a class string and constructs the model internally to resolve its connection and table, as every other operation does. A connection or table set on one instance at runtime is not supported, as for every other operation. This differs from the page's earlier recommendation, which took a model instance. Its answer can change around an install. It is stable only inside a transaction, so never cache it across requests.
 
 ## Commands
 
@@ -107,12 +118,16 @@ Every method returns the `Compatibility` it was called on.
 | :-- | :-- |
 | `compatibility:backfill {model} {--chunk=}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
 | `compatibility:check {--model=*} {--limit=}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, and trashed rows separately |
-| `compatibility:sql {model} {--for=} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
-| `compatibility:status` | prints the stage of each legacy model |
+| `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
+| `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names |
 | `compatibility:cache` | discovers the served models and caches the list |
 | `compatibility:clear` | removes the cached list |
 
-`compatibility:sql --for=install` also prints each lock install takes, with its mode and table. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+`compatibility:backfill` takes no `--since`, because `compatibility_backfills` stores the watermark.
+
+`compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed. This differs from the page's earlier recommendation, which kept `--for=` and the name `recompile`.
+
+`compatibility:sql install` also prints each lock install takes, with its mode and table. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
 
 The commands are public by name. Their classes are internal.
 
@@ -122,7 +137,7 @@ The commands are public by name. Their classes are internal.
 
 - discovery does not find the model,
 - the map does not compile,
-- the installed view differs from the view the map compiles,
+- the installed view differs from the view the map compiles, and the message tells the developer to run `Compatibility::update()`,
 - a native create of the root successor fails, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.
 
@@ -168,7 +183,8 @@ interface ReportsChanges
 }
 ```
 
-- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. It returns what `$write` returns. The package reads those keys without a lock. Inside `$write`, it locks the successors and checks that their keys equal the keys `run()` received. A difference refuses the write with a retryable error, and the application's outermost transaction retries. [Operations](operations.md#the-write-scope) states the check.
+- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. It returns what `$write` returns. The scope must run `$write` inside a transaction it opens, so the locks it takes hold until that transaction commits. The package calls the scope first, and opens its own transaction inside it. The package reads those keys without a lock. Inside `$write`, it locks the successors and checks that their keys equal the keys `run()` received. A difference refuses the write with a retryable error, and the application's outermost transaction retries. [Operations](operations.md#the-write-scope) states the check.
+- Install's final catch-up pass and rollback's refill never call `ScopesWrites::run()`, and run no key re-check. Their table lock serializes them against live writes. [Operations](operations.md#the-write-scope) states why.
 - `ReportsChanges::since()` returns the legacy keys whose served values changed through other tables since the watermark.
 - `Write\Successors` is generic over the root class, so `Successors<Job>::root()` returns a `Job`. [Operations](operations.md#successors) states its methods.
 - `Write\Change` carries `record`, `original`, `attribute` and `origin`. [Operations](operations.md#the-change-context) states each one.
@@ -181,64 +197,8 @@ The package discovers served models from the Composer classmap. It classifies a 
 
 ## Internal
 
-Everything else is internal. That includes the conversion classes, `Builder\LegacyBuilder`, the writers, the schema classes, the console command classes, `Provider`, the PHPStan rules under `Tooling\`, and the exceptions.
+Everything else is internal. That includes the conversion classes, `Builder\LegacyBuilder`, the writers, the schema classes, the console command classes, `Provider`, the PHPStan rules under `Tooling\`, and the concrete exception classes.
 
 On `Compatibility`, the methods outside the tables above carry `@internal`: `of()`, `resolve()`, `successors()` and `connection()`.
 
-## Open questions
-
-### 1. Namespaces of the new classes
-
-The plan settled this layout. Its work item "Turn legacy writes into successor operations" declares the operation arguments as `Write\Successors`, `Write\Change`, `Write\Origin` and `Write\Refusal`, beside the writers. The same work item puts the interfaces in `Contracts\`, and the successor trait in `Provides\`. The work item "Keep legacy identity on the legacy table" puts `Targets` in `Definition\`.
-
-A different namespace is a deviation from the plan. It needs a plan edit before this page changes.
-
-### 2. Exceptions on the surface
-
-Decision 11 names no exception class. A caller that wants to catch a refusal then has no supported type.
-
-- **A.** Keep every exception internal. A caller catches `RuntimeException`.
-- **B.** Publish `Exceptions\CompatibilityException` as the one public base. `Write\Refusal` and every package refusal extend it. The concrete classes stay internal.
-
-**Recommendation: B.** It gives a caller one supported type to catch, and it publishes one class.
-
-### 3. Map methods the session did not name
-
-Three methods of today's map appear in no decision. The plan removes `identifiedBy()` and `discriminatedBy()`, as [removed from today's map](#removed-from-todays-map) states.
-
-- `timestamps()` declares `created_at` and `updated_at` as attributes of the root. The worked Listing map declares them as plain attributes. **Recommendation:** keep it as a shortcut for those two attributes.
-- `atMostOne(because:)` refuses a second related row on a write. Decision 10 compiles a plain join only where the database proves uniqueness. **Recommendation:** keep it for writes. The view still uses a lateral join unless a unique index proves the relation.
-- `external()` reads a value stored outside the database. Decision 5 replaces only its write closure. **Recommendation:** keep `external()` with its read closure alone.
-
-### 4. `Compatibility::recompile()`
-
-The operations list omits `recompile()`. A map change after install still needs it, and `assertServesCompatibility()` tells the developer to run it.
-
-- **A.** Keep it public.
-- **B.** Make it internal, and recompile inside `install()` when the legacy model is already installed.
-
-**Recommendation: A.** A migration that ships a map change calls it today, and B changes what an idempotent `install()` does.
-
-### 5. Parameter names
-
-PHP named arguments make parameter names part of a signature. The worked examples pass `key:`, `successor:`, `choose:`, `targets:` and `because:` by name.
-
-- **A.** Those names are public. Every other parameter is positional, and its name may change.
-- **B.** Every parameter name on this page is public.
-
-**Recommendation: A.** It publishes the names the examples use, and nothing else.
-
-### 6. The argument of `Compatibility::serves()`
-
-The session wrote `serves($model)`. Today's `ServedTable::serves()` takes a model instance.
-
-- **A.** A model instance. It carries a non-default connection.
-- **B.** A class string, like the other operations.
-
-**Recommendation: A.** The answer depends on the connection, and only an instance carries a non-default one.
-
-### 7. Command options
-
-- `compatibility:backfill --since=` takes a watermark today. `compatibility_backfills` now stores the watermark. **Recommendation:** remove `--since`.
-- `compatibility:sql --for=` takes `prepare`, `install`, `recompile` or `uninstall` today. **Recommendation:** accept `prepare`, `install`, `recompile`, `rollback` and `retire`.
-- `compatibility:status` has no settled arguments. **Recommendation:** print every discovered legacy model, and accept `--model=*` as `compatibility:check` does.
+Every public method on a published `Definition\` class outside the map tables carries `@internal` too. That covers `Definition\Successor`, `Definition\Attribute` and `Definition\Targets`, with methods such as `attributes()`, `relations()`, `read()`, `write()` and `filter()`. The surface's verification checks each public method of a published class, not only each class.

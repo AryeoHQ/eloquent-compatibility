@@ -11,8 +11,9 @@ Under the lock, install scanned whole tables to prove its invariants. `lock_time
 With legacy identity on the legacy table, install needs no foreign key repointing, no generated column, no install-time key and no step after the commit. It runs in one transaction.
 
 - Whole-table proofs, of existence and of values, run before the lock.
-- Under the lock, install runs only the final small catch-up, the rename, the drop of mapped columns, the view and the dependent hooks.
-- `compatibility:sql --for=install` prints each lock with its mode and table. A configurable `statement_timeout` bounds the hold.
+- Under the lock, install runs only the final small catch-up, one indexed probe for a NULL successor key, the rename, the drop of mapped columns, the view and the dependent hooks.
+- The final catch-up calls no write scope and runs no key re-check. The table lock serializes it against live writes.
+- `compatibility:sql install` prints each lock with its mode and table. A configurable `statement_timeout` bounds the hold.
 - Prepare, install, rollback and `compatibility:sql` list every object that depends on the legacy table. Install refuses before any work when one exists and the map declares no `dependents()`.
 - The dependents class runs inside the install transaction, before and after the swap, and mirrors both for rollback.
 - The package has no public state() method. `compatibility:status` prints each legacy model's stage, and `prepare()`, `install()` and `rollback()` are idempotent.
@@ -22,7 +23,7 @@ Declined: package-managed rebinding of dependent views, until a second adopter n
 
 ## Consequences
 
-- A failed install commits nothing, so a retry starts from the same state.
+- A failed install commits nothing under its lock, so a retry starts from the same state. Its pre-lock proofs commit in their own transaction, and keep the ledger rows they mark failed.
 - The time install holds its locks no longer grows with the table's size.
 - The consumer decides what a dependent becomes after install, through its dependents class.
 - The consumer searches for raw writes, and ships the trait-carrying model at least one release before install.

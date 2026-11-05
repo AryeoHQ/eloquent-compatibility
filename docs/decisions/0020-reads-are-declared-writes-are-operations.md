@@ -21,7 +21,9 @@ The map's read half declares each attribute's projection. Every legacy write int
 
 `writtenBy()` replaces writeTo(), transitions(), the external write closure, and the consumer's use of `Applying::run()`.
 
-The package runs a write as a unit of work. It opens the write scope and its transaction, locks the record's successors parents first, and runs every changed attribute's operation in declaration order. It saves each changed successor once, applies deletions, and runs the queued after-save actions. It then reads the record back through the view and forwards one legacy event.
+The package runs a write as a unit of work. It calls the write scope first, opens its own transaction inside the scope, locks the record's successors parents first, and runs every changed attribute's operation in declaration order. It saves each changed successor once, applies deletions, and runs the queued after-save actions. It then reads the record back through the view and forwards one legacy event.
+
+The scope comes first on purpose, and this reverses the order decision 5 of the plan names. The write scope's contract requires the scope to run the write inside a transaction it opens. A scope's parent locks then hold until the package's work commits, rather than being released in autocommit before the package locks the record.
 
 After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it.
 
@@ -39,4 +41,5 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - The map's membership decides which native successor creates insert a legacy row.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
+- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live rows of its legacy parent.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

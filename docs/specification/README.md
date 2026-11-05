@@ -80,7 +80,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No conflict detection and no provenance.** Catch-up overwrites native edits to mapped columns before install. This is documented, not enforced.
 - **No set-based successor writes.** Mass writes and the backfill run once per record.
 - **No identity table.** Per-successor identity tables, a shared identity table, the exclusive arc and a surrogate key are all declined.
-- **No dependency on eloquent-concurrency or eloquent-ordering.** The consumer's write scope sets the lock order.
+- **No dependency on eloquent-concurrency.** The package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
 - **No retries inside the package's writers.** The application's outermost transaction is the retry point. Install keeps its own retries.
 - **No public `Compatibility::state()`.** `compatibility:status` and idempotent operations cover its uses.
 - **No package-managed rebinding of dependent views,** until a second adopter needs plain rebinds.
@@ -89,4 +89,8 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No two-primary maps.** A retained table may still hold two nullable root keys if a real split appears.
 - **Out of scope:** the audit findings not named here, `Event::fake()` suppressing forwarding, and guards on insert. Database-enforced exclusivity on shared successors and every change inside Aryeo are out of scope too.
 
-One external dependency remains. eloquent-ordering must publish a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media write scope needs it.
+Three external dependencies on eloquent-ordering remain:
+
+- It publishes its position expression as public API, which `position()` reads.
+- It adds `Placement::at(int $position)`, which the default operation of `position()` uses.
+- It publishes a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media write scope needs it.

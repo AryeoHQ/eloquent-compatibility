@@ -37,26 +37,27 @@ final class ListingMap
     {
         return $listing
             ->retainedIn('listings_retained')
-            ->servedFrom(Job::class, key: 'job_id', successor: fn (Successor $job) => $job
-                ->attribute('created_at', fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
-                ->attribute('updated_at', fn (Attribute $a) => $a->from('updated_at')->inTimeZone('UTC'))
-                ->attribute('deleted_at', fn (Attribute $a) => $a->from('deleted_at')->inTimeZone('UTC'))
-                ->attribute('company_id', fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.'))
-                ->attribute('is_draft', fn (Attribute $a) => $a
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
+                ->attribute(name: 'updated_at', definition: fn (Attribute $a) => $a->from('updated_at')->inTimeZone('UTC'))
+                ->attribute(name: 'deleted_at', definition: fn (Attribute $a) => $a->from('deleted_at')->inTimeZone('UTC'))
+                ->attribute(name: 'company_id', definition: fn (Attribute $a) => $a->from('company_id')->readOnly(because: 'A Job never changes company.'))
+                ->attribute(name: 'is_draft', definition: fn (Attribute $a) => $a
                     ->readAs('"jobs"."lifecycle_status" = \'draft\'')
                     ->writtenBy(PublishOrDraftJob::class))
-                ->attribute('downloads_enabled', fn (Attribute $a) => $a
-                    ->readAs('COALESCE("jobs"."are_customer_downloads_enabled", "listing_compatibility_states"."downloads_enabled_fallback")')
+                ->attribute(name: 'downloads_enabled', definition: fn (Attribute $a) => $a
+                    ->from(column: 'are_customer_downloads_enabled')
+                    ->orFrom(successor: ListingCompatibilityState::class, column: 'downloads_enabled_fallback')
                     ->writtenBy(SetDownloadsPermission::class))
-                ->attribute('address_id', fn (Attribute $a) => $a
-                    ->readAs('"addresses"."id"')
-                    ->writtenBy(ChangeListingAddress::class))
                 ->related(fn (Job $job) => $job->listingCompatibilityState())
-                ->related(fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-                    ->attribute('place_id', fn (Attribute $a) => $a->from('id'))
-                    ->related(fn (Place $place) => $place->address()->withTrashed()))
-                ->related(fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
-                    ->attribute('job_site_id', fn (Attribute $a) => $a->from('id'))))
+                ->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
+                    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id'))
+                    ->related(relation: fn (Place $place) => $place->address()->withTrashed(), successor: fn (Successor $address) => $address
+                        ->attribute(name: 'address_id', definition: fn (Attribute $a) => $a
+                            ->from(column: 'id')
+                            ->writtenBy(ChangeListingAddress::class))))
+                ->related(relation: fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
+                    ->attribute(name: 'job_site_id', definition: fn (Attribute $a) => $a->from('id'))))
             ->successorsInitializedBy(InitializeListingJob::class)
             ->legacyInitializedBy(InitializeLegacyListing::class)
             ->writesWithin(ListingWriteScope::class)
@@ -66,7 +67,7 @@ final class ListingMap
 }
 ```
 
-`place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, their default operations assign those keys to the new rows, so a reserved id is honored ([Operations: creates](../operations.md#creates)). `address_id` reads the `id` of the Address the Place points at. That read is what `ChangeListingAddress` must satisfy for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads it in `readAs()`.
+`place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, their default operations assign those keys to the new rows, so a reserved id is honored ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
 
 ## The operations
 
@@ -84,14 +85,24 @@ final class PublishOrDraftJob implements WritesAttribute
 }
 ```
 
-`SetDownloadsPermission` writes the Job's own column. The fallback on the state row keeps serving a Job whose column is NULL.
+`SetDownloadsPermission` writes the Job's own column when the column holds a value. When the column is NULL, the operation fills the fallback on the state row instead, through `relatedOrNew()`, so NULL keeps its meaning. An adopted Job never runs `InitializeListingJob`, so the operation owns the fallback, and the initializer does not.
 
 ```php
 final class SetDownloadsPermission implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $successors->root()->are_customer_downloads_enabled = (bool) $value;
+        $job = $successors->root();
+
+        if ($job->are_customer_downloads_enabled === null) {
+            $successors->relatedOrNew(ListingCompatibilityState::class)->fill([
+                'downloads_enabled_fallback' => (bool) ($value ?? true),
+            ]);
+
+            return;
+        }
+
+        $job->are_customer_downloads_enabled = (bool) $value;
     }
 }
 ```
@@ -135,9 +146,6 @@ final class InitializeListingJob implements InitializesSuccessors
         $job->payment_status = $change->origin === Origin::Backfill
             ? PaymentStatus::fromOrders($listing->orders)
             : PaymentStatus::Unpaid;
-        $successors->relatedOrNew(ListingCompatibilityState::class)->fill([
-            'downloads_enabled_fallback' => $listing->downloads_enabled ?? true,
-        ]);
     }
 }
 ```
@@ -163,7 +171,7 @@ final class ListingWriteScope implements ScopesWrites
 {
     public function run(array $successors, Closure $write): mixed
     {
-        return JobWriteTransaction::run($successors[Job::class] ?? [], $write);
+        return JobWriteTransaction::run(jobs: $successors[Job::class] ?? [], write: $write);
     }
 }
 ```
@@ -209,7 +217,7 @@ final class ListingAddressChanges implements ReportsChanges
     /** @return iterable<int> */
     public function since(CarbonImmutable $watermark): iterable
     {
-        return Listing::query()->whereIn('address_id', Address::query()->where('updated_at', '>=', $watermark)->select('id'))->pluck('id');
+        return Listing::query()->whereIn(column: 'address_id', values: Address::query()->where(column: 'updated_at', operator: '>=', value: $watermark)->select('id'))->pluck('id');
     }
 }
 ```

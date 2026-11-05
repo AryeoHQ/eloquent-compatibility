@@ -42,6 +42,14 @@ The unique constraint can also come from a unique index built `CONCURRENTLY`. Th
 
 `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key.
 
+## The position index
+
+Each `position()` attribute needs an index on the legacy table: `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL`. The consumer creates it `CONCURRENTLY` before prepare. `prepare()` refuses without it, and `compatibility:sql prepare` prints the statement.
+
+```sql
+CREATE INDEX CONCURRENTLY floorplans_listing_id_index_id ON floorplans (listing_id, "index", id) WHERE deleted_at IS NULL;
+```
+
 ## The view
 
 At install, the legacy name becomes a view. The view reads from the retained table, joins the root on the successor key, and reaches every related successor through the root's relations ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
@@ -128,16 +136,16 @@ When install finishes, the package deletes the legacy model's row from `compatib
 - **A.** `prepare()` creates `compatibility_backfills` and `<legacy>_backfill`.
 - **B.** The first pass creates them.
 
-**Recommendation: A.** `compatibility:sql --for=prepare` then prints every statement the package runs before install.
+**Recommendation: A.** `compatibility:sql prepare` then prints every statement the package runs before install.
 
 ### 2. NOT NULL on the successor key
 
 The view's inner join leaves a retained row without a root key unserved. The session did not say whether install makes the successor key NOT NULL.
 
-- **A.** `prepare()` adds `CHECK (job_id IS NOT NULL) NOT VALID`. Install validates it before the lock, and under the lock `SET NOT NULL` uses it without a scan.
-- **B.** The key stays nullable. The existence proof and the foreign key cover it.
+- **A.** The database enforces a non-NULL key: a `CHECK (job_id IS NOT NULL) NOT VALID`, or `SET NOT NULL` at install.
+- **B.** The key stays nullable. The existence proof covers it before the lock. Under the lock, after the final catch-up pass, install runs one indexed probe for a NULL key and refuses when the probe finds one.
 
-**Recommendation: A.** The database then refuses a retained row that the view would silently drop. A retained table with two root keys keeps both nullable.
+**Recommendation: B.** Before install, the legacy model inserts natively with a NULL successor key, and a pass fills it later. PostgreSQL enforces a `NOT VALID` CHECK on every new row. A CHECK added at prepare or before the lock would therefore fail every native legacy insert with `23514`. A `SET NOT NULL` under the lock would scan the whole table, which decision 8 forbids. This differs from the page's earlier recommendation, A at prepare. A retained table with two root keys keeps both nullable.
 
 ### 3. An added successor key in the view
 

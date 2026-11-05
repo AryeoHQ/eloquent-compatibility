@@ -31,6 +31,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 - It adds a unique constraint on the successor key.
 - It adds the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`.
 - It lists every object that depends on the legacy table.
+- For each `position()` attribute, it refuses unless the index `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL` exists. The consumer creates that index `CONCURRENTLY` before prepare. `compatibility:sql prepare` prints the statement.
 
 It allocates nothing on the successors. Running it again changes nothing. [Storage](storage.md#the-successor-key) shows its statements.
 
@@ -56,7 +57,7 @@ A failure rolls back that row only, and the chunk continues.
 
 The watermark is a timestamp and nothing else: the database time at which the last completed pass started. It holds no key. A pass that does not complete leaves the watermark where it was.
 
-The margin is subtracted from each pass's lower bound. It covers clock skew between the application servers, which stamp `updated_at`, and the database, which stamps the pass start.
+The margin is subtracted from each pass's lower bound. It must exceed the clock skew between the application servers, which stamp `updated_at`, and the database, which stamps the pass start, plus the longest legacy write transaction. A write stamps `updated_at` when it runs, but a pass sees the row only after its transaction commits.
 
 ### Per-row outcomes
 
@@ -93,10 +94,14 @@ final class ListingAddressChanges implements ReportsChanges
     /** @return iterable<int> */
     public function since(CarbonImmutable $watermark): iterable
     {
-        return Listing::query()->whereIn('address_id', Address::query()->where('updated_at', '>=', $watermark)->select('id'))->pluck('id');
+        return Listing::query()->whereIn(column: 'address_id', values: Address::query()->where(column: 'updated_at', operator: '>=', value: $watermark)->select('id'))->pluck('id');
     }
 }
 ```
+
+### Positions
+
+A pass converts a `position()` attribute's legacy value to a rank on each backfill row and each catch-up row. The rank is the value's place among the live rows of the same legacy parent, ordered by the value with NULLs last, then by key. [Operations: positions](operations.md#positions) states the conversion.
 
 ### Trashed rows
 
@@ -112,7 +117,7 @@ Trashed legacy rows follow the same rules as live ones. `compatibility:check` re
        It records watermark_at = 14:00.
 14:05  Pass 3 walks far fewer rows. Passes repeat until one walks fewer than about 1,000 rows.
        Install then proves existence and values before its lock. Under the lock it runs the
-       final small pass, the rename, the drop of mapped columns, the view and the dependent hooks.
+       final small pass, the NULL-key probe, the rename, the drop of mapped columns, the view and the dependent hooks.
 ```
 
 ## The install gate
@@ -120,9 +125,9 @@ Trashed legacy rows follow the same rules as live ones. `compatibility:check` re
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
 - **Existence.** No legacy row lacks both a ledger row and a successor key.
-- **Values.** The drift check's value comparison finds no difference.
+- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. Each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order.
 
-Install refuses on any difference. Each legacy model passes its own gate, even on a shared successor.
+Install refuses on any difference. It records each key the value proof flags as `failed`, with the reason `values differ`, and keeps those ledger rows when it refuses. The next pass retries them, whatever the watermark, so a row whose write left `updated_at` alone is walked. Each legacy model passes its own gate, even on a shared successor.
 
 The package has no partial install. A legacy row without a successor cannot be served, so install waits until every row has one. Unblocking is the consumer's work: complete the prerequisite, widen the successor to represent the state, retire rows, split the legacy table, or order the installs.
 
@@ -136,20 +141,30 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 2. It proves the install gate: the ledger, existence and values.
 3. It validates the successor key's foreign key.
 
-These whole-table proofs never run under the lock.
+These whole-table proofs never run under the lock. The pre-lock proofs, and the ledger rows they mark `failed`, run and commit in their own transaction before install's transaction opens, so a refused install keeps them.
 
 ### Under the lock
 
-1. The final small catch-up pass.
-2. `ManagesDependents::beforeSwap()`.
-3. The rename of the legacy table to the retained table.
-4. The drop of the mapped columns.
-5. The creation of the view.
-6. `ManagesDependents::afterSwap()`.
+1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)).
+2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one. The successor key stays nullable ([Storage](storage.md#2-not-null-on-the-successor-key)).
+3. `ManagesDependents::beforeSwap()`.
+4. The rename of the legacy table to the retained table.
+5. The drop of the mapped columns.
+6. The creation of the view.
+7. `ManagesDependents::afterSwap()`.
 
-A configurable `statement_timeout` bounds how long install holds its locks. `compatibility:sql --for=install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
+A configurable `statement_timeout` bounds how long install holds its locks. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
 
 When install finishes, the package deletes this legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills` itself, because the table holds the watermarks of other legacy models. Dropping it would erase them, and those models could no longer install independently.
+
+### Positions after install
+
+After install, a `position()` attribute reads the successor's position, not the stored legacy value. The order of the rows does not change, but two kinds of value do:
+
+- A row whose legacy value was NULL reads a number.
+- Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
+
+Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install.
 
 ### Inside a caller's transaction
 
@@ -193,7 +208,7 @@ final class ListingDependents implements ManagesDependents
 1. It runs `ManagesDependents::beforeRollback()`, which removes every object that depends on the view.
 2. It drops the view.
 3. It renames the retained table back to the legacy name.
-4. It restores the mapped columns, and refills them from the successors through the successor key. The refill runs inside the write scope.
+4. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
 5. It carries the view's grants back to the restored table.
 6. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
 
@@ -221,10 +236,12 @@ The package documents this boundary and does not enforce it.
 | Writer | Before install | After install |
 | :-- | :-- | :-- |
 | Eloquent through the legacy model, from the release that ships the trait | writes the legacy table | the package runs the operations |
-| `Model::query()->toBase()` writes | writes the legacy table | the package's query builder translates them |
-| `DB::table('listings')` writes and raw SQL | writes the legacy table, and a pass catches up | fails with a database error |
+| `Model::query()->toBase()` writes | writes the legacy table; a pass catches up only a write that sets `updated_at` | the package's query builder translates them |
+| `DB::table('listings')` writes and raw SQL | writes the legacy table; a pass catches up only a write that sets `updated_at` | fails with a database error |
 | a legacy model class from before that release, during a deploy | writes the legacy table | fails with a database error |
 | reads of any kind | read the table | read the view |
+
+A pass never selects a row whose write left `updated_at` alone. Install's value proof flags that row's key and records it `failed`, so the next pass walks it, as [the install gate](#the-install-gate) states. A write that leaves `updated_at` alone after the value proof and before the lock is lost when install drops the mapped columns.
 
 The view is not automatically updatable, and the package creates no trigger and no rule. A consumer therefore searches for raw writes to the legacy name before install. It ships the model that carries `Provides\ServesCompatibility` at least one release before install.
 
@@ -259,7 +276,7 @@ The timeline repeats passes until one is small, then installs. The session did n
 
 The session did not say how `retire()` treats dependent objects, or where its report goes. Its idempotence is settled: [status and idempotence](#status-and-idempotence) states it.
 
-- **A.** `retire()` refuses while any object depends on the view or the retained table, and lists each one. `compatibility:sql --for=retire` prints the data it would discard.
+- **A.** `retire()` refuses while any object depends on the view or the retained table, and lists each one. `compatibility:sql retire` prints the data it would discard.
 - **B.** `retire()` prints its report and asks for confirmation.
 
 **Recommendation: A.** `retire()` runs in a migration, where nobody can confirm. The refusal follows the rule for inbound foreign keys.

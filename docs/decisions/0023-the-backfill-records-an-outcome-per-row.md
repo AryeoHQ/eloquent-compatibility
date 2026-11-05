@@ -13,11 +13,11 @@ Aryeo's Listing team rebuilt the lifecycle for its own writer: a run table, a re
 - Each legacy row is written in its own savepoint. A failure rolls back that row only, and the chunk continues.
 - An operation or initializer refuses a row with a refusal that carries its reason.
 - Every pass retries refused and failed rows, whatever the watermark.
-- The watermark is a timestamp only: the database time at which the last completed pass started. Each pass subtracts a clock-skew margin from its lower bound, and walks every row whose `updated_at` is NULL.
+- The watermark is a timestamp only: the database time at which the last completed pass started. Each pass subtracts a margin from its lower bound, and walks every row whose `updated_at` is NULL. The margin must exceed the clock skew plus the longest legacy write transaction, because a row becomes visible only when its write commits.
 - `catchUpAlso()` names a change source. It returns the legacy keys whose served values changed through other tables since the watermark.
 - A deletion is a ledger row whose legacy row is gone. The pass deletes the successor through its model, and marks the row deleted, or failed when a foreign key refuses.
 - Trashed rows follow the same rules, and `compatibility:check` reports them separately.
-- Install refuses while any row of this legacy model is refused or failed, and names the reasons and the first keys. Before its lock, install also proves existence and values, and refuses on any difference.
+- Install refuses while any row of this legacy model is refused or failed, and names the reasons and the first keys. Before its lock, install also proves existence and values, and refuses on any difference. It records each key the value proof flags as failed, with the reason "values differ", so the next pass walks a row whose write left `updated_at` alone.
 - Each legacy model installs independently, even on a shared successor.
 - `compatibility_backfills` holds one row per legacy model, and `<legacy>_backfill` holds one row per legacy row. When install finishes, it deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills`, because dropping the shared table would erase other models' watermarks and break their independent installs. This amends the "both dropped" wording of the plan's decision 7.
 

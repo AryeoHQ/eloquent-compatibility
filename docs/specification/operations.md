@@ -11,6 +11,7 @@ Each attribute has exactly one operation:
 - **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
 - **`readOnly(because:)`.** The default operation refuses. No path writes the attribute.
+- **A `position()` attribute's default operation.** It runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses.
 
 `writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of `external()`, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
 
@@ -21,7 +22,17 @@ final class SetDownloadsPermission implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $successors->root()->are_customer_downloads_enabled = (bool) $value;
+        $job = $successors->root();
+
+        if ($job->are_customer_downloads_enabled === null) {
+            $successors->relatedOrNew(ListingCompatibilityState::class)->fill([
+                'downloads_enabled_fallback' => (bool) ($value ?? true),
+            ]);
+
+            return;
+        }
+
+        $job->are_customer_downloads_enabled = (bool) $value;
     }
 }
 
@@ -68,10 +79,10 @@ A write through the legacy model runs with `Origin::Live`. Every backfill pass r
 One legacy write runs these steps, in this order:
 
 1. **Scope.** The package resolves the successors the write touches with an unlocked read. It calls the write scope with their keys, and takes no lock before this step.
-2. **Lock.** Inside the scope, the package opens its transaction and loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
+2. **Lock.** Inside the scope, the package opens its transaction and loads the record's successors. The scope runs first and the package's transaction opens inside it on purpose. Decision 5 of the plan names the transaction first. A scope's parent locks would then be released in autocommit before the package's transaction locked the record. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
-5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or `moveTo()` saves on its own, with its own events.
+5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events.
 6. **Verify.** The package reads the record back through the view and runs the round-trip check.
 7. **Forward.** The package forwards one legacy event.
 
@@ -95,7 +106,7 @@ A mass write runs the unit of work once per record, so it forwards one legacy ev
 
 After a write, every written attribute must read back its new value through the view. The round-trip check compares each written attribute's value with what the view now serves. When one differs, the check refuses the write and rolls the unit of work back.
 
-The round trip binds an operation to its attribute's read. `address_id` reads `"addresses"."id"` through the Place. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
+The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
 ## Creates
 
@@ -107,9 +118,17 @@ A create through the legacy model runs with `Origin::Live`. The backfill creates
 
 ## Mass writes, the backfill and catch-up
 
-- **A mass write** runs the unit of work once per record. Each record's lock step checks its locked keys, as every path does. A mass write has no retry of its own.
+- **A mass write** runs the unit of work once per record. Each record's lock step checks its locked keys, as every scoped path does. A mass write has no retry of its own.
 - **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`.
 - **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently.
+
+## Positions
+
+A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. Its default operation moves the successor with `Placement::at()`.
+
+The rank conversion runs in the legacy-to-successor direction only: on a backfill row, a catch-up row, and a write before install. The legacy value becomes its rank among the live rows of the same legacy parent, the column `legacyWithin` names. The rows are ordered by the value with NULLs last, then by key. The default operation then moves the successor to that rank.
+
+After install, a write compares the raw value with the position. A written `index` of 3 moves the row to position 3, and the round trip reads 3 back. [Lifecycle: positions after install](lifecycle.md#positions-after-install) states what consumers then read.
 
 ## Initializers
 
@@ -129,9 +148,6 @@ final class InitializeListingJob implements InitializesSuccessors
         $job->payment_status = $change->origin === Origin::Backfill
             ? PaymentStatus::fromOrders($listing->orders)
             : PaymentStatus::Unpaid;
-        $successors->relatedOrNew(ListingCompatibilityState::class)->fill([
-            'downloads_enabled_fallback' => $listing->downloads_enabled ?? true,
-        ]);
     }
 }
 ```
@@ -171,16 +187,17 @@ final class ListingWriteScope implements ScopesWrites
 {
     public function run(array $successors, Closure $write): mixed
     {
-        return JobWriteTransaction::run($successors[Job::class] ?? [], $write);
+        return JobWriteTransaction::run(jobs: $successors[Job::class] ?? [], write: $write);
     }
 }
 ```
 
-- The package calls the scope before it takes any lock of its own. That holds on every path: a record write, a mass write, a backfill row, catch-up, and the refill inside rollback.
-- `$successors` holds the keys of the successors the write touches, by class. The scope calls `$write` and returns its result.
+- The package calls the scope before it takes any lock of its own. That holds on every scoped path: a record write, a mass write, a backfill row, and catch-up in an ordinary pass.
+- Install's final catch-up pass and rollback's refill never call the scope, and run no key re-check. Their table lock serializes them against live writes. Rollback waits for in-flight writes to commit, so its refill reads only committed successors. A scope there would deadlock with a live write that holds its scope lock and reads through the view.
+- `$successors` holds the keys of the successors the write touches, by class. The scope opens a transaction, runs `$write` inside it, and returns its result. The scope's own locks therefore hold until the package's work commits.
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
-- Every path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
+- Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
 - A difference refuses with a retryable error. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
 - The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
 
@@ -290,7 +307,7 @@ The session settled native creates for the retained row. It did not settle two c
 
 The lock step refuses with a retryable error when the locked keys differ from the keys the scope received. The spec names no class for it. `Write\Refusal` is the refusal an operation or initializer throws, and nothing marks it retryable.
 
-- **A.** A new exception under `Exceptions\`, which [the public surface](public-surface.md#2-exceptions-on-the-surface) decides whether to publish.
+- **A.** A new internal exception under `Exceptions\`.
 - **B.** `Write\Refusal`, with a flag that marks it retryable.
 
-The session did not settle this. Public surface open question 2 decides whether a caller can catch either one by a supported type.
+The session did not settle this. Either one extends `Exceptions\CompatibilityException`, which [the public surface](public-surface.md#classes) publishes, so a caller catches it by that supported type.
