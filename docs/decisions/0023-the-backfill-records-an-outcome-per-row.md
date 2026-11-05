@@ -14,14 +14,15 @@ Aryeo's Listing team rebuilt the lifecycle for its own writer: a run table, a re
 - An operation or initializer refuses a row with a refusal that carries its reason.
 - Every pass retries refused and failed rows, whatever the watermark.
 - The watermark is a timestamp only: the database time at which the last completed pass started. Each pass subtracts a margin from its lower bound, and walks every row whose `updated_at` is NULL. The margin must exceed the clock skew plus the longest legacy write transaction, because a row becomes visible only when its write commits.
-- `catchUpAlso()` names a change source. It returns the legacy keys whose served values changed through other tables since the watermark.
+- A walked row whose legacy values are unchanged runs no operation. A copy between successor tables, such as an Address's coordinates on a JobSite, is the consumer's own consistency rule, and it must hold after install too. The change sources of decision 7 of the plan are removed.
 - A deletion is a ledger row whose legacy row is gone. The pass deletes the successor through its model, and marks the row deleted, or failed when a foreign key refuses.
 - Trashed rows follow the same rules, and `compatibility:check` reports them separately.
-- Install refuses while any row of this legacy model is refused or failed, and names the reasons and the first keys. Before its lock, install also proves existence and values, and refuses on any difference. It records each key the value proof flags as failed, with the reason "values differ", so the next pass walks a row whose write left `updated_at` alone.
+- Install refuses while any row of this legacy model is refused or failed, and names the reasons and the first keys. Before its lock, install runs passes until one walks fewer rows than its pass size. It then proves existence and values. The proofs read only, and write no ledger row. Install catches up the keys the value proof flags, proves them again, and refuses only when they still differ. A row is failed only when its write raised an error.
 - Each legacy model installs independently, even on a shared successor.
-- `compatibility_backfills` holds one row per legacy model, and `<legacy>_backfill` holds one row per legacy row. When install finishes, it deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills`, because dropping the shared table would erase other models' watermarks and break their independent installs. This amends the "both dropped" wording of the plan's decision 7.
+- `prepare()` creates `compatibility_backfills` and `<legacy>_backfill`. The first holds one row per legacy model, keyed by the legacy table's name, so a renamed class keeps its watermark. The second holds one row per legacy row.
+- The margin is a named argument of `compatibility:backfill` and install, with a default of 5 minutes. The pass size, 1,000 rows by default, is install's argument alone, because it only sets install's stop condition. The package has no configuration of its own. When install finishes, it deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills`, because dropping the shared table would erase other models' watermarks and break their independent installs. This amends the "both dropped" wording of the plan's decision 7.
 
-Declined: a declared row scope, and a partial install that serves rows without a successor.
+Declined: package-wide configuration keys, the legacy model's class as `legacy_type`, the first pass creating the tables, a declared row scope, a partial install that serves rows without a successor, and re-running operations for rows another table reports, without the equality skip.
 
 ## Consequences
 

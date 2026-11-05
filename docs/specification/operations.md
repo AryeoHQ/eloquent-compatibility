@@ -10,8 +10,10 @@ Each attribute has exactly one operation:
 
 - **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
-- **`readOnly(because:)`.** The default operation refuses. No path writes the attribute.
+- **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates. This amends decision 10 of the plan, which said that no path writes the attribute ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 - **A `position()` attribute's default operation.** It runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses.
+
+A `readAs()` attribute has no inverse. When it declares neither `writtenBy()` nor `readOnly()`, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
 
 `writtenBy()` replaces `writeTo()`, `transitions()`, the write closure of `external()`, and an application's own use of `Applying::run()`. An operation can write several successor columns, write related successors, or run a domain action.
 
@@ -54,10 +56,12 @@ An operation makes in-memory assignments only. The package saves. A domain actio
 | Method | Returns or does |
 | :-- | :-- |
 | `root()` | the root successor, loaded and locked; on a create, the new root |
-| `related(class-string<T> $class)` | the related successor of that class, loaded and locked |
+| `related(class-string<T> $class)` | the related successor of that class, loaded and locked, or `null` when the row is absent |
 | `relatedOrNew(class-string<T> $class)` | the related successor, or a new instance the package saves with the others |
 | `deleteRelated(class-string<Model> $class)` | deletes the related successor through its model, after the saves |
 | `afterSave(Closure $action)` | queues an action that runs after the saves, in the order queued |
+
+A morph has one target at a time, and a related row can be missing, so `related()` returns `?T`. `relatedOrNew()` covers the case where the row must exist.
 
 A companion, such as Listing's compatibility state row, is a declared relation. An operation reaches it with `relatedOrNew()`. The package has no `add()` for undeclared rows.
 
@@ -68,23 +72,38 @@ A companion, such as Listing's compatibility state row, is a declared relation. 
 | Property | Holds |
 | :-- | :-- |
 | `record` | the legacy record after the write |
-| `original` | the legacy record before the write |
+| `original` | the legacy record before the write, as a legacy model instance; empty on a create |
 | `attribute` | the name of the attribute the operation writes |
 | `origin` | `Origin::Live` or `Origin::Backfill` |
 
+`original` is an instance, because operations read relations from `record`, and `original` reads the same way. During catch-up, `original` is the record as the successors serve it before the pass writes, read through the view's compiled `SELECT`.
+
 A write through the legacy model runs with `Origin::Live`. Every backfill pass runs with `Origin::Backfill`, including the final pass inside install.
+
+### The creation context
+
+`Write\Creation` carries the context an initializer receives.
+
+| Property | Holds |
+| :-- | :-- |
+| `record` | the legacy record the successors serve; on a native create, the new legacy model |
+| `origin` | `Origin::Live` or `Origin::Backfill` |
+
+Declined: `Change` with a null `attribute` and an empty `original`. An initializer writes no single attribute and has no record before it. This differs from the page's earlier recommendation, which passed initializers a `Change` with a null `attribute`.
 
 ## The unit of work
 
 One legacy write runs these steps, in this order:
 
-1. **Scope.** The package resolves the successors the write touches with an unlocked read. It calls the write scope with their keys, and takes no lock before this step.
-2. **Lock.** Inside the scope, the package opens its transaction and loads the record's successors. The scope runs first and the package's transaction opens inside it on purpose. Decision 5 of the plan names the transaction first. A scope's parent locks would then be released in autocommit before the package's transaction locked the record. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
+1. **Scope.** The package opens its transaction. It resolves the successors the write touches with an unlocked read, and calls the write scope with their keys inside that transaction. It takes no lock of its own before this step.
+2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
 5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events.
 6. **Verify.** The package reads the record back through the view and runs the round-trip check.
 7. **Forward.** The package forwards one legacy event.
+
+This is the order decision 5 of the plan names. The scope runs inside the package's transaction, so the locks the scope takes hold until the package's work commits.
 
 `$listing->update(['is_draft' => false, 'downloads_enabled' => true, 'address_id' => 9])` therefore locks the Job, the Place, the JobSite and the state row. It runs `PublishOrDraftJob`, `SetDownloadsPermission` and `ChangeListingAddress`, and saves each changed row once. `publish()` then saves the Job again, as v2's own publish does.
 
@@ -100,7 +119,7 @@ One legacy write runs these steps, in this order:
 
 The legacy model's listeners receive one event sequence for the write, such as one `updating` and one `updated` for an update. The package forwards none of the successor events above as legacy events.
 
-A mass write runs the unit of work once per record, so it forwards one legacy event sequence per record. Eloquent's own mass writes fire no model events, and a served legacy model differs from them here. Decision 5 settles this.
+A mass write forwards no legacy event, as Eloquent's own mass writes fire no model events. Successor events still fire for each record. This amends decision 5 of the plan, which forwarded one legacy event sequence per record on the mass path. It differs from the page's earlier text, which forwarded per record.
 
 ## The round trip
 
@@ -108,17 +127,23 @@ After a write, every written attribute must read back its new value through the 
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
+Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
+
 ## Creates
 
 A create is a write of every supplied attribute against an empty original. The attribute operations run first, in declaration order. `successorsInitializedBy()` then runs once on the new root.
 
-A create's default operation for a related row's key assigns that key to the new related row. A Listing created with a reserved `place_id` therefore creates its Place with that id. Decision 10 states this rule.
+A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. An update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
 
 A create through the legacy model runs with `Origin::Live`. The backfill creates with `Origin::Backfill`.
 
+## Morph targets
+
+When `choose:` picks another target class for a record, the package moves the target. It deletes the old target through its model, and creates the new one, in the same unit of work. A FloorPlan whose `url` becomes non-null therefore moves from a File to a Link.
+
 ## Mass writes, the backfill and catch-up
 
-- **A mass write** runs the unit of work once per record. Each record's lock step checks its locked keys, as every scoped path does. A mass write has no retry of its own.
+- **A mass write** makes one unlocked read of every record's successors. It calls the write scope once, with the keys of all of them. Inside the scope, it locks every record's successors, parents first, and re-checks the keys once. It then runs steps 3 to 6 of [the unit of work](#the-unit-of-work) once per record, and forwards no legacy event. A mass write has no retry of its own.
 - **The backfill** creates each missing successor graph through the attribute operations and `successorsInitializedBy()`, with `Origin::Backfill`.
 - **Catch-up** runs the attribute operations for changed values. It skips an attribute whose value the view already serves equivalently.
 
@@ -139,13 +164,13 @@ The class implements `Contracts\InitializesSuccessors`. It sets only two kinds o
 ```php
 final class InitializeListingJob implements InitializesSuccessors
 {
-    public function initialize(Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
-        $listing = $change->record;
+        $listing = $creation->record;
         $job = $successors->root();
         $job->name = $listing->title ?: 'Legacy listing '.$listing->uuid;
         $job->opted_in_to_zma = false;
-        $job->payment_status = $change->origin === Origin::Backfill
+        $job->payment_status = $creation->origin === Origin::Backfill
             ? PaymentStatus::fromOrders($listing->orders)
             : PaymentStatus::Unpaid;
     }
@@ -156,18 +181,31 @@ The legacy record never owns a successor-only column. The initializer and the su
 
 ### `legacyInitializedBy()`
 
-The reverse direction. An application creates a successor natively, and the successor carries `Provides\CarriesLegacy`. Inside the successor's transaction, the package inserts the legacy row:
+The reverse direction. An application creates a successor natively, and the successor carries `Provides\CarriesLegacy`. From install onward, the package inserts the legacy row inside the successor's transaction:
 
 1. It inserts a legacy row only when the new successor is inside the map's membership.
 2. It allocates the legacy identity: `id` from the legacy table's own sequence, and `uuid` through the legacy model's `newUniqueId()` when the model defines it.
 3. It fills the successor key.
-4. It calls the `Contracts\InitializesLegacy` class, which sets the legacy-only values that need the successor graph.
+4. It calls the `Contracts\InitializesLegacy` class, which sets the legacy-only values that need the successor graph. `Creation::$record` is the new legacy model.
 
 `photos.listing_id`, derived through Place, Job and `listings.job_id`, is one such value. `listings.title`, copied from `Job.name`, is another. The class is optional.
 
-When the map compiles, it refuses a legacy-only NOT NULL column that has neither a default nor an initializer. `assertServesCompatibility()` runs a native create, so a test proves the initializer sets what the column needs.
+`Provides\CarriesLegacy` refuses a native create outside a transaction. An insert in a statement of its own could fail and leave a successor that no legacy reader sees, and nothing would report it. Every native create of a member successor therefore runs in a transaction.
+
+When the map compiles, it refuses a legacy-only NOT NULL column that nothing initializes. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key and a `newUniqueId()` column. `assertServesCompatibility()` runs a native create, so a test proves the initializer sets what the column needs.
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
+
+### Native successors before install
+
+`Provides\CarriesLegacy` does nothing before install, so a root created natively then gets no legacy row. Install never inserts a row for such a root before its lock ([Lifecycle: install](lifecycle.md#install)):
+
+- **Before the lock**, install reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. It writes nothing for them, and it reports their count.
+- **Under the lock**, after the final pass, the rename and the drop of the mapped columns, install inserts one retained row per key in that set. It also inserts one for every member root created since that read, through an indexed range on the root's key or `created_at`. Each row holds the root's key in the successor key, and install runs `legacyInitializedBy()` for it.
+
+No pass ever walks these rows, and before install no legacy reader sees a half-filled row. The cost is that install's pause grows with the number of natively created roots, inside the same `statement_timeout`. Declined: an insert before the lock with the mapped columns filled from the successors, because the final pass would then overwrite a v2 edit made inside the install window. After install, the trait inserts the legacy row on create.
+
+Legacy readers therefore see no v2-created listing until install. Declined: mirroring native successor saves into the legacy row before install, which needs a listener per related class and a two-way sync. This differs from the page's earlier recommendation, which had the trait act from its release and filled the new row's mapped columns before install.
 
 ## Refusals
 
@@ -192,9 +230,10 @@ final class ListingWriteScope implements ScopesWrites
 }
 ```
 
-- The package calls the scope before it takes any lock of its own. That holds on every scoped path: a record write, a mass write, a backfill row, and catch-up in an ordinary pass.
+- The package opens its transaction, then calls the scope inside it, before it takes any lock of its own. That holds on every scoped path: a record write, a mass write, a backfill row, and catch-up in an ordinary pass. A mass write calls the scope once, with the keys of every record it writes.
 - Install's final catch-up pass and rollback's refill never call the scope, and run no key re-check. Their table lock serializes them against live writes. Rollback waits for in-flight writes to commit, so its refill reads only committed successors. A scope there would deadlock with a live write that holds its scope lock and reads through the view.
-- `$successors` holds the keys of the successors the write touches, by class. The scope opens a transaction, runs `$write` inside it, and returns its result. The scope's own locks therefore hold until the package's work commits.
+- `$successors` holds the keys of the successors the write touches, by class. A successor the write creates has no key yet, so its class is present with an empty list. A scope that must lock a parent before a create then knows the create happens.
+- The scope runs `$write` and returns its result. The package's transaction is already open, so the scope's own locks hold until the package's work commits. A scope needs no transaction of its own.
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
@@ -205,105 +244,7 @@ A map over ordered successors without a write scope can deadlock against an orde
 
 ## Open questions
 
-### 1. `company_id` on a create, and an update of `place_id`
-
-Decision 10 settles `place_id` and `job_site_id` on a create, as [creates](#creates) states. Two questions remain.
-
-**`company_id` on a create.** Decision 10 says no path writes a `readOnly()` attribute. The worked Listing map marks `company_id` read-only, and a new Job needs `company_id`.
-
-- **A.** `company_id` drops `readOnly()`, and `writtenBy()` names an operation that assigns it on a create and refuses on an update.
-- **B.** `company_id` stays read-only, and `successorsInitializedBy()` sets `Job.company_id` at birth. Decision 5 limits that initializer to successor-only values, so B amends decision 5.
-
-**Recommendation: A.** It stays inside decisions 5 and 10, and the refusal on an update keeps the reason the map states.
-
-**An update of `place_id`.** `place_id`'s default operation assigns the inverse, so an update would assign a new key to the existing Place.
-
-- **A.** The default operation of a related row's key refuses on an update. A map that supports the change names a `writtenBy()` operation, such as one that moves the Job to another Place.
-- **B.** The default operation re-points the root's `BelongsTo` relation at the row with the new key, and refuses for any other relation.
-
-**Recommendation: A.** Moving a Job to another Place is a v2 domain action with its own rules, so the map names it. The package never re-keys a related row.
-
-### 2. An attribute with no inverse and no `writtenBy()`
-
-A `readAs()` attribute has no inverse. Without `writtenBy()` or `readOnly()`, it has no operation.
-
-- **A.** The map refuses to compile such an attribute.
-- **B.** A write of the attribute refuses at run time.
-
-**Recommendation: A.** Every write intent then maps to an operation that the map states.
-
-### 3. `related()` on an absent row
-
-`related()` returns `T`. A morph has one target at a time, and a related row can be missing.
-
-- **A.** `related()` returns `null` when the row is absent.
-- **B.** `related()` refuses when the row is absent.
-
-**Recommendation: A.** `relatedOrNew()` already covers the case where the row must exist. PHPStan then makes an operation handle the absence.
-
-### 4. The types inside `Change`
-
-- **`original`.** A legacy model instance with the original attributes, empty on a create, or an array of attributes. **Recommendation:** an instance, because operations read relations from `record`, and `original` should read the same way.
-- **`attribute` on an initializer.** An initializer writes no single attribute. **Recommendation:** `null`.
-- **`record` on a native create.** **Recommendation:** the new legacy model, which `InitializesLegacy::initialize()` also receives as `$legacy`.
-- **`original` during catch-up.** **Recommendation:** the record as the view serves it before the pass writes.
-
-### 5. What the write scope receives for a successor the write creates
-
-A created successor has no key until the package saves it.
-
-- **A.** The class is absent from `$successors`.
-- **B.** The class is present, with an empty list.
-
-**Recommendation: B.** A scope that must lock a parent before a create then knows the create happens. The worked scopes handle both forms with `?? []`.
-
-### 6. A change of morph target
-
-A FloorPlan whose `url` becomes non-null moves from a File to a Link.
-
-- **A.** The package moves the target when `choose:` picks another class. It deletes the old target through its model and creates the new one in the same unit of work.
-- **B.** An operation moves it with `deleteRelated()` and `relatedOrNew()`.
-
-**Recommendation: A.** The map already declares the choice, and today's package performs morph moves.
-
-### 7. The round-trip check before install
-
-Before install, no view exists to read back through.
-
-- **A.** The check reads the record through the view's compiled `SELECT`, filtered to the record's key.
-- **B.** The backfill skips the check, and the install gate's value comparison covers it.
-
-**Recommendation: A.** An operation that loses a value then refuses its row at once. The cost is one read per backfill row.
-
-### 8. What counts as an initializer for the NOT NULL refusal
-
-- **A.** A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key and a `newUniqueId()` column.
-- **B.** The map lists the columns its initializer sets.
-
-**Recommendation: A.** The native create in `assertServesCompatibility()` proves the class sets the column, and no second declaration can drift.
-
-### 9. A native create outside a transaction
-
-The session put the legacy insert inside the successor's transaction. An application can call `Job::create()` outside any transaction.
-
-- **A.** `Provides\CarriesLegacy` refuses a create outside a transaction.
-- **B.** The trait inserts the legacy row in a statement of its own after the successor's insert.
-
-**Recommendation: A.** With B, a failed insert leaves a successor that no legacy reader sees, and nothing reports it. The cost is that every native create of a member successor runs in a transaction.
-
-### 10. Native successors before install
-
-The session settled native creates for the retained row. It did not settle two cases before install:
-
-- A successor created while the legacy table is still a table needs a legacy row with values in its mapped columns. Otherwise the next pass overwrites the successor.
-- A successor created before the trait shipped has no legacy row at all.
-
-- **A.** The trait acts from its release. Before install, the package fills the new legacy row's mapped columns from the successor's served values, as rollback refills them. The backfill also walks member successors without a legacy row, and inserts one through the same path.
-- **B.** The trait acts only after install. Member successors without a legacy row stay unserved, and `compatibility:check` reports them.
-
-**Recommendation: A.** A legacy reader then sees every member successor after install. Catch-up finds the filled values equal and skips them. The cost is a second walk in the backfill.
-
-### 11. The error for moved successor keys
+### 1. The error for moved successor keys
 
 The lock step refuses with a retryable error when the locked keys differ from the keys the scope received. The spec names no class for it. `Write\Refusal` is the refusal an operation or initializer throws, and nothing marks it retryable.
 

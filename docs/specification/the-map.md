@@ -83,6 +83,8 @@ An operation references a related successor by its model class, such as `$succes
         ->as(target: Link::class, successor: fn (Successor $link) => $link))
 ```
 
+When `choose:` picks another class for a record, the package moves the target in one unit of work ([Operations: morph targets](operations.md#morph-targets)).
+
 ### Membership
 
 `when()` on the root scopes the successor rows the legacy model serves. FloorPlan serves only the `PlaceAsset` rows whose `type` is `floorplan`. A native successor create inserts a legacy row only for a successor inside that scope.
@@ -96,15 +98,16 @@ An operation references a related successor by its model class, such as `$succes
 | `legacyInitializedBy()` | `Contracts\InitializesLegacy` | when an application creates a member successor natively |
 | `writesWithin()` | `Contracts\ScopesWrites` | before every lock the package takes, on every path except install's final catch-up and rollback's refill |
 | `dependents()` | `Contracts\ManagesDependents` | inside the install and rollback transactions |
-| `catchUpAlso()` | `Contracts\ReportsChanges` | on every backfill pass that has a watermark |
 
-Every hook is optional. Without `writtenBy()`, an attribute runs its default operation. Without `dependents()`, install refuses when an object depends on the legacy table.
+Every hook is optional, and a map declares each hook at most once. Without `writtenBy()`, an attribute runs its default operation. Without `dependents()`, install refuses when an object depends on the legacy table.
 
 ## Classes only
 
-`writtenBy()`, `successorsInitializedBy()`, `legacyInitializedBy()`, `writesWithin()`, `dependents()` and `catchUpAlso()` take a class-string of their interface. A closure is a type error ([0022](../decisions/0022-operations-are-classes.md)).
+`writtenBy()`, `successorsInitializedBy()`, `legacyInitializedBy()`, `writesWithin()` and `dependents()` take a class-string of their interface. A closure is a type error ([0022](../decisions/0022-operations-are-classes.md)).
 
-The classes live under the model's `Compatibility` namespace. The worked examples place `Listing`'s classes, for the model `App\Listings\Models\Listing`, under `App\Listings\Compatibility`. [Open question 2](#2-the-compatibility-namespace) covers the exact rule.
+The other closures a map holds stay closures. They are `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`. Each one selects rows, picks a class or computes a value, and none of them writes. The five hooks are the places where application behavior runs inside the package's transaction.
+
+The classes live in the consumer's entity namespace plus `\Compatibility`. This is a documented convention, and no tool checks it. Aryeo's is `App\Entities\<Plural>\Compatibility`, whether or not the model itself lives there. The worked examples therefore place the classes of `App\Entities\Listings\Listing` under `App\Entities\Listings\Compatibility`. This amends decision 5 of the plan, which said `<model namespace>\Compatibility`. It differs from the page's earlier recommendation, which replaced a final `Models` segment with `Compatibility`.
 
 ## Hide, guard and forwarding
 
@@ -131,33 +134,3 @@ These three declarations keep today's behavior.
 | `Successors` | the unit of work an operation receives, generic over the root class |
 | the round trip | after a write, every written attribute reads back its new value |
 | the round-trip check | the package's check of the round trip, which refuses the write and rolls it back when it fails |
-
-## Open questions
-
-### 1. Declaration closures under the classes-only rule
-
-The session settled classes only for six hooks. It did not settle the other closures a map holds. They are `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`.
-
-- **A.** They stay closures.
-- **B.** Each becomes a class with its own interface.
-
-**Recommendation: A.** Each one selects rows, picks a class or computes a value, and none of them writes. The six hooks are the places where application behavior runs inside the package's transaction.
-
-### 2. The `Compatibility` namespace
-
-Decision 6 says `<model namespace>\Compatibility`. Read literally, `App\Listings\Models\Listing` puts its classes under `App\Listings\Models\Compatibility`. The worked examples use `App\Listings\Compatibility`.
-
-- **A.** The literal rule: the model's namespace, then `\Compatibility`.
-- **B.** The examples' rule: replace a final `Models` segment with `Compatibility`, and append `\Compatibility` otherwise.
-- **C.** Either rule, as a convention the documentation states and no tool checks.
-
-**Recommendation: B, as a convention.** The reviewed examples use it, and the class-string types already keep closures out.
-
-### 3. Hooks declared more than once
-
-The session did not say whether a map may declare a hook twice.
-
-- **A.** `catchUpAlso()` may repeat, because one legacy model can derive values from several other tables. Every other hook is declared at most once.
-- **B.** Every hook is declared at most once, and one change source reports every table.
-
-**Recommendation: A.** A second change source then needs no edit to the first.

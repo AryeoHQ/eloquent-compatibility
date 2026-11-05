@@ -13,7 +13,7 @@ Status: Proposed
 ## The model
 
 ```php
-namespace App\Listings\Models;
+namespace App\Entities\Listings;
 
 final class Listing extends Model implements Compatible
 {
@@ -29,7 +29,7 @@ final class Listing extends Model implements Compatible
 ## The map
 
 ```php
-namespace App\Listings\Compatibility;
+namespace App\Entities\Listings\Compatibility;
 
 final class ListingMap
 {
@@ -51,30 +51,29 @@ final class ListingMap
                     ->writtenBy(SetDownloadsPermission::class))
                 ->related(fn (Job $job) => $job->listingCompatibilityState())
                 ->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-                    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id'))
+                    ->attribute(name: 'place_id', definition: fn (Attribute $a) => $a->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
                     ->related(relation: fn (Place $place) => $place->address()->withTrashed(), successor: fn (Successor $address) => $address
                         ->attribute(name: 'address_id', definition: fn (Attribute $a) => $a
                             ->from(column: 'id')
                             ->writtenBy(ChangeListingAddress::class))))
                 ->related(relation: fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
-                    ->attribute(name: 'job_site_id', definition: fn (Attribute $a) => $a->from('id'))))
+                    ->attribute(name: 'job_site_id', definition: fn (Attribute $a) => $a->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.'))))
             ->successorsInitializedBy(InitializeListingJob::class)
             ->legacyInitializedBy(InitializeLegacyListing::class)
             ->writesWithin(ListingWriteScope::class)
-            ->dependents(ListingDependents::class)
-            ->catchUpAlso(ListingAddressChanges::class);
+            ->dependents(ListingDependents::class);
     }
 }
 ```
 
-`place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, their default operations assign those keys to the new rows, so a reserved id is honored ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
+`company_id`, `place_id` and `job_site_id` are `readOnly()`. `place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, each default operation assigns its key into the row the create creates, so a reserved id is honored. An update of any of the three refuses ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
 
 ## The operations
 
 `PublishOrDraftJob` runs a domain action. Its `afterSave()` action runs after the staged saves, and `publish()` or `draft()` saves the Job on its own.
 
 ```php
-namespace App\Listings\Compatibility;
+namespace App\Entities\Listings\Compatibility;
 
 final class PublishOrDraftJob implements WritesAttribute
 {
@@ -137,27 +136,27 @@ final class ChangeListingAddress implements WritesAttribute
 ```php
 final class InitializeListingJob implements InitializesSuccessors
 {
-    public function initialize(Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
-        $listing = $change->record;
+        $listing = $creation->record;
         $job = $successors->root();
         $job->name = $listing->title ?: 'Legacy listing '.$listing->uuid;
         $job->opted_in_to_zma = false;
-        $job->payment_status = $change->origin === Origin::Backfill
+        $job->payment_status = $creation->origin === Origin::Backfill
             ? PaymentStatus::fromOrders($listing->orders)
             : PaymentStatus::Unpaid;
     }
 }
 ```
 
-`InitializeLegacyListing` runs the other way. `Job` carries `Provides\CarriesLegacy`, so a Job created natively becomes a listing. The package allocates `listings.id` from the listing sequence and the uuid through `Listing::newUniqueId()`, and sets `job_id`. The class sets the title.
+`InitializeLegacyListing` runs the other way. `Job` carries `Provides\CarriesLegacy`, so from install onward a Job created natively becomes a listing. `Creation::$record` is the new listing. The package allocates `listings.id` from the listing sequence and the uuid through `Listing::newUniqueId()`, and sets `job_id`. The class sets the title.
 
 ```php
 final class InitializeLegacyListing implements InitializesLegacy
 {
-    public function initialize(Model $legacy, Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
-        $legacy->title = $successors->root()->name;
+        $creation->record->title = $successors->root()->name;
     }
 }
 ```
@@ -178,19 +177,19 @@ final class ListingWriteScope implements ScopesWrites
 
 ## Dependent schema
 
-`job_sites_view` reads `listings`. `ListingDependents` drops it before the swap and redefines it over the served listings after the swap, inside the install transaction.
+`job_sites_view` reads `listings`. `ListingDependents` drops it in `beforeInstall()` and redefines it over the served listings in `afterInstall()`, inside the install transaction.
 
 The rollback mirrors reverse that, inside the rollback transaction. `beforeRollback()` drops `job_sites_view` before rollback drops the view it reads. `afterRollback()` recreates it over the restored `listings` table, after the refill.
 
 ```php
 final class ListingDependents implements ManagesDependents
 {
-    public function beforeSwap(Connection $connection): void
+    public function beforeInstall(Connection $connection): void
     {
         $connection->statement('DROP VIEW job_sites_view');
     }
 
-    public function afterSwap(Connection $connection): void
+    public function afterInstall(Connection $connection): void
     {
         $connection->statement(JobSiteViewSql::overServedListings());
     }
@@ -203,21 +202,6 @@ final class ListingDependents implements ManagesDependents
     public function afterRollback(Connection $connection): void
     {
         $connection->statement(JobSiteViewSql::overLegacyListings());
-    }
-}
-```
-
-## The change source
-
-An Address edit changes a listing's served values without touching `listings.updated_at`. `ListingAddressChanges` returns the listings whose Address changed since the watermark.
-
-```php
-final class ListingAddressChanges implements ReportsChanges
-{
-    /** @return iterable<int> */
-    public function since(CarbonImmutable $watermark): iterable
-    {
-        return Listing::query()->whereIn(column: 'address_id', values: Address::query()->where(column: 'updated_at', operator: '>=', value: $watermark)->select('id'))->pluck('id');
     }
 }
 ```

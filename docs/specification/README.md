@@ -26,7 +26,7 @@ A change that departs from this specification on purpose updates the specificati
 | [Listing example](examples/listing.md) | the complete `Listing` map over `Job`, with its operation and hook classes |
 | [Floor plan example](examples/floor-plan.md) | the complete `FloorPlan` map over `PlaceAsset`, with its operation and hook classes |
 
-Each page ends with its open questions. An open question names a detail the session did not settle, the options, and one recommendation.
+A page with unsettled details ends with its open questions. An open question names a detail the session did not settle, the options, and one recommendation.
 
 ## Decisions
 
@@ -56,7 +56,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 | Finding | Answered in |
 | :-- | :-- |
 | L1. Reconciliation cannot keep authoritative successor data | [Lifecycle: the source of truth](lifecycle.md#the-source-of-truth) and [Not in this design](#not-in-this-design) |
-| L2. Catch-up misses changes outside the legacy row | [Lifecycle: a pass](lifecycle.md#a-pass), [change sources](lifecycle.md#change-sources) and [deletions](lifecycle.md#deletions) |
+| L2. Catch-up misses changes outside the legacy row | [Lifecycle: a pass](lifecycle.md#a-pass), [changes outside the legacy row](lifecycle.md#changes-outside-the-legacy-row) and [deletions](lifecycle.md#deletions) |
 | L3. Prepare discards an existing correspondence | [Storage: the successor key](storage.md#the-successor-key) |
 | L4. Install does not compose with dependent schema | [Lifecycle: dependent schema](lifecycle.md#dependent-schema) |
 | L5. Generic materialization cannot build the successor graph | [Operations: initializers](operations.md#initializers) and [Lifecycle: the backfill](lifecycle.md#the-backfill) |

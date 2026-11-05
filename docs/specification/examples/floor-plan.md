@@ -19,7 +19,7 @@ CREATE INDEX CONCURRENTLY floorplans_listing_id_index_id ON floorplans (listing_
 ## The map
 
 ```php
-namespace App\Media\Compatibility;
+namespace App\Entities\FloorPlans\Compatibility;
 
 final class FloorPlanMap
 {
@@ -88,10 +88,10 @@ final class WriteDisplayType implements WritesAttribute
 ```php
 final class InitializeFloorPlanAsset implements InitializesSuccessors
 {
-    public function initialize(Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
         $asset = $successors->root();
-        $asset->place_id = Listing::query()->whereKey($change->record->listing_id)->value('place_id');
+        $asset->place_id = Listing::query()->whereKey($creation->record->listing_id)->value('place_id');
         $asset->subsection_id = DefaultSection::for(type: 'floorplan', place: $asset->place_id);
     }
 }
@@ -102,10 +102,10 @@ final class InitializeFloorPlanAsset implements InitializesSuccessors
 ```php
 final class InitializeLegacyFloorPlan implements InitializesLegacy
 {
-    public function initialize(Model $legacy, Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
         $job = $successors->root()->place->job;
-        $legacy->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
+        $creation->record->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
     }
 }
 ```
@@ -119,28 +119,26 @@ final class InitializeLegacyFloorPlan implements InitializesLegacy
 ```php
 final class InitializeLegacyPhoto implements InitializesLegacy
 {
-    public function initialize(Model $legacy, Successors $successors, Change $change): void
+    public function initialize(Successors $successors, Creation $creation): void
     {
         $job = $successors->root()->place->job;
-        $legacy->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
+        $creation->record->listing_id = Listing::query()->where(column: 'job_id', operator: '=', value: $job->getKey())->value('id');
     }
 }
 ```
 
 ## The write scope
 
-`MediaWriteScope` applies eloquent-ordering's rule: lock the parents first. It calls Aryeo's own use of eloquent-ordering to take that lock order. The package requires eloquent-ordering for `position()`, but takes no lock order from it. `OrderedParents::lockFirst()` stands for the routine that eloquent-ordering must publish.
+`MediaWriteScope` applies eloquent-ordering's rule: lock the parents first. It runs inside the package's transaction, so it opens none of its own. It calls Aryeo's own use of eloquent-ordering to take that lock order. The package requires eloquent-ordering for `position()`, but takes no lock order from it. `OrderedParents::lockFirst()` stands for the routine that eloquent-ordering must publish.
 
 ```php
 final class MediaWriteScope implements ScopesWrites
 {
     public function run(array $successors, Closure $write): mixed
     {
-        return DB::transaction(function () use ($successors, $write) {
-            OrderedParents::lockFirst(PlaceAsset::query()->whereKey($successors[PlaceAsset::class] ?? [])->get());
+        OrderedParents::lockFirst(PlaceAsset::query()->whereKey($successors[PlaceAsset::class] ?? [])->get());
 
-            return $write();
-        });
+        return $write();
     }
 }
 ```

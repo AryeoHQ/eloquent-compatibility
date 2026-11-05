@@ -40,6 +40,16 @@ ALTER TABLE listings ADD FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CAS
 
 The unique constraint can also come from a unique index built `CONCURRENTLY`. The foreign key starts `NOT VALID`, and install validates it before it takes its lock.
 
+Under its lock, after the final pass, the NULL-key probe and the insert of retained rows for natively created roots, install adds the database's guarantee of a non-NULL key:
+
+```sql
+ALTER TABLE listings_retained ADD CONSTRAINT listings_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
+```
+
+The check needs no scan, and it checks every later insert and update. Install runs no `SET NOT NULL`, which would scan the whole table under the lock. Prepare does not add the check: a `NOT VALID` check still applies to new rows, and before install the legacy model inserts natively with a NULL key that a pass fills later. Every such insert would fail with `23514`. This differs from the page's earlier recommendation, which left the key nullable and relied on the probe alone.
+
+Rollback mirrors install. Before it renames the retained table back, it drops the check, because native legacy inserts with a NULL key resume after a rollback.
+
 `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key.
 
 ## The position index
@@ -69,6 +79,8 @@ LEFT JOIN "job_sites" ON <the Job's relation to its JobSite>;
 - **A related successor** is a plain `LEFT JOIN` where the database proves at most one row: a `BelongsTo`, or a `HasOne` over a unique index.
 - **A degrade `HasOne`**, which no unique index bounds, is a `LEFT JOIN LATERAL (... LIMIT 1)`. It is the only lateral join.
 
+The view serves an added successor key, such as `floorplans.place_asset_id`, as it serves `job_id`. The legacy model hydrates that column from `prepare()` onward, so its attributes stay the same across install.
+
 The view holds no constant: no discriminator literal and no membership filter. The successor key is the membership, so a retained row with a root key is a served record.
 
 A plain join lets PostgreSQL use the related table's index for a filter on a related attribute. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
@@ -77,7 +89,7 @@ The view is not automatically updatable. [Lifecycle](lifecycle.md#the-writer-bou
 
 ## `compatibility_backfills`
 
-One row per legacy model holds the state of its backfill.
+One row per legacy model holds the state of its backfill. `prepare()` creates the table when it does not exist, and creates the legacy model's `<legacy>_backfill`.
 
 ```sql
 CREATE TABLE compatibility_backfills (
@@ -92,7 +104,7 @@ CREATE TABLE compatibility_backfills (
 
 | Column | Holds |
 | :-- | :-- |
-| `legacy_type` | the legacy model the row describes |
+| `legacy_type` | the legacy table's name, as in `<legacy>_backfill`; a renamed model class keeps its watermark |
 | `watermark_at` | the database time at which the last completed pass started; NULL before the first pass completes |
 | `pass` | the number of the last pass that started |
 | `pass_started_at` | when that pass started |
@@ -128,38 +140,3 @@ CREATE INDEX ON listings_backfill (status) WHERE status IN ('refused', 'failed')
 The partial index lets every pass find the `refused` and `failed` rows without a scan. The table's name obeys the identifier limit ([0009](../decisions/0009-map-names-fit-the-object-name-limit.md)).
 
 When install finishes, the package deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It never drops `compatibility_backfills`. The table holds one row per legacy model, so dropping it would erase the watermarks of models not yet installed. Each legacy model installs independently, and that rule needs those watermarks. `rollback()` needs neither, because it refills the legacy table from the successors through the successor key.
-
-## Open questions
-
-### 1. Who creates the ledger
-
-- **A.** `prepare()` creates `compatibility_backfills` and `<legacy>_backfill`.
-- **B.** The first pass creates them.
-
-**Recommendation: A.** `compatibility:sql prepare` then prints every statement the package runs before install.
-
-### 2. NOT NULL on the successor key
-
-The view's inner join leaves a retained row without a root key unserved. The session did not say whether install makes the successor key NOT NULL.
-
-- **A.** The database enforces a non-NULL key: a `CHECK (job_id IS NOT NULL) NOT VALID`, or `SET NOT NULL` at install.
-- **B.** The key stays nullable. The existence proof covers it before the lock. Under the lock, after the final catch-up pass, install runs one indexed probe for a NULL key and refuses when the probe finds one.
-
-**Recommendation: B.** Before install, the legacy model inserts natively with a NULL successor key, and a pass fills it later. PostgreSQL enforces a `NOT VALID` CHECK on every new row. A CHECK added at prepare or before the lock would therefore fail every native legacy insert with `23514`. A `SET NOT NULL` under the lock would scan the whole table, which decision 8 forbids. This differs from the page's earlier recommendation, A at prepare. A retained table with two root keys keeps both nullable.
-
-### 3. An added successor key in the view
-
-`place_asset_id` is a new column on `floorplans`. From `prepare()` onward, the legacy model hydrates it.
-
-- **A.** The view serves the added key, as it serves `job_id`.
-- **B.** The view leaves it out.
-
-**Recommendation: A.** The legacy model's attributes then stay the same across install.
-
-### 4. The value of `legacy_type`
-
-- **A.** The legacy table's name, as in `<legacy>_backfill`.
-- **B.** The legacy model's class.
-- **C.** The legacy model's morph class.
-
-**Recommendation: A.** A renamed class then keeps its watermark, and one name identifies both tables.

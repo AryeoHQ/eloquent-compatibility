@@ -10,7 +10,7 @@ The research proposed that the package depend on eloquent-concurrency's parent-l
 
 ## Decision
 
-`writesWithin()` names a class whose `run()` receives the touched successor keys by class, and the write to run. The package calls it before it takes any lock of its own. That holds on a record write, a mass write, a backfill row, and catch-up in an ordinary pass. The scope must run the write inside a transaction it opens, and the package opens its own transaction inside the scope.
+`writesWithin()` names a class whose `run()` receives the touched successor keys by class, and the write to run. The package opens its own transaction, then calls the scope inside it, before it takes any lock of its own. That holds on a record write, a mass write, a backfill row, and catch-up in an ordinary pass. The scope's locks hold until the package's work commits, so a scope needs no transaction of its own. A mass write calls the scope once, with the keys of every record it writes. A successor the write creates appears under its class with an empty key list.
 
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.

@@ -21,6 +21,6 @@ Declined: provenance and both-sides conflict detection in the ledger.
 ## Consequences
 
 - A native edit to a mapped column before install is lost at the next pass. The package documents this and does not enforce it, because Aryeo's v2 writes Jobs live.
-- The drift check's "values differ" finding shows what the next pass would overwrite.
+- The drift check's value comparison shows what the next pass would overwrite.
 - The skip rule keeps a nullable override whose served value already matches.
 - [Lifecycle](../specification/lifecycle.md#the-source-of-truth) states the rule.

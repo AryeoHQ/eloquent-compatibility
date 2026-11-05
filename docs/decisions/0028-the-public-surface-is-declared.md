@@ -22,6 +22,11 @@ The documentation lists exactly that surface. Every parameter of a public constr
 - Discovery lands commit `6ec7755`, which classifies a classmap entry by its real path, with a test over an optimized classmap.
 - `install()` may run inside a caller's transaction when no catch-up is pending.
 - The redesign ships as a new 0.x minor release, with no data migration, because no production install exists.
+- recompile() stays public under the new name update(). `compatibility:sql` and the testing assertion say update. Declined: keeping the name recompile().
+- `compatibility:sql` takes the operation as its first positional argument: `compatibility:sql {operation} {model}`, with the operation one of prepare, install, update, rollback and retire. Its `--for=` option is removed. Declined: keeping `--for=`.
+- `compatibility:backfill` drops `--since`, because the package stores the watermark. Declined: keeping `--since`.
+- The map loses identifiedBy(), discriminatedBy() and timestamps(). Identity comes from the legacy table, and every map declares `created_at` and `updated_at` as plain attributes. Declined: keeping identifiedBy() and discriminatedBy(), and keeping timestamps() as a shortcut.
+- The map keeps `atMostOne(because:)` for writes, and `external()` with its read closure only. Declined: removing either one.
 - The [interface specification](../specification/README.md) ships first. Every later change is checked against it, and a deliberate deviation updates it in the same pull request.
 
 Declined: a public state() reader, because `compatibility:status` and idempotent operations cover its uses.

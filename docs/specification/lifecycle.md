@@ -21,7 +21,7 @@ The legacy model is the source of truth until install. The successor is the sour
 - The legacy record never owns a successor-only column. The initializers and the successor's own code own it.
 - The package detects no conflicts and records no provenance.
 
-This is documented, not enforced, because Aryeo's v2 writes Jobs live before install. `compatibility:check` reports where the values differ, which shows what the next pass would overwrite.
+This is documented, not enforced, because Aryeo's v2 writes Jobs live before install. `compatibility:check` reports each served value that disagrees with its legacy value, which shows what the next pass would overwrite.
 
 ## Prepare
 
@@ -31,6 +31,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 - It adds a unique constraint on the successor key.
 - It adds the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`.
 - It lists every object that depends on the legacy table.
+- It creates `compatibility_backfills` when the table does not exist, and this legacy model's `<legacy>_backfill`. `compatibility:sql prepare` therefore prints every statement the package runs before install.
 - For each `position()` attribute, it refuses unless the index `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL` exists. The consumer creates that index `CONCURRENTLY` before prepare. `compatibility:sql prepare` prints the statement.
 
 It allocates nothing on the successors. Running it again changes nothing. [Storage](storage.md#the-successor-key) shows its statements.
@@ -45,8 +46,7 @@ It allocates nothing on the successors. Running it again changes nothing. [Stora
 2. The first pass walks every row. Each later pass walks:
    - rows whose `updated_at` is at or after the watermark minus the margin,
    - rows whose `updated_at` is NULL,
-   - rows whose ledger status is `refused` or `failed`, and
-   - the keys each `catchUpAlso()` source returns.
+   - rows whose ledger status is `refused` or `failed`.
 3. Each row is written in its own savepoint, through the operations, and its ledger row is upserted.
 4. The pass handles deletions: ledger rows whose legacy row is gone.
 5. The pass sets the watermark to its recorded start.
@@ -57,7 +57,7 @@ A failure rolls back that row only, and the chunk continues.
 
 The watermark is a timestamp and nothing else: the database time at which the last completed pass started. It holds no key. A pass that does not complete leaves the watermark where it was.
 
-The margin is subtracted from each pass's lower bound. It must exceed the clock skew between the application servers, which stamp `updated_at`, and the database, which stamps the pass start, plus the longest legacy write transaction. A write stamps `updated_at` when it runs, but a pass sees the row only after its transaction commits.
+The margin is subtracted from each pass's lower bound. It is a named argument of each operation, and the package has no configuration of its own: `compatibility:backfill --margin=` takes seconds, and `Compatibility::install()` takes `margin:`. Both default to 5 minutes. The pass size is `install()`'s `passSize:` alone, because it only sets install's stop condition, and `compatibility:backfill` runs one pass. The margin must exceed the clock skew between the application servers, which stamp `updated_at`, and the database, which stamps the pass start, plus the longest legacy write transaction. A write stamps `updated_at` when it runs, but a pass sees the row only after its transaction commits.
 
 ### Per-row outcomes
 
@@ -84,20 +84,11 @@ A ledger row whose legacy row is gone names a deletion. The pass deletes that ro
 
 One rule covers every origin. The pass deletes the successor of a deleted legacy row, whether the backfill created it or not. A soft delete keeps it recoverable. A foreign key, and the per-row outcome, refuse loudly when native history depends on it.
 
-### Change sources
+### Changes outside the legacy row
 
-A served value can change through another table without touching the legacy row's `updated_at`. `catchUpAlso()` names a `Contracts\ReportsChanges` class. On each pass with a watermark, its `since()` returns the legacy keys whose served values changed through other tables, and the pass walks them.
+A pass walks only the rows above. A walked row whose legacy values are unchanged runs no operation. A served value can still change through another table, as when an Address edit changes the coordinates a JobSite copies. That copy between successor tables is the consumer's own consistency rule, and it must hold after install too. The package runs nothing for it.
 
-```php
-final class ListingAddressChanges implements ReportsChanges
-{
-    /** @return iterable<int> */
-    public function since(CarbonImmutable $watermark): iterable
-    {
-        return Listing::query()->whereIn(column: 'address_id', values: Address::query()->where(column: 'updated_at', operator: '>=', value: $watermark)->select('id'))->pluck('id');
-    }
-}
-```
+The change sources are removed: `catchUpAlso()` and `Contracts\ReportsChanges` are gone from the map. Declined: re-running the operations of reported rows without the equality skip.
 
 ### Positions
 
@@ -113,11 +104,12 @@ Trashed legacy rows follow the same rules as live ones. `compatibility:check` re
 10:00  Pass 1 records watermark_at = 10:00 from the database clock.
        It walks every row by key, one savepoint each.
 14:00  Pass 2 walks rows with updated_at >= 10:00 minus the margin, rows with NULL updated_at,
-       refused and failed rows, change-source keys, and ledger rows whose legacy row is gone.
+       refused and failed rows, and ledger rows whose legacy row is gone.
        It records watermark_at = 14:00.
-14:05  Pass 3 walks far fewer rows. Passes repeat until one walks fewer than about 1,000 rows.
-       Install then proves existence and values before its lock. Under the lock it runs the
-       final small pass, the NULL-key probe, the rename, the drop of mapped columns, the view and the dependent hooks.
+14:05  Install runs passes until one walks fewer rows than passSize. It then proves
+       existence and values before its lock. Under the lock it runs the final small pass, the
+       NULL-key probe, the rename, the drop of mapped columns, the native-root inserts, the
+       check, the view and the dependent hooks.
 ```
 
 ## The install gate
@@ -127,7 +119,7 @@ Install refuses while any row of this legacy model is `refused` or `failed`. The
 - **Existence.** No legacy row lacks both a ledger row and a successor key.
 - **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. Each row's successor `rank_key` must exceed its previous legacy sibling's, through `lag()` over the legacy order.
 
-Install refuses on any difference. It records each key the value proof flags as `failed`, with the reason `values differ`, and keeps those ledger rows when it refuses. The next pass retries them, whatever the watermark, so a row whose write left `updated_at` alone is walked. Each legacy model passes its own gate, even on a shared successor.
+The proofs read only, and write no ledger row. When the value proof flags keys, install catches up those keys and proves them again. It refuses only when they still differ. A row whose write left `updated_at` alone is therefore caught up before the lock. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 
 The package has no partial install. A legacy row without a successor cannot be served, so install waits until every row has one. Unblocking is the consumer's work: complete the prerequisite, widen the successor to represent the state, retire rows, split the legacy table, or order the installs.
 
@@ -137,23 +129,29 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 
 ### Before the lock
 
-1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`.
-2. It proves the install gate: the ledger, existence and values.
-3. It validates the successor key's foreign key.
+1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`. It also refuses when `<legacy>_backfill` is missing, and the refusal names `prepare()`.
+2. It runs passes until one walks fewer rows than its `passSize:` argument, 1,000 by default.
+3. It reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. It writes nothing for them, and it reports their count.
+4. It proves the install gate: the ledger, existence and values. It catches up the keys the value proof flags, proves those keys again, and refuses only when they still differ.
+5. It validates the successor key's foreign key.
 
-These whole-table proofs never run under the lock. The pre-lock proofs, and the ledger rows they mark `failed`, run and commit in their own transaction before install's transaction opens, so a refused install keeps them.
+These whole-table proofs never run under the lock.
 
 ### Under the lock
 
 1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)).
-2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one. The successor key stays nullable ([Storage](storage.md#2-not-null-on-the-successor-key)).
-3. `ManagesDependents::beforeSwap()`.
+2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one.
+3. `ManagesDependents::beforeInstall()`.
 4. The rename of the legacy table to the retained table.
 5. The drop of the mapped columns.
-6. The creation of the view.
-7. `ManagesDependents::afterSwap()`.
+6. The insert of one retained row per natively created member root: each key the pre-lock read found, and every member root created since that read, through an indexed range on the root's key or `created_at`. Install runs `legacyInitializedBy()` per row ([Operations: native successors before install](operations.md#native-successors-before-install)).
+7. The addition of `CHECK (<key> IS NOT NULL) NOT VALID` on the successor key. It needs no scan, and it checks every later insert and update ([Storage](storage.md#the-successor-key)).
+8. The creation of the view.
+9. `ManagesDependents::afterInstall()`.
 
-A configurable `statement_timeout` bounds how long install holds its locks. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
+Install's required `statementTimeout:` argument sets the `statement_timeout` that bounds how long install holds its locks. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
+
+`Provides\CarriesLegacy` does nothing before install, so a natively created root has no legacy row until install inserts one under its lock. No pass walks that row, and install's pause grows with the number of such roots. After install, the trait inserts the legacy row on create. Legacy readers do not see a v2-created listing until install ([Operations: native successors before install](operations.md#native-successors-before-install)).
 
 When install finishes, the package deletes this legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It keeps `compatibility_backfills` itself, because the table holds the watermarks of other legacy models. Dropping it would erase them, and those models could no longer install independently.
 
@@ -170,21 +168,23 @@ Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a num
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A test that uses `RefreshDatabase` can therefore install a served model.
 
+Inside a caller's transaction, a refusal loses nothing. The proofs write no ledger row, and the next install's value proof flags the same keys again.
+
 ### Dependent schema
 
 `prepare()`, `install()`, `rollback()` and `compatibility:sql` list every object that depends on the legacy table: views, materialized views, rules, policies and SQL functions.
 
-`dependents()` names a `Contracts\ManagesDependents` class. Its `beforeSwap()` and `afterSwap()` run inside the install transaction. Its `beforeRollback()` and `afterRollback()` run inside the rollback. The package does not rebind dependent views itself.
+`dependents()` names a `Contracts\ManagesDependents` class. Its `beforeInstall()` and `afterInstall()` run inside the install transaction. Its `beforeRollback()` and `afterRollback()` run inside the rollback. The package does not rebind dependent views itself.
 
 ```php
 final class ListingDependents implements ManagesDependents
 {
-    public function beforeSwap(Connection $connection): void
+    public function beforeInstall(Connection $connection): void
     {
         $connection->statement('DROP VIEW job_sites_view');
     }
 
-    public function afterSwap(Connection $connection): void
+    public function afterInstall(Connection $connection): void
     {
         $connection->statement(JobSiteViewSql::overServedListings());
     }
@@ -207,14 +207,19 @@ final class ListingDependents implements ManagesDependents
 
 1. It runs `ManagesDependents::beforeRollback()`, which removes every object that depends on the view.
 2. It drops the view.
-3. It renames the retained table back to the legacy name.
-4. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
-5. It carries the view's grants back to the restored table.
-6. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
+3. It drops `CHECK (<key> IS NOT NULL)` from the successor key, because native legacy inserts with a NULL key resume after a rollback ([Storage](storage.md#the-successor-key)).
+4. It renames the retained table back to the legacy name.
+5. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
+6. It carries the view's grants back to the restored table.
+7. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
 
-`beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterSwap()` recreates it.
+`beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterInstall()` recreates it.
 
-The legacy model is then the source of truth again. Install had dropped the ledger, so a later install starts with a first pass.
+The legacy model is then the source of truth again.
+
+### Re-install after rollback
+
+Install had dropped `<legacy>_backfill`, so a re-install runs `prepare()` again. `prepare()` is idempotent, and it recreates the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger is missing, and the refusal names `prepare()`.
 
 ## Retire
 
@@ -222,12 +227,13 @@ The legacy model is then the source of truth again. Install had dropped the ledg
 
 - It drops the view and the retained table.
 - It leaves every successor untouched.
-- It refuses while an inbound foreign key points at the retained table, and lists each one.
-- It prints the legacy-only data it would discard.
+- It refuses while any object depends on the view or the retained table, and lists each one. An inbound foreign key is one such object.
+- `compatibility:sql retire` prints the legacy-only data it would discard. `retire()` runs in a migration, where nobody can confirm, so it asks nothing.
+- A second `retire()` changes nothing.
 
 ## Status and idempotence
 
-`compatibility:status` prints each legacy model's stage. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The plan's work item "Keep legacy identity on the legacy table" settles all four. The package has no public `Compatibility::state()`.
+`compatibility:status` prints each legacy model's stage: one of the five stages in the table at the top of this page, read from the catalog and the ledger. A model that is still backfilling also shows its pass count, its watermark, and its counts of refused and failed rows. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The plan's work item "Keep legacy identity on the legacy table" settles all four. The package has no public `Compatibility::state()`.
 
 ## The writer boundary
 
@@ -241,49 +247,6 @@ The package documents this boundary and does not enforce it.
 | a legacy model class from before that release, during a deploy | writes the legacy table | fails with a database error |
 | reads of any kind | read the table | read the view |
 
-A pass never selects a row whose write left `updated_at` alone. Install's value proof flags that row's key and records it `failed`, so the next pass walks it, as [the install gate](#the-install-gate) states. A write that leaves `updated_at` alone after the value proof and before the lock is lost when install drops the mapped columns.
+A pass never selects a row whose write left `updated_at` alone. Install's value proof flags that row's key, and install catches it up before its lock, as [the install gate](#the-install-gate) states. A write that leaves `updated_at` alone after the value proof and before the lock is lost when install drops the mapped columns.
 
 The view is not automatically updatable, and the package creates no trigger and no rule. A consumer therefore searches for raw writes to the legacy name before install. It ships the model that carries `Provides\ServesCompatibility` at least one release before install.
-
-## Open questions
-
-### 1. Configuration values
-
-The session named three values without settling them. They are the clock-skew margin, the pass size at which install proceeds, and the `statement_timeout` budget.
-
-- **A.** Package configuration keys, with defaults: 1,000 rows for the pass size, as today, and 5 minutes for the margin. The `statement_timeout` budget has no default, and install refuses until it is set.
-- **B.** Arguments to `install()` and `compatibility:backfill`.
-
-**Recommendation: A.** A migration calls `install()` with no room for tuning arguments. The hold budget depends on each application's tolerance, so the package should not guess it.
-
-### 2. The bound `ReportsChanges::since()` receives
-
-- **A.** The watermark itself.
-- **B.** The watermark minus the margin, as the pass's own lower bound.
-
-**Recommendation: B.** The other tables' `updated_at` values come from the same application clocks, so they need the same margin.
-
-### 3. Who runs the passes before install
-
-The timeline repeats passes until one is small, then installs. The session did not say whether install runs those passes itself.
-
-- **A.** Install runs passes until one walks fewer rows than the configured size. It then proves the gate and takes the lock.
-- **B.** Install refuses when the last pass was large, and the operator runs more passes.
-
-**Recommendation: A.** Today's install converges itself, and the proofs then run against a nearly current table.
-
-### 4. Retire and its report
-
-The session did not say how `retire()` treats dependent objects, or where its report goes. Its idempotence is settled: [status and idempotence](#status-and-idempotence) states it.
-
-- **A.** `retire()` refuses while any object depends on the view or the retained table, and lists each one. `compatibility:sql retire` prints the data it would discard.
-- **B.** `retire()` prints its report and asks for confirmation.
-
-**Recommendation: A.** `retire()` runs in a migration, where nobody can confirm. The refusal follows the rule for inbound foreign keys.
-
-### 5. The stages `compatibility:status` prints
-
-- **A.** The five stages in the table at the top of this page, read from the catalog and the ledger. A backfilling model also shows its pass count, its watermark and its count of refused and failed rows.
-- **B.** A free-form description of each model.
-
-**Recommendation: A.** A fixed set of stages can be tested and scripted, and enums type fixed sets ([0013](../decisions/0013-enums-and-value-objects-type-the-fixed-sets.md)).
