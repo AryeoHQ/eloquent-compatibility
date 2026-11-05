@@ -14,6 +14,7 @@ The map declares each relation with a closure that returns the Eloquent relation
 - A PHPStan rule reports an operation that references a class the map does not relate.
 - Attribute names and column names stay strings.
 - A companion, such as the state row, is a declared relation. An operation reaches it with `relatedOrNew()`.
+- `related()` returns null when the related row is absent, because a morph has one target at a time and a related row can be missing. Declined: refusing.
 
 Declined: string names, an add() method for undeclared rows, and disambiguation of two relations of one class before a real case needs it.
 

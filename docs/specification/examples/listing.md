@@ -66,6 +66,8 @@ final class ListingMap
 }
 ```
 
+`deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the Job's `delete()`, and a legacy restore queues its `restore()`, so the Job's `deleting`, `deleted`, `restoring` and `restored` listeners run. A legacy `forceDelete()` runs the Job's `forceDelete()`. `PublishOrDraftJob`'s `publish()` saves the Job again under `Model::withoutTimestampsOn()`, so the Job keeps the legacy `updated_at`.
+
 `company_id`, `place_id` and `job_site_id` are `readOnly()`. `place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, each default operation assigns its key into the row the create creates, so a reserved id is honored. An update of any of the three refuses ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
 
 ## The operations

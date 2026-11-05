@@ -38,6 +38,18 @@ An operation receives the change context: the record after the write, the origin
 
 Two projection helpers cover the common reads, as decision 13 of the plan states. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position(legacyWithin:)` reads eloquent-ordering's published position expression, and its default operation moves the row. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
 
+A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row. The plan's work item "Serve reads from the retained table with plain joins" implements both, as decision 13 of the plan states.
+
+`prepare()` refuses a `position()` attribute without its position index on the legacy table.
+
+When `choose:` picks another target class for a record, the package moves the morph target. It deletes the old target through its model and creates the new one, in one unit of work. Declined: an operation that moves it.
+
+The backfill's round-trip check reads through the view's compiled `SELECT`, filtered to the record's key, because no view exists before install. Declined: skipping the check before install.
+
+The root's soft-delete column and a successor's updated-at column have default operations of their own, as decision 16 of the plan states. A change of the soft-delete column queues `delete()` or `restore()` after the saves. A legacy record delete runs the root's `forceDelete()` as its own step, after the lock and in place of the assignments, the saves, the actions and the round-trip check. An assigned updated-at column survives the after-save actions, because the package runs them under `Model::withoutTimestampsOn()` for that successor. Declined: plain assignment of the soft-delete column.
+
+`delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to decision 2 of the plan, because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
+
 Declined: a complete column specification, and one adapter class per legacy model.
 
 ## Consequences
@@ -49,4 +61,5 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
 - A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live rows of its legacy parent.
+- A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so decision 2 of the plan holds on the delete path, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

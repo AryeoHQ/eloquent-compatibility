@@ -12,6 +12,7 @@ Each attribute has exactly one operation:
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
 - **`readOnly(because:)`.** On an update, the default operation refuses. On a create, it assigns the inverse, but only into a successor row this create creates. This amends decision 10 of the plan, which said that no path writes the attribute ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 - **A `position()` attribute's default operation.** It runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses.
+- **The default operations of Eloquent-managed columns.** The root's soft-delete column and a successor's updated-at column keep the record writer's current behavior. [Eloquent-managed columns](#eloquent-managed-columns) states them.
 
 A `readAs()` attribute has no inverse. When it declares neither `writtenBy()` nor `readOnly()`, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
 
@@ -99,9 +100,11 @@ One legacy write runs these steps, in this order:
 2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
-5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events.
+5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor.
 6. **Verify.** The package reads the record back through the view and runs the round-trip check.
 7. **Forward.** The package forwards one legacy event.
+
+A legacy record delete runs a delete step in place of steps 3 to 6 ([Eloquent-managed columns](#eloquent-managed-columns)).
 
 This is the order decision 5 of the plan names. The scope runs inside the package's transaction, so the locks the scope takes hold until the package's work commits.
 
@@ -114,6 +117,8 @@ This is the order decision 5 of the plan names. The scope runs inside the packag
 | changed by assignments | one `UPDATE` | one `saving`, `updating`, `updated` and `saved` |
 | created by `relatedOrNew()` | one `INSERT` | one `saving`, `creating`, `created` and `saved` |
 | removed by `deleteRelated()` | its model's `delete()` | the events its model's `delete()` fires |
+| the root, trashed or restored by its soft-delete column | its model's `delete()` or `restore()` | the events that call fires, including `deleting` and `deleted`, or `restoring` and `restored` |
+| the root, removed by a legacy record delete | its model's `forceDelete()` | the events `forceDelete()` fires, including `deleting` and `deleted` |
 | saved by an `afterSave()` action | what the action runs | the action's own events |
 | unchanged | none | none |
 
@@ -128,6 +133,23 @@ After a write, every written attribute must read back its new value through the 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
 Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
+
+## Eloquent-managed columns
+
+Eloquent manages a successor's soft-delete and updated-at columns itself. Their default operations therefore keep the record writer's current behavior, as decision 16 of the plan states ([0020](../decisions/0020-reads-are-declared-writes-are-operations.md)).
+
+- **Soft delete.** A mapped change of the root's soft-delete column does not assign the column. A non-NULL value queues the root's `delete()` as an `afterSave()` action, and NULL queues its `restore()`. When the root's trashed state already matches the value, the operation assigns the value instead.
+- **The deletion date.** `delete()` always stamps the current time. After `delete()`, the package therefore writes the legacy `deleted_at` and `updated_at` onto the root's row with a base-query `UPDATE`, which fires no further events. A backfilled trashed row keeps its original deletion date, and the round trip holds.
+- **Updated-at.** An assigned updated-at column keeps the legacy value through step 4, Save, even when that value equals the stored one. The package runs step 5, Act, under `Model::withoutTimestampsOn([...])` for that successor. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, therefore keeps the legacy value, and the round trip holds.
+- **Hard delete.** From install onward, a legacy record delete runs the root's `forceDelete()` as its own step. The step runs after step 2, Lock, and replaces steps 3 to 6, because a delete writes no attribute. Step 7 then forwards the legacy delete's events. The successor key's `ON DELETE CASCADE` carries the delete through the retained row ([Storage](storage.md)).
+
+The successor's `deleting`, `deleted`, `restoring` and `restored` events therefore fire on the delete path. Decision 2 of the plan holds there too: every package path writes a successor through its model. The deletion date's `UPDATE` is the one named exception to decision 2. It runs after the model's `deleting` and `deleted` events have fired, and it writes only the two timestamps.
+
+Declined for the deletion date: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
+
+Before install, a legacy delete removes the legacy row, and a pass deletes the successor through its model ([Lifecycle: deletions](lifecycle.md#deletions)).
+
+Declined: plain assignment of the soft-delete column. The successor would then fire `updated` but never `deleted` or `restored`, and a legacy delete would have no path to `forceDelete()`.
 
 ## Creates
 

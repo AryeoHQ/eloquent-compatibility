@@ -31,6 +31,7 @@ final class FloorPlanMap
                 ->when(fn (Builder $assets) => $assets->where(column: 'type', operator: '=', value: 'floorplan'))
                 ->attribute(name: 'created_at', definition: fn (Attribute $a) => $a->from('created_at')->inTimeZone('UTC'))
                 ->attribute(name: 'updated_at', definition: fn (Attribute $a) => $a->from('updated_at')->inTimeZone('UTC'))
+                ->attribute(name: 'deleted_at', definition: fn (Attribute $a) => $a->from('deleted_at')->inTimeZone('UTC'))
                 ->attribute(name: 'index', definition: fn (Attribute $a) => $a->position(legacyWithin: 'listing_id'))
                 ->attribute(name: 'display_type', definition: fn (Attribute $a) => $a
                     ->readAs('CASE WHEN "asset_files"."displays_on_property_websites" THEN "asset_files"."display_type" ELSE \'none\' END')
@@ -48,6 +49,8 @@ final class FloorPlanMap
 ```
 
 `when()` declares membership: a `PlaceAsset` is a floor plan when its `type` is `floorplan`. The example elides the mapped attributes of the File and the Link.
+
+`floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
 `index` reads its one-based position through eloquent-ordering's published position expression, and `legacyWithin:` names the legacy parent column, `listing_id`. It needs no `writtenBy()`: its default operation moves the `PlaceAsset` with `Placement::at($value)` ([Operations: positions](../operations.md#positions)).
 
