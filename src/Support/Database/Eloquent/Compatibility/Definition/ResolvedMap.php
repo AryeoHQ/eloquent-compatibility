@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use ReflectionFunction;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
@@ -16,7 +17,7 @@ final readonly class ResolvedMap
 {
     public Successor $primary;
 
-    public null|string $retainedKey;
+    public string $successorKey;
 
     /** @var list<Related> */
     public array $related;
@@ -27,13 +28,6 @@ final readonly class ResolvedMap
     /** @var array<string, Successor> */
     public array $owners;
 
-    public null|Membership $membership;
-
-    public null|Closure $selector;
-
-    /** @var array<class-string<Model>, ResolvedMap> */
-    public array $branches;
-
     public null|RelatedMorph $morph;
 
     /** @var array<class-string<Model>, ResolvedMap> */
@@ -43,40 +37,25 @@ final readonly class ResolvedMap
 
     /**
      * @param  class-string<Model>  $model
-     * @param  array<string, Identifier>  $identifiers
      * @param  list<Hide>  $hides
      * @param  array<string, Guard>  $guards
      * @param  array<class-string, string>  $withoutForwarding
-     * @param  array<class-string<Model>, Branch>  $branches
+     * @param  null|class-string<ManagesDependents>  $dependents
      * @param  null|class-string<Model>  $variant
      */
     public function __construct(
         public string $model,
         public string $table,
-        public array $identifiers,
         public null|string $retainedTable,
-        null|string $retainedKey,
-        bool $timestamps,
+        null|string $successorKey,
         null|Successor $primary,
         public array $hides,
         public array $guards,
         public array $withoutForwarding,
-        null|string $discriminator = null,
-        null|Closure $selector = null,
-        array $branches = [],
-        public bool $branch = false,
+        public null|string $dependents = null,
         null|string $variant = null,
     ) {
-        if ($selector !== null || $branches !== []) {
-            $this->resolveBranches($retainedKey, $timestamps, $discriminator, $selector, $branches);
-
-            return;
-        }
-
-        $this->selector = null;
-        $this->branches = [];
-
-        if ($primary === null) {
+        if ($primary === null || $successorKey === null) {
             throw $this->invalid('it says no servedFrom(), so it names no successor');
         }
 
@@ -87,7 +66,11 @@ final readonly class ResolvedMap
         $morph = $primary->morph();
 
         if ($morph !== null && $variant === null) {
-            $this->resolveMorphs($primary, $morph, $retainedKey, $timestamps, $discriminator);
+            $this->resolveMorphs(
+                primary: $primary,
+                morph: $morph,
+                successorKey: $successorKey,
+            );
 
             return;
         }
@@ -96,28 +79,23 @@ final readonly class ResolvedMap
         $this->morphs = [];
         $this->target = $variant === null || $morph === null ? null : $morph->targets[$variant];
 
-        $legacy = new $model;
-        $key = $legacy->getKeyName();
-
-        if (! array_key_exists($key, $identifiers)) {
-            throw $this->invalid("it declares no identifiedBy('{$key}'), so it serves no {$key} for ".class_basename($model));
-        }
-
-        foreach ($identifiers as $identifier) {
-            $identifier->resolve($primary, $discriminator);
-        }
-
         [$related, $successors] = $this->walk($primary);
-        [$attributes, $owners] = $this->collect($successors, $timestamps ? $this->timestamps($legacy, $primary) : []);
-        $this->refuseSharedColumns($primary, $attributes, $owners, $discriminator);
-        $this->membership = $this->resolveMembership($legacy, $primary, $discriminator);
+        [$attributes, $owners] = $this->collect(
+            successors: $successors,
+            successorKey: $successorKey,
+        );
+        $this->refuseSharedColumns(
+            primary: $primary,
+            attributes: $attributes,
+            owners: $owners,
+        );
 
         if ($retainedTable !== null && ($retainedTable === $table || in_array($retainedTable, array_map(fn (Successor $successor) => $successor->table, $successors), true))) {
             throw $this->invalid("retainedIn() names the table {$retainedTable}, which the map already reads as another table");
         }
 
         $this->primary = $primary;
-        $this->retainedKey = $retainedTable === null ? null : ($retainedKey ?? (new $primary->model)->getForeignKey());
+        $this->successorKey = $successorKey;
         $this->related = $related;
         $this->attributes = $attributes;
         $this->owners = $owners;
@@ -127,7 +105,7 @@ final readonly class ResolvedMap
     {
         $captured = array_keys(array_filter(
             (new ReflectionFunction($closure))->getClosureUsedVariables(),
-            fn (mixed $value) => ! $value instanceof Compatibility && ! $value instanceof Successor && ! $value instanceof Attribute && ! $value instanceof Identifier,
+            fn (mixed $value) => ! $value instanceof Compatibility && ! $value instanceof Successor && ! $value instanceof Attribute,
         ));
 
         if ($captured !== []) {
@@ -135,26 +113,10 @@ final readonly class ResolvedMap
         }
     }
 
-    public function branchFor(Model $legacy): self
-    {
-        $selector = $this->selector ?? throw new LogicException("Compatibility map '{$this->table}' serves one successor, so it has no branch to choose.");
-        $successor = $selector($legacy);
-
-        if (is_string($successor) && array_key_exists($successor, $this->branches)) {
-            return $this->branches[$successor];
-        }
-
-        throw $this->invalid('the servedFrom() choose: closure returns '.(is_string($successor) ? $successor : get_debug_type($successor)).', and successors: declares only '.implode(' and ', array_keys($this->branches)));
-    }
-
     public function morphFor(Model $legacy): self
     {
         $morph = $this->morph ?? throw new LogicException("Compatibility map '{$this->table}' declares no relatedMorph(), so it has no target to choose.");
         $variants = $this->morphs === [] ? throw new LogicException("Compatibility map '{$this->table}' is one target of its relatedMorph(), so it has no other target to choose.") : $this->morphs;
-
-        if ($morph->choose === null) {
-            return reset($variants);
-        }
 
         $target = ($morph->choose)($legacy);
 
@@ -162,7 +124,10 @@ final readonly class ResolvedMap
             return $variants[$target];
         }
 
-        throw $this->invalid('the relatedMorph() choose: closure returns '.(is_string($target) ? $target : get_debug_type($target)).', and successors: declares only '.implode(' and ', array_keys($variants)));
+        throw $this->invalid('the relatedMorph() choose: closure returns '.(is_string($target) ? $target : get_debug_type($target)).', and targets: declares only '.implode(
+            separator: ' and ',
+            array: array_keys($variants),
+        ));
     }
 
     public function morphHolding(mixed $alias): null|self
@@ -185,7 +150,7 @@ final readonly class ResolvedMap
 
     public function isExternal(string $name): bool
     {
-        foreach ($this->branches === [] ? ($this->morphs === [] ? [$this] : $this->morphs) : $this->branches as $served) {
+        foreach ($this->morphs === [] ? [$this] : $this->morphs as $served) {
             if (($served->attributes[$name] ?? null)?->isExternal() === true) {
                 return true;
             }
@@ -212,7 +177,6 @@ final readonly class ResolvedMap
             $this->retainedTable,
             $this->primary->table,
             ...array_map(fn (Related $related) => $related->table, $this->related),
-            ...array_merge([], ...array_map(fn (self $branch) => $branch->tables(), array_values($this->branches))),
         ], is_string(...))));
     }
 
@@ -222,119 +186,52 @@ final readonly class ResolvedMap
      */
     public function legacyOnly(array $columns): array
     {
-        return array_values(array_filter($columns, fn (string $column) => ! array_key_exists($column, $this->identifiers) && ! array_key_exists($column, $this->attributes)));
+        return array_values(array_filter(
+            array: $columns,
+            callback: fn (string $column) => ! array_key_exists(
+                key: $column,
+                array: $this->attributes,
+            ),
+        ));
     }
 
-    /**
-     * @param  array<class-string<Model>, Branch>  $branches
-     */
-    private function resolveBranches(null|string $retainedKey, bool $timestamps, null|string $discriminator, null|Closure $selector, array $branches): void
-    {
-        if ($selector === null) {
-            throw $this->invalid('servedFrom() declares successors: without choose:, so nothing picks between them');
-        }
-
-        if ($branches === []) {
-            throw $this->invalid('servedFrom() takes choose:, and successors: declares no successor for it to pick');
-        }
-
-        foreach ($branches as $successor => $branch) {
-            if ($branch->successor->morph() !== null) {
-                throw $this->invalid('relatedMorph() on '.class_basename($successor).', one of the successors servedFrom() chooses between, would choose a second time for each record; serve the record from one successor with relatedMorph(), or from several without it');
-            }
-        }
-
-        $names = implode(' and ', array_map(class_basename(...), array_keys($branches)));
-
-        if ($discriminator === null) {
-            throw $this->invalid("servedFrom() chooses between {$names}, and they share one morph identity on one identifier sequence only through discriminatedBy()");
-        }
-
-        $resolved = [];
-        $tables = [];
-
-        foreach ($branches as $successor => $branch) {
-            $table = $branch->successor->table;
-
-            if (array_key_exists($table, $tables)) {
-                throw $this->invalid('as('.class_basename($successor).") reads the table {$table}, which as(".class_basename($tables[$table]).') already reads');
-            }
-
-            $tables[$table] = $successor;
-            $resolved[$successor] = new self(
-                $this->model,
-                $this->table,
-                $this->identifiers,
-                $this->retainedTable,
-                $retainedKey ?? (new $this->model)->getKeyName(),
-                $timestamps,
-                $branch->successor,
-                $this->hides,
-                $this->guards,
-                $this->withoutForwarding,
-                $discriminator,
-                branch: true,
-            );
-        }
-
-        $this->refuseUnreadable($resolved, 'branch');
-        $first = reset($resolved);
-        $this->primary = $first->primary;
-        $this->retainedKey = $first->retainedKey;
-        $this->related = $first->related;
-        $this->attributes = $first->attributes;
-        $this->owners = $first->owners;
-        $this->membership = $first->membership;
-        $this->selector = $selector;
-        $this->branches = $resolved;
-        $this->morph = null;
-        $this->morphs = [];
-        $this->target = null;
-    }
-
-    private function resolveMorphs(Successor $primary, RelatedMorph $morph, null|string $retainedKey, bool $timestamps, null|string $discriminator): void
+    private function resolveMorphs(Successor $primary, RelatedMorph $morph, string $successorKey): void
     {
         $variants = [];
         $tables = [];
 
-        if (in_array($discriminator, [$morph->typeColumn, $morph->idColumn], true)) {
-            throw $this->invalid("discriminatedBy() names {$primary->table}.{$discriminator}, which relatedMorph() reads through ".class_basename($primary->model).'; give the discriminator a column of its own');
-        }
-
         foreach ($morph->targets as $target => $related) {
             if (array_key_exists($related->table, $tables)) {
-                throw $this->invalid('relatedMorph() reaches the table '.$related->table.' through '.class_basename($target).' and through '.class_basename($tables[$related->table]).'; give each successors: class a table of its own');
+                throw $this->invalid('relatedMorph() reaches the table '.$related->table.' through '.class_basename($target).' and through '.class_basename($tables[$related->table]).'; give each targets: class a table of its own');
             }
 
             $tables[$related->table] = $target;
             $variants[$target] = new self(
                 $this->model,
                 $this->table,
-                $this->identifiers,
                 $this->retainedTable,
-                $retainedKey,
-                $timestamps,
+                $successorKey,
                 $primary,
                 $this->hides,
                 $this->guards,
                 $this->withoutForwarding,
-                $discriminator,
+                $this->dependents,
                 variant: $target,
             );
         }
 
-        $this->refuseUnreadable($variants, 'successor');
+        $this->refuseUnreadable($variants);
         $first = reset($variants);
 
         if ($first === false) {
             throw new LogicException("Compatibility map '{$this->table}' resolves no relatedMorph() target.");
         }
+
         $this->primary = $first->primary;
-        $this->retainedKey = $first->retainedKey;
+        $this->successorKey = $first->successorKey;
         $this->related = [...array_values(array_filter($first->related, fn (Related $related) => $related->morphType === null)), ...array_values($morph->targets)];
         $this->attributes = $first->attributes;
         $this->owners = $first->owners;
-        $this->membership = $first->membership;
         $this->morph = $morph;
         $this->morphs = $variants;
         $this->target = null;
@@ -343,8 +240,10 @@ final readonly class ResolvedMap
     /**
      * @param  array<class-string<Model>, ResolvedMap>  $branches
      */
-    private function refuseUnreadable(array $branches, string $noun): void
+    private function refuseUnreadable(array $branches): void
     {
+        $noun = 'target';
+
         $declaredIn = [];
 
         foreach ($branches as $successor => $branch) {
@@ -392,7 +291,7 @@ final readonly class ResolvedMap
             }
 
             if ($successor !== $primary && $successor->membershipScope() !== null) {
-                throw $this->invalid("when() on {$name} decides membership, and only the servedFrom() successor carries the discriminator");
+                throw $this->invalid("when() on {$name} decides membership, and only the servedFrom() root carries when()");
             }
 
             if ($successor !== $primary && $successor->morph() !== null) {
@@ -418,100 +317,50 @@ final readonly class ResolvedMap
 
     /**
      * @param  list<Successor>  $successors
-     * @param  array<string, Attribute>  $timestamps
      * @return array{array<string, Attribute>, array<string, Successor>}
      */
-    private function collect(array $successors, array $timestamps): array
+    private function collect(array $successors, string $successorKey): array
     {
         $attributes = [];
         $owners = [];
-        $declared = [];
+        $key = (new $this->model)->getKeyName();
 
         foreach ($successors as $successor) {
             foreach ($successor->attributes() as $name => $attribute) {
-                $declared[] = [$name, $attribute, $successor];
+                if ($name === $key) {
+                    throw $this->invalid("attribute '{$name}' maps the key of ".class_basename($this->model).', and legacy identity stays on the legacy table');
+                }
+
+                if ($name === $successorKey) {
+                    throw $this->invalid("attribute '{$name}' maps the successor key that servedFrom() names, and the retained table holds it");
+                }
+
+                if (array_key_exists(
+                    key: $name,
+                    array: $attributes,
+                )) {
+                    throw $this->invalid("attribute '{$name}' is declared twice");
+                }
+
+                $attributes[$name] = $attribute->resolve();
+                $owners[$name] = $successor;
             }
-        }
-
-        foreach ($timestamps as $name => $attribute) {
-            $declared[] = [$name, $attribute, $successors[0]];
-        }
-
-        foreach ($declared as [$name, $attribute, $successor]) {
-            if (array_key_exists($name, $this->identifiers)) {
-                throw $this->invalid("attribute '{$name}' is also an identifier");
-            }
-
-            if (array_key_exists($name, $attributes)) {
-                throw $this->invalid("attribute '{$name}' is declared twice");
-            }
-
-            $attributes[$name] = $attribute->resolve();
-            $owners[$name] = $successor;
         }
 
         return [$attributes, $owners];
     }
 
     /**
-     * @return array<string, Attribute>
-     */
-    private function timestamps(Model $legacy, Successor $primary): array
-    {
-        $successor = new $primary->model;
-
-        if (! $legacy->usesTimestamps()) {
-            throw $this->invalid('timestamps() maps the timestamps of '.class_basename($legacy).', which uses none');
-        }
-
-        if (! $successor->usesTimestamps()) {
-            throw $this->invalid('timestamps() reads the timestamps of '.class_basename($successor).', which uses none');
-        }
-
-        $columns = [[$legacy->getCreatedAtColumn(), $successor->getCreatedAtColumn()], [$legacy->getUpdatedAtColumn(), $successor->getUpdatedAtColumn()]];
-
-        if (method_exists($legacy, 'getDeletedAtColumn') && method_exists($successor, 'getDeletedAtColumn')) {
-            $columns[] = [(string) $legacy->getDeletedAtColumn(), (string) $successor->getDeletedAtColumn()];
-        }
-
-        $attributes = [];
-
-        foreach ($columns as [$legacyColumn, $successorColumn]) {
-            if ($legacyColumn === null) {
-                continue;
-            }
-
-            if ($successorColumn === null) {
-                throw $this->invalid("timestamps() maps '{$legacyColumn}', and ".class_basename($successor).' keeps no such timestamp');
-            }
-
-            $attributes[$legacyColumn] = (new Attribute($this->table, $legacyColumn))->from($successorColumn);
-        }
-
-        return $attributes;
-    }
-
-    /**
      * @param  array<string, Attribute>  $attributes
      * @param  array<string, Successor>  $owners
      */
-    private function refuseSharedColumns(Successor $primary, array $attributes, array $owners, null|string $discriminator): void
+    private function refuseSharedColumns(Successor $primary, array $attributes, array $owners): void
     {
-        $columns = $discriminator === null ? [] : [$primary->table.'.'.$discriminator => 'discriminatedBy()'];
+        $columns = [];
 
         if ($this->morph !== null) {
-            $columns[$primary->table.'.'.$this->morph->typeColumn] ??= 'relatedMorph()';
-            $columns[$primary->table.'.'.$this->morph->idColumn] ??= 'relatedMorph()';
-        }
-
-        foreach ($this->identifiers as $name => $identifier) {
-            $column = $primary->table.'.'.$identifier->column();
-
-            if (array_key_exists($column, $columns)) {
-                throw $this->invalid("identifier '{$name}' reads {$column}, which {$columns[$column]} already reads");
-            }
-
-            $columns[$column] = "identifier '{$name}'";
+            $columns[$primary->table.'.'.$this->morph->typeColumn] = 'relatedMorph()';
+            $columns[$primary->table.'.'.$this->morph->idColumn] = 'relatedMorph()';
         }
 
         foreach ($attributes as $name => $attribute) {
@@ -527,21 +376,6 @@ final readonly class ResolvedMap
 
             $columns[$column] = "attribute '{$name}'";
         }
-    }
-
-    private function resolveMembership(Model $legacy, Successor $primary, null|string $discriminator): null|Membership
-    {
-        if ($discriminator === null) {
-            return $primary->membershipScope() === null ? null : throw $this->invalid('when() on '.class_basename($primary->model).' states which rows may carry the morph alias, and the map declares no discriminatedBy()');
-        }
-
-        $alias = $legacy->getMorphClass();
-
-        if ($alias === $legacy::class) {
-            throw $this->invalid('discriminatedBy() stores the morph alias of '.class_basename($legacy).', which has none; register one with Relation::morphMap(), because a class name changes when the class moves');
-        }
-
-        return new Membership($this->table, $primary->model, $primary->table, $discriminator, $alias, $primary->membershipScope());
     }
 
     private function invalid(string $problem): InvalidCompatibilityMap

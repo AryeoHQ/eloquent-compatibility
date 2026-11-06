@@ -13,7 +13,6 @@ use Illuminate\Support\Collection as Values;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
@@ -44,24 +43,33 @@ final class Photo extends Model implements Compatible
     public static function compatibility(Compatibility $photo): Compatibility
     {
         return $photo
-            ->discriminatedBy('legacy_type')
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier
-                ->integer()
-                ->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier
-                ->uuid()
-                ->from('legacy_uuid'))
             ->retainedIn('photos_retained')
-            ->timestamps()
-            ->servedFrom(File::class, fn (Successor $file) => $file
+            ->servedFrom(root: File::class, key: 'file_id', successor: fn (Successor $file) => $file
                 ->when(fn (Builder $files) => $files->where('mime_type', 'like', 'image/%'))
-                ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute
-                    ->external(
-                        read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                        write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                ->attribute('size_kb', fn (Attribute $attribute) => $attribute
-                    ->from('size_bytes')
-                    ->dividedBy(1000)));
+                ->attribute(
+                    name: 'created_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                )
+                ->attribute(
+                    name: 'updated_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                )
+                ->attribute(
+                    name: 'file_name',
+                    definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                )
+                ->attribute(
+                    name: 'mime_type',
+                    definition: fn (Attribute $attribute) => $attribute
+                        ->external(
+                            read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
+                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                )
+                ->attribute(
+                    name: 'size_kb',
+                    definition: fn (Attribute $attribute) => $attribute
+                        ->from('size_bytes')
+                        ->dividedBy(1000),
+                ));
     }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Files;
 
+use Carbon\CarbonInterval;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -13,7 +14,9 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 
 final class FileTables
 {
-    public const array MODELS = [Photo::class, FloorPlan::class, LegacyFile::class];
+    public const array MODELS = [Photo::class, LegacyFile::class];
+
+    public const int TIMEOUT = 30;
 
     public static function create(): void
     {
@@ -21,8 +24,9 @@ final class FileTables
 
         Schema::create('files', function (Blueprint $table): void {
             $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
-            $table->string('filename');
-            $table->string('mime_type');
+            $table->string('filename')->nullable();
+            $table->string('mime_type')->nullable();
+            $table->string('embed_url')->nullable();
             $table->bigInteger('size_bytes')->nullable();
             $table->string('zml_asset_id')->nullable();
             $table->timestampsTz();
@@ -36,15 +40,6 @@ final class FileTables
             $table->string('caption')->nullable();
             $table->integer('views')->default(0);
             $table->decimal('size_kb', 12, 3)->nullable();
-            $table->timestamps();
-        });
-
-        Schema::create('floorplans', function (Blueprint $table): void {
-            $table->increments('id');
-            $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
-            $table->string('file_name');
-            $table->string('mime_type');
-            $table->integer('level')->nullable();
             $table->timestamps();
         });
 
@@ -103,11 +98,6 @@ final class FileTables
             ['file_name' => 'elm.png', 'mime_type' => 'image/png', 'size_kb' => 1.5, 'caption' => 'Elm', 'created_at' => '2026-01-03 10:00:00', 'updated_at' => '2026-01-03 10:00:00'],
         ]);
 
-        DB::table('floorplans')->insert([
-            ['file_name' => 'oak-plan.pdf', 'mime_type' => 'application/pdf', 'level' => 1, 'created_at' => '2026-01-04 10:00:00', 'updated_at' => '2026-01-04 10:00:00'],
-            ['file_name' => 'elm-plan.png', 'mime_type' => 'image/png', 'level' => null, 'created_at' => '2026-01-05 10:00:00', 'updated_at' => '2026-01-05 10:00:00'],
-        ]);
-
         DB::table('legacy_files')->insert([
             ['file_name' => 'contract.pdf', 'mime_type' => 'application/pdf', 'created_at' => '2026-01-06 10:00:00', 'updated_at' => '2026-01-06 10:00:00'],
             ['file_name' => 'notes.txt', 'mime_type' => 'text/plain', 'created_at' => '2026-01-07 10:00:00', 'updated_at' => '2026-01-07 10:00:00'],
@@ -133,10 +123,11 @@ final class FileTables
 
     public static function backfillMedia(): void
     {
-        DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select 'video', id, uuid, original_file_name, mime_type, round(size_kb * 1000), created_at, updated_at from videos where youtube_embed_url is null");
-        self::catalog('video');
-        DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'video', id, uuid, youtube_embed_url, created_at, updated_at from videos where youtube_embed_url is not null");
-        DB::statement("insert into links (legacy_type, legacy_id, legacy_uuid, url, created_at, updated_at) select 'interactive_content', id, uuid, url, created_at, updated_at from interactive_content");
+        DB::statement('update videos set file_id = gen_random_uuid() where file_id is null');
+        DB::statement('insert into files (id, filename, mime_type, size_bytes, embed_url, created_at, updated_at) select file_id, original_file_name, mime_type, round(size_kb * 1000), youtube_embed_url, created_at, updated_at from videos');
+        self::catalog('videos');
+        DB::statement('update interactive_content set link_id = gen_random_uuid() where link_id is null');
+        DB::statement('insert into links (id, url, created_at, updated_at) select link_id, url, created_at, updated_at from interactive_content');
     }
 
     public static function installMedia(): void
@@ -144,22 +135,36 @@ final class FileTables
         Compatibility::prepare(Video::class);
         Compatibility::prepare(InteractiveContent::class);
         self::backfillMedia();
-        Compatibility::install(InteractiveContent::class);
-        Compatibility::install(Video::class);
+        Compatibility::install(
+            model: InteractiveContent::class,
+            statementTimeout: CarbonInterval::seconds(self::TIMEOUT),
+        );
+        Compatibility::install(
+            model: Video::class,
+            statementTimeout: CarbonInterval::seconds(self::TIMEOUT),
+        );
     }
 
     public static function backfill(): void
     {
-        foreach (['photo' => ['photos', 'round(size_kb * 1000)'], 'floorplan' => ['floorplans', 'null'], 'legacy_file' => ['legacy_files', 'null']] as $type => [$table, $size]) {
-            DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select '{$type}', id, uuid, file_name, mime_type, {$size}, created_at, updated_at from {$table}");
+        foreach (['photos' => 'round(size_kb * 1000)', 'legacy_files' => 'null'] as $table => $size) {
+            DB::statement("update {$table} set file_id = gen_random_uuid() where file_id is null");
+            DB::statement("insert into files (id, filename, mime_type, size_bytes, created_at, updated_at) select file_id, file_name, mime_type, {$size}, created_at, updated_at from {$table}");
         }
 
-        self::catalog('photo');
+        self::catalog('photos');
     }
 
-    public static function catalog(string $type): void
+    public static function catalog(string $table): void
     {
-        File::query()->where('legacy_type', $type)->whereNull('zml_asset_id')->orderBy('legacy_id')->each(function (File $file): void {
+        File::query()->whereIn(
+            column: 'id',
+            values: DB::table($table)->select('file_id'),
+        )->whereNull('zml_asset_id')->orderBy(DB::table($table)->select('id')->whereColumn(
+            first: "{$table}.file_id",
+            operator: '=',
+            second: 'files.id',
+        ))->each(function (File $file): void {
             $file->metadata()->mimeType = $file->mime_type;
             $file->timestamps = false;
             $file->save();
@@ -175,22 +180,32 @@ final class FileTables
         self::backfill();
 
         foreach (self::MODELS as $model) {
-            Compatibility::install($model);
+            Compatibility::install(
+                model: $model,
+                statementTimeout: CarbonInterval::seconds(self::TIMEOUT),
+            );
         }
+    }
+
+    public static function fileOf(string $table, int $id): mixed
+    {
+        return DB::table(Schema::hasTable("{$table}_retained") ? "{$table}_retained" : $table)
+            ->where(column: 'id', operator: '=', value: $id)
+            ->value('file_id');
     }
 
     public static function drop(): void
     {
         DB::statement('drop table if exists photo_comments, photo_shares cascade');
 
-        foreach (['photos', 'floorplans', 'legacy_files', 'videos', 'interactive_content'] as $view) {
+        foreach (['photos', 'legacy_files', 'videos', 'interactive_content'] as $view) {
             if (Schema::hasView($view)) {
                 DB::statement("drop view {$view}");
             }
         }
 
-        DB::statement('drop table if exists photos, photos_retained, photos_backfilled, floorplans, floorplans_retained, floorplans_backfilled, legacy_files, legacy_files_retained, legacy_files_backfilled, videos, videos_retained, videos_backfilled, interactive_content, interactive_content_retained, interactive_content_backfilled, files, links cascade');
-        DB::statement('drop sequence if exists compatibility_legacy_id_seq');
+        DB::statement('drop table if exists photos, photos_retained, photos_backfill, legacy_files, legacy_files_retained, legacy_files_backfill, videos, videos_retained, videos_backfill, interactive_content, interactive_content_retained, interactive_content_backfill, files, links cascade');
+        DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('photos', 'legacy_files', 'videos', 'interactive_content'); IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
         LegacyBuilder::forgetViews();
     }
 }

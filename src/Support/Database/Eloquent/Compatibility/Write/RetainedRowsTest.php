@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -27,7 +28,10 @@ final class RetainedRowsTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -38,15 +42,12 @@ final class RetainedRowsTest extends TestCase
     }
 
     #[Test]
-    public function it_inserts_a_retained_row_the_first_time_a_record_writes_a_legacy_only_fact(): void
+    public function it_inserts_the_retained_row_that_holds_a_created_records_identity(): void
     {
-        $job = Job::query()->create(['name' => 'Cedar Barn', 'company_id' => ListingTables::COMPANY]);
-        $listing = Listing::query()->findOrFail($job->refresh()->legacy_id);
-        $unretained = DB::table('listings_retained')->where('job_id', $job->id)->count();
+        $listing = Listing::query()->create(['title' => 'Cedar Barn', 'company_id' => ListingTables::COMPANY, 'mls_number' => 'MLS-4']);
+        $job = Job::query()->where(column: 'name', operator: '=', value: 'Cedar Barn')->firstOrFail();
 
-        $listing->update(['mls_number' => 'MLS-4']);
-
-        $this->assertSame(0, $unretained);
+        $this->assertSame([4, $job->id], [$listing->getKey(), ListingTables::jobOf(4)]);
         $this->assertSame([['MLS-4', false]], $this->retained($job->id));
     }
 
@@ -54,7 +55,7 @@ final class RetainedRowsTest extends TestCase
     public function it_changes_only_the_legacy_only_facts_a_write_changes(): void
     {
         $listing = Listing::query()->findOrFail(1);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $listing->update(['featured' => false]);
         $unfeatured = $this->retained($job->id);
@@ -65,15 +66,15 @@ final class RetainedRowsTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_no_retained_row_for_a_write_that_changes_no_legacy_only_fact(): void
+    public function it_leaves_the_retained_row_for_a_write_that_changes_no_legacy_only_fact(): void
     {
-        $job = Job::query()->create(['name' => 'Cedar Barn', 'company_id' => ListingTables::COMPANY]);
-        $listing = Listing::query()->findOrFail($job->refresh()->legacy_id);
+        $listing = Listing::query()->findOrFail(1);
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $listing->update(['title' => 'Cedar Hall']);
 
         $this->assertSame('Cedar Hall', $job->refresh()->name);
-        $this->assertSame([], $this->retained($job->id));
+        $this->assertSame([['MLS-1', true]], $this->retained($job->id));
     }
 
     /**

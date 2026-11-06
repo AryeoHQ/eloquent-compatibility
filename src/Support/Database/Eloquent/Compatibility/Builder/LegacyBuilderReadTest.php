@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Carbon\CarbonInterval;
 use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
@@ -18,7 +19,6 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -68,7 +68,7 @@ final class LegacyBuilderReadTest extends TestCase
         $this->install();
 
         $this->assertSame(
-            'select * from "listings" where "listings"."id" in (select "jobs"."legacy_id" from "jobs" where ("jobs"."price_cents" > 10000)) and not ("listings"."id" not in (select "jobs"."legacy_id" from "jobs" where ("jobs"."lifecycle_status" = \'closed\'))) and "listings"."deleted_at" is null',
+            'select * from "listings" where "listings"."job_id" in (select "jobs"."id" from "jobs" where ("jobs"."price_cents" > 10000)) and not ("listings"."job_id" not in (select "jobs"."id" from "jobs" where ("jobs"."lifecycle_status" = \'closed\'))) and "listings"."deleted_at" is null',
             Listing::query()->where('price', '>', 100)->whereNot(fn (Builder $listings) => $listings->where('status', '!=', ListingStatus::Sold))->toBase()->toRawSql(),
         );
     }
@@ -111,7 +111,13 @@ final class LegacyBuilderReadTest extends TestCase
         $this->assertSame([1, 5], $before['price above']);
         $this->assertSame(
             ['unconverted', 'ordered by price', 'ordered by status', 'latest'],
-            array_keys(array_filter($queries, fn (Closure $query) => ! str_contains($query(Listing::query())->toBase()->toRawSql(), 'select "jobs"."legacy_id"'))),
+            array_keys(array_filter(
+                array: $queries,
+                callback: fn (Closure $query) => ! str_contains(
+                    haystack: $query(Listing::query())->toBase()->toRawSql(),
+                    needle: 'select "jobs"."id"',
+                ),
+            )),
         );
     }
 
@@ -140,10 +146,12 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
-                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')->multipliedBy(2))));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->related(
+                            relation: fn (Job $job) => $job->site(),
+                            definition: fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')->multipliedBy(2)),
+                        ));
             }
         };
 
@@ -151,7 +159,7 @@ final class LegacyBuilderReadTest extends TestCase
 
         $this->assertInstanceOf(LegacyBuilder::class, $query);
         $this->assertSame(
-            'select * from "listings" where "listings"."id" in (select "jobs"."legacy_id" from "jobs" LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true where ("job_sites"."latitude" > 20))',
+            'select * from "listings" where "listings"."job_id" in (select "jobs"."id" from "jobs" LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true where ("job_sites"."latitude" > 20))',
             $query->toBase()->toRawSql(),
         );
         $this->assertSame([1], $query->pluck('id')->all());
@@ -249,8 +257,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('featured', fn (Attribute $attribute) => $attribute->from('price_cents')->isNotNull(fn () => 0)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'featured',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->isNotNull(fn () => 0),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -284,17 +295,29 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('listed_on', fn (Attribute $attribute) => $attribute->from('listed_at')->asType('date'))
-                        ->attribute('floor', fn (Attribute $attribute) => $attribute->from('floor_code')->asType('integer'))
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_mills')->dividedBy(1000)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'listed_on',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_at')->asType('date'),
+                        )
+                        ->attribute(
+                            name: 'floor',
+                            definition: fn (Attribute $attribute) => $attribute->from('floor_code')->asType('integer'),
+                        )
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_mills')->dividedBy(1000),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set listed_at = '2026-01-01 15:30:00+00', floor_code = '01', price_mills = 1005 where legacy_id = 1");
-        DB::update("update jobs set listed_at = '2026-01-02 00:30:00+00', floor_code = '2', price_mills = 1010 where legacy_id = 3");
-        Compatibility::install($model::class);
+        DB::update("update jobs set listed_at = '2026-01-01 15:30:00+00', floor_code = '01', price_mills = 1005 where id = (select job_id from listings where id = 1)");
+        DB::update("update jobs set listed_at = '2026-01-02 00:30:00+00', floor_code = '2', price_mills = 1010 where id = (select job_id from listings where id = 3)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'a date' => fn (Builder|QueryBuilder $listings) => $listings->where('listed_on', '2026-01-01'),
@@ -324,12 +347,19 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(0.3333333333333333)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(0.3333333333333333),
+                        ));
             }
         };
         $this->installMap($model::class);
-        DB::table('jobs')->where('legacy_id', 1)->update(['price_cents' => 1]);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->update(['price_cents' => 1]);
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'a whole price' => fn (Builder|QueryBuilder $listings) => $listings->where('price', 3),
@@ -351,8 +381,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(1e100)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(1e100),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -379,12 +412,15 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('score', fn (Attribute $attribute) => $attribute->from('score')->multipliedBy(2)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'score',
+                            definition: fn (Attribute $attribute) => $attribute->from('score')->multipliedBy(2),
+                        ));
             }
         };
         $this->installMap($model::class);
-        DB::update('update jobs set score = 0.1 where legacy_id = 1');
+        DB::update('update jobs set score = 0.1 where id = (select job_id from listings where id = 1)');
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'the doubled value' => fn (Builder|QueryBuilder $listings) => $listings->where('score', 0.2),
@@ -424,12 +460,19 @@ final class LegacyBuilderReadTest extends TestCase
                 public static function compatibility(Compatibility $listing): Compatibility
                 {
                     return LegacyBuilderReadTest::identified($listing)
-                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'LIVE' => 'Draft', 'closed' => 'Sold'])));
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute(
+                                name: 'status',
+                                definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'LIVE' => 'Draft', 'closed' => 'Sold']),
+                            ));
                 }
             };
             $this->installMap($model::class);
-            DB::table('jobs')->where('legacy_id', 4)->update(['lifecycle_status' => 'LIVE']);
+            DB::table('jobs')->where(
+                column: 'id',
+                operator: '=',
+                value: ListingTables::jobOf(4),
+            )->update(['lifecycle_status' => 'LIVE']);
 
             $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
                 'a value whose key equals another key' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Draft'),
@@ -461,8 +504,11 @@ final class LegacyBuilderReadTest extends TestCase
                 public static function compatibility(Compatibility $listing): Compatibility
                 {
                     return LegacyBuilderReadTest::identified($listing)
-                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'ACTIVE', 'closed' => 'Sold'])));
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute(
+                                name: 'status',
+                                definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'ACTIVE', 'closed' => 'Sold']),
+                            ));
                 }
             };
             $this->installMap($model::class);
@@ -496,8 +542,11 @@ final class LegacyBuilderReadTest extends TestCase
                 public static function compatibility(Compatibility $listing): Compatibility
                 {
                     return LegacyBuilderReadTest::identified($listing)
-                        ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                            ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'Draft', 'closed' => 'Sold'])));
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                            ->attribute(
+                                name: 'status',
+                                definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['live' => 'Active', 'drafting' => 'Draft', 'closed' => 'Sold']),
+                            ));
                 }
             };
             $before = array_map(intval(...), DB::table('listings')->where('status', 'active')->orderBy('id')->pluck('id')->all());
@@ -527,14 +576,20 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 1, 'closed' => 2])));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 1, 'closed' => 2]),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
         DB::statement("alter table listings alter column status drop default, alter column status type integer using case status when 'Draft' then 0 when 'Active' then 1 when 'Sold' then 2 end, alter column status set default 0");
-        Compatibility::install($model::class);
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'a padded value' => fn (Builder|QueryBuilder $listings) => $listings->where('status', '01'),
@@ -557,15 +612,21 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('featured', fn (Attribute $attribute) => $attribute->from('is_featured')->orDefault(false)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'featured',
+                            definition: fn (Attribute $attribute) => $attribute->from('is_featured')->orDefault(false),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update('update jobs set is_featured = true where legacy_id = 1');
-        DB::update('update jobs set is_featured = false where legacy_id = 3');
-        Compatibility::install($model::class);
+        DB::update('update jobs set is_featured = true where id = (select job_id from listings where id = 1)');
+        DB::update('update jobs set is_featured = false where id = (select job_id from listings where id = 3)');
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'true' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', true),
@@ -603,17 +664,26 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('cents')->dividedBy(100)->orDefault(0))
-                        ->attribute('label', fn (Attribute $attribute) => $attribute->from('code')->mapping(['a' => 'Alpha', 'b' => 'Beta'])->orDefault('None')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'budget',
+                            definition: fn (Attribute $attribute) => $attribute->from('cents')->dividedBy(100)->orDefault(0),
+                        )
+                        ->attribute(
+                            name: 'label',
+                            definition: fn (Attribute $attribute) => $attribute->from('code')->mapping(['a' => 'Alpha', 'b' => 'Beta'])->orDefault('None'),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set cents = 500, code = 'a' where legacy_id = 1");
-        DB::update('update jobs set cents = null, code = null where legacy_id = 2');
-        DB::update("update jobs set cents = 0, code = 'zzz' where legacy_id = 3");
-        Compatibility::install($model::class);
+        DB::update("update jobs set cents = 500, code = 'a' where id = (select job_id from listings where id = 1)");
+        DB::update('update jobs set cents = null, code = null where id = (select job_id from listings where id = 2)');
+        DB::update("update jobs set cents = 0, code = 'zzz' where id = (select job_id from listings where id = 3)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'a budget' => fn (Builder|QueryBuilder $listings) => $listings->where('budget', 5),
@@ -642,14 +712,20 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('code')->mapping(['1' => 'Draft', '2' => 'Active', '3' => 'Sold'])));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute->from('code')->mapping(['1' => 'Draft', '2' => 'Active', '3' => 'Sold']),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
         DB::update("update jobs set code = case lifecycle_status when 'live' then '2' when 'closed' then '3' else '1' end");
-        Compatibility::install($model::class);
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'active' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
@@ -673,16 +749,28 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('listed_on', fn (Attribute $attribute) => $attribute->from('listed_at')->asType('date'))
-                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.'))
-                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/Los_Angeles')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'listed_on',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_at')->asType('date'),
+                        )
+                        ->attribute(
+                            name: 'listed_wall',
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.'),
+                        )
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/Los_Angeles'),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where legacy_id = 1");
-        Compatibility::install($model::class);
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $inZone = fn (string $zone, Closure $read) => DB::transaction(function () use ($zone, $read): mixed {
             DB::statement("set local time zone '{$zone}'");
 
@@ -720,15 +808,24 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('listed_cast', fn (Attribute $attribute) => $attribute->from('listed_instant')->asType('compatibility_wall_clock'))
-                        ->attribute('listed_raw', fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'listed_cast',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_instant')->asType('compatibility_wall_clock'),
+                        )
+                        ->attribute(
+                            name: 'listed_raw',
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.'),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where legacy_id = 1");
-        Compatibility::install($model::class);
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $inZone = fn (string $zone, Closure $read) => DB::transaction(function () use ($zone, $read): mixed {
             DB::statement("set local time zone '{$zone}'");
 
@@ -803,12 +900,15 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01),
+                        ));
             }
         };
         $this->installMap($model::class);
-        DB::update('update jobs set price_cents = 0 where legacy_id = 4');
+        DB::update('update jobs set price_cents = 0 where id = (select job_id from listings where id = 4)');
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'equal to a trillionth' => fn (Builder|QueryBuilder $listings) => $listings->where('price', '0.000000000001'),
@@ -830,8 +930,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/New_York')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('America/New_York'),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -862,8 +965,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('code', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 'Draft', 'live' => 'Active', 'closed' => 'Sold'])));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'code',
+                            definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 'Draft', 'live' => 'Active', 'closed' => 'Sold']),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -924,12 +1030,15 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
-    public function it_stops_translating_a_filter_once_another_process_uninstalls_the_view(): void
+    public function it_stops_translating_a_filter_once_another_process_rolls_back_the_view(): void
     {
         $this->install();
         $installed = array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
 
-        (new Installer(DB::connection()))->run(Statements::uninstall(Compatibility::of(Listing::class)->resolve(), DB::connection()));
+        (new Installer(DB::connection()))->run(Statements::rollback(
+            map: Compatibility::of(Listing::class)->resolve(),
+            connection: DB::connection(),
+        ));
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
         $this->assertSame([[1, 5], [1, 3, 5]], [$installed, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
@@ -949,14 +1058,20 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('listed', fn (Attribute $attribute) => $attribute->from('listed_at')->asType('text')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'listed',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_at')->asType('text'),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where legacy_id = 1");
-        Compatibility::install($model::class);
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSame('2026-01-01 23:30:00+00', DB::scalar('select listed from listings where id = 1'));
     }
@@ -973,8 +1088,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -1001,8 +1119,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 'Active', 'closed' => 'Sold'])));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 0, 'live' => 'Active', 'closed' => 'Sold']),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -1028,16 +1149,25 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('status', fn (Attribute $attribute) => $attribute->from('grade')->mapping([1 => 'Active', 2 => 'Sold']))
-                        ->attribute('city', fn (Attribute $attribute) => $attribute->from('floor')->mapping(['01' => 'Ground', '02' => 'First'])));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute->from('grade')->mapping([1 => 'Active', 2 => 'Sold']),
+                        )
+                        ->attribute(
+                            name: 'city',
+                            definition: fn (Attribute $attribute) => $attribute->from('floor')->mapping(['01' => 'Ground', '02' => 'First']),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update('update jobs set grade = 1.00, floor = 1 where legacy_id = 1');
-        DB::update('update jobs set grade = 2, floor = 2 where legacy_id = 3');
-        Compatibility::install($model::class);
+        DB::update('update jobs set grade = 1.00, floor = 1 where id = (select job_id from listings where id = 1)');
+        DB::update('update jobs set grade = 2, floor = 2 where id = (select job_id from listings where id = 3)');
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'a key a numeric value prints differently' => fn (Builder|QueryBuilder $listings) => $listings->where('status', 'Active'),
@@ -1060,14 +1190,20 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(1000)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'budget',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(1000),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update('update jobs set price_cents = 3000000 where legacy_id = 1');
-        Compatibility::install($model::class);
+        DB::update('update jobs set price_cents = 3000000 where id = (select job_id from listings where id = 1)');
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSame('3000000000.00', DB::scalar('select cast(budget as text) from listings where id = 1'));
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
@@ -1089,17 +1225,29 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('featured', fn (Attribute $attribute) => $attribute->from('is_featured')->orDefault('false'))
-                        ->attribute('budget', fn (Attribute $attribute) => $attribute->from('budget')->orDefault(0.001))
-                        ->attribute('big', fn (Attribute $attribute) => $attribute->from('big')->orDefault(9007199254740992)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'featured',
+                            definition: fn (Attribute $attribute) => $attribute->from('is_featured')->orDefault('false'),
+                        )
+                        ->attribute(
+                            name: 'budget',
+                            definition: fn (Attribute $attribute) => $attribute->from('budget')->orDefault(0.001),
+                        )
+                        ->attribute(
+                            name: 'big',
+                            definition: fn (Attribute $attribute) => $attribute->from('big')->orDefault(9007199254740992),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update('update jobs set is_featured = true, budget = 5, big = 9007199254740993 where legacy_id = 1');
-        DB::update('update jobs set is_featured = false, budget = 0, big = 1 where legacy_id = 3');
-        Compatibility::install($model::class);
+        DB::update('update jobs set is_featured = true, budget = 5, big = 9007199254740993 where id = (select job_id from listings where id = 1)');
+        DB::update('update jobs set is_featured = false, budget = 0, big = 1 where id = (select job_id from listings where id = 3)');
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), [
             'zero against a text default' => fn (Builder|QueryBuilder $listings) => $listings->where('featured', '0'),
@@ -1177,15 +1325,24 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->from('listed_at'))
-                        ->attribute('listed_clock', fn (Attribute $attribute) => $attribute->from('listed_instant')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'listed_wall',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_at'),
+                        )
+                        ->attribute(
+                            name: 'listed_clock',
+                            definition: fn (Attribute $attribute) => $attribute->from('listed_instant'),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where legacy_id = 1");
-        Compatibility::install($model::class);
+        DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $served = fn (string $zone) => DB::transaction(function () use ($zone): array {
             DB::statement("set local time zone '{$zone}'");
 
@@ -1210,8 +1367,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('created_at', fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'),
+                        ));
             }
         };
         $this->installMap($model::class);
@@ -1236,8 +1396,11 @@ final class LegacyBuilderReadTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->multipliedBy(0.01),
+                        ));
             }
         };
         $queries = [
@@ -1247,7 +1410,7 @@ final class LegacyBuilderReadTest extends TestCase
             'in floats' => fn (Builder|QueryBuilder $listings) => $listings->whereIn('price', [0.009999999999999998, 99.99]),
         ];
         $this->installMap($model::class);
-        DB::update('update jobs set price_cents = 1 where legacy_id = 4');
+        DB::update('update jobs set price_cents = 1 where id = (select job_id from listings where id = 4)');
 
         $this->assertSameRows(fn () => $model->newQuery(), fn () => DB::table('listings'), $queries);
         $this->assertSameRows(fn () => Listing::query(), fn () => DB::table('listings')->whereNull('deleted_at'), $queries);
@@ -1257,9 +1420,7 @@ final class LegacyBuilderReadTest extends TestCase
     public static function identified(Compatibility $listing): Compatibility
     {
         return $listing
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-            ->retainedIn('listings_retained', key: 'job_id');
+            ->retainedIn('listings_retained');
     }
 
     public static function required(Successor $job): Successor
@@ -1281,7 +1442,10 @@ final class LegacyBuilderReadTest extends TestCase
     {
         Compatibility::prepare($model);
         ListingTables::backfill();
-        Compatibility::install($model);
+        Compatibility::install(
+            model: $model,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     /**

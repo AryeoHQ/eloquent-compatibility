@@ -12,8 +12,6 @@ use Illuminate\Support\Carbon;
 /**
  * @property string $id
  * @property null|string $legacy_type
- * @property int $legacy_id
- * @property string $legacy_uuid
  * @property string $asset_type
  * @property string $asset_id
  * @property null|string $title

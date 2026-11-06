@@ -78,7 +78,25 @@ final class LegacyRecord
     {
         $connection = $successor->getConnection();
         $catalog = new ColumnCatalog($connection, throughSearchPath: true);
-        $columns = (new ViewCompiler($catalog, $connection))->served($served, $catalog->of($map->table), $map->externals());
+        $retained = $catalog->of(ViewCompiler::retainedTable($map));
+        $view = $catalog->of($map->table);
+        $legacyOnly = $served->legacyOnly(array_keys($view));
+        $shape = array_filter(
+            array: $view,
+            callback: fn (string $name) => ! in_array(
+                needle: $name,
+                haystack: $legacyOnly,
+                strict: true,
+            ) || array_key_exists(
+                key: $name,
+                array: $retained,
+            ),
+            mode: ARRAY_FILTER_USE_KEY,
+        );
+        $columns = (new ViewCompiler(
+            columnCatalog: $catalog,
+            connection: $connection,
+        ))->columns(map: $served, shape: $shape, defaultsOn: ViewCompiler::retainedTable($map), retained: $retained, external: $map->externals());
         $json = array_filter($catalog->of($successor->getTable()), fn (Column $column) => in_array($column->baseType ?? $column->type, ['json', 'jsonb'], true));
         $reads = $connection->select(
             "select distinct attribute.attname as name from pg_rewrite rewrite join pg_depend depend on depend.classid = 'pg_rewrite'::regclass and depend.objid = rewrite.oid join pg_attribute attribute on attribute.attrelid = depend.refobjid and attribute.attnum = depend.refobjsubid where rewrite.ev_class = to_regclass(?) and depend.refobjid = to_regclass(?)",
@@ -292,14 +310,15 @@ final class LegacyRecord
 
     private static function identity(ResolvedMap $map, Model $held): null|int|string
     {
-        $served = $map->branches === [] ? ($map->primary->model === $held::class ? $map : null) : $map->branches[$held::class] ?? null;
-
-        if ($served === null || ! $held->exists) {
+        if ($map->primary->model !== $held::class || ! $held->exists || $map->retainedTable === null) {
             return null;
         }
 
-        $column = (string) $served->identifiers[(new $map->model)->getKeyName()]->column();
-        $key = $held->getAttributes()[$column] ?? $held->newModelQuery()->whereKey($held->getKey())->value($column);
+        $key = $held->getConnection()->table($map->retainedTable)->where(
+            column: $map->successorKey,
+            operator: '=',
+            value: $held->getKey(),
+        )->value((new $map->model)->getKeyName());
 
         return is_int($key) || is_string($key) ? $key : null;
     }
@@ -352,9 +371,9 @@ final class LegacyRecord
 
         $primary = $this->served->primary->table;
         $legacyKey = $this->legacyKey();
-        $identifier = SqlFragments::identifier($primary).'.'.SqlFragments::identifier((string) $this->served->identifiers[$legacyKey]->column());
+        $root = SqlFragments::identifier($primary).'.'.SqlFragments::identifier($this->served->primary->key);
         $rows = $successor->getConnection()->select(
-            'SELECT * FROM '.SqlFragments::identifier($this->map->table).' WHERE '.SqlFragments::identifier($legacyKey).' IN (SELECT '.$identifier.' FROM '.ViewCompiler::primary($this->served).' WHERE '.$filter[0].') ORDER BY '.SqlFragments::identifier($legacyKey),
+            'SELECT * FROM '.SqlFragments::identifier($this->map->table).' WHERE '.SqlFragments::identifier($this->served->successorKey).' IN (SELECT '.$root.' FROM '.ViewCompiler::primary($this->served).' WHERE '.$filter[0].') ORDER BY '.SqlFragments::identifier($legacyKey),
             $filter[1],
             false,
         );
@@ -425,26 +444,18 @@ final class LegacyRecord
         }
 
         return $connection->select(
-            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(', ', $select).' FROM '.ViewCompiler::primary($this->served)
-                .$this->retained()
+            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(
+                separator: ', ',
+                array: $select,
+            ).' FROM '.SqlFragments::identifier(ViewCompiler::retainedTable($this->served)).' '.ViewCompiler::root(
+                map: $this->served,
+                retained: ViewCompiler::retainedTable($this->served),
+            )
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
             [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
             false,
         );
-    }
-
-    private function retained(): string
-    {
-        $retained = $this->served->retainedTable;
-
-        if ($retained === null || $this->served->retainedKey === null) {
-            return '';
-        }
-
-        $by = $this->served->branch ? (string) $this->served->identifiers[$this->legacyKey()]->column() : $this->served->primary->key;
-
-        return ' LEFT JOIN '.SqlFragments::identifier($retained).' ON '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($this->served->retainedKey).' = '.SqlFragments::identifier($this->served->primary->table).'.'.SqlFragments::identifier($by);
     }
 
     /**

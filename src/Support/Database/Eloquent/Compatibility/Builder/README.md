@@ -18,12 +18,12 @@ Listing::query()
 
 ```sql
 select * from "listings"
-where "listings"."id" in (select "jobs"."legacy_id" from "jobs" where ("jobs"."price_cents" > 10000))
-  and not ("listings"."id" not in (select "jobs"."legacy_id" from "jobs" where ("jobs"."lifecycle_status" = 'closed')))
+where "listings"."job_id" in (select "jobs"."id" from "jobs" where ("jobs"."price_cents" > 10000))
+  and not ("listings"."job_id" not in (select "jobs"."id" from "jobs" where ("jobs"."lifecycle_status" = 'closed')))
   and "listings"."deleted_at" is null
 ```
 
-Each translated filter becomes a membership test on the legacy key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own lateral joins.
+Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own lateral joins.
 
 Everything that does not touch a converted attribute passes through to Laravel unchanged. So does every query before install, while the legacy name is still a table.
 
@@ -72,7 +72,7 @@ Eloquent forwards most query methods straight to the query builder, so an overri
 - **`LegacyBuilder::converted()`** returns the attribute name only for a map attribute with conversions, or one stored outside the database, once the view is installed. Every other column passes through. `LegacyBuilder::attributeOf()` strips this model's table prefix first.
 - **`LegacyBuilder::relation()`** reads once per builder the current schema, whether the legacy name is a view, and whether the role can read the successors. A legacy name that is still a table is cached for the process.
 - **`LegacyBuilder::map()`** caches the resolved map per model class. `LegacyBuilder::collations()` caches collations per connection, schema and table.
-- **`LegacyBuilder::forgetViews()`** clears the column, collation and still-a-table caches. `Compatibility::prepare()`, `Compatibility::install()`, `Compatibility::recompile()` and `Compatibility::uninstall()` call it after they run. A builder created before the operation keeps its own relation.
+- **`LegacyBuilder::forgetViews()`** clears the column, collation and still-a-table caches. `Compatibility::prepare()`, `Compatibility::install()`, `Compatibility::update()`, `Compatibility::rollback()` and `Compatibility::retire()` call it after they run. A builder created before the operation keeps its own relation.
 
 ## Which filters translate
 

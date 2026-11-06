@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Events;
 
+use Carbon\CarbonInterval;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -16,7 +17,6 @@ use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
-use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\TestCase;
@@ -35,7 +35,10 @@ final class LegacyRecordTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -57,7 +60,7 @@ final class LegacyRecordTest extends TestCase
             $seen[] = [$listing->getOriginal('price'), $listing->price, $listing->title, array_keys($listing->getChanges())];
         });
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['price_cents' => 99]);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['price_cents' => 99]);
 
         $this->assertSame([['1250.50', '0.99', 'Oak House', ['price']], ['1250.50', '0.99', 'Oak House', ['price', 'updated_at']]], $seen);
     }
@@ -66,7 +69,7 @@ final class LegacyRecordTest extends TestCase
     public function it_reads_the_view_once_before_the_successor_writes_and_once_after(): void
     {
         Event::listen('eloquent.updating: '.Listing::class, fn () => null);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         DB::enableQueryLog();
 
         $job->update(['name' => 'Oak Lodge']);
@@ -101,29 +104,29 @@ final class LegacyRecordTest extends TestCase
             });
         }
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['price_cents' => DB::raw('price_cents + 1')]);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['price_cents' => DB::raw('price_cents + 1')]);
 
         $this->assertSame([['updating', '1250.50'], ['updated', '1250.51']], $seen);
     }
 
     #[Test]
-    public function it_gives_a_created_listener_the_identifiers_and_defaults_the_successor_row_stored(): void
+    public function it_forwards_no_created_event_for_a_root_that_no_retained_row_holds(): void
     {
         $seen = [];
 
         foreach (['creating', 'created'] as $event) {
-            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
-                $seen[] = [$event, $listing->id, is_string($listing->uuid), $listing->getAttribute('status'), $listing->featured, $listing->exists, $listing->wasRecentlyCreated];
-            });
+            Event::listen(
+                events: "eloquent.{$event}: ".Listing::class,
+                listener: function () use (&$seen, $event): void {
+                    $seen[] = $event;
+                },
+            );
         }
 
         $job = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
 
-        $this->assertSame([
-            ['creating', null, false, null, null, false, false],
-            ['created', 4, true, ListingStatus::Draft, false, true, true],
-        ], $seen);
-        $this->assertSame(4, Job::query()->whereKey($job->id)->value('legacy_id'));
+        $this->assertSame([], $seen);
+        $this->assertSame(0, DB::table('listings_retained')->where(column: 'job_id', operator: '=', value: $job->id)->count());
     }
 
     #[Test]
@@ -134,8 +137,12 @@ final class LegacyRecordTest extends TestCase
             $seen[] = [$listing->id, $listing->getOriginal('street'), $listing->street, array_keys($listing->getDirty())];
         });
 
-        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->update(['street' => '5 Oak St']);
-        Place::query()->create(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id'), 'street' => '2 Pine St']);
+        Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->update(['street' => '5 Oak St']);
+        Place::query()->create(['job_id' => Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id'), 'street' => '2 Pine St']);
 
         $this->assertSame([[1, '1 Oak St', '5 Oak St', ['street']], [2, null, '2 Pine St', ['street']]], $seen);
     }
@@ -154,7 +161,7 @@ final class LegacyRecordTest extends TestCase
             });
         }
 
-        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 3)->firstOrFail();
+        $file = File::query()->whereKey(DB::table('photos_retained')->where(column: 'id', operator: '=', value: 3)->value('file_id'))->firstOrFail();
         $file->update(['filename' => 'elm-2.png']);
         $calls = count(FakeMediaLibrary::bound()->calls);
         $file->delete();
@@ -178,7 +185,7 @@ final class LegacyRecordTest extends TestCase
         });
         $asset = FakeMediaLibrary::bound()->store(new FileMetadata('image/webp'));
 
-        File::query()->where('legacy_type', 'photo')->where('legacy_id', 3)->firstOrFail()->update(['zml_asset_id' => $asset]);
+        File::query()->whereKey(DB::table('photos_retained')->where(column: 'id', operator: '=', value: 3)->value('file_id'))->firstOrFail()->update(['zml_asset_id' => $asset]);
 
         $this->assertSame([['updating', 'image/png'], ['updated', 'image/webp', 'image/png', true]], $seen);
     }

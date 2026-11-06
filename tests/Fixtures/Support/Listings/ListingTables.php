@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Listings;
 
+use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -57,6 +58,7 @@ final class ListingTables
         Schema::create('listings', function (Blueprint $table): void {
             $table->increments('id');
             $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('job_id')->nullable();
             $table->string('title');
             $table->uuid('company_id');
             $table->decimal('price', 10, 2)->nullable();
@@ -106,13 +108,28 @@ final class ListingTables
 
     public static function backfill(): void
     {
+        DB::statement('update listings set job_id = gen_random_uuid() where job_id is null');
         DB::statement(
-            "insert into jobs (legacy_id, legacy_uuid, name, company_id, price_cents, lifecycle_status, created_at, updated_at, deleted_at)
-             select id, uuid, title, company_id, round(price * 100), case status when 'Draft' then 'drafting' when 'Active' then 'live' when 'Sold' then 'closed' end, created_at, updated_at, deleted_at
+            "insert into jobs (id, name, company_id, price_cents, lifecycle_status, created_at, updated_at, deleted_at)
+             select job_id, title, company_id, round(price * 100), case status when 'Draft' then 'drafting' when 'Active' then 'live' when 'Sold' then 'closed' end, created_at, updated_at, deleted_at
              from listings",
         );
-        DB::statement('insert into places (job_id, street, city) select jobs.id, listings.street, listings.city from listings join jobs on jobs.legacy_id = listings.id where listings.street is not null');
-        DB::statement('insert into job_sites (job_id, latitude) select jobs.id, listings.latitude from listings join jobs on jobs.legacy_id = listings.id where listings.latitude is not null');
+        DB::statement('insert into places (job_id, street, city) select listings.job_id, listings.street, listings.city from listings where listings.street is not null');
+        DB::statement('insert into job_sites (job_id, latitude) select listings.job_id, listings.latitude from listings where listings.latitude is not null');
+    }
+
+    public static function legacyId(): Builder
+    {
+        return DB::table(Schema::hasTable('listings_retained') ? 'listings_retained' : 'listings')
+            ->whereColumn(first: 'job_id', operator: '=', second: 'jobs.id')
+            ->select('id');
+    }
+
+    public static function jobOf(int|string $listing): mixed
+    {
+        return DB::table(Schema::hasTable('listings_retained') ? 'listings_retained' : 'listings')
+            ->where(column: 'id', operator: '=', value: $listing)
+            ->value('job_id');
     }
 
     public static function drop(): void
@@ -123,7 +140,8 @@ final class ListingTables
             DB::statement('drop view listings');
         }
 
-        DB::statement('drop table if exists listings, listings_retained, listings_backfilled, job_sites, places, jobs cascade');
+        DB::statement('drop table if exists listings, listings_retained, listings_backfill, job_sites, places, jobs cascade');
+        DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('listings'); IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
         LegacyBuilder::forgetViews();
     }
 }

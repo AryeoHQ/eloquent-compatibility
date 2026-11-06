@@ -341,7 +341,7 @@ final class LegacyQueryBuilder extends QueryBuilder
             $relation = LegacyBuilder::relationOf($legacy, fresh: true);
             $table = $legacy->getTable();
             $why = match (true) {
-                $relation['oid'] !== $this->translatedFor => "Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that {$table} no longer serves.",
+                $relation['oid'] !== $this->translatedFor => "Another process rolled back or replaced that view after the filters were translated, so they read successor rows that {$table} no longer serves.",
                 $relation['unbound'] !== [] => 'The search path now resolves '.implode(' and ', $relation['unbound']).(count($relation['unbound']) === 1 ? ' to another table' : ' to other tables')." than the view reads, so the filters would read rows that {$table} does not serve.",
                 ! $relation['readable'] => "The current role cannot read every successor table the view reads, so the filters would not read the rows that {$table} serves.",
                 default => null,

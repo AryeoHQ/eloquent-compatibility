@@ -14,8 +14,6 @@ use Support\Database\Eloquent\StateMachines\StateMachine;
 
 /**
  * @property string $id
- * @property int $legacy_id
- * @property string $legacy_uuid
  * @property string $name
  * @property string $company_id
  * @property null|int $price_cents

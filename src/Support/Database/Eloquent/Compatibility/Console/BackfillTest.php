@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Carbon\CarbonInterval;
 use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Artisan;
@@ -14,7 +15,6 @@ use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -72,7 +72,7 @@ final class BackfillTest extends TestCase
         $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class, '--since' => $since]);
 
         $this->assertSame([0, 'Backfilled 1 listings rows, which changed 1 successor rows.'], [$exit, explode("\n", trim(Artisan::output()))[1]]);
-        $this->assertSame('Pine Loft', DB::scalar('select name from jobs where legacy_id = 2'));
+        $this->assertSame('Pine Loft', DB::table('jobs')->where(column: 'id', operator: '=', value: ListingTables::jobOf(2))->value('name'));
     }
 
     #[Test]
@@ -153,12 +153,16 @@ final class BackfillTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(BackfillTest::$reporting, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: BackfillTest::$reporting, key: 'successor_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
             }
         };
 
@@ -174,7 +178,10 @@ final class BackfillTest extends TestCase
     public function it_refuses_to_backfill_once_the_legacy_table_is_the_view(): void
     {
         Artisan::call('compatibility:backfill', ['model' => Listing::class]);
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->artisan('compatibility:backfill', ['model' => Listing::class])
             ->expectsOutputToContain("Compatibility map 'listings' cannot backfill: listings is already installed as a view, and the backfill walks the legacy table while it is still a table.")

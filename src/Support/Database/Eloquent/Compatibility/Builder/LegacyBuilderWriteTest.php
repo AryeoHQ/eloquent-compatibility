@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Carbon\CarbonInterval;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -15,7 +16,6 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Job;
@@ -149,9 +149,11 @@ final class LegacyBuilderWriteTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    ));
             }
         };
         $job = $this->job(1);
@@ -182,12 +184,13 @@ final class LegacyBuilderWriteTest extends TestCase
             [0, "select cast(oid as bigint) from pg_class where oid = to_regclass(?) and relkind = 'v'"],
             [0, "select array_to_string(current_schemas(true), ',') as path,"],
             [1, "select set_config('TimeZone', ?, true)"],
+            [1, 'select listings_retained'],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],
             [1, 'select places'],
             [1, 'select job_sites'],
             [1, 'select listings'],
-            [1, 'insert listings_retained'],
+            [1, 'update listings_retained'],
             [1, 'select places for update'],
             [1, 'update jobs'],
             [1, 'update places'],
@@ -211,14 +214,13 @@ final class LegacyBuilderWriteTest extends TestCase
         $this->assertSame([
             "select set_config('TimeZone', ?, true)",
             'insert jobs',
-            'select jobs',
+            'insert listings_retained',
             'select places for update',
             'select job_sites for update',
             'select places for update',
             'insert places',
             'select job_sites for update',
             'insert job_sites',
-            'insert listings_retained',
             'select listings',
         ], $statements);
     }
@@ -353,7 +355,10 @@ final class LegacyBuilderWriteTest extends TestCase
     {
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     /**
@@ -386,7 +391,7 @@ final class LegacyBuilderWriteTest extends TestCase
 
     private function job(int $legacyId): Job
     {
-        return Job::withTrashed()->where('legacy_id', $legacyId)->firstOrFail();
+        return Job::withTrashed()->whereKey(ListingTables::jobOf($legacyId))->firstOrFail();
     }
 
     /**

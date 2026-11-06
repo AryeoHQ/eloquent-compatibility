@@ -4,14 +4,17 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Carbon\CarbonInterval;
 use Closure;
+use DateInterval;
+use DateTimeImmutable;
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\QueryException;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
-use Throwable;
 
 final readonly class Installer
 {
@@ -54,53 +57,85 @@ final readonly class Installer
     /**
      * @param  Closure(): Statements  $compile
      */
-    public function install(ResolvedMap $map, Closure $compile): void
+    public function install(ResolvedMap $map, CarbonInterval $statementTimeout, Closure $compile): void
     {
         $outside = $this->connection->transactionLevel() === 0;
         $backfiller = new Backfiller($map, $this->connection);
         $watermark = $backfiller->remembered();
+        $budget = self::milliseconds($statementTimeout);
+
+        if ($budget < 1) {
+            throw new LogicException('Compatibility::install() takes a statementTimeout of at least one millisecond, which bounds how long it holds its lock.');
+        }
 
         if ($watermark !== null && ! $outside) {
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
-        $retaining = false;
+        if ($watermark !== null) {
+            $backfiller->refuseUnconvergeable($watermark);
+            $watermark = $this->converge(
+                map: $map,
+                backfiller: $backfiller,
+                watermark: $watermark,
+            );
+        }
 
-        try {
-            if ($watermark !== null) {
-                $backfiller->refuseUnconvergeable($watermark);
-                $watermark = $this->converge($map, $backfiller, $watermark);
+        $install = $this->locked(function () use ($map, $backfiller, $watermark, $compile, $outside, $budget): Statements {
+            $this->connection->statement("SET LOCAL statement_timeout = '{$budget}ms'");
+            $started = hrtime(true);
+            $this->lockSchema($map->tables());
+            $install = $this->compile(
+                compile: $compile,
+                outside: $outside,
+            );
 
-                if ($map->branches === []) {
-                    $retaining = true;
-                    $this->retain(Statements::retain($map, $this->connection));
-                    $watermark = $this->converge($map, $backfiller, $watermark);
-                }
-            }
-
-            $install = $this->locked(function () use ($map, $backfiller, $watermark, $compile, $outside): Statements {
-                $this->lockSchema($map->tables());
-                $install = $this->compile($compile, $outside);
-                $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
-
-                if ($watermark !== null) {
-                    $backfiller->catchUp($watermark);
-                }
-
-                $this->apply($install);
-                $backfiller->forget();
-
+            if ($install->transaction === []) {
                 return $install;
-            });
-
-            $retaining = false;
-            $this->runAfterwards($install);
-        } catch (Throwable $exception) {
-            if ($retaining) {
-                $this->unretain($map);
             }
 
-            throw $exception;
+            $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
+
+            if ($watermark !== null) {
+                $backfiller->catchUp($watermark);
+            }
+
+            $this->apply(
+                statements: $install,
+                before: fn (string $statement) => $this->refuseSpent(
+                    map: $map,
+                    started: $started,
+                    budget: $budget,
+                    statement: $statement,
+                ),
+            );
+
+            return $install;
+        });
+
+        $this->runAfterwards($install);
+    }
+
+    private static function milliseconds(DateInterval $interval): int
+    {
+        $start = new DateTimeImmutable('@0');
+
+        return (int) round(((float) $start->add($interval)->format('U.u') - (float) $start->format('U.u')) * 1000);
+    }
+
+    private function refuseSpent(ResolvedMap $map, int|float $started, int $budget, string $statement): void
+    {
+        $elapsed = (hrtime(true) - $started) / 1e6;
+
+        if ($elapsed >= $budget) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'install',
+                because: 'it held its lock for '.(int) $elapsed." ms of its {$budget} ms statementTimeout before the step ".strtok(
+                    string: $statement,
+                    token: "\n",
+                ).', so it rolled back. Raise statementTimeout, or shorten the final catch-up, then install again',
+            );
         }
     }
 
@@ -112,37 +147,22 @@ final readonly class Installer
     {
         for ($pass = 1; ; $pass++) {
             [$changed, $read, $watermark] = $backfiller->catchUp($watermark);
-            $backfiller->remember($watermark);
+            $backfiller->remember(
+                watermark: $watermark,
+                rows: $read,
+            );
 
             if ($changed < self::THRESHOLD && $read < self::THRESHOLD) {
                 return $watermark;
             }
 
             if ($pass === self::PASSES) {
-                throw InvalidCompatibilityMap::cannot($map->table, 'install', "its catch-up pass {$pass} still read {$read} legacy rows and changed {$changed} successor rows, and install() takes the lock only once a pass reads and changes fewer than ".self::THRESHOLD.' rows each. Run php artisan compatibility:backfill '.$map->model." --since={$watermark['updatedAt']} again, then install()");
+                throw InvalidCompatibilityMap::cannot(
+                    map: $map->table,
+                    operation: 'install',
+                    because: "its catch-up pass {$pass} still read {$read} legacy rows and changed {$changed} successor rows, and install() takes the lock only once a pass reads and changes fewer than ".self::THRESHOLD.' rows each. Run php artisan compatibility:backfill '.$map->model.' again, then install()',
+                );
             }
-        }
-    }
-
-    private function retain(Statements $retain): void
-    {
-        $this->locked(function () use ($retain): void {
-            foreach ($retain->transaction as $statement) {
-                $this->connection->unprepared($statement);
-            }
-        });
-
-        $this->runAfterwards($retain);
-    }
-
-    private function unretain(ResolvedMap $map): void
-    {
-        try {
-            $this->locked(function () use ($map): void {
-                $this->connection->unprepared(Statements::unretain($map));
-            });
-        } catch (Throwable) {
-            return;
         }
     }
 
@@ -190,22 +210,35 @@ final readonly class Installer
     private function compile(Closure $compile, bool $outside): Statements
     {
         $statements = $compile();
-        $afterwards = [...$statements->afterwards, ...$statements->exclusive];
-
-        if ($afterwards !== [] && ! $outside) {
-            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
+        if ($statements->afterwards !== [] && ! $outside) {
+            throw new LogicException("Compatibility::{$statements->operation}() runs ".count($statements->afterwards).' statements after its own transaction commits, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.');
         }
 
         return $statements;
     }
 
-    private function apply(Statements $statements): void
+    /**
+     * @param  null|Closure(string): void  $before
+     */
+    private function apply(Statements $statements, null|Closure $before = null): void
     {
         foreach ($statements->transaction as $index => $statement) {
+            if ($before !== null) {
+                $before($statement);
+            }
+
             $this->connection->unprepared($statement);
 
             foreach ($statements->steps[$index] ?? [] as $step) {
                 $step($this->connection);
+            }
+
+            foreach ($statements->hooks[$index] ?? [] as [, $hook]) {
+                if (! $this->connection instanceof Connection) {
+                    throw new LogicException('The hooks of dependents() take an Illuminate\\Database\\Connection.');
+                }
+
+                $hook($this->connection);
             }
         }
     }
@@ -214,14 +247,6 @@ final readonly class Installer
     {
         foreach ($statements->afterwards as $statement) {
             $this->connection->unprepared($statement);
-        }
-
-        if ($statements->exclusive !== []) {
-            $this->locked(function () use ($statements): void {
-                foreach ($statements->exclusive as $statement) {
-                    $this->connection->unprepared($statement);
-                }
-            });
         }
     }
 }

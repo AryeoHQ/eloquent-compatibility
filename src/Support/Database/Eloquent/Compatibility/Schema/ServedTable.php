@@ -60,10 +60,6 @@ final class ServedTable
      */
     public static function successorsOf(ResolvedMap $map): array
     {
-        if ($map->branches !== []) {
-            return array_values(array_unique(array_merge(...array_map(self::successorsOf(...), array_values($map->branches)))));
-        }
-
         return [$map->primary->table, ...array_map(fn (Related $related) => $related->table, array_values($map->related))];
     }
 

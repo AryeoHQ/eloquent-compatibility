@@ -13,7 +13,6 @@ use LogicException;
 use Stringable;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -147,7 +146,7 @@ final class ExternalAttributes
     public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
     {
         $values = [];
-        $served = $map->branches === [] && $map->isMorphed($name) ? $map->morphs : $map->branches;
+        $served = $map->isMorphed($name) ? $map->morphs : [];
 
         foreach ($served === [] ? [$map] : $served as $branch) {
             $attribute = $branch->attributes[$name];
@@ -208,37 +207,52 @@ final class ExternalAttributes
     public static function restore(ResolvedMap $map, ConnectionInterface $connection, string $name, string $type): void
     {
         $key = (new $map->model)->getKeyName();
-        $retainedKey = (string) $map->retainedKey;
         $table = SqlFragments::identifier($map->table);
-        $retainedType = (new ColumnCatalog($connection))->type($map->table, $retainedKey) ?? throw new LogicException("{$map->table} has no column {$retainedKey} to restore attribute '{$name}' by.");
+        $keyType = (new ColumnCatalog($connection))->type(
+            table: $map->table,
+            column: $key,
+        ) ?? throw new LogicException("{$map->table} has no column {$key} to restore attribute '{$name}' by.");
 
-        $connection->table($map->table)->select([$retainedKey, $key])->chunkById(self::CHUNK, function (iterable $rows) use ($map, $connection, $name, $type, $key, $retainedKey, $retainedType, $table): void {
-            $retained = [];
+        $connection->table($map->table)->select([$key])->chunkById(
+            count: self::CHUNK,
+            callback: function (iterable $rows) use ($map, $connection, $name, $type, $key, $keyType, $table): void {
+                $keys = [];
 
-            foreach ($rows as $row) {
-                $row = (array) $row;
-                $retained[self::key($row[$key] ?? null)] = self::key($row[$retainedKey] ?? null);
-            }
-
-            $bindings = [];
-
-            foreach (self::values($map, $name, array_keys($retained), (new $map->model)->getConnectionName(), true) as $legacyKey => $value) {
-                if ($value !== null) {
-                    array_push($bindings, (string) $retained[$legacyKey], self::bindable($map, $name, $value));
+                foreach ($rows as $row) {
+                    $keys[] = self::key(((array) $row)[$key] ?? null);
                 }
-            }
 
-            if ($bindings === []) {
-                return;
-            }
+                $bindings = [];
 
-            $connection->update(
-                "UPDATE {$table} SET ".SqlFragments::identifier($name)." = CAST(restored.value AS {$type})"
-                .' FROM (VALUES '.implode(', ', array_fill(0, intdiv(count($bindings), 2), '(?, ?)')).') AS restored (key, value)'
-                ." WHERE {$table}.".SqlFragments::identifier($retainedKey)." = CAST(restored.key AS {$retainedType})",
-                $bindings,
-            );
-        }, $retainedKey);
+                foreach (self::values(
+                    map: $map,
+                    name: $name,
+                    keys: $keys,
+                    connection: (new $map->model)->getConnectionName(),
+                    writePdo: true,
+                ) as $legacyKey => $value) {
+                    if ($value !== null) {
+                        array_push($bindings, (string) $legacyKey, self::bindable(
+                            map: $map,
+                            name: $name,
+                            value: $value,
+                        ));
+                    }
+                }
+
+                if ($bindings === []) {
+                    return;
+                }
+
+                $connection->update(
+                    "UPDATE {$table} SET ".SqlFragments::identifier($name)." = CAST(restored.value AS {$type})"
+                    .' FROM (VALUES '.implode(', ', array_fill(0, intdiv(count($bindings), 2), '(?, ?)')).') AS restored (key, value)'
+                    ." WHERE {$table}.".SqlFragments::identifier($key)." = CAST(restored.key AS {$keyType})",
+                    $bindings,
+                );
+            },
+            column: $key,
+        );
     }
 
     /**
@@ -248,18 +262,39 @@ final class ExternalAttributes
      */
     private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, null|Closure $read = null, bool $aliased = true): array
     {
-        $identifier = $branch->identifiers[(new $map->model)->getKeyName()];
-        $column = (string) $identifier->column();
+        $legacy = (new $map->model)->setConnection($connection);
+        $key = $legacy->getKeyName();
+        $legacyQuery = $legacy->getConnection()->table($map->table)->whereRaw(
+            sql: SqlFragments::identifier($key).' = any(cast(? as '.self::arrayType(
+                map: $map,
+                legacy: $legacy,
+            ).'))',
+            bindings: [self::arrayLiteral($keys)],
+        )->whereNotNull($map->successorKey);
+
+        if ($writePdo) {
+            $legacyQuery->useWritePdo();
+        }
+
+        $roots = $legacyQuery->pluck(
+            column: $map->successorKey,
+            key: $key,
+        )->all();
         $primary = (new $branch->primary->model)->setConnection($connection);
-        $query = $primary->newModelQuery();
-        $query->whereRaw($query->getQuery()->getGrammar()->wrap($primary->qualifyColumn($column)).' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral($keys)]);
+        $rootType = ((new ColumnCatalog(
+            connection: $legacy->getConnection(),
+            throughSearchPath: true,
+        ))->type(
+            table: $map->table,
+            column: $map->successorKey,
+        ) ?? 'text').'[]';
+        $query = $primary->newModelQuery()->whereRaw(sql: SqlFragments::identifier($primary->getTable()).'.'.SqlFragments::identifier($primary->getKeyName()).' = any(cast(? as '.$rootType.'))', bindings: [self::arrayLiteral(array_values(array_map(
+            callback: self::key(...),
+            array: $roots,
+        )))]);
 
         if ($writePdo) {
             $query->useWritePdo();
-        }
-
-        if ($branch->membership !== null) {
-            $query->where($branch->membership->column, $branch->membership->alias);
         }
 
         if ($aliased && $branch->target !== null && $branch->morph !== null) {
@@ -268,14 +303,24 @@ final class ExternalAttributes
 
         $successors = $query->get();
         $read = $read === null ? null : $read($successors);
-        $held = [];
+        $found = [];
 
         foreach ($successors as $successor) {
-            $key = $successor->getAttribute($column);
             $successorKey = $successor->getKey();
 
-            if ((is_int($key) || is_string($key)) && (is_int($successorKey) || is_string($successorKey))) {
-                $held[$key] = $read === null ? null : $read[$successorKey];
+            if (is_int($successorKey) || is_string($successorKey)) {
+                $found[(string) $successorKey] = $successorKey;
+            }
+        }
+
+        $held = [];
+
+        foreach ($roots as $legacyKey => $root) {
+            if (is_scalar($root) && array_key_exists(
+                key: (string) $root,
+                array: $found,
+            )) {
+                $held[$legacyKey] = $read === null ? null : $read[$found[(string) $root]];
             }
         }
 
@@ -290,23 +335,29 @@ final class ExternalAttributes
      */
     private static function heldThrough(ResolvedMap $map, ResolvedMap $branch, string $owner, array $keys, null|string $connection, bool $writePdo, Closure $read): array
     {
-        $identifier = $branch->identifiers[(new $map->model)->getKeyName()];
-        $legacyKey = SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier((string) $identifier->column());
+        $legacy = (new $map->model)->setConnection($connection);
+        $held = SqlFragments::identifier(self::HELD_BY);
+        $legacyKey = $held.'.'.SqlFragments::identifier($legacy->getKeyName());
         $model = (new $owner)->setConnection($connection);
         $table = $model->getTable();
         $query = $model->newQueryWithoutScopes()
-            ->fromRaw(SqlFragments::identifier($branch->primary->table).' '.implode(' ', ViewCompiler::laterals($branch, $table)))
+            ->fromRaw(SqlFragments::identifier($map->table).' AS '.$held.' JOIN '.SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($branch->primary->key).' = '.$held.'.'.SqlFragments::identifier($map->successorKey).' '.implode(
+                separator: ' ',
+                array: ViewCompiler::laterals(
+                    map: $branch,
+                    owner: $table,
+                ),
+            ))
             ->select($table.'.*')
-            ->selectRaw($legacyKey.' AS '.SqlFragments::identifier(self::HELD_BY))
-            ->whereRaw($legacyKey.' = any(cast(? as '.self::arrayType($identifier).'))', [self::arrayLiteral($keys)])
+            ->selectRaw($legacyKey.' AS '.$held)
+            ->whereRaw($legacyKey.' = any(cast(? as '.self::arrayType(
+                map: $map,
+                legacy: $legacy,
+            ).'))', [self::arrayLiteral($keys)])
             ->whereNotNull($table.'.'.$model->getKeyName());
 
         if ($writePdo) {
             $query->useWritePdo();
-        }
-
-        if ($branch->membership !== null) {
-            $query->whereRaw($branch->membership->of($branch->primary->table));
         }
 
         $heldBy = [];
@@ -376,13 +427,15 @@ final class ExternalAttributes
         }
     }
 
-    private static function arrayType(Identifier $identifier): string
+    private static function arrayType(ResolvedMap $map, Model $legacy): string
     {
-        return match (true) {
-            $identifier->isUuid() => 'uuid[]',
-            $identifier->isInteger() => 'bigint[]',
-            default => 'text[]',
-        };
+        return ((new ColumnCatalog(
+            connection: $legacy->getConnection(),
+            throughSearchPath: true,
+        ))->type(
+            table: $map->table,
+            column: $legacy->getKeyName(),
+        ) ?? 'text').'[]';
     }
 
     /**
@@ -417,7 +470,7 @@ final class ExternalAttributes
         return match (true) {
             is_scalar($value) => $value,
             $value instanceof Stringable => (string) $value,
-            default => throw new LogicException("The external() read of attribute '{$name}' on {$map->table} returns ".get_debug_type($value).', which uninstall() cannot store in a column.'),
+            default => throw new LogicException("The external() read of attribute '{$name}' on {$map->table} returns ".get_debug_type($value).', which rollback() cannot store in a column.'),
         };
     }
 }

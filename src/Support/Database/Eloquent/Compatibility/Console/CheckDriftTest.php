@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -13,7 +14,6 @@ use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FileTables;
@@ -21,6 +21,8 @@ use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\PlaceAssets\Image;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\TestCase;
 
 #[CoversClass(CheckDrift::class)]
@@ -44,6 +46,7 @@ final class CheckDriftTest extends TestCase
         DB::statement('set session characteristics as transaction read write');
         FileTables::drop();
         ListingTables::drop();
+        PlaceAssetTables::drop();
 
         parent::tearDown();
     }
@@ -51,7 +54,10 @@ final class CheckDriftTest extends TestCase
     #[Test]
     public function it_says_so_and_exits_zero_when_the_served_model_has_not_drifted(): void
     {
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class]])
             ->expectsOutputToContain('No drift in 1 served model.')
@@ -66,7 +72,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
                 [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
             ])
             ->expectsOutputToContain('2 drift findings in 1 served model.')
@@ -89,7 +95,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class], '--limit' => '1'])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             ])
             ->expectsOutputToContain('1 drift finding in 1 served model.')
             ->assertFailed();
@@ -119,19 +125,23 @@ final class CheckDriftTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
+                    ->retainedIn('listings_retained')
                     ->guard('unreadable', fn () => throw new RuntimeException('The guard reads a service that is down.'), because: 'It reads a service.', instead: 'Wait for the service.')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
             }
         };
 
         $this->artisan('compatibility:check', ['--model' => [$refusing::class, Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             ])
             ->expectsOutputToContain('1 drift finding in 2 served models.')
             ->expectsOutputToContain($refusing::class.': The guard reads a service that is down.')
@@ -148,7 +158,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class, Photo::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             ])
             ->expectsOutputToContain('1 drift finding in 2 served models.')
             ->expectsOutputToContain(Photo::class.": Compatibility map 'photos' cannot check: the stale-view check creates a temporary view, so it needs a writable connection with the TEMP privilege, and the connection refused it with SQLSTATE 25006.")
@@ -168,13 +178,13 @@ final class CheckDriftTest extends TestCase
 
             public static function compatibility(Compatibility $listing): Compatibility
             {
-                return $listing->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'));
+                return $listing;
             }
         };
 
         $this->artisan('compatibility:check', ['--model' => [$unresolved::class, Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             ])
             ->expectsOutputToContain($unresolved::class.": Compatibility map 'listings' is declared wrongly: it says no servedFrom(), so it names no successor.")
             ->doesntExpectOutputToContain('No drift')
@@ -182,36 +192,23 @@ final class CheckDriftTest extends TestCase
     }
 
     #[Test]
-    public function it_reports_unclassified_rows_as_informational_and_exits_zero_on_them_alone(): void
+    public function it_exits_non_zero_on_a_record_whose_root_left_the_when_of_its_map(): void
     {
-        $this->installPhotos();
-        DB::unprepared("insert into files (filename, mime_type) values ('stray.jpg', 'image/jpeg')");
-
-        $this->artisan('compatibility:check', ['--model' => [Photo::class]])
-            ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Photo::class, 'unclassified rows', 'files', '1 row has no legacy_type, so no legacy model serves it'],
-            ])
-            ->expectsOutputToContain('1 informational finding in 1 served model, which does not fail the check.')
-            ->expectsOutputToContain('No drift in 1 served model.')
-            ->assertSuccessful();
-    }
-
-    #[Test]
-    public function it_exits_non_zero_on_a_drift_finding_beside_an_informational_one(): void
-    {
-        $this->installPhotos();
-        DB::unprepared("insert into files (filename, mime_type) values ('stray.jpg', 'image/jpeg')");
         DB::unprepared("insert into listings (title, company_id) values ('Ash Barn', '".ListingTables::COMPANY."')");
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::install();
+        DB::update("update place_assets set legacy_type = 'place_video' where id = (select place_asset_id from place_images where id = 2)");
 
-        $this->artisan('compatibility:check', ['--model' => [Listing::class, Photo::class]])
+        $this->artisan(
+            command: 'compatibility:check',
+            parameters: ['--model' => [Listing::class, Image::class]],
+        )
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Image::class, 'outside when()', 'place_images#2', 'its place_assets row no longer matches the when() of Image'],
             ])
-            ->expectsOutputToContain('1 drift finding in 2 served models.')
-            ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Photo::class, 'unclassified rows', 'files', '1 row has no legacy_type, so no legacy model serves it'],
-            ])
-            ->expectsOutputToContain('1 informational finding in 2 served models, which does not fail the check.')
+            ->expectsOutputToContain('2 drift findings in 2 served models.')
             ->doesntExpectOutputToContain('No drift')
             ->assertFailed();
     }
@@ -242,6 +239,9 @@ final class CheckDriftTest extends TestCase
         }
 
         FileTables::backfill();
-        Compatibility::install(Photo::class);
+        Compatibility::install(
+            model: Photo::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 }

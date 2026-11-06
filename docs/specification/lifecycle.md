@@ -243,7 +243,7 @@ The legacy model is then the source of truth again.
 
 ### Re-install after rollback
 
-Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger is missing, and the refusal names `prepare()`.
+Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger or this model's `compatibility_backfills` row is missing, and the refusal names `prepare()`.
 
 ## Retire
 
@@ -258,7 +258,7 @@ Install deleted this model's `compatibility_backfills` row. A re-install therefo
 
 ## Status and idempotence
 
-`compatibility:status` prints each legacy model's stage: one of the six stages in the table at the top of this page, read from the catalog and the ledger. `prepare()` inserts the model's `compatibility_backfills` row, and install deletes it. A legacy table with its `<legacy>_backfill` but no `compatibility_backfills` row therefore reads as `rolled back`. A model that is still backfilling also shows its pass count, its watermark, and its counts of refused and failed rows. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The package has no public `Compatibility::state()`.
+`compatibility:status` prints each legacy model's stage: one of the six stages in the table at the top of this page, read from the catalog and the ledger. `prepare()` inserts the model's `compatibility_backfills` row, and install deletes it. A legacy table with its `<legacy>_backfill` but no `compatibility_backfills` row therefore reads as `rolled back`. A catalog that matches no stage, such as a legacy table beside its retained table, reads as `unknown`, and the status names both tables. A model that is still backfilling also shows its pass count, its watermark, and its counts of refused and failed rows. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The package has no public `Compatibility::state()`.
 
 ## The writer boundary
 

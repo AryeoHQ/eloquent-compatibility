@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -16,7 +17,6 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -55,8 +55,8 @@ final class LegacyQueryBuilderTest extends TestCase
         $updated = Listing::query()->whereKey(1)->toBase()->update(['updated_at' => $at]);
 
         $this->assertSame(1, $updated);
-        $this->assertSame('2026-06-07 08:09:10', Job::query()->where('legacy_id', 1)->firstOrFail()->updated_at?->toDateTimeString());
-        $this->assertSame('2026-01-05 08:00:00', Job::query()->where('legacy_id', 3)->firstOrFail()->updated_at?->toDateTimeString());
+        $this->assertSame('2026-06-07 08:09:10', Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->updated_at?->toDateTimeString());
+        $this->assertSame('2026-01-05 08:00:00', Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail()->updated_at?->toDateTimeString());
     }
 
     #[Test]
@@ -68,8 +68,8 @@ final class LegacyQueryBuilderTest extends TestCase
         $deleted = Listing::query()->toBase()->delete(3);
 
         $this->assertSame([1, 1], [$updated, $deleted]);
-        $this->assertSame('Pine Lodge', Job::withTrashed()->where('legacy_id', 2)->value('name'));
-        $this->assertSame([1, 2], Job::withTrashed()->orderBy('legacy_id')->pluck('legacy_id')->all());
+        $this->assertSame('Pine Lodge', Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('name'));
+        $this->assertSame([1, 2], DB::table('listings_retained')->whereIn(column: 'job_id', values: Job::withTrashed()->select('id'))->orderBy('id')->pluck('id')->all());
     }
 
     #[Test]
@@ -85,8 +85,8 @@ final class LegacyQueryBuilderTest extends TestCase
         $deleted = Listing::query()->getQuery()->from('listings as legacy')->delete(2);
 
         $this->assertSame([1, 1, 1, 1], [$updated, $eloquent, $incremented, $deleted]);
-        $this->assertSame(['Renamed', 'Elm Lodge', 10099], [Job::query()->where('legacy_id', 1)->value('name'), Job::query()->where('legacy_id', 3)->value('name'), Job::query()->where('legacy_id', 3)->value('price_cents')]);
-        $this->assertFalse(Job::withTrashed()->where('legacy_id', 2)->exists());
+        $this->assertSame(['Renamed', 'Elm Lodge', 10099], [Job::query()->whereKey(ListingTables::jobOf(1))->value('name'), Job::query()->whereKey(ListingTables::jobOf(3))->value('name'), Job::query()->whereKey(ListingTables::jobOf(3))->value('price_cents')]);
+        $this->assertFalse(Job::withTrashed()->whereKey(ListingTables::jobOf(2))->exists());
     }
 
     #[Test]
@@ -103,7 +103,7 @@ final class LegacyQueryBuilderTest extends TestCase
 
         Event::assertDispatchedTimes('eloquent.created: '.Job::class, 3);
         $this->assertSame(6, $id);
-        $this->assertSame([[4, 'Birch House', 1000], [5, 'Cedar House', null], [6, 'Fir House', null]], DB::table('jobs')->where('legacy_id', '>', 3)->orderBy('legacy_id')->get(['legacy_id', 'name', 'price_cents'])->map(fn (object $job) => array_values((array) $job))->all());
+        $this->assertSame([[4, 'Birch House', 1000], [5, 'Cedar House', null], [6, 'Fir House', null]], DB::table('jobs')->join(table: 'listings_retained', first: 'listings_retained.job_id', operator: '=', second: 'jobs.id')->where(column: 'listings_retained.id', operator: '>', value: 3)->orderBy('listings_retained.id')->get(['listings_retained.id', 'jobs.name', 'jobs.price_cents'])->map(fn (object $job) => array_values((array) $job))->all());
         $this->assertSame(['9 Birch St', null, null], Listing::query()->where('id', '>', 3)->orderBy('id')->pluck('street')->all());
         $this->assertSame(['MLS-9', null, null], Listing::query()->where('id', '>', 3)->orderBy('id')->pluck('mls_number')->all());
     }
@@ -189,16 +189,22 @@ final class LegacyQueryBuilderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
             }
         };
 
         $key = $keyed->newQuery()->toBase()->insertGetId(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
 
-        $this->assertSame(Job::query()->where('name', 'Birch House')->value('legacy_uuid'), $key);
+        $this->assertSame(DB::table('listings_retained')->where(column: 'job_id', operator: '=', value: Job::query()->where(column: 'name', operator: '=', value: 'Birch House')->value('id'))->value('uuid'), $key);
     }
 
     #[Test]
@@ -244,7 +250,12 @@ final class LegacyQueryBuilderTest extends TestCase
             $this->refusal(fn () => $query()->upsert([['id' => 1, 'title' => 'X']], ['id'], ['title'])),
             $this->refusal(fn () => $query()->insertUsing(['title'], DB::table('jobs')->select('name'))),
             $this->refusal(fn () => $query()->insertOrIgnoreUsing(['title'], DB::table('jobs')->select('name'))),
-            $this->refusal(fn () => $query()->join('jobs', 'jobs.legacy_id', '=', 'listings.id')->updateFrom(['title' => 'X'])),
+            $this->refusal(fn () => $query()->join(
+                table: 'jobs',
+                first: 'jobs.id',
+                operator: '=',
+                second: 'listings.job_id',
+            )->updateFrom(['title' => 'X'])),
             $this->refusal(fn () => $query()->truncate()),
             $this->refusal(fn () => $query()->insertOrIgnoreReturning(['title' => 'X'], ['id'], ['uuid'])),
         ];
@@ -254,7 +265,7 @@ final class LegacyQueryBuilderTest extends TestCase
             array_map(fn (CompatibilityWriteRefused $refused) => substr($refused->refused, strlen(Listing::class.' cannot run '), -strlen(' through its compatibility map')), $refusals),
         );
         $this->assertSame(3, DB::table('jobs')->count());
-        $this->assertSame(['Oak House', 'Pine Flat', 'Elm Cottage'], DB::table('jobs')->orderBy('legacy_id')->pluck('name')->all());
+        $this->assertSame(['Oak House', 'Pine Flat', 'Elm Cottage'], DB::table('jobs')->orderBy(ListingTables::legacyId())->pluck('name')->all());
     }
 
     #[Test]
@@ -273,7 +284,10 @@ final class LegacyQueryBuilderTest extends TestCase
     {
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     private function refusal(Closure $write): CompatibilityWriteRefused
