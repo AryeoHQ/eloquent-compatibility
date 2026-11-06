@@ -37,7 +37,7 @@ final class ServedModelsTest extends TestCase
     {
         parent::setUp();
 
-        $this->bootstrap = sys_get_temp_dir().'/compatibility-'.bin2hex(random_bytes(8));
+        $this->bootstrap = realpath(sys_get_temp_dir()).'/compatibility-'.bin2hex(random_bytes(8));
         (new Filesystem)->ensureDirectoryExists("{$this->bootstrap}/cache");
         $this->app->useBootstrapPath($this->bootstrap);
         $this->app->forgetInstance(ServedModels::class);
@@ -88,19 +88,33 @@ final class ServedModelsTest extends TestCase
             ['name' => 'acme/registry', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/registry.zip'], 'install-path' => '../acme/registry'],
             ['name' => 'acme/symlinked', 'dist' => ['type' => 'path', 'url' => '../packages/symlinked'], 'install-path' => '../acme/symlinked'],
         ]], JSON_THROW_ON_ERROR));
-        $loader = new ClassLoader($vendor);
-        $loader->addClassMap($classmap);
-        $loader->register();
-
-        try {
-            $served = $this->app->make(ServedModels::class)->all();
-        } finally {
-            $loader->unregister();
-        }
+        $served = $this->served(vendor: $vendor, classmap: $classmap);
 
         $this->assertSame(
             [true, true, false],
             [in_array("Acme\\Symlinked\\Served{$suffix}", $served, true), in_array("Acme\\Mirrored\\Served{$suffix}", $served, true), in_array("Acme\\Registry\\Served{$suffix}", $served, true)],
+        );
+    }
+
+    #[Test]
+    public function it_lists_no_model_of_a_registry_package_that_composer_installers_places_outside_the_vendor_directory(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $classmap = [
+            "Acme\\Plugin\\Served{$suffix}" => $this->package("{$this->bootstrap}/plugins/acme-plugin", 'Acme\\Plugin', "Served{$suffix}"),
+            "Acme\\Dependent\\Served{$suffix}" => $this->package("{$this->bootstrap}/plugins/acme-dependent", 'Acme\\Dependent', "Served{$suffix}"),
+        ];
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+        file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => [
+            ['name' => 'acme/plugin', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/plugin.zip'], 'install-path' => '../../plugins/acme-plugin'],
+            ['name' => 'acme/dependent', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/dependent.zip'], 'install-path' => '../../plugins/acme-dependent', 'require' => ['aryeo/eloquent-compatibility' => '^1.0']],
+        ]], JSON_THROW_ON_ERROR));
+        $served = $this->served(vendor: $vendor, classmap: $classmap);
+
+        $this->assertSame(
+            [false, false],
+            [in_array("Acme\\Plugin\\Served{$suffix}", $served, true), in_array("Acme\\Dependent\\Served{$suffix}", $served, true)],
         );
     }
 
@@ -123,20 +137,45 @@ final class ServedModelsTest extends TestCase
         file_put_contents("{$vendor}/composer/installed.json", json_encode(['packages' => [
             ['name' => 'acme/base', 'dist' => ['type' => 'zip', 'url' => 'https://repo.example/acme/base.zip'], 'install-path' => '../acme/base', 'require' => ['aryeo/eloquent-compatibility' => '^1.0']],
         ]], JSON_THROW_ON_ERROR));
-        $loader = new ClassLoader($vendor);
-        $loader->addClassMap($classmap);
-        $loader->register();
-
-        try {
-            $served = $this->app->make(ServedModels::class)->all();
-        } finally {
-            $loader->unregister();
-        }
+        $served = $this->served(vendor: $vendor, classmap: $classmap);
 
         $this->assertSame(
             [true, true, false],
             [in_array("App\\Models\\Inherited{$suffix}", $served, true), in_array("App\\Models\\Traited{$suffix}", $served, true), in_array("Acme\\Base\\Shipped{$suffix}", $served, true)],
         );
+    }
+
+    #[Test]
+    public function it_discovers_an_application_model_that_an_optimized_classmap_lists_through_the_vendor_directory(): void
+    {
+        $vendor = "{$this->bootstrap}/vendor";
+        $suffix = bin2hex(random_bytes(4));
+        $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Optimized{$suffix}");
+        (new Filesystem)->ensureDirectoryExists("{$vendor}/composer");
+
+        $this->assertContains("App\\Models\\Optimized{$suffix}", $this->served(vendor: $vendor, classmap: ["App\\Models\\Optimized{$suffix}" => "{$vendor}/composer/../../app/Models/src/Optimized{$suffix}.php"]));
+    }
+
+    #[Test]
+    public function it_reads_the_application_files_once_per_process_while_the_registered_classmaps_keep_their_size(): void
+    {
+        $suffix = bin2hex(random_bytes(4));
+        $file = $this->package("{$this->bootstrap}/app/Models", 'App\\Models', "Scanned{$suffix}");
+        $loader = new ClassLoader("{$this->bootstrap}/vendor");
+        $loader->addClassMap(["App\\Models\\Scanned{$suffix}" => $file]);
+        $loader->register();
+
+        try {
+            $first = $this->app->make(ServedModels::class)->all();
+            unlink($file);
+            $this->app->forgetInstance(ServedModels::class);
+            $second = $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
+
+        $this->assertContains("App\\Models\\Scanned{$suffix}", $first);
+        $this->assertSame($first, $second);
     }
 
     #[Test]
@@ -180,6 +219,23 @@ final class ServedModelsTest extends TestCase
         file_put_contents("{$this->bootstrap}/cache/compatibility.php", '<?php return '.var_export([Photo::class, 'Tests\Fixtures\Support\Files\RemovedPhoto'], true).';');
 
         $this->assertSame([Photo::class], $this->app->make(ServedModels::class)->all());
+    }
+
+    /**
+     * @param  array<string, string>  $classmap
+     * @return list<string>
+     */
+    private function served(string $vendor, array $classmap): array
+    {
+        $loader = new ClassLoader($vendor);
+        $loader->addClassMap($classmap);
+        $loader->register();
+
+        try {
+            return $this->app->make(ServedModels::class)->all();
+        } finally {
+            $loader->unregister();
+        }
     }
 
     private function source(string $file, string $code): string
