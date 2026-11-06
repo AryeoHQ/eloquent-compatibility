@@ -1022,7 +1022,6 @@ final class InstallerTest extends TestCase
         return [
             'a successor key without its unique index' => ['alter table listings drop constraint listings_job_id_unique', 'listings.job_id has no unique index of its own'],
             'no backfill ledger' => ['drop table listings_backfill', 'listings_backfill does not exist'],
-            'no backfill row' => ['delete from compatibility_backfills', 'compatibility_backfills holds no row for listings'],
             'no at-most-one index' => ['drop index places_listings_at_most_one', 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
             'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
         ];
@@ -1687,7 +1686,7 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_catches_up_on_a_reinstall_the_legacy_writes_made_after_a_rollback_once_prepare_and_a_pass_run_again(): void
+    public function it_catches_up_on_a_reinstall_the_legacy_writes_made_after_a_rollback(): void
     {
         $this->backfiller(Listing::class)->run();
         Compatibility::install(
@@ -1696,6 +1695,24 @@ final class InstallerTest extends TestCase
         );
         Compatibility::rollback(Listing::class);
         Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+        Compatibility::prepare(Listing::class);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+    }
+
+    #[Test]
+    public function it_refuses_an_undeclared_dependent_view_before_its_catch_up_writes_a_successor_or_advances_the_pass(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::table('listings')->where('id', 1)->update(['title' => 'Oak Manor', 'updated_at' => now()->addMinute()]);
+        $job = DB::table('listings')->where('id', 1)->value('job_id');
+        $before = [DB::table('compatibility_backfills')->where('legacy_type', 'listings')->value('pass'), DB::table('jobs')->where('id', $job)->value('name')];
+        DB::statement('create view listing_headlines as select title from listings');
 
         try {
             Compatibility::install(
@@ -1703,19 +1720,19 @@ final class InstallerTest extends TestCase
                 statementTimeout: CarbonInterval::seconds(30),
             );
             $refusal = 'no refusal';
-        } catch (QueryException $exception) {
+        } catch (InvalidCompatibilityMap $exception) {
             $refusal = $exception->getMessage();
+        } finally {
+            DB::statement('drop view listing_headlines');
         }
 
-        Compatibility::prepare(Listing::class);
-        $this->backfiller(Listing::class)->run();
-        Compatibility::install(
-            model: Listing::class,
-            statementTimeout: CarbonInterval::seconds(30),
-        );
-
-        $this->assertStringContainsString("Compatibility map 'listings' cannot install: compatibility_backfills holds no row for listings, so prepare() has not finished.", $refusal);
-        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+        $this->assertSame(InvalidCompatibilityMap::cannot(
+            map: 'listings',
+            operation: 'install',
+            because: 'view listing_headlines depends on listings, and the map declares no dependents(); declare a ManagesDependents class that drops and recreates them inside the install transaction',
+        )->getMessage(), $refusal);
+        $this->assertSame($before, [DB::table('compatibility_backfills')->where('legacy_type', 'listings')->value('pass'), DB::table('jobs')->where('id', $job)->value('name')]);
+        $this->assertSame([1, 'Oak House'], $before);
     }
 
     #[Test]
@@ -2159,6 +2176,68 @@ final class InstallerTest extends TestCase
 
         $this->assertSame([['beforeInstall', 1], ['afterInstall', 1], ['beforeRollback', 1], ['afterRollback', 1]], $dependents::$calls);
         $this->assertSame([['v', ['Oak House', 'Pine Flat', 'Elm Cottage']], ['r', ['Oak House', 'Pine Flat', 'Elm Cottage']]], [$installed, $rolledBack]);
+    }
+
+    #[Test]
+    public function it_lists_the_declared_dependents_at_install_and_at_rollback_before_their_hooks_drop_them(): void
+    {
+        DB::statement('create view listing_titles as select id, title from listings');
+        $dependents = new class implements ManagesDependents
+        {
+            public function beforeInstall(Connection $connection): void
+            {
+                $connection->statement('drop view listing_titles');
+            }
+
+            public function afterInstall(Connection $connection): void
+            {
+                $connection->statement('create view listing_titles as select id, title from listings');
+            }
+
+            public function beforeRollback(Connection $connection): void
+            {
+                $connection->statement('drop view listing_titles');
+            }
+
+            public function afterRollback(Connection $connection): void
+            {
+                $connection->statement('create view listing_titles as select id, title from listings');
+            }
+        };
+        self::$dependents = $dependents::class;
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing)->dependents(InstallerTest::$dependents);
+            }
+        };
+        $notices = [];
+        $pdo = DB::connection()->getPdo();
+        $this->assertInstanceOf(Pgsql::class, $pdo);
+        $pdo->setNoticeCallback(function (string $notice) use (&$notices): void {
+            $notices[] = $notice;
+        });
+
+        try {
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $installed = $notices;
+            $notices = [];
+            Compatibility::rollback($model::class);
+        } finally {
+            $pdo->setNoticeCallback(null);
+            DB::statement('drop view if exists listing_titles');
+        }
+
+        $this->assertStringContainsString("Compatibility map 'listings' install: view listing_titles depends on listings", implode("\n", $installed));
+        $this->assertStringContainsString("Compatibility map 'listings' rollback: view listing_titles depends on listings", implode("\n", $notices));
     }
 
     #[Test]

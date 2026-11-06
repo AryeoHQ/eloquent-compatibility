@@ -105,21 +105,10 @@ final readonly class Statements
             throw InvalidCompatibilityMap::because($map->table, "{$map->table} enables row-level security, and the view would read its successors with its owner's privileges and serve rows a policy hides");
         }
 
-        $dependents = self::dependents(
+        self::refuseUndeclaredDependents(
+            map: $map,
             connection: $connection,
-            table: $map->table,
         );
-
-        if ($dependents !== [] && $map->dependents === null) {
-            throw InvalidCompatibilityMap::cannot(
-                map: $map->table,
-                operation: 'install',
-                because: implode(
-                    separator: ', ',
-                    array: $dependents,
-                ).' '.(count($dependents) === 1 ? 'depends' : 'depend')." on {$map->table}, and the map declares no dependents(); declare a ".class_basename(ManagesDependents::class).' class that drops and recreates them inside the install transaction',
-            );
-        }
 
         $columnCatalog = new ColumnCatalog($connection);
         $view = (new ViewCompiler(
@@ -205,6 +194,11 @@ final readonly class Statements
                 key: $key,
             ),
             ...($hidden === null ? [] : [$hidden]),
+            ...self::reportDependents(
+                map: $map,
+                connection: $connection,
+                operation: 'install',
+            ),
             $readGrants,
         ];
         $beforeInstall = count($transaction) - 1;
@@ -328,6 +322,11 @@ final readonly class Statements
 
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
+            ...self::reportDependents(
+                map: $map,
+                connection: $connection,
+                operation: 'rollback',
+            ),
             $readGrants,
         ];
         $beforeRollback = count($statements) - 1;
@@ -515,6 +514,32 @@ final readonly class Statements
                 bindings: [$named, ...($except === null ? [] : [SqlFragments::identifier($except)]), $named, $named, $named],
             ),
         ));
+    }
+
+    public static function refuseUndeclaredDependents(ResolvedMap $map, ConnectionInterface $connection): void
+    {
+        if ($map->dependents !== null || self::kind(
+            connection: $connection,
+            table: $map->table,
+        ) !== 'r') {
+            return;
+        }
+
+        $dependents = self::dependents(
+            connection: $connection,
+            table: $map->table,
+        );
+
+        if ($dependents !== []) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'install',
+                because: implode(
+                    separator: ', ',
+                    array: $dependents,
+                ).' '.(count($dependents) === 1 ? 'depends' : 'depend')." on {$map->table}, and the map declares no dependents(); declare a ".class_basename(ManagesDependents::class).' class that drops and recreates them inside the install transaction',
+            );
+        }
     }
 
     /**

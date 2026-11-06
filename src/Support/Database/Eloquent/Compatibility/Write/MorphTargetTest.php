@@ -165,7 +165,7 @@ final class MorphTargetTest extends TestCase
         }
 
         $this->assertStringContainsString("cannot run a write that moves record 3, whose PlaceAsset stores asset_type 'retired_asset', into AssetFile without \$original_file_name", $refusal);
-        $this->assertStringContainsString('asset_files.filename needs a value', $refusal);
+        $this->assertStringContainsString('targets: declares no target for that asset_type, so the view serves no value for the move to keep, and asset_files.filename needs a value', $refusal);
         $this->assertSame($before, $this->rows());
     }
 

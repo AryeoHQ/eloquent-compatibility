@@ -287,6 +287,23 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_no_change_a_successor_listener_makes_to_the_record_a_legacy_write_is_writing_when_the_instance_swaps_its_key_name(): void
+    {
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            Place::query()->where('job_id', $job->id)->firstOrFail()->update(['city' => 'Tacoma']);
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->getAttribute('id')]);
+        $listing = Listing::query()->findOrFail(1);
+        $listing->setKeyName('uuid');
+        $listing->setKeyType('string');
+
+        $listing->update(['title' => 'Oak Lodge']);
+
+        $this->assertSame([['saving', 1], ['updating', 1], ['updated', 1], ['saved', 1]], $this->seen);
+        $this->assertSame(['Oak Lodge', 'Tacoma'], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->city]);
+    }
+
+    #[Test]
     public function it_forwards_no_save_a_successor_listener_makes_through_another_instance_of_the_primary_a_legacy_write_is_writing(): void
     {
         Event::listen('eloquent.saved: '.Place::class, function (Place $place): void {

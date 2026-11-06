@@ -333,28 +333,6 @@ final class StatementsTest extends TestCase
         }
     }
 
-    #[Test]
-    public function it_refuses_to_install_over_a_dependent_view_before_any_work_when_the_map_declares_no_dependents(): void
-    {
-        Compatibility::prepare(Listing::class);
-        DB::statement('create view listing_headlines as select title from listings');
-
-        try {
-            $this->expectExceptionObject(InvalidCompatibilityMap::cannot(
-                map: 'listings',
-                operation: 'install',
-                because: 'view listing_headlines depends on listings, and the map declares no dependents(); declare a ManagesDependents class that drops and recreates them inside the install transaction',
-            ));
-
-            Statements::install(
-                map: $this->map(),
-                connection: DB::connection(),
-            );
-        } finally {
-            DB::statement('drop view listing_headlines');
-        }
-    }
-
     private function map(): ResolvedMap
     {
         return Compatibility::of(Listing::class)->resolve();

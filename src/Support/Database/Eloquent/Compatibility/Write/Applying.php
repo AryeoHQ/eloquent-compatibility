@@ -76,12 +76,15 @@ final class Applying
      */
     public static function writes(string $model, int|string $key, string $connection, null|Closure $identify = null): bool
     {
+        $keyName = null;
+
         foreach (self::$writes ?? [] as $successor => $legacy) {
             if ($legacy::class !== $model || $successor->getConnection()->getName() !== $connection) {
                 continue;
             }
 
-            $written = array_filter([$legacy->getRawOriginal($legacy->getKeyName()), $legacy->getKey()], fn (mixed $written) => is_int($written) || is_string($written));
+            $keyName ??= (new $model)->getKeyName();
+            $written = array_filter([$legacy->getRawOriginal($keyName), $legacy->getAttribute($keyName)], fn (mixed $written) => is_int($written) || is_string($written));
 
             foreach ($written === [] ? [self::identity($legacy, $successor, $identify)] : $written as $held) {
                 if ($held !== null && (string) $held === (string) $key) {

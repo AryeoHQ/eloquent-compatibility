@@ -427,7 +427,7 @@ final class ExternalAttributesTest extends TestCase
     #[Test]
     public function it_copies_an_unread_value_into_a_replica_and_writes_it_through_the_new_successor(): void
     {
-        $copy = Photo::query()->findOrFail(3)->replicate(['uuid', 'file_id']);
+        $copy = Photo::query()->findOrFail(3)->replicate(['uuid']);
         $copy->save();
 
         $this->assertSame(['image/png', 'image/png'], [$copy->mime_type, Photo::query()->findOrFail($copy->id)->mime_type]);

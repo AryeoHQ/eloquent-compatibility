@@ -310,7 +310,7 @@ final readonly class RecordWriter
             $column = (string) $this->map->morph?->typeColumn;
             $stores = $type === null ? 'no '.$column : $column.' '.self::quoted($type);
 
-            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'successors: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
+            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'targets: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
         }
     }
 

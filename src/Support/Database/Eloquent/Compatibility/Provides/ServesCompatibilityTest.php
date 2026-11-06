@@ -132,6 +132,25 @@ final class ServesCompatibilityTest extends TestCase
         $this->assertSame([4, [[4, 'Birch Hall', false], [5, 'Ash', true]], 0], [$native, $tableRows, $nativeJobs]);
         $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('listings', 'id', 'title')]);
     }
+
+    #[Test]
+    public function it_replicates_a_served_record_onto_a_root_of_its_own_once_installed(): void
+    {
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $jobs = DB::table('jobs')->count();
+
+        $replica = Listing::query()->findOrFail(1)->replicate(['uuid']);
+        $replica->status = ListingStatus::Draft;
+        $replica->save();
+
+        $this->assertSame(['Oak House', $jobs + 1], [Listing::query()->findOrFail($replica->id)->title, DB::table('jobs')->count()]);
+        $this->assertNotSame(DB::table('listings')->where('id', 1)->value('job_id'), DB::table('listings')->where('id', $replica->id)->value('job_id'));
+    }
 }
 
 final class Unmapped extends Model implements Compatible

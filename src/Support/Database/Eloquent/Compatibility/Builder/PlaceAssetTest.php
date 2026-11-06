@@ -341,6 +341,7 @@ final class PlaceAssetTest extends TestCase
         }
 
         $this->assertStringContainsString("cannot run a mass write that reaches record 3, whose PlaceAsset stores asset_type 'retired_asset' through its compatibility map", $refusal);
+        $this->assertStringContainsString('targets: declares no target for it, so no target statement would write the record', $refusal);
         $this->assertEquals($before, DB::table('place_assets')->orderBy('id')->get()->all());
         $this->assertSame(['Tour', 'Oak walkthrough', null], Video::query()->orderBy('id')->pluck('title')->all());
     }

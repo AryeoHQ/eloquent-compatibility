@@ -60,16 +60,26 @@ final readonly class Installer
     public function install(ResolvedMap $map, CarbonInterval $statementTimeout, Closure $compile): void
     {
         $outside = $this->connection->transactionLevel() === 0;
-        $backfiller = new Backfiller($map, $this->connection);
-        $watermark = $backfiller->remembered();
         $budget = self::milliseconds($statementTimeout);
 
         if ($budget < 1) {
             throw new LogicException('Compatibility::install() takes a statementTimeout of at least one millisecond, which bounds how long it holds its lock.');
         }
 
-        if ($watermark !== null && ! $outside) {
+        Statements::refuseUndeclaredDependents(
+            map: $map,
+            connection: $this->connection,
+        );
+        $backfiller = new Backfiller($map, $this->connection);
+        $watermark = $backfiller->remembered();
+        $rolledBack = $watermark === null && $this->rolledBack($map);
+
+        if (($watermark !== null || $rolledBack) && ! $outside) {
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
+        }
+
+        if ($rolledBack) {
+            $watermark = $backfiller->run()['watermark'];
         }
 
         if ($watermark !== null) {
@@ -114,6 +124,24 @@ final readonly class Installer
         });
 
         $this->runAfterwards($install);
+    }
+
+    private function rolledBack(ResolvedMap $map): bool
+    {
+        $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
+        $ledger = Backfiller::ledger($map->table);
+
+        if ($this->connection->scalar(
+            query: "select relkind::text from pg_class where oid = {$relation}",
+            bindings: [SqlFragments::identifier($map->table)],
+        ) !== 'r' || $this->connection->scalar(
+            query: "select {$relation} is not null",
+            bindings: [SqlFragments::identifier($ledger)],
+        ) !== true) {
+            return false;
+        }
+
+        return $this->connection->scalar('select exists (select from '.SqlFragments::identifier($ledger).')') === true;
     }
 
     private static function milliseconds(DateInterval $interval): int

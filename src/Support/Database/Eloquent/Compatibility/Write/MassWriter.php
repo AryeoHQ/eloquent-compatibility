@@ -421,7 +421,7 @@ final readonly class MassWriter
                 $record = is_int($record) || is_string($record) ? $record : '';
 
                 if ($from === null) {
-                    throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.$record.', whose '.class_basename($this->map->primary->model).' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'successors: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
+                    throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.$record.', whose '.class_basename($this->map->primary->model).' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'targets: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
                 }
 
                 $holding[spl_object_id($from)] = $from;

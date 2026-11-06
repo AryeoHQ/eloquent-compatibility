@@ -142,7 +142,7 @@ trait ServesCompatibility
             ExternalAttributes::resolveAll($this);
         }
 
-        return parent::replicate($except);
+        return parent::replicate([...$except ?? [], LegacyBuilder::mapOf(static::class)->successorKey]);
     }
 
     /**

@@ -198,9 +198,6 @@ final readonly class Preparer
             ."  END IF;\n"
             .'  IF '.$this->relation(Backfiller::ledger($map->table))." IS NULL THEN\n"
             ."    RAISE EXCEPTION '%', ".$refusal(Backfiller::ledger($map->table).' does not exist').";\n"
-            ."  END IF;\n"
-            .'  IF '.$this->relation(Backfiller::BACKFILLS).' IS NULL OR NOT EXISTS (SELECT FROM '.SqlFragments::identifier(Backfiller::BACKFILLS).' WHERE legacy_type = '.SqlFragments::literal($map->table).") THEN\n"
-            ."    RAISE EXCEPTION '%', ".$refusal(Backfiller::BACKFILLS." holds no row for {$map->table}").";\n"
             ."  END IF;\nEND\n\$compatibility\$"];
 
         foreach ($map->related as $related) {

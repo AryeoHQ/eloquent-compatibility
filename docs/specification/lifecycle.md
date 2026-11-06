@@ -243,7 +243,7 @@ The legacy model is then the source of truth again.
 
 ### Re-install after rollback
 
-Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger or this model's `compatibility_backfills` row is missing, and the refusal names `prepare()`.
+Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger is missing, and the refusal names `prepare()`.
 
 ## Retire
 
