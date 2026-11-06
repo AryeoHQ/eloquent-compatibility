@@ -11,6 +11,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Throwable;
@@ -91,60 +92,54 @@ final class Status extends Command
      */
     public static function stage(ResolvedMap $map, ConnectionInterface $connection): array
     {
-        $legacy = self::kind(
+        $legacy = Statements::kind(
             connection: $connection,
             table: $map->table,
         );
-        $retained = self::kind(
+        $retained = Statements::kind(
             connection: $connection,
             table: ViewCompiler::retainedTable($map),
         );
-        $ledger = self::kind(
+        $ledger = Statements::kind(
             connection: $connection,
             table: Backfiller::ledger($map->table),
         ) !== null;
-        $backfill = self::kind(
+        $pass = Statements::kind(
             connection: $connection,
             table: Backfiller::BACKFILLS,
-        ) === null ? null : $connection->selectOne(
-            query: "select pass, to_char(watermark_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as watermark from ".SqlFragments::identifier(Backfiller::BACKFILLS).' where legacy_type = ?',
+        ) === null ? null : $connection->scalar(
+            query: 'select pass from '.SqlFragments::identifier(Backfiller::BACKFILLS).' where legacy_type = ?',
             bindings: [$map->table],
+            useReadPdo: false,
         );
 
         return match (true) {
             $legacy === 'v' && $retained === 'r' => ['installed', ''],
             $legacy === null && $retained === null => ['retired', ''],
             $legacy !== 'r' || $retained !== null => ['unknown', "{$map->table} and ".ViewCompiler::retainedTable($map).' match no stage'],
-            $backfill === null && ! $ledger => ['discovered', ''],
-            $backfill === null => ['rolled back', ''],
-            (int) $backfill->pass === 0 => ['prepared', ''],
+            $pass === null && ! $ledger => ['discovered', ''],
+            $pass === null => ['rolled back', ''],
+            (int) $pass === 0 => ['prepared', ''],
             default => ['backfilling', self::progress(
                 map: $map,
                 connection: $connection,
-                pass: (int) $backfill->pass,
-                watermark: is_string($backfill->watermark) ? $backfill->watermark : null,
+                pass: (int) $pass,
                 ledger: $ledger,
             )],
         };
     }
 
-    private static function progress(ResolvedMap $map, ConnectionInterface $connection, int $pass, null|string $watermark, bool $ledger): string
+    private static function progress(ResolvedMap $map, ConnectionInterface $connection, int $pass, bool $ledger): string
     {
         $counts = $ledger ? (array) $connection->selectOne(
-            "select count(*) filter (where status = 'refused') as refused, count(*) filter (where status = 'failed') as failed from ".SqlFragments::identifier(Backfiller::ledger($map->table)),
+            query: "select count(*) filter (where status = 'refused') as refused, count(*) filter (where status = 'failed') as failed from ".SqlFragments::identifier(Backfiller::ledger($map->table))." where status in ('refused', 'failed')",
+            useReadPdo: false,
         ) : [];
 
-        return "pass {$pass}, watermark ".($watermark ?? 'none').', '.(int) ($counts['refused'] ?? 0).' refused, '.(int) ($counts['failed'] ?? 0).' failed';
-    }
-
-    private static function kind(ConnectionInterface $connection, string $table): null|string
-    {
-        $kind = $connection->scalar(
-            query: "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)",
-            bindings: [SqlFragments::identifier($table)],
-        );
-
-        return is_string($kind) ? $kind : null;
+        return "pass {$pass}, watermark ".((new Backfiller(
+            map: $map,
+            connection: $connection,
+        ))->remembered() ?? 'none').', '.(int) ($counts['refused'] ?? 0).' refused, '.(int) ($counts['failed'] ?? 0).' failed';
     }
 
     private function refuse(string $message): int

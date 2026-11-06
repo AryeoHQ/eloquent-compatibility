@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -339,6 +340,36 @@ final class DriftQueriesTest extends TestCase
         $this->assertSame([
             [Image::class, 'outside when()', 'place_images#2', 'its place_assets row no longer matches the when() of Image'],
         ], $this->find(Image::class));
+    }
+
+    #[Test]
+    public function it_plans_the_membership_check_as_an_anti_join_that_tests_each_legacy_row_once(): void
+    {
+        $this->backfilled(Image::class);
+        $queries = [];
+        DB::listen(function (QueryExecuted $query) use (&$queries): void {
+            $queries[] = $query;
+        });
+
+        (new DriftQueries(DB::connection()))->membership(
+            map: Compatibility::of(Image::class)->resolve(),
+            siblings: [],
+            limit: 100,
+        );
+        $this->assertCount(1, $queries);
+        $plan = implode(
+            separator: "\n",
+            array: array_map(
+                callback: fn (object $row) => (string) (((array) $row)['QUERY PLAN'] ?? ''),
+                array: DB::select(
+                    query: 'EXPLAIN '.$queries[0]->sql,
+                    bindings: $queries[0]->bindings,
+                ),
+            ),
+        );
+
+        $this->assertStringContainsString('Anti Join', $plan);
+        $this->assertStringNotContainsString('SubPlan', $plan);
     }
 
     #[Test]

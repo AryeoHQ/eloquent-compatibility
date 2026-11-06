@@ -143,8 +143,12 @@ final class ExternalAttributes
      * @param  list<int|string>  $keys
      * @return array<array-key, mixed>
      */
-    public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo): array
+    public static function values(ResolvedMap $map, string $name, array $keys, null|string $connection, bool $writePdo, null|ColumnCatalog $catalog = null): array
     {
+        $catalog ??= self::catalog(
+            map: $map,
+            connection: $connection,
+        );
         $values = [];
         $served = $map->isMorphed($name) ? $map->morphs : [];
 
@@ -154,8 +158,26 @@ final class ExternalAttributes
 
             if ($attribute->isExternal()) {
                 $values += $owner === $branch->primary
-                    ? self::held($map, $branch, $keys, $connection, $writePdo, $attribute->readExternally(...), false)
-                    : self::heldThrough($map, $branch, $owner->model, $keys, $connection, $writePdo, $attribute->readExternally(...));
+                    ? self::held(
+                        map: $map,
+                        branch: $branch,
+                        keys: $keys,
+                        connection: $connection,
+                        writePdo: $writePdo,
+                        catalog: $catalog,
+                        read: $attribute->readExternally(...),
+                        aliased: false,
+                    )
+                    : self::heldThrough(
+                        map: $map,
+                        branch: $branch,
+                        owner: $owner->model,
+                        keys: $keys,
+                        connection: $connection,
+                        writePdo: $writePdo,
+                        catalog: $catalog,
+                        read: $attribute->readExternally(...),
+                    );
             }
         }
 
@@ -165,7 +187,17 @@ final class ExternalAttributes
             $remaining = array_values(array_filter($keys, fn (int|string $key) => ! array_key_exists($key, $values)));
 
             if ($remaining !== [] && ! $attribute->isExternal() && $fixed instanceof Fixed && $fixed->value !== null) {
-                $values += array_fill_keys(array_keys(self::held($map, $branch, $remaining, $connection, $writePdo)), $fixed->value);
+                $values += array_fill_keys(
+                    keys: array_keys(self::held(
+                        map: $map,
+                        branch: $branch,
+                        keys: $remaining,
+                        connection: $connection,
+                        writePdo: $writePdo,
+                        catalog: $catalog,
+                    )),
+                    value: $fixed->value,
+                );
             }
         }
 
@@ -177,8 +209,12 @@ final class ExternalAttributes
         $key = (new $map->model)->getKeyName();
         $refused = 0;
         $first = [];
+        $catalog = self::catalog(
+            map: $map,
+            connection: (new $map->model)->getConnectionName(),
+        );
 
-        $connection->table($map->table)->select([$key, $name])->chunkById(self::CHUNK, function (iterable $rows) use ($map, $name, $key, &$refused, &$first): void {
+        $connection->table($map->table)->select([$key, $name])->chunkById(self::CHUNK, function (iterable $rows) use ($map, $name, $key, $catalog, &$refused, &$first): void {
             $stored = [];
 
             foreach ($rows as $row) {
@@ -186,7 +222,14 @@ final class ExternalAttributes
                 $stored[self::key($row[$key] ?? null)] = $row[$name] ?? null;
             }
 
-            $values = self::values($map, $name, array_keys($stored), (new $map->model)->getConnectionName(), true);
+            $values = self::values(
+                map: $map,
+                name: $name,
+                keys: array_keys($stored),
+                connection: (new $map->model)->getConnectionName(),
+                writePdo: true,
+                catalog: $catalog,
+            );
 
             foreach ($stored as $legacyKey => $value) {
                 if (! self::same($value, $values[$legacyKey] ?? null)) {
@@ -212,10 +255,14 @@ final class ExternalAttributes
             table: $map->table,
             column: $key,
         ) ?? throw new LogicException("{$map->table} has no column {$key} to restore attribute '{$name}' by.");
+        $catalog = self::catalog(
+            map: $map,
+            connection: (new $map->model)->getConnectionName(),
+        );
 
         $connection->table($map->table)->select([$key])->chunkById(
             count: self::CHUNK,
-            callback: function (iterable $rows) use ($map, $connection, $name, $type, $key, $keyType, $table): void {
+            callback: function (iterable $rows) use ($map, $connection, $name, $type, $key, $keyType, $table, $catalog): void {
                 $keys = [];
 
                 foreach ($rows as $row) {
@@ -230,6 +277,7 @@ final class ExternalAttributes
                     keys: $keys,
                     connection: (new $map->model)->getConnectionName(),
                     writePdo: true,
+                    catalog: $catalog,
                 ) as $legacyKey => $value) {
                     if ($value !== null) {
                         array_push($bindings, (string) $legacyKey, self::bindable(
@@ -260,14 +308,19 @@ final class ExternalAttributes
      * @param  null|Closure(Collection<array-key, Model>): array<array-key, mixed>  $read
      * @return array<array-key, mixed>
      */
-    private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, null|Closure $read = null, bool $aliased = true): array
+    private static function held(ResolvedMap $map, ResolvedMap $branch, array $keys, null|string $connection, bool $writePdo, ColumnCatalog $catalog, null|Closure $read = null, bool $aliased = true): array
     {
         $legacy = (new $map->model)->setConnection($connection);
         $key = $legacy->getKeyName();
-        $legacyQuery = $legacy->getConnection()->table($map->table)->whereRaw(
+        $holder = self::holder(
+            map: $map,
+            catalog: $catalog,
+        );
+        $legacyQuery = $legacy->getConnection()->table($holder)->whereRaw(
             sql: SqlFragments::identifier($key).' = any(cast(? as '.self::arrayType(
-                map: $map,
-                legacy: $legacy,
+                catalog: $catalog,
+                table: $holder,
+                column: $key,
             ).'))',
             bindings: [self::arrayLiteral($keys)],
         )->whereNotNull($map->successorKey);
@@ -281,13 +334,11 @@ final class ExternalAttributes
             key: $key,
         )->all();
         $primary = (new $branch->primary->model)->setConnection($connection);
-        $rootType = ((new ColumnCatalog(
-            connection: $legacy->getConnection(),
-            throughSearchPath: true,
-        ))->type(
-            table: $map->table,
+        $rootType = self::arrayType(
+            catalog: $catalog,
+            table: $holder,
             column: $map->successorKey,
-        ) ?? 'text').'[]';
+        );
         $query = $primary->newModelQuery()->whereRaw(sql: SqlFragments::identifier($primary->getTable()).'.'.SqlFragments::identifier($primary->getKeyName()).' = any(cast(? as '.$rootType.'))', bindings: [self::arrayLiteral(array_values(array_map(
             callback: self::key(...),
             array: $roots,
@@ -333,15 +384,19 @@ final class ExternalAttributes
      * @param  Closure(Collection<array-key, Model>): array<array-key, mixed>  $read
      * @return array<array-key, mixed>
      */
-    private static function heldThrough(ResolvedMap $map, ResolvedMap $branch, string $owner, array $keys, null|string $connection, bool $writePdo, Closure $read): array
+    private static function heldThrough(ResolvedMap $map, ResolvedMap $branch, string $owner, array $keys, null|string $connection, bool $writePdo, ColumnCatalog $catalog, Closure $read): array
     {
         $legacy = (new $map->model)->setConnection($connection);
+        $holder = self::holder(
+            map: $map,
+            catalog: $catalog,
+        );
         $held = SqlFragments::identifier(self::HELD_BY);
         $legacyKey = $held.'.'.SqlFragments::identifier($legacy->getKeyName());
         $model = (new $owner)->setConnection($connection);
         $table = $model->getTable();
         $query = $model->newQueryWithoutScopes()
-            ->fromRaw(SqlFragments::identifier($map->table).' AS '.$held.' JOIN '.SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($branch->primary->key).' = '.$held.'.'.SqlFragments::identifier($map->successorKey).' '.implode(
+            ->fromRaw(SqlFragments::identifier($holder).' AS '.$held.' JOIN '.SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($branch->primary->key).' = '.$held.'.'.SqlFragments::identifier($map->successorKey).' '.implode(
                 separator: ' ',
                 array: ViewCompiler::laterals(
                     map: $branch,
@@ -351,8 +406,9 @@ final class ExternalAttributes
             ->select($table.'.*')
             ->selectRaw($legacyKey.' AS '.$held)
             ->whereRaw($legacyKey.' = any(cast(? as '.self::arrayType(
-                map: $map,
-                legacy: $legacy,
+                catalog: $catalog,
+                table: $holder,
+                column: $legacy->getKeyName(),
             ).'))', [self::arrayLiteral($keys)])
             ->whereNotNull($table.'.'.$model->getKeyName());
 
@@ -427,14 +483,26 @@ final class ExternalAttributes
         }
     }
 
-    private static function arrayType(ResolvedMap $map, Model $legacy): string
+    private static function catalog(ResolvedMap $map, null|string $connection): ColumnCatalog
     {
-        return ((new ColumnCatalog(
-            connection: $legacy->getConnection(),
+        return new ColumnCatalog(
+            connection: (new $map->model)->setConnection($connection)->getConnection(),
             throughSearchPath: true,
-        ))->type(
-            table: $map->table,
-            column: $legacy->getKeyName(),
+        );
+    }
+
+    private static function holder(ResolvedMap $map, ColumnCatalog $catalog): string
+    {
+        $retained = ViewCompiler::retainedTable($map);
+
+        return $catalog->of($retained) === [] ? $map->table : $retained;
+    }
+
+    private static function arrayType(ColumnCatalog $catalog, string $table, string $column): string
+    {
+        return ($catalog->type(
+            table: $table,
+            column: $column,
         ) ?? 'text').'[]';
     }
 

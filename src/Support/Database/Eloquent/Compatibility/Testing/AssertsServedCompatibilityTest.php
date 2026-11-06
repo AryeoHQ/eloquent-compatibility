@@ -20,6 +20,8 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Discovery\InheritedServed;
+use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -43,6 +45,7 @@ final class AssertsServedCompatibilityTest extends TestCase
 
         ListingTables::create();
         ListingTables::seed();
+        $this->app->instance(ServedModels::class, ResolvableServedModels::of($this->app->make(ServedModels::class)));
     }
 
     protected function tearDown(): void
@@ -196,6 +199,21 @@ final class AssertsServedCompatibilityTest extends TestCase
         }
 
         $this->assertStringStartsWith('nativeCreate creates a PlaceAsset that the when() of FloorPlan and of '.class_basename($overlap).' both match, so one root would gain a legacy row in each.', $failure);
+    }
+
+    #[Test]
+    public function it_fails_and_names_a_sibling_map_that_does_not_compile(): void
+    {
+        $this->install();
+        $this->app->forgetInstance(ServedModels::class);
+
+        $this->assertStringStartsWith(
+            'The map of '.InheritedServed::class.', which compatibility:check reads beside '.Listing::class." to prove that no shared successor serves two legacy records, does not compile: Compatibility map 'inherited_serveds' is declared wrongly: it says no servedFrom(), so it names no successor.",
+            $this->failureOf(
+                model: Listing::class,
+                nativeCreate: self::job(),
+            ),
+        );
     }
 
     #[Test]

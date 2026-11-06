@@ -307,7 +307,7 @@ final class MorphTargetTest extends TestCase
         $before = $this->asset('place_brochure', 1);
         DB::update('update place_brochures set id = 99, updated_at = localtimestamp(0) where id = 1');
 
-        $backfiller->run(since: $watermark['updatedAt']);
+        $backfiller->run(since: $watermark);
         Compatibility::install(
             model: Brochure::class,
             statementTimeout: CarbonInterval::seconds(30),

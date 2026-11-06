@@ -64,9 +64,14 @@ final readonly class RelatedMorph
 
         $declared = [];
 
+        ResolvedMap::refuseCaptures(
+            map: $map,
+            role: 'the relatedMorph() choose: closure',
+            closure: $choose,
+        );
+
         foreach (Targets::declare(
             map: $map,
-            choose: $choose,
             targets: $targets,
         ) as $model => $successor) {
             $key = (new $model)->getKeyName();

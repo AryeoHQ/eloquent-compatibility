@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\ConfigurationUrlParser;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
@@ -83,10 +84,13 @@ final class Compatibility
             (new Installer($connection))->install(
                 map: $map,
                 statementTimeout: $statementTimeout,
-                compile: fn () => Statements::install(
+                compile: fn () => self::logged(
                     map: $map,
-                    connection: $connection,
-                    catchingUp: true,
+                    statements: Statements::install(
+                        map: $map,
+                        connection: $connection,
+                        catchingUp: true,
+                    ),
                 ),
             );
         } finally {
@@ -104,10 +108,23 @@ final class Compatibility
 
     public static function rollback(string $model): void
     {
-        self::run(
-            model: $model,
-            statements: Statements::rollback(...),
-        );
+        $map = self::of($model)->resolve();
+        $connection = self::connection($map);
+
+        try {
+            (new Installer($connection))->rollback(
+                map: $map,
+                compile: fn () => self::logged(
+                    map: $map,
+                    statements: Statements::rollback(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                ),
+            );
+        } finally {
+            LegacyBuilder::forgetViews();
+        }
     }
 
     public static function retire(string $model): void
@@ -244,7 +261,7 @@ final class Compatibility
     }
 
     /**
-     * @return array<class-string<Model>, list<class-string<Model>>>
+     * @return list<class-string<Model>>
      */
     public function successors(): array
     {
@@ -263,7 +280,7 @@ final class Compatibility
             }
         }
 
-        return [$this->root->model => $models];
+        return $models;
     }
 
     public function resolve(): ResolvedMap
@@ -358,10 +375,25 @@ final class Compatibility
         $connection = self::connection($map);
 
         try {
-            (new Installer($connection))->compileAndRun($map->tables(), fn () => $statements($map, $connection));
+            (new Installer($connection))->compileAndRun(
+                tables: $map->tables(),
+                compile: fn () => self::logged(
+                    map: $map,
+                    statements: $statements($map, $connection),
+                ),
+            );
         } finally {
             LegacyBuilder::forgetViews();
         }
+    }
+
+    private static function logged(ResolvedMap $map, Statements $statements): Statements
+    {
+        foreach ($statements->notes as $note) {
+            Log::info("Compatibility map '{$map->table}' {$statements->operation}: {$note}");
+        }
+
+        return $statements;
     }
 
     /**

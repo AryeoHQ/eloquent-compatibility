@@ -103,18 +103,36 @@ final class Forwarder
      */
     public static function register(DispatcherContract $events, string $model): void
     {
-        foreach (Compatibility::of($model)->successors() as $primary => $successors) {
-            foreach ($successors as $successor) {
-                $forward = self::lazily($model, $primary, $successor);
-                $forwarded = array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT);
+        $successors = Compatibility::of($model)->successors();
+        $primary = $successors[0] ?? null;
 
-                foreach ($forwarded as $event) {
-                    self::prepend($events, "eloquent.{$event}: {$successor}", fn (Model $instance): null|false => $forward($event, $instance, false));
-                }
+        foreach ($successors as $successor) {
+            $forward = self::lazily(
+                model: $model,
+                successor: $successor,
+            );
+            $forwarded = array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT);
 
-                foreach (self::objects($successor, $forwarded) as $object) {
-                    self::prepend($events, $object, fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
-                }
+            foreach ($forwarded as $event) {
+                self::prepend(
+                    events: $events,
+                    event: "eloquent.{$event}: {$successor}",
+                    listener: fn (Model $instance): null|false => $forward($event, $instance, false),
+                );
+            }
+
+            foreach (self::objects(
+                successor: $successor,
+                events: $forwarded,
+            ) as $object) {
+                self::prepend(
+                    events: $events,
+                    event: $object,
+                    listener: fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin(
+                        fired: $fired,
+                        successor: $successor,
+                    )) === null ? null : $forward($origin[0], $origin[1], true),
+                );
             }
         }
     }
@@ -162,12 +180,15 @@ final class Forwarder
      * @param  class-string<Model>  $model
      * @return Closure(string, Model, bool): (null|false)
      */
-    private static function lazily(string $model, string $primary, string $successor): Closure
+    private static function lazily(string $model, string $successor): Closure
     {
         $forwarder = null;
 
-        return function (string $event, Model $instance, bool $object) use (&$forwarder, $model, $primary, $successor): null|false {
-            $forwarder ??= self::resolve(LegacyBuilder::mapOf($model), $primary, $successor);
+        return function (string $event, Model $instance, bool $object) use (&$forwarder, $model, $successor): null|false {
+            $forwarder ??= self::resolve(
+                map: LegacyBuilder::mapOf($model),
+                successor: $successor,
+            );
 
             return $forwarder->forward($event, $instance, $object);
         };
@@ -319,7 +340,7 @@ final class Forwarder
         return $caller !== null && $caller['function'] === $frame[1] && ($caller['object'] ?? null) === $successor;
     }
 
-    private static function resolve(ResolvedMap $map, string $primary, string $successor): self
+    private static function resolve(ResolvedMap $map, string $successor): self
     {
         $served = $map->morphs[$successor] ?? $map;
 

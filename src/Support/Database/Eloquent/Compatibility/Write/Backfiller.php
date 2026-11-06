@@ -56,15 +56,15 @@ final readonly class Backfiller
 
     /**
      * @param  null|Closure(list<int|string>, int): void  $chunked
-     * @return array{read: int, changed: int, watermark: array{key: null|int|string, updatedAt: string}}
+     * @return array{read: int, changed: int, watermark: string}
      */
     public function run(int $chunk = self::CHUNK, null|string $since = null, null|Closure $chunked = null): array
     {
         $this->refuseUnwalkable($chunk);
         $previous = $this->remembered();
 
-        if ($since !== null && $previous !== null && new DateTimeImmutable($since) > new DateTimeImmutable($previous['updatedAt'])) {
-            throw new LogicException("--since takes a watermark no later than {$previous['updatedAt']}, which the last backfill of {$this->map->table} remembers, not ".(new DateTimeImmutable($since))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z').'; a later one skips the legacy rows updated in between.');
+        if ($since !== null && $previous !== null && new DateTimeImmutable($since) > new DateTimeImmutable($previous)) {
+            throw new LogicException("--since takes a watermark no later than {$previous}, which the last backfill of {$this->map->table} remembers, not ".(new DateTimeImmutable($since))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z').'; a later one skips the legacy rows updated in between.');
         }
 
         $updatedAt = $this->now('backfill');
@@ -74,39 +74,34 @@ final readonly class Backfiller
             chunked: $chunked,
         );
         $changed += $this->deleteGone();
-        $watermark = ['key' => null, 'updatedAt' => $updatedAt];
         $this->remember(
-            watermark: $watermark,
+            watermark: $updatedAt,
             rows: $read,
         );
 
-        return ['read' => $read, 'changed' => $changed, 'watermark' => $watermark];
+        return ['read' => $read, 'changed' => $changed, 'watermark' => $updatedAt];
     }
 
     /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     * @return array{int, int, array{key: null|int|string, updatedAt: string}}
+     * @return array{int, int, string}
      */
-    public function catchUp(array $watermark): array
+    public function catchUp(string $watermark): array
     {
         $this->refuseUnwalkable(self::CHUNK);
         $updatedAt = $this->now('install');
         $updated = $this->updatedAt();
-        $since = $updated === null ? null : $this->updatedSince($watermark['updatedAt']);
-        $scope = $updated === null || $since === null ? null : fn (QueryBuilder $query) => $query->where($since)->orWhereNull($updated)->orWhereNull($this->map->successorKey);
+        $since = $updated === null ? null : $this->updatedSince($watermark);
+        $scope = $since === null ? null : fn (QueryBuilder $query) => $query->where($since)->orWhereNull($updated)->orWhereNull($this->map->successorKey);
         [$read, $changed] = $this->walk(
             chunk: self::CHUNK,
             scope: $scope,
             chunked: null,
         );
 
-        return [$changed + $this->deleteGone(), $read, ['key' => null, 'updatedAt' => $updatedAt]];
+        return [$changed + $this->deleteGone(), $read, $updatedAt];
     }
 
-    /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     */
-    public function refuseUnconvergeable(array $watermark): void
+    public function refuseUnconvergeable(string $watermark): void
     {
         if ($this->updatedAt() === null) {
             throw InvalidCompatibilityMap::cannot($this->map->table, 'install', "{$this->map->table} has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock");
@@ -218,10 +213,7 @@ final readonly class Backfiller
             ."  END IF;\nEND\n\$compatibility\$";
     }
 
-    /**
-     * @return null|array{key: null, updatedAt: string}
-     */
-    public function remembered(): null|array
+    public function remembered(): null|string
     {
         if (! $this->exists(self::BACKFILLS)) {
             return null;
@@ -233,17 +225,14 @@ final readonly class Backfiller
             useReadPdo: false,
         );
 
-        return is_string($watermark) ? ['key' => null, 'updatedAt' => $watermark] : null;
+        return is_string($watermark) ? $watermark : null;
     }
 
-    /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     */
-    public function remember(array $watermark, int $rows): void
+    public function remember(string $watermark, int $rows): void
     {
         $this->connection->update(
             query: 'update '.SqlFragments::identifier(self::BACKFILLS).' set watermark_at = cast(? as timestamptz), pass = pass + 1, pass_started_at = cast(? as timestamptz), pass_finished_at = now(), pass_rows = ? where legacy_type = ?',
-            bindings: [$watermark['updatedAt'], $watermark['updatedAt'], $rows, $this->map->table],
+            bindings: [$watermark, $watermark, $rows, $this->map->table],
         );
     }
 
@@ -259,7 +248,7 @@ final readonly class Backfiller
     /**
      * @param  null|Closure(QueryBuilder): mixed  $scope
      * @param  null|Closure(list<int|string>, int): void  $chunked
-     * @return array{int, int, null|int|string}
+     * @return array{int, int}
      */
     private function walk(int $chunk, null|Closure $scope, null|Closure $chunked): array
     {
@@ -301,7 +290,7 @@ final readonly class Backfiller
             $last = $rows === [] ? $last : self::keyOf(end($rows)[$this->key] ?? null);
         } while (count($rows) === $chunk);
 
-        return [$read, $changed, $last];
+        return [$read, $changed];
     }
 
     /**
@@ -344,6 +333,29 @@ final readonly class Backfiller
             }
         }
 
+        $allocated = $unkeyed === [] ? [] : array_combine(
+            keys: $unkeyed,
+            values: $this->allocate(count($unkeyed)),
+        );
+
+        foreach (array_chunk(
+            array: $allocated === [] ? [] : $this->fillKeys($allocated),
+            length: self::BINDINGS - 2,
+        ) as $batch) {
+            foreach ($this->connection->table($this->map->table)->useWritePdo()->whereIn(
+                column: $this->key,
+                values: $batch,
+            )->whereNotNull($this->map->successorKey)->pluck(
+                column: $this->map->successorKey,
+                key: $this->key,
+            ) as $key => $root) {
+                if (is_int($root) || is_string($root)) {
+                    $named[$key] = $root;
+                    unset($allocated[$key]);
+                }
+            }
+        }
+
         $existing = [];
 
         foreach (array_chunk(
@@ -356,15 +368,6 @@ final readonly class Backfiller
             )->pluck($primary->key) as $found) {
                 $existing[(string) $found] = true;
             }
-        }
-
-        $allocated = $unkeyed === [] ? [] : array_combine(
-            keys: $unkeyed,
-            values: $this->allocate(count($unkeyed)),
-        );
-
-        if ($allocated !== []) {
-            $this->fillKeys($allocated);
         }
 
         $roots = [];
@@ -432,8 +435,9 @@ final readonly class Backfiller
 
     /**
      * @param  array<int|string, int|string>  $allocated
+     * @return list<int|string>
      */
-    private function fillKeys(array $allocated): void
+    private function fillKeys(array $allocated): array
     {
         $types = [(string) $this->catalog->type(
             table: $this->map->table,
@@ -445,12 +449,19 @@ final readonly class Backfiller
         $legacy = SqlFragments::identifier($this->map->table);
         $successorKey = SqlFragments::identifier($this->map->successorKey);
         $pairs = array_map(fn (int|string $legacyKey, int|string $root) => [$legacyKey, $root], array_keys($allocated), $allocated);
+        $unfilled = array_fill_keys(
+            keys: array_map(
+                callback: strval(...),
+                array: array_keys($allocated),
+            ),
+            value: true,
+        );
 
         foreach ($this->batches(
             rows: $pairs,
             width: 2,
         ) as $batch) {
-            $this->connection->affectingStatement(
+            foreach ($this->connection->select(
                 query: "UPDATE {$legacy} SET {$successorKey} = source.compatibility_root"
                     ."\nFROM (VALUES ".implode(
                         separator: ', ',
@@ -460,10 +471,22 @@ final readonly class Backfiller
                             value: "(CAST(? AS {$types[0]}), CAST(? AS {$types[1]}))",
                         ),
                     ).') AS source (compatibility_legacy, compatibility_root)'
-                    ."\nWHERE {$legacy}.".SqlFragments::identifier($this->key)." = source.compatibility_legacy AND {$legacy}.{$successorKey} IS NULL",
+                    ."\nWHERE {$legacy}.".SqlFragments::identifier($this->key)." = source.compatibility_legacy AND {$legacy}.{$successorKey} IS NULL"
+                    ."\nRETURNING {$legacy}.".SqlFragments::identifier($this->key).' AS '.SqlFragments::identifier(self::KEY),
                 bindings: array_merge(...$batch),
-            );
+                useReadPdo: false,
+            ) as $filled) {
+                unset($unfilled[(string) self::keyOf(((array) $filled)[self::KEY] ?? null)]);
+            }
         }
+
+        return array_values(array_filter(
+            array: array_keys($allocated),
+            callback: fn (int|string $legacyKey) => array_key_exists(
+                key: (string) $legacyKey,
+                array: $unfilled,
+            ),
+        ));
     }
 
     /**

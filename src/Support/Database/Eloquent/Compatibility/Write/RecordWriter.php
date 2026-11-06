@@ -554,9 +554,10 @@ final readonly class RecordWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null && $name === $this->map->successorKey && $key !== null) {
-                throw CompatibilityWriteRefused::unsupported(
+                throw CompatibilityWriteRefused::readOnly(
                     model: $legacy::class,
-                    operation: "a write of its successor key {$name} on record {$key}",
+                    attribute: $name,
+                    key: $key,
                     because: 'The successor key binds the record to its '.class_basename($this->map->primary->model).', and a write that rebinds it would serve another root under the same legacy identity.',
                 );
             }

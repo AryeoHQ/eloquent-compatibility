@@ -6,7 +6,7 @@ Compatibility::uninstall() reversed an install. It replayed constraints, indexes
 
 ## Decision
 
-`rollback()` replaces uninstall() as the emergency reversal. It drops the view, drops the successor key's foreign key and its non-NULL check, renames the retained table back, and refills the mapped columns from the successors through the successor key. The legacy model becomes the source of truth again. Rollback also carries the view's grants back to the restored table.
+`rollback()` replaces uninstall() as the emergency reversal. It drops the view, renames the retained table back, and refills the mapped columns from the successors through the successor key. It carries the view's grants back to the restored table. Last, it drops the successor key's foreign key and its non-NULL check. The legacy model becomes the source of truth again.
 
 `retire()` is the separate deprecation operation. Once a legacy model has no readers, it drops the view and the retained table, and leaves the successors untouched. It also drops `<legacy>_backfill` and deletes the model's row from `compatibility_backfills`, because retire rules out the re-install that the ledger's deleted rows serve. It refuses while any object depends on the view or the retained table, inbound foreign keys included, and lists each one. `compatibility:sql retire` prints the legacy-only data it would discard, the ledger and the model's backfill row among it. A second retire() changes nothing.
 

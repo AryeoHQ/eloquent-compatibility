@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Closure;
+use Illuminate\Container\Container;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
@@ -48,8 +49,7 @@ final readonly class Statements
             );
         }
 
-        $preparer = new Preparer(new ColumnCatalog($connection));
-        $prepared = $preparer->statements(
+        $prepared = (new Preparer(new ColumnCatalog($connection)))->statements(
             map: $map,
             connection: $connection,
         );
@@ -57,7 +57,7 @@ final readonly class Statements
         return new self(
             operation: 'prepare',
             transaction: $prepared->transaction,
-            afterwards: [...$prepared->afterwards, ...$preparer->updatedAtIndex($map)],
+            afterwards: $prepared->afterwards,
             notes: self::dependentNotes(
                 connection: $connection,
                 table: $map->table,
@@ -71,10 +71,12 @@ final readonly class Statements
             throw InvalidCompatibilityMap::cannot($map->table, 'install', "the last compatibility:backfill of {$map->table} left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead");
         }
 
-        if (self::kind(
+        $legacyKind = self::kind(
             connection: $connection,
             table: $map->table,
-        ) === 'v' && self::kind(
+        );
+
+        if ($legacyKind === 'v' && self::kind(
             connection: $connection,
             table: ViewCompiler::retainedTable($map),
         ) === 'r') {
@@ -84,17 +86,14 @@ final readonly class Statements
             );
         }
 
-        if (self::kind(
-            connection: $connection,
-            table: $map->table,
-        ) === null) {
+        if ($legacyKind === null) {
             throw InvalidCompatibilityMap::because(
                 map: $map->table,
                 problem: "the legacy table {$map->table} does not exist",
             );
         }
 
-        if (self::kind($connection, $map->table) !== 'r') {
+        if ($legacyKind !== 'r') {
             throw InvalidCompatibilityMap::because(
                 map: $map->table,
                 problem: "{$map->table} is not a plain table, so install() cannot serve it through a view; update() replaces an installed view",
@@ -194,11 +193,6 @@ final readonly class Statements
                 key: $key,
             ),
             ...($hidden === null ? [] : [$hidden]),
-            ...self::reportDependents(
-                map: $map,
-                connection: $connection,
-                operation: 'install',
-            ),
             $readGrants,
         ];
         $beforeInstall = count($transaction) - 1;
@@ -244,16 +238,29 @@ final readonly class Statements
                 connection: $connection,
                 table: $map->table,
             ),
-            locks: [
-                [$map->table, 'SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit'],
-                [$map->primary->table, 'SHARE ROW EXCLUSIVE, from the foreign key, install\'s last statement, until commit'],
-            ],
+            locks: array_map(
+                callback: fn (string $table) => [$table, match ($table) {
+                    $map->table => 'SHARE UPDATE EXCLUSIVE from install\'s first statement, then SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit',
+                    $map->primary->table => 'SHARE UPDATE EXCLUSIVE from install\'s first statement, then SHARE ROW EXCLUSIVE from the foreign key, install\'s last statement, until commit',
+                    default => 'SHARE UPDATE EXCLUSIVE from install\'s first statement until commit',
+                }],
+                array: array_values(array_filter(
+                    array: $map->tables(),
+                    callback: fn (string $table) => self::kind(
+                        connection: $connection,
+                        table: $table,
+                    ) !== null,
+                )),
+            ),
         );
     }
 
     public static function update(ResolvedMap $map, ConnectionInterface $connection): self
     {
-        if (self::kind($connection, $map->table) !== 'v') {
+        if (self::kind(
+            connection: $connection,
+            table: $map->table,
+        ) !== 'v') {
             throw InvalidCompatibilityMap::because(
                 map: $map->table,
                 problem: "{$map->table} is not a view, so update() has nothing to replace; install() creates it",
@@ -272,11 +279,12 @@ final readonly class Statements
     public static function rollback(ResolvedMap $map, ConnectionInterface $connection): self
     {
         $retainedName = ViewCompiler::retainedTable($map);
-
-        if (self::kind(
+        $legacyKind = self::kind(
             connection: $connection,
             table: $map->table,
-        ) === 'r' && self::kind(
+        );
+
+        if ($legacyKind === 'r' && self::kind(
             connection: $connection,
             table: $retainedName,
         ) === null) {
@@ -286,10 +294,7 @@ final readonly class Statements
             );
         }
 
-        if (self::kind(
-            connection: $connection,
-            table: $map->table,
-        ) !== 'v') {
+        if ($legacyKind !== 'v') {
             throw InvalidCompatibilityMap::because(
                 map: $map->table,
                 problem: "{$map->table} is not a view, so rollback() has nothing to reverse",
@@ -322,18 +327,12 @@ final readonly class Statements
 
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
-            ...self::reportDependents(
-                map: $map,
-                connection: $connection,
-                operation: 'rollback',
-            ),
             $readGrants,
         ];
         $beforeRollback = count($statements) - 1;
         $statements = [
             ...$statements,
             "DROP VIEW {$legacyTable}",
-            "ALTER TABLE {$retainedTable}\n  DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier(self::foreignName($map)).",\n  DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier(self::notNullName($map)),
             "ALTER TABLE {$retainedTable} RENAME TO {$legacyTable}",
             ...($columns === [] && $external === [] ? [] : ["ALTER TABLE {$legacyTable}\n  ".implode(
                 separator: ",\n  ",
@@ -373,6 +372,11 @@ final readonly class Statements
             map: $map,
             positions: [$beforeRollback => 'beforeRollback', count($statements) - 1 => 'afterRollback'],
         );
+        $statements = [
+            ...$statements,
+            Installer::lockTimeout(),
+            "ALTER TABLE {$legacyTable}\n  DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier(self::foreignName($map)).",\n  DROP CONSTRAINT IF EXISTS ".SqlFragments::identifier(self::notNullName($map)),
+        ];
 
         return new self(
             operation: 'rollback',
@@ -397,13 +401,16 @@ final readonly class Statements
         $retainedName = ViewCompiler::retainedTable($map);
         $ledger = Backfiller::ledger($map->table);
 
-        if (self::kind(
+        $legacyKind = self::kind(
             connection: $connection,
             table: $map->table,
-        ) === null && self::kind(
+        );
+        $retainedKind = self::kind(
             connection: $connection,
             table: $retainedName,
-        ) === null) {
+        );
+
+        if ($legacyKind === null && $retainedKind === null) {
             return new self(
                 operation: 'retire',
                 transaction: self::kind(
@@ -413,13 +420,7 @@ final readonly class Statements
             );
         }
 
-        if (self::kind(
-            connection: $connection,
-            table: $map->table,
-        ) !== 'v' || self::kind(
-            connection: $connection,
-            table: $retainedName,
-        ) !== 'r') {
+        if ($legacyKind !== 'v' || $retainedKind !== 'r') {
             throw InvalidCompatibilityMap::cannot(
                 map: $map->table,
                 operation: 'retire',
@@ -542,22 +543,6 @@ final readonly class Statements
         }
     }
 
-    /**
-     * @return list<string>
-     */
-    public static function reportDependents(ResolvedMap $map, ConnectionInterface $connection, string $operation): array
-    {
-        $dependents = self::dependents(
-            connection: $connection,
-            table: $map->table,
-        );
-
-        return $dependents === [] ? [] : ["DO \$compatibility\$\nBEGIN\n  RAISE NOTICE '%', ".SqlFragments::literal("Compatibility map '{$map->table}' {$operation}: ".implode(
-            separator: ', ',
-            array: $dependents,
-        ).' '.(count($dependents) === 1 ? 'depends' : 'depend')." on {$map->table}").";\nEND\n\$compatibility\$"];
-    }
-
     public static function notNullName(ResolvedMap $map): string
     {
         return SqlFragments::objectName(
@@ -651,8 +636,7 @@ final readonly class Statements
 
         foreach ($positions as $position => $hook) {
             $hooks[$position][] = [class_basename($dependents).'::'.$hook.'()', function (Connection $connection) use ($dependents, $hook): void {
-                $instance = app($dependents);
-                $instance->{$hook}($connection);
+                Container::getInstance()->make($dependents)->{$hook}($connection);
             }];
         }
 
@@ -678,7 +662,45 @@ final readonly class Statements
             ."  END IF;\nEND\n\$compatibility\$";
     }
 
-    private static function reportHidden(ResolvedMap $map, string $key): null|string
+    public static function hiddenBeforeTheLock(ResolvedMap $map, ConnectionInterface $connection): null|string
+    {
+        $key = (new $map->model)->getKeyName();
+        $hidden = self::hiddenRows($map);
+
+        if ($hidden === null || self::kind(
+            connection: $connection,
+            table: $map->table,
+        ) !== 'r' || $connection->scalar(
+            query: "select exists (select from pg_attribute where attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attname = ? and attnum > 0 and not attisdropped)",
+            bindings: [SqlFragments::identifier($map->table), $map->successorKey],
+            useReadPdo: false,
+        ) !== true) {
+            return null;
+        }
+
+        $legacyKey = SqlFragments::identifier($map->table).'.'.SqlFragments::identifier($key);
+        $count = $connection->scalar(
+            query: "SELECT count(*) {$hidden}",
+            useReadPdo: false,
+        );
+
+        if (! is_int($count) || $count === 0) {
+            return null;
+        }
+
+        return "hides {$count} {$map->table} rows, because a hide() rule matches their {$map->primary->table} row; the first are {$key} ".implode(
+            separator: ', ',
+            array: array_map(
+                callback: fn (object $row) => (string) (((array) $row)['key'] ?? ''),
+                array: $connection->select(
+                    query: "SELECT {$legacyKey} AS key {$hidden} ORDER BY {$legacyKey} LIMIT 5",
+                    useReadPdo: false,
+                ),
+            ),
+        ).'. Install read this count before it took its lock.';
+    }
+
+    private static function hiddenRows(ResolvedMap $map): null|string
     {
         $conditions = ViewCompiler::hidden($map);
 
@@ -688,9 +710,21 @@ final readonly class Statements
 
         $legacyTable = SqlFragments::identifier($map->table);
         $primary = SqlFragments::identifier($map->primary->table);
-        $legacyKey = "{$legacyTable}.".SqlFragments::identifier($key);
-        $hidden = "FROM {$legacyTable} WHERE EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($map->primary->key)." = {$legacyTable}.".SqlFragments::identifier($map->successorKey).' AND ('
+
+        return "FROM {$legacyTable} WHERE EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($map->primary->key)." = {$legacyTable}.".SqlFragments::identifier($map->successorKey).' AND ('
             .implode(' OR ', array_map(fn (string $condition) => 'COALESCE(('.$condition.'), false)', $conditions)).'))';
+    }
+
+    private static function reportHidden(ResolvedMap $map, string $key): null|string
+    {
+        $hidden = self::hiddenRows($map);
+
+        if ($hidden === null) {
+            return null;
+        }
+
+        $legacyTable = SqlFragments::identifier($map->table);
+        $legacyKey = "{$legacyTable}.".SqlFragments::identifier($key);
         $notice = SqlFragments::literal("Compatibility map '{$map->table}' install hides ")
             .' || hidden_rows || '.SqlFragments::literal(" {$map->table} rows, because a hide() rule matches their {$map->primary->table} row; the first are {$key} ")
             .' || first_keys || '.SqlFragments::literal('.');
@@ -886,30 +920,17 @@ final readonly class Statements
     }
 
     /**
-     * @return list<object{name: string, table: string, qualifiedTable: string, column: string, referencingColumns: list<string>, referencedColumn: string, columns: int, onUpdate: string, onDelete: string, matchType: string, deferrable: bool, deferred: bool, validated: bool}>
+     * @return list<object{name: string, table: string, referencedColumn: string}>
      */
     private static function foreignKeysTo(ConnectionInterface $connection, string $table): array
     {
         $rows = $connection->select(
             "select foreign_key.conname as name,
-                    case when referencing_schema.nspname = current_schema() then null else referencing_schema.nspname end as schema,
                     referencing_table.relname as \"table\",
-                    referencing_column.attname as \"column\",
-                    (select json_agg(attribute.attname order by key_column.position)
-                     from unnest(foreign_key.conkey) with ordinality as key_column (attnum, position)
-                     join pg_attribute attribute on attribute.attrelid = foreign_key.conrelid and attribute.attnum = key_column.attnum) as referencing_columns,
-                    referenced_column.attname as referenced_column,
-                    cardinality(foreign_key.conkey) as columns,
-                    foreign_key.confupdtype::text as on_update,
-                    foreign_key.confdeltype::text as on_delete,
-                    foreign_key.confmatchtype::text as match_type,
-                    foreign_key.condeferrable as deferrable,
-                    foreign_key.condeferred as deferred,
-                    foreign_key.convalidated as validated
+                    referenced_column.attname as referenced_column
              from pg_constraint foreign_key
              join pg_class referencing_table on referencing_table.oid = foreign_key.conrelid
              join pg_namespace referencing_schema on referencing_schema.oid = referencing_table.relnamespace
-             join pg_attribute referencing_column on referencing_column.attrelid = foreign_key.conrelid and referencing_column.attnum = foreign_key.conkey[cardinality(foreign_key.conkey)]
              join pg_attribute referenced_column on referenced_column.attrelid = foreign_key.confrelid and referenced_column.attnum = foreign_key.confkey[cardinality(foreign_key.confkey)]
              where foreign_key.contype = 'f' and foreign_key.conparentid = 0
                and foreign_key.confrelid = to_regclass(quote_ident(current_schema()) || '.' || ?)
@@ -920,17 +941,7 @@ final readonly class Statements
         return array_values(array_map(fn (object $row) => (object) [
             'name' => (string) $row->name,
             'table' => (string) $row->table,
-            'qualifiedTable' => ($row->schema === null ? '' : SqlFragments::identifier((string) $row->schema).'.').SqlFragments::identifier((string) $row->table),
-            'column' => (string) $row->column,
-            'referencingColumns' => array_values(array_map(strval(...), (array) json_decode((string) $row->referencing_columns, true))),
             'referencedColumn' => (string) $row->referenced_column,
-            'columns' => (int) $row->columns,
-            'onUpdate' => (string) $row->on_update,
-            'onDelete' => (string) $row->on_delete,
-            'matchType' => (string) $row->match_type,
-            'deferrable' => $row->deferrable === true,
-            'deferred' => $row->deferred === true,
-            'validated' => $row->validated === true,
         ], $rows));
     }
 
@@ -941,14 +952,13 @@ final readonly class Statements
         return is_string($sequence) ? $sequence : null;
     }
 
-    private static function relationIn(string $name): string
+    public static function kind(ConnectionInterface $connection, string $table): null|string
     {
-        return 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
-    }
-
-    private static function kind(ConnectionInterface $connection, string $table): null|string
-    {
-        $kind = $connection->scalar("select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)", [SqlFragments::identifier($table)]);
+        $kind = $connection->scalar(
+            query: "select relkind::text from pg_class where oid = to_regclass(quote_ident(current_schema()) || '.' || ?)",
+            bindings: [SqlFragments::identifier($table)],
+            useReadPdo: false,
+        );
 
         return is_string($kind) ? $kind : null;
     }

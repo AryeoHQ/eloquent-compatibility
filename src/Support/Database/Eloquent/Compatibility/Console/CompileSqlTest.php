@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
@@ -18,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Schema\InstallerTest;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
@@ -26,6 +28,7 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\ListingTitles;
 use Tests\TestCase;
 
 #[CoversClass(CompileSql::class)]
@@ -100,6 +103,119 @@ final class CompileSqlTest extends TestCase
         )."\n;\n\nCOMMIT;\n", $body);
         $this->assertStringEndsWith("ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY (\"job_id\") REFERENCES \"jobs\" (\"id\") ON DELETE CASCADE NOT VALID\n;\n\nCOMMIT;\n", $body);
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
+    }
+
+    #[Test]
+    public function it_prints_each_dependent_and_where_each_hook_of_dependents_runs_in_the_install(): void
+    {
+        DB::statement(ListingTitles::VIEW);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing)->dependents(ListingTitles::class);
+            }
+        };
+
+        try {
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => $model::class],
+            );
+            [$header, $body] = explode(
+                separator: "\n\nBEGIN;\n\n",
+                string: Artisan::output(),
+                limit: 2,
+            );
+        } finally {
+            DB::statement('drop view listing_titles');
+        }
+
+        $printed = explode(
+            separator: "\n\n",
+            string: $body,
+        );
+        $before = array_search(
+            needle: '-- ListingTitles::beforeInstall() runs here, inside the transaction',
+            haystack: $printed,
+            strict: true,
+        );
+        $after = array_search(
+            needle: '-- ListingTitles::afterInstall() runs here, inside the transaction',
+            haystack: $printed,
+            strict: true,
+        );
+
+        $this->assertContains('-- view listing_titles depends on listings', explode(
+            separator: "\n",
+            string: $header,
+        ));
+        $this->assertIsInt($before);
+        $this->assertIsInt($after);
+        $this->assertStringStartsWith("SELECT set_config('compatibility.grants'", $printed[$before - 1]);
+        $this->assertStringContainsString('EXECUTE granted;', $printed[$after - 1]);
+        $this->assertStringStartsWith('ALTER TABLE "listings" RENAME TO "listings_retained"', $printed[$before + 1]);
+    }
+
+    #[Test]
+    public function it_prints_the_legacy_only_data_retire_discards(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        DB::statement('drop table listing_photos, listing_shares');
+
+        $this->assertSame(0, Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'retire', 'model' => Listing::class],
+        ));
+
+        $this->assertSame([
+            '-- retire() discards listings_retained: 3 rows, with the legacy-only columns uuid, mls_number, featured',
+            '-- retire() discards listings_backfill, the backfill ledger of listings',
+            '-- retire() discards the compatibility_backfills row of listings',
+        ], array_slice(
+            array: explode(
+                separator: "\n",
+                string: explode(
+                    separator: "\n\nBEGIN;\n\n",
+                    string: Artisan::output(),
+                    limit: 2,
+                )[0],
+            ),
+            offset: 3,
+        ));
+    }
+
+    #[DataProviderExternal(InstallerTest::class, 'dependents')]
+    #[Test]
+    public function it_prints_each_object_that_depends_on_the_legacy_table_in_the_prepare_header(string $create, string $drop, string $dependent): void
+    {
+        DB::statement($create);
+
+        try {
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'prepare', 'model' => Listing::class],
+            );
+            $printed = Artisan::output();
+        } finally {
+            DB::statement($drop);
+        }
+
+        $this->assertContains("-- {$dependent} depends on listings", explode(
+            separator: "\n",
+            string: explode(
+                separator: "\n\nBEGIN;\n\n",
+                string: $printed,
+                limit: 2,
+            )[0],
+        ));
     }
 
     #[Test]

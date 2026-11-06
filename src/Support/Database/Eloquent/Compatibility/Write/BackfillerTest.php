@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -95,14 +96,13 @@ final class BackfillerTest extends TestCase
         DB::update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
         DB::update("update listings set title = 'Elm Lodge' where id = 3");
 
-        $caughtUp = $this->backfiller(Listing::class)->run(since: $watermark['updatedAt']);
+        $caughtUp = $this->backfiller(Listing::class)->run(since: $watermark);
 
         $this->assertSame([1, 1], [$caughtUp['read'], $caughtUp['changed']]);
         $this->assertSame(['Oak Manor', 'Pine Flat', 'Elm Cottage'], array_column(
             array: $this->rows('select jobs.name from jobs join listings on listings.job_id = jobs.id order by listings.id'),
             column_key: 'name',
         ));
-        $this->assertSame($watermark['key'], $caughtUp['watermark']['key']);
         $this->assertSame($caughtUp['watermark'], $this->backfiller(Listing::class)->remembered());
     }
 
@@ -189,7 +189,7 @@ final class BackfillerTest extends TestCase
 
         $opened = trim((string) fgets($pipes[1]));
         usleep(1200000);
-        $watermark = $this->backfiller(Listing::class)->run()['watermark']['updatedAt'];
+        $watermark = $this->backfiller(Listing::class)->run()['watermark'];
         proc_close($process);
 
         $this->assertMatchesRegularExpression('/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/', $opened);
@@ -527,6 +527,27 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
+    public function it_writes_the_root_a_live_writer_names_while_its_pass_runs_and_creates_no_root_beside_it(): void
+    {
+        $raced = '019a5e3c-8f00-7000-8000-000000000002';
+        $read = false;
+        DB::listen(function (QueryExecuted $query) use (&$read, $raced): void {
+            if ($read || $query->sql !== 'select * from "listings" order by "id" asc limit 1000') {
+                return;
+            }
+
+            $read = true;
+            $this->assertSame('unblocked', $this->concurrently("insert into jobs (id, name, company_id) values ('{$raced}', 'Raced', '".ListingTables::COMPANY."'); update listings set job_id = '{$raced}' where id = 2"));
+        });
+
+        $this->backfiller(Listing::class)->run();
+
+        $this->assertSame([true, $raced, 3, 0], [$read, DB::scalar('select job_id from listings where id = 2'), DB::table('jobs')->count(), DB::scalar('select count(*) from jobs where id not in (select job_id from listings)')]);
+        $this->assertSame(['successor_id' => $raced, 'status' => 'updated'], (array) DB::selectOne('select successor_id, status from listings_backfill where legacy_id = 2'));
+        $this->assertSame('Pine Flat', DB::scalar('select name from jobs where id = ?', [$raced]));
+    }
+
+    #[Test]
     public function it_keeps_the_successors_of_a_legacy_row_whose_key_changed(): void
     {
         $watermark = $this->backfiller(Listing::class)->run()['watermark'];
@@ -534,7 +555,7 @@ final class BackfillerTest extends TestCase
         DB::statement('alter table listing_photos drop constraint listing_photos_listing_id_foreign, add constraint listing_photos_listing_id_foreign foreign key (listing_id) references listings (id) on update cascade');
         DB::update('update listings set id = 99, updated_at = localtimestamp(0) where id = 1');
 
-        $this->backfiller(Listing::class)->run(since: $watermark['updatedAt']);
+        $this->backfiller(Listing::class)->run(since: $watermark);
         Compatibility::install(
             model: Listing::class,
             statementTimeout: CarbonInterval::seconds(30),

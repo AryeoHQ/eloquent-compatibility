@@ -750,6 +750,38 @@ final class MassWriterTest extends TestCase
         )->whereNotNull('jobs.price_cents')->orderBy('listings_retained.id')->pluck('jobs.price_cents')->all());
     }
 
+    #[DataProvider('successorKeyWrites')]
+    #[Test]
+    public function it_refuses_a_write_of_the_successor_key_as_a_write_of_an_attribute_the_legacy_model_cannot_change(Closure $write, string $refused, string $because): void
+    {
+        $before = DB::table('listings_retained')->orderBy('id')->pluck('job_id')->all();
+
+        $refusal = $this->refusal(fn () => $write(DB::table('jobs')->where(
+            column: 'name',
+            operator: '=',
+            value: 'Elm Cottage',
+        )->value('id')));
+
+        $this->assertSame("{$refused} cannot change \$job_id. Why: {$because} Instead: Leave job_id unchanged in writes through Listing.", $refusal->getMessage());
+        $this->assertSame($before, DB::table('listings_retained')->orderBy('id')->pluck('job_id')->all());
+    }
+
+    /**
+     * @return array<string, array{Closure(mixed): mixed, string, string}>
+     */
+    public static function successorKeyWrites(): array
+    {
+        return [
+            'a record write' => [function (mixed $job): void {
+                $listing = Listing::query()->findOrFail(1);
+                $listing->job_id = $job;
+                $listing->save();
+            }, Listing::class.' record 1', 'The successor key binds the record to its Job, and a write that rebinds it would serve another root under the same legacy identity.'],
+            'a mass write' => [fn (mixed $job) => Listing::query()->whereKey(1)->update(['job_id' => $job]), Listing::class.' records', 'The successor key binds each record to its Job, and a write that changes it would serve another root under the same legacy identity.'],
+            'an increment' => [fn () => Listing::query()->whereKey(1)->increment('job_id'), Listing::class.' records', 'The successor key binds each record to its Job, and a write that changes it would serve another root under the same legacy identity.'],
+        ];
+    }
+
     #[Test]
     public function it_refuses_a_mass_write_of_an_attribute_that_runs_transitions(): void
     {

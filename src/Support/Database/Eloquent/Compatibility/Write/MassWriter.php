@@ -176,9 +176,10 @@ final readonly class MassWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null && $name === $this->map->successorKey) {
-                throw CompatibilityWriteRefused::unsupported(
+                throw CompatibilityWriteRefused::readOnly(
                     model: $this->map->model,
-                    operation: "an increment of its successor key {$name}",
+                    attribute: $name,
+                    key: null,
                     because: 'The successor key binds each record to its '.class_basename($this->map->primary->model).', and a write that changes it would serve another root under the same legacy identity.',
                 );
             }
@@ -665,9 +666,10 @@ final readonly class MassWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null && $name === $this->map->successorKey) {
-                throw CompatibilityWriteRefused::unsupported(
+                throw CompatibilityWriteRefused::readOnly(
                     model: $this->map->model,
-                    operation: "a mass write of its successor key {$name}",
+                    attribute: $name,
+                    key: null,
                     because: 'The successor key binds each record to its '.class_basename($this->map->primary->model).', and a write that changes it would serve another root under the same legacy identity.',
                 );
             }

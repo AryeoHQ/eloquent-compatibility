@@ -54,8 +54,14 @@ final class CheckDrift extends Command
         foreach ($served->all() as $sibling) {
             try {
                 $siblings[] = Compatibility::of($sibling)->resolve();
-            } catch (Throwable) {
-                continue;
+            } catch (Throwable $exception) {
+                if (! in_array(
+                    needle: $sibling,
+                    haystack: $models,
+                    strict: true,
+                )) {
+                    $refusals[] = "{$sibling}: {$exception->getMessage()} The check of every map that shares its successors is incomplete.";
+                }
             }
         }
 

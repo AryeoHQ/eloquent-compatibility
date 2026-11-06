@@ -36,11 +36,6 @@ final readonly class Preparer
                     map: $map,
                     connection: $connection,
                 ),
-                ...Statements::reportDependents(
-                    map: $map,
-                    connection: $connection,
-                    operation: 'prepare',
-                ),
             ],
             afterwards: [
                 ...$this->uniqueIndex(
@@ -51,6 +46,7 @@ final readonly class Preparer
                     constraint: true,
                 ),
                 ...$indexes,
+                ...$this->updatedAtIndex($map),
             ],
         );
     }
@@ -103,7 +99,7 @@ final readonly class Preparer
     /**
      * @return list<string>
      */
-    public function updatedAtIndex(ResolvedMap $map): array
+    private function updatedAtIndex(ResolvedMap $map): array
     {
         $legacy = new $map->model;
         $column = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;

@@ -15,7 +15,11 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Discovery\InheritedServed;
+use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
+use Tests\Fixtures\Support\Discovery\TraitServed;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
@@ -39,6 +43,7 @@ final class CheckDriftTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
+        $this->app->instance(ServedModels::class, ResolvableServedModels::of($this->app->make(ServedModels::class)));
     }
 
     protected function tearDown(): void
@@ -187,6 +192,21 @@ final class CheckDriftTest extends TestCase
                 [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             ])
             ->expectsOutputToContain($unresolved::class.": Compatibility map 'listings' is declared wrongly: it says no servedFrom(), so it names no successor.")
+            ->doesntExpectOutputToContain('No drift')
+            ->assertFailed();
+    }
+
+    #[Test]
+    public function it_names_each_sibling_map_that_fails_to_resolve_and_exits_non_zero_although_the_model_it_checks_has_not_drifted(): void
+    {
+        $this->app->forgetInstance(ServedModels::class);
+
+        $this->artisan(
+            command: 'compatibility:check',
+            parameters: ['--model' => [Listing::class]],
+        )
+            ->expectsOutputToContain(InheritedServed::class.": Compatibility map 'inherited_serveds' is declared wrongly: it says no servedFrom(), so it names no successor. The check of every map that shares its successors is incomplete.")
+            ->expectsOutputToContain(TraitServed::class.": Compatibility map 'trait_serveds' is declared wrongly: it says no servedFrom(), so it names no successor. The check of every map that shares its successors is incomplete.")
             ->doesntExpectOutputToContain('No drift')
             ->assertFailed();
     }

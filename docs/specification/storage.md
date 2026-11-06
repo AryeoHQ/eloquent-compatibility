@@ -65,7 +65,7 @@ Prepare adds neither constraint. A `NOT VALID` constraint still applies to new r
 
 Declined: a nullable key that relies on the probe alone. Declined: requiring a backfill, or the creation of every physical Job, before `prepare()`. Declined: keeping the foreign key at prepare as `NO ACTION`, which still rejects the same inserts ([0018](../decisions/0018-legacy-identity-stays-on-the-legacy-table.md)).
 
-Rollback mirrors install. Before it renames the retained table back, it drops the check and the foreign key. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback.
+Rollback mirrors install. As its last statement, it drops the check and the foreign key, because the drop locks the root's table against every read until rollback commits. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback.
 
 From install onward, `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key. Before install, a successor delete leaves the legacy row in place. Its key then names no row, and the backfill treats the row as having no successor yet. The delete leaves the legacy row's `updated_at` unchanged, so no incremental pass walks the row. Install's existence proof flags its key, and install's catch-up reaches the row and creates the root with the key value.
 

@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Closure;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\QueryException;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
@@ -194,35 +195,36 @@ final readonly class DriftQueries
         $retained = SqlFragments::identifier(ViewCompiler::retainedTable($map));
         $legacyKey = $retained.'.'.SqlFragments::identifier($key);
         [$pending, $bindings] = $this->pending($map, $retained);
-        $findings = [];
+        $differs = [];
 
-        foreach ([$map] as $branch) {
-            $differs = [];
-
-            foreach ($compiler->served($branch, $shape, $map->externals(), $map->table) as $name => $read) {
-                [$read, $stored] = self::comparable($catalog, $shape[$name], $read, $retained.'.'.SqlFragments::identifier($name));
-                $differs[] = "CASE WHEN {$read} IS DISTINCT FROM {$stored} THEN ".SqlFragments::literal($name).' END';
-            }
-
-            $rows = $this->connection->select(
-                "SELECT compared.key, array_to_string(compared.attributes, ', ') AS attributes FROM (SELECT {$legacyKey} AS key, array_remove(ARRAY[".implode(', ', $differs).'], NULL) AS attributes'
-                    .' FROM '.SqlFragments::identifier($map->table).' AS '.$retained
-                    .' '.ViewCompiler::root(
-                        map: $branch,
-                        retained: ViewCompiler::retainedTable($map),
-                    )
-                    .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($branch)))
-                    .($pending === '' ? '' : " WHERE {$pending}").') AS compared WHERE cardinality(compared.attributes) > 0 ORDER BY compared.key LIMIT ?',
-                [...$bindings, $limit],
-                false,
-            );
-
-            foreach ($rows as $row) {
-                $findings[] = new DriftFinding($map->model, DriftCheck::ValuesDiffer, self::record($map->table, $row->key ?? null), "{$map->table} holds other values for ".self::text($row->attributes ?? null).' than the view would serve from '.$branch->primary->table);
-            }
+        foreach ($compiler->served($map, $shape, $map->externals(), $map->table) as $name => $read) {
+            [$read, $stored] = self::comparable($catalog, $shape[$name], $read, $retained.'.'.SqlFragments::identifier($name));
+            $differs[] = "CASE WHEN {$read} IS DISTINCT FROM {$stored} THEN ".SqlFragments::literal($name).' END';
         }
 
-        $findings = array_slice($findings, 0, $limit);
+        $findings = array_values(array_map(
+            callback: fn (object $row) => new DriftFinding(
+                model: $map->model,
+                check: DriftCheck::ValuesDiffer,
+                record: self::record(
+                    table: $map->table,
+                    key: $row->key ?? null,
+                ),
+                detail: "{$map->table} holds other values for ".self::text($row->attributes ?? null).' than the view would serve from '.$map->primary->table,
+            ),
+            array: $this->connection->select(
+                query: "SELECT compared.key, array_to_string(compared.attributes, ', ') AS attributes FROM (SELECT {$legacyKey} AS key, array_remove(ARRAY[".implode(', ', $differs).'], NULL) AS attributes'
+                    .' FROM '.SqlFragments::identifier($map->table).' AS '.$retained
+                    .' '.ViewCompiler::root(
+                        map: $map,
+                        retained: ViewCompiler::retainedTable($map),
+                    )
+                    .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($map)))
+                    .($pending === '' ? '' : " WHERE {$pending}").') AS compared WHERE cardinality(compared.attributes) > 0 ORDER BY compared.key LIMIT ?',
+                bindings: [...$bindings, $limit],
+                useReadPdo: false,
+            ),
+        ));
 
         return [...$findings, ...$this->externalsDiffering($map, $shape, $limit - count($findings))];
     }
@@ -258,13 +260,24 @@ final readonly class DriftQueries
         }
 
         $connection = (new $map->model)->getConnectionName();
+        $catalog = new ColumnCatalog(
+            connection: (new $map->model)->setConnection($connection)->getConnection(),
+            throughSearchPath: true,
+        );
         $findings = [];
 
-        $this->walk($map, function (array $rows) use ($map, $externals, $connection, $limit, &$findings): bool {
+        $this->walk($map, function (array $rows) use ($map, $externals, $connection, $catalog, $limit, &$findings): bool {
             $differs = [];
 
             foreach ($externals as $name) {
-                $values = ExternalAttributes::values($map, $name, array_keys($rows), $connection, true);
+                $values = ExternalAttributes::values(
+                    map: $map,
+                    name: $name,
+                    keys: array_keys($rows),
+                    connection: $connection,
+                    writePdo: true,
+                    catalog: $catalog,
+                );
 
                 foreach ($rows as $key => $row) {
                     if (! ExternalAttributes::same($row[$name] ?? null, $values[$key] ?? null)) {
@@ -406,7 +419,7 @@ final readonly class DriftQueries
 
         $column = $table.'.'.SqlFragments::identifier($updatedAt);
 
-        return ["NOT (COALESCE({$column} >= {$bound}, false) OR {$column} IS NULL OR {$table}.".SqlFragments::identifier($map->successorKey).' IS NULL)', [$watermark['updatedAt']]];
+        return ["NOT (COALESCE({$column} >= {$bound}, false) OR {$column} IS NULL OR {$table}.".SqlFragments::identifier($map->successorKey).' IS NULL)', [$watermark]];
     }
 
     /**
@@ -417,8 +430,10 @@ final readonly class DriftQueries
         $retainedTable = ViewCompiler::retainedTable($map);
         $retained = SqlFragments::identifier($retainedTable);
         $legacyKey = $retained.'.'.SqlFragments::identifier(self::key($map));
-        $primary = SqlFragments::identifier($map->primary->table);
-        $sql = "SELECT {$legacyKey} AS key FROM {$retained} WHERE NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($map->primary->key)." = {$retained}.".SqlFragments::identifier($map->successorKey).')';
+        $sql = "SELECT {$legacyKey} AS key FROM {$retained} WHERE NOT ".self::held(
+            map: $map,
+            legacy: $retained,
+        );
 
         return array_values(array_map(
             fn (object $row) => new DriftFinding(
@@ -537,14 +552,21 @@ final readonly class DriftQueries
             return [];
         }
 
-        $members = (new $map->primary->model)->setConnection((new $map->model)->getConnectionName())->newModelQuery();
-        $when($members);
-        $members->select($members->qualifyColumn($map->primary->key));
         $legacy = SqlFragments::identifier($map->table);
-        $successorKey = $legacy.'.'.SqlFragments::identifier($map->successorKey);
+        $members = (new $map->primary->model)->setConnection((new $map->model)->getConnectionName())->newModelQuery();
+        $members->select($members->qualifyColumn($map->primary->key))->whereColumn(
+            first: $members->qualifyColumn($map->primary->key),
+            operator: '=',
+            second: $map->table.'.'.$map->successorKey,
+        )->where(function (Builder $member) use ($when): void {
+            $when($member);
+        });
         $base = $members->toBase();
         $rows = $this->connection->select(
-            query: "SELECT {$legacy}.".SqlFragments::identifier(self::key($map))." AS key FROM {$legacy} WHERE {$successorKey} IS NOT NULL AND EXISTS (SELECT FROM ".SqlFragments::identifier($map->primary->table).' WHERE '.SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier($map->primary->key)." = {$successorKey}) AND {$successorKey} NOT IN (".$base->toSql().') ORDER BY 1 LIMIT ?',
+            query: "SELECT {$legacy}.".SqlFragments::identifier(self::key($map))." AS key FROM {$legacy} WHERE ".self::held(
+                map: $map,
+                legacy: $legacy,
+            ).' AND NOT EXISTS ('.$base->toSql().') ORDER BY 1 LIMIT ?',
             bindings: [...$base->getBindings(), $limit],
             useReadPdo: false,
         );

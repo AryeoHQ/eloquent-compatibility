@@ -242,8 +242,6 @@ final readonly class ResolvedMap
      */
     private function refuseUnreadable(array $branches): void
     {
-        $noun = 'target';
-
         $declaredIn = [];
 
         foreach ($branches as $successor => $branch) {
@@ -255,7 +253,7 @@ final readonly class ResolvedMap
         foreach ($branches as $successor => $branch) {
             foreach ($declaredIn as $name => $declared) {
                 if (! array_key_exists($name, $branch->attributes)) {
-                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared)." {$noun} and not in the ".class_basename($successor)." {$noun}; give it from(), external() or fixed() there");
+                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' target and not in the '.class_basename($successor).' target; give it from(), external() or fixed() there');
                 }
             }
         }
@@ -267,7 +265,7 @@ final readonly class ResolvedMap
                 $attribute = $branch->attributes[$name];
 
                 if (! $attribute->isExternal() && ! ($attribute->column() === null && ($attribute->conversions()[0] ?? null) instanceof Fixed)) {
-                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external))." {$noun} and reads SQL in the ".class_basename($successor)." {$noun}, and the view serves an external attribute from no {$noun}; declare it external() or fixed() there");
+                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external)).' target and reads SQL in the '.class_basename($successor).' target, and the view serves an external attribute from no target; declare it external() or fixed() there');
                 }
             }
         }

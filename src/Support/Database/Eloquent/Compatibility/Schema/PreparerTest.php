@@ -7,11 +7,14 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 use DateTimeImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
@@ -125,6 +128,58 @@ final class PreparerTest extends TestCase
             notNull: false,
         ), (new ColumnCatalog(DB::connection()))->of('floorplans')['place_asset_id']);
         $this->assertSame(['UNIQUE (place_asset_id)', 0], [DB::scalar("select pg_get_constraintdef(oid) from pg_constraint where conname = 'floorplans_place_asset_id_unique'"), DB::table('place_assets')->count()]);
+    }
+
+    #[DataProviderExternal(InstallerTest::class, 'dependents')]
+    #[Test]
+    public function it_writes_each_object_that_depends_on_the_legacy_table_to_the_log(string $create, string $drop, string $dependent): void
+    {
+        DB::statement($create);
+        $logged = [];
+        Event::listen(MessageLogged::class, function (MessageLogged $message) use (&$logged): void {
+            $logged[] = [$message->level, $message->message];
+        });
+
+        try {
+            Compatibility::prepare(Listing::class);
+        } finally {
+            DB::statement($drop);
+        }
+
+        $this->assertSame([['info', "Compatibility map 'listings' prepare: {$dependent} depends on listings"]], $logged);
+    }
+
+    #[Test]
+    public function it_refuses_an_adopted_successor_key_that_is_a_generated_column_and_changes_nothing(): void
+    {
+        DB::statement('alter table listings drop column job_id');
+        DB::statement('alter table listings add column job_id uuid generated always as (company_id) stored');
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame("Compatibility map 'listings' is declared wrongly: listings.job_id is a generated or identity column, and the backfill writes the key of each row's Job into it.", $refusal);
+        $this->assertSame([false, false], [DB::scalar("select to_regclass('compatibility_backfills') is not null"), DB::scalar("select to_regclass('listings_job_id_unique') is not null")]);
+    }
+
+    #[Test]
+    public function it_refuses_a_root_table_without_the_key_its_successor_key_holds_and_changes_nothing(): void
+    {
+        DB::statement('alter table jobs rename column id to job_key');
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame("Compatibility map 'listings' is declared wrongly: the successor table jobs has no column id.", $refusal);
+        $this->assertSame([false, false], [DB::scalar("select to_regclass('compatibility_backfills') is not null"), DB::scalar("select to_regclass('listings_job_id_unique') is not null")]);
     }
 
     #[Test]

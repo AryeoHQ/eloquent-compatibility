@@ -292,12 +292,12 @@ final class LegacyBuilderRolloutTest extends TestCase
         $installed = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
         $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
-        $uninstalled = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
+        $rolledBack = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
 
         $this->assertStringNotContainsString('"jobs"', $before);
         $this->assertStringContainsString('"jobs"."price_cents" > ?', $installed[0]);
-        $this->assertStringNotContainsString('"jobs"', $uninstalled[0]);
-        $this->assertSame([[1], [1, 3]], [$installed[1], $uninstalled[1]]);
+        $this->assertStringNotContainsString('"jobs"', $rolledBack[0]);
+        $this->assertSame([[1], [1, 3]], [$installed[1], $rolledBack[1]]);
     }
 
     /**

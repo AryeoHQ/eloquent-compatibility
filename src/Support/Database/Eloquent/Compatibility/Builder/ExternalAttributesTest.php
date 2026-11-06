@@ -86,6 +86,43 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_the_successor_keys_of_a_loaded_collection_from_the_retained_table_and_its_column_types_once(): void
+    {
+        $photos = Photo::query()->orderBy('id')->get();
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        $read = $photos[1]->mime_type;
+
+        $this->assertSame(['image/jpeg', 1, 1, 0], [
+            $read,
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_contains(
+                    haystack: $sql,
+                    needle: 'from pg_attribute table_column',
+                ),
+            )),
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_starts_with(
+                    haystack: $sql,
+                    needle: 'select "file_id", "id" from "photos_retained"',
+                ),
+            )),
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_contains(
+                    haystack: $sql,
+                    needle: 'from "photos" ',
+                ),
+            )),
+        ]);
+    }
+
+    #[Test]
     public function it_reads_one_record_through_a_collection_of_one(): void
     {
         $library = FakeMediaLibrary::bound();

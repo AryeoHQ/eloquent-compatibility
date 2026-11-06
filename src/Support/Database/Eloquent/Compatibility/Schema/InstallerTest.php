@@ -13,9 +13,11 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use InvalidArgumentException;
-use Pdo\Pgsql;
+use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
@@ -53,6 +55,9 @@ final class InstallerTest extends TestCase
 
     /** @var null|array{resource, array<int, resource>} */
     private null|array $concurrent = null;
+
+    /** @var list<array{string, string}> */
+    private array $logged = [];
 
     protected function setUp(): void
     {
@@ -498,9 +503,9 @@ final class InstallerTest extends TestCase
             );
             $installed = $foreignKey();
             Compatibility::update(Listing::class);
-            $recompiled = $foreignKey();
+            $updated = $foreignKey();
             Compatibility::rollback(Listing::class);
-            $uninstalled = $foreignKey();
+            $rolledBack = $foreignKey();
         } finally {
             DB::statement('drop table listing_notes');
         }
@@ -509,7 +514,7 @@ final class InstallerTest extends TestCase
             ['definition' => 'FOREIGN KEY (listing_id) REFERENCES listings_retained(id) NOT VALID', 'convalidated' => false],
             ['definition' => 'FOREIGN KEY (listing_id) REFERENCES listings_retained(id) NOT VALID', 'convalidated' => false],
             ['definition' => 'FOREIGN KEY (listing_id) REFERENCES listings(id) NOT VALID', 'convalidated' => false],
-        ], [$installed, $recompiled, $uninstalled]);
+        ], [$installed, $updated, $rolledBack]);
     }
 
     #[Test]
@@ -589,23 +594,23 @@ final class InstallerTest extends TestCase
     public function it_reports_how_many_legacy_rows_a_hide_rule_hides_at_install(): void
     {
         DB::update('update jobs set merged_into_job_id = (select job_id from listings where id = 3) where id = (select job_id from listings where id = 1)');
-        $notices = [];
-        $pdo = DB::connection()->getPdo();
-        $this->assertInstanceOf(Pgsql::class, $pdo);
-        $pdo->setNoticeCallback(function (string $notice) use (&$notices): void {
-            $notices[] = $notice;
+        $this->listenToTheLog();
+        $loggedBeforeTheLock = null;
+        DB::listen(function (QueryExecuted $query) use (&$loggedBeforeTheLock): void {
+            if ($loggedBeforeTheLock === null && str_starts_with(
+                haystack: $query->sql,
+                needle: 'SET LOCAL lock_timeout',
+            )) {
+                $loggedBeforeTheLock = $this->logged;
+            }
         });
 
-        try {
-            Compatibility::install(
-                model: Listing::class,
-                statementTimeout: CarbonInterval::seconds(30),
-            );
-        } finally {
-            $pdo->setNoticeCallback(null);
-        }
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertStringContainsString("Compatibility map 'listings' install hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1.", implode("\n", $notices));
+        $this->assertSame([['info', "Compatibility map 'listings' install: hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1. Install read this count before it took its lock."]], $loggedBeforeTheLock);
         $this->assertSame([2, 3], array_map(intval(...), array_column(DB::select('select id from listings order by id'), 'id')));
     }
 
@@ -1389,12 +1394,12 @@ final class InstallerTest extends TestCase
             );
             $installed = [$collations(), $behaviour()];
             Compatibility::update(Listing::class);
-            $recompiled = [$collations(), $behaviour()];
+            $updated = [$collations(), $behaviour()];
             Compatibility::rollback(Listing::class);
 
             $this->assertSame(
                 array_fill(0, 4, [['city' => 'default', 'street' => 'C', 'title' => 'compatibility_case_insensitive'], [[1], []]]),
-                [$before, $installed, $recompiled, [$collations(), $behaviour()]],
+                [$before, $installed, $updated, [$collations(), $behaviour()]],
             );
         } finally {
             ListingTables::drop();
@@ -1440,12 +1445,12 @@ final class InstallerTest extends TestCase
         );
         $served = [$this->kind('listings'), $read()];
         Compatibility::update($model::class);
-        $recompiled = $read();
+        $updated = $read();
         Compatibility::rollback($model::class);
 
         $this->assertSame(
             [['v', [1 => '2026-01-01 10:00:00', 2 => null, 3 => null]], [1 => '2026-01-01 10:00:00', 2 => null, 3 => null], ['r', [1 => '2026-01-01 10:00:00', 2 => null, 3 => null]]],
-            [$served, $recompiled, [$this->kind('listings'), $read()]],
+            [$served, $updated, [$this->kind('listings'), $read()]],
         );
     }
 
@@ -1705,14 +1710,15 @@ final class InstallerTest extends TestCase
         $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
     }
 
+    #[DataProvider('dependents')]
     #[Test]
-    public function it_refuses_an_undeclared_dependent_view_before_its_catch_up_writes_a_successor_or_advances_the_pass(): void
+    public function it_refuses_an_undeclared_dependent_before_its_catch_up_writes_a_successor_or_advances_the_pass(string $create, string $drop, string $dependent): void
     {
         $this->backfiller(Listing::class)->run();
         DB::table('listings')->where('id', 1)->update(['title' => 'Oak Manor', 'updated_at' => now()->addMinute()]);
         $job = DB::table('listings')->where('id', 1)->value('job_id');
         $before = [DB::table('compatibility_backfills')->where('legacy_type', 'listings')->value('pass'), DB::table('jobs')->where('id', $job)->value('name')];
-        DB::statement('create view listing_headlines as select title from listings');
+        DB::statement($create);
 
         try {
             Compatibility::install(
@@ -1723,13 +1729,13 @@ final class InstallerTest extends TestCase
         } catch (InvalidCompatibilityMap $exception) {
             $refusal = $exception->getMessage();
         } finally {
-            DB::statement('drop view listing_headlines');
+            DB::statement($drop);
         }
 
         $this->assertSame(InvalidCompatibilityMap::cannot(
             map: 'listings',
             operation: 'install',
-            because: 'view listing_headlines depends on listings, and the map declares no dependents(); declare a ManagesDependents class that drops and recreates them inside the install transaction',
+            because: "{$dependent} depends on listings, and the map declares no dependents(); declare a ManagesDependents class that drops and recreates them inside the install transaction",
         )->getMessage(), $refusal);
         $this->assertSame($before, [DB::table('compatibility_backfills')->where('legacy_type', 'listings')->value('pass'), DB::table('jobs')->where('id', $job)->value('name')]);
         $this->assertSame([1, 'Oak House'], $before);
@@ -2048,7 +2054,7 @@ final class InstallerTest extends TestCase
 
         $this->assertIsArray($last);
         $this->assertSame('ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID', $last[0]);
-        $this->assertSame(["SET LOCAL lock_timeout = '5s'"], array_map(
+        $this->assertSame(["SET LOCAL lock_timeout = '5000ms'"], array_map(
             callback: fn (int $index) => $installed[$index][0],
             array: $timeouts,
         ));
@@ -2059,29 +2065,315 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_retries_the_install_when_the_foreign_key_cannot_take_its_lock_on_the_root_within_the_lock_timeout(): void
     {
-        $holding = $this->holdConcurrently(
-            sql: "update jobs set name = name where name = 'Oak House'",
-            seconds: 6,
-        );
+        $holding = $this->holdUntilReleased("update jobs set name = name where name = 'Oak House'");
         $attempts = 0;
-        DB::listen(function (QueryExecuted $query) use (&$attempts): void {
+        $released = null;
+        DB::listen(function (QueryExecuted $query) use (&$attempts, &$released): void {
             if (str_starts_with(
                 haystack: $query->sql,
                 needle: 'SET LOCAL lock_timeout',
-            )) {
-                $attempts++;
+            ) && ++$attempts === 2) {
+                $released = $this->release();
             }
         });
-        $started = microtime(true);
+        $this->listenToTheLog();
 
         Compatibility::install(
             model: Listing::class,
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertSame(["locked\n", 2, 'v'], [$holding, $attempts, $this->kind('listings')]);
-        $this->assertGreaterThanOrEqual(5.0, microtime(true) - $started);
+        $this->assertSame(["locked\n", "committed\n", 2, 'v'], [$holding, $released, $attempts, $this->kind('listings')]);
+        $this->assertCount(2, $this->logged);
+        $this->assertSame('warning', $this->logged[0][0]);
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03 on ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY \\(\"job_id\"\\) REFERENCES \"jobs\" \\(\"id\"\\) ON DELETE CASCADE NOT VALID after \\d+ ms, so it rolled back and retries$/", $this->logged[0][1]);
+        $this->assertSame(['info', "Compatibility map 'listings' install: took its locks on attempt 2 of 4"], $this->logged[1]);
         $this->assertSame('', $this->concurrentFailure());
+    }
+
+    #[Test]
+    public function it_retries_a_lock_wait_on_the_root_under_a_statement_timeout_shorter_than_its_lock_timeout(): void
+    {
+        $holding = $this->holdUntilReleased("update jobs set name = name where name = 'Oak House'");
+        $timeouts = [];
+        $released = null;
+        DB::listen(function (QueryExecuted $query) use (&$timeouts, &$released): void {
+            if (str_starts_with(
+                haystack: $query->sql,
+                needle: 'SET LOCAL lock_timeout',
+            )) {
+                $timeouts[] = $query->sql;
+
+                if (count($timeouts) === 2) {
+                    $released = $this->release();
+                }
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(2),
+        );
+
+        $this->assertSame(
+            [["SET LOCAL lock_timeout = '1000ms'", "SET LOCAL lock_timeout = '1000ms'"], "locked\n", "committed\n", 'v'],
+            [$timeouts, $holding, $released, $this->kind('listings')],
+        );
+        $this->assertSame('', $this->concurrentFailure());
+    }
+
+    #[Test]
+    public function it_refuses_naming_the_statement_its_statement_timeout_cancels_and_rolls_back(): void
+    {
+        $dependents = new class implements ManagesDependents
+        {
+            public function beforeInstall(Connection $connection): void
+            {
+                $connection->statement('select pg_sleep(2)');
+            }
+
+            public function afterInstall(Connection $connection): void {}
+
+            public function beforeRollback(Connection $connection): void {}
+
+            public function afterRollback(Connection $connection): void {}
+        };
+        self::$dependents = $dependents::class;
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing)->dependents(InstallerTest::$dependents);
+            }
+        };
+
+        try {
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::milliseconds(500),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' cannot install: it held its lock for \\d+ ms of its 500 ms statementTimeout during the step select pg_sleep\\(2\\), so it rolled back\\./", $refusal);
+        $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    #[Test]
+    public function it_rolls_back_once_its_last_statement_spends_the_statement_timeout(): void
+    {
+        DB::listen(function (QueryExecuted $query): void {
+            if (str_starts_with(
+                haystack: $query->sql,
+                needle: 'ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign"',
+            )) {
+                usleep(1200000);
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(1),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' cannot install: it held its lock for \\d+ ms of its 1000 ms statementTimeout after the step ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY \\(\"job_id\"\\) REFERENCES \"jobs\" \\(\"id\"\\) ON DELETE CASCADE NOT VALID, so it rolled back\\./", $refusal);
+        $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    #[Test]
+    public function it_rolls_back_once_the_hold_spends_its_statement_timeout_after_the_rename_naming_the_next_step(): void
+    {
+        DB::listen(function (QueryExecuted $query): void {
+            if ($query->sql === 'ALTER TABLE "listings" RENAME TO "listings_retained"') {
+                usleep(1200000);
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(1),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' cannot install: it held its lock for \\d+ ms of its 1000 ms statementTimeout before the step ALTER TABLE \"listings_retained\", so it rolled back\\./", $refusal);
+        $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    #[Test]
+    public function it_refuses_a_statement_timeout_under_one_millisecond(): void
+    {
+        $this->expectExceptionObject(new LogicException('Compatibility::install() takes a statementTimeout of at least one millisecond, which bounds how long it holds its lock.'));
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::milliseconds(0),
+        );
+    }
+
+    #[Test]
+    public function it_keeps_the_root_readable_through_its_rollback_until_its_last_statement_drops_the_foreign_key(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
+        $read = null;
+        $statements = [];
+
+        DB::listen(function (QueryExecuted $query) use (&$read, &$statements): void {
+            if ($query->connectionName === 'compatibility_concurrent') {
+                return;
+            }
+
+            $statements[] = $query->sql;
+
+            if ($read !== null || ! str_starts_with(
+                haystack: $query->sql,
+                needle: 'UPDATE "listings" AS "listings_retained" SET',
+            )) {
+                return;
+            }
+
+            try {
+                $read = DB::connection('compatibility_concurrent')->transaction(function (): mixed {
+                    DB::connection('compatibility_concurrent')->statement("set local lock_timeout = '200ms'");
+
+                    return DB::connection('compatibility_concurrent')->scalar('select count(*) from jobs');
+                });
+            } catch (QueryException $exception) {
+                $read = (string) $exception->getCode();
+            }
+        });
+
+        try {
+            Compatibility::rollback(Listing::class);
+        } finally {
+            DB::purge('compatibility_concurrent');
+        }
+
+        $drop = array_search(
+            needle: "ALTER TABLE \"listings\"\n  DROP CONSTRAINT IF EXISTS \"listings_retained_job_id_foreign\",\n  DROP CONSTRAINT IF EXISTS \"listings_retained_job_id_not_null\"",
+            haystack: $statements,
+            strict: true,
+        );
+
+        $this->assertSame(3, $read);
+        $this->assertIsInt($drop);
+        $this->assertSame("SET LOCAL lock_timeout = '5000ms'", $statements[$drop - 1]);
+        $this->assertStringStartsWith('DO $compatibility$', $statements[$drop - 2]);
+        $this->assertSame(0, DB::scalar("select count(*) from pg_constraint where conname in ('listings_retained_job_id_foreign', 'listings_retained_job_id_not_null')"));
+    }
+
+    #[Test]
+    public function it_retries_the_rollback_when_dropping_the_foreign_key_cannot_take_its_lock_on_the_root_within_the_lock_timeout(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $holding = $this->holdUntilReleased('select count(*) from jobs');
+        $attempts = 0;
+        $released = null;
+        DB::listen(function (QueryExecuted $query) use (&$attempts, &$released): void {
+            if (str_starts_with(
+                haystack: $query->sql,
+                needle: 'LOCK TABLE "jobs"',
+            ) && ++$attempts === 2) {
+                $released = $this->release();
+            }
+        });
+        $this->listenToTheLog();
+
+        Compatibility::rollback(Listing::class);
+
+        $this->assertSame(["locked\n", "committed\n", 2, 'r'], [$holding, $released, $attempts, $this->kind('listings')]);
+        $this->assertCount(2, $this->logged);
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' rollback: attempt 1 of 4 could not take a lock, SQLSTATE 55P03 on ALTER TABLE \"listings\" after \\d+ ms, so it rolled back and retries$/", $this->logged[0][1]);
+        $this->assertSame(['info', "Compatibility map 'listings' rollback: took its locks on attempt 2 of 4"], $this->logged[1]);
+        $this->assertSame('', $this->concurrentFailure());
+    }
+
+    #[Test]
+    public function it_restores_the_statement_and_lock_timeouts_of_the_caller_s_transaction_after_it_installs_and_rolls_back_inside_it(): void
+    {
+        $timeouts = DB::transaction(function (): array {
+            DB::statement("set local statement_timeout = '7s'");
+            DB::statement("set local lock_timeout = '3s'");
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $installed = [DB::scalar('show statement_timeout'), DB::scalar('show lock_timeout')];
+            Compatibility::rollback(Listing::class);
+
+            return [$installed, [DB::scalar('show statement_timeout'), DB::scalar('show lock_timeout')]];
+        });
+
+        $this->assertSame([['7s', '3s'], ['7s', '3s']], $timeouts);
+    }
+
+    #[Test]
+    public function it_prints_a_lock_for_every_table_install_holds_when_its_last_statement_runs(): void
+    {
+        $printed = array_column(
+            array: Statements::install(
+                map: Compatibility::of(Listing::class)->resolve(),
+                connection: DB::connection(),
+            )->locks,
+            column_key: 1,
+            index_key: 0,
+        );
+        $tables = array_column(
+            array: DB::select("select cast(oid as bigint) as oid, relname from pg_class where oid in (to_regclass('listings'), to_regclass('jobs'), to_regclass('places'), to_regclass('job_sites'))"),
+            column_key: 'relname',
+            index_key: 'oid',
+        );
+        $held = [];
+        DB::listen(function (QueryExecuted $query) use (&$held, $tables): void {
+            if (! str_starts_with(
+                haystack: $query->sql,
+                needle: 'ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign"',
+            )) {
+                return;
+            }
+
+            foreach (DB::select("select cast(relation as bigint) as oid, mode from pg_locks where pid = pg_backend_pid() and locktype = 'relation' and granted and mode in ('ShareUpdateExclusiveLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock')") as $lock) {
+                if (array_key_exists($lock->oid, $tables)) {
+                    $held[$tables[$lock->oid]][] = $lock->mode;
+                }
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        ksort($held);
+        ksort($printed);
+
+        $this->assertSame(array_keys($held), array_keys($printed));
+
+        foreach ($held as $table => $modes) {
+            foreach ($modes as $mode) {
+                $this->assertStringContainsString(['ShareUpdateExclusiveLock' => 'SHARE UPDATE EXCLUSIVE', 'ShareRowExclusiveLock' => 'SHARE ROW EXCLUSIVE', 'AccessExclusiveLock' => 'ACCESS EXCLUSIVE'][$mode], $printed[$table]);
+            }
+        }
     }
 
     #[Test]
@@ -2216,28 +2508,22 @@ final class InstallerTest extends TestCase
                 return Listing::compatibility($listing)->dependents(InstallerTest::$dependents);
             }
         };
-        $notices = [];
-        $pdo = DB::connection()->getPdo();
-        $this->assertInstanceOf(Pgsql::class, $pdo);
-        $pdo->setNoticeCallback(function (string $notice) use (&$notices): void {
-            $notices[] = $notice;
-        });
+        $this->listenToTheLog();
 
         try {
             Compatibility::install(
                 model: $model::class,
                 statementTimeout: CarbonInterval::seconds(30),
             );
-            $installed = $notices;
-            $notices = [];
             Compatibility::rollback($model::class);
         } finally {
-            $pdo->setNoticeCallback(null);
             DB::statement('drop view if exists listing_titles');
         }
 
-        $this->assertStringContainsString("Compatibility map 'listings' install: view listing_titles depends on listings", implode("\n", $installed));
-        $this->assertStringContainsString("Compatibility map 'listings' rollback: view listing_titles depends on listings", implode("\n", $notices));
+        $this->assertSame([
+            ['info', "Compatibility map 'listings' install: view listing_titles depends on listings"],
+            ['info', "Compatibility map 'listings' rollback: view listing_titles depends on listings"],
+        ], $this->logged);
     }
 
     #[Test]
@@ -2282,6 +2568,7 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
         DB::statement('create view listing_titles as select id, title from listings');
+        DB::statement('create view retained_ids as select id from listings_retained');
 
         try {
             Compatibility::retire(Listing::class);
@@ -2290,13 +2577,90 @@ final class InstallerTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        DB::statement('drop view listing_titles');
+        DB::statement('drop view listing_titles, retained_ids');
         DB::statement('drop table listing_photos, listing_shares');
+        $this->listenToTheLog();
         Compatibility::retire(Listing::class);
         Compatibility::retire(Listing::class);
 
-        $this->assertSame("Compatibility map 'listings' cannot retire: view listing_titles, the foreign key listing_photos_listing_id_foreign on listing_photos, the foreign key listing_shares_listing_uuid_foreign on listing_shares depend on listings or listings_retained; drop each one, then retire again.", $refusal);
+        $this->assertSame("Compatibility map 'listings' cannot retire: view listing_titles, view retained_ids, the foreign key listing_photos_listing_id_foreign on listing_photos, the foreign key listing_shares_listing_uuid_foreign on listing_shares depend on listings or listings_retained; drop each one, then retire again.", $refusal);
+        $this->assertSame([
+            ['info', "Compatibility map 'listings' retire: retire() discards listings_retained: 3 rows, with the legacy-only columns uuid, mls_number, featured"],
+            ['info', "Compatibility map 'listings' retire: retire() discards listings_backfill, the backfill ledger of listings"],
+            ['info', "Compatibility map 'listings' retire: retire() discards the compatibility_backfills row of listings"],
+        ], $this->logged);
         $this->assertSame([null, null, null, 3], [$this->kind('listings'), $this->kind('listings_retained'), $this->kind('listings_backfill'), DB::table('jobs')->count()]);
+    }
+
+    #[Test]
+    public function it_retires_a_legacy_table_whose_foreign_key_references_itself(): void
+    {
+        DB::statement('alter table listings add column parent_listing_id integer references listings (id)');
+        DB::update('update listings set parent_listing_id = 1 where id = 3');
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        DB::statement('drop table listing_photos, listing_shares');
+
+        Compatibility::retire(Listing::class);
+
+        $this->assertSame([null, null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    /**
+     * @return array<string, array{string, string, string}>
+     */
+    public static function dependents(): array
+    {
+        return [
+            'a view' => ['create view listing_headlines as select title from listings', 'drop view listing_headlines', 'view listing_headlines'],
+            'a materialized view' => ['create materialized view listing_counts as select count(*) as listings from listings', 'drop materialized view listing_counts', 'materialized view listing_counts'],
+            'a rule' => ['create rule listings_kept as on delete to listings do instead nothing', 'drop rule listings_kept on listings', 'rule listings_kept on listings'],
+            'a policy' => ['create policy listings_visible on listings using (true)', 'drop policy listings_visible on listings', 'policy listings_visible on listings'],
+            'an SQL function' => ['create function listing_count() returns bigint language sql begin atomic select count(*) from listings; end', 'drop function listing_count()', 'function listing_count()'],
+        ];
+    }
+
+    private function listenToTheLog(): void
+    {
+        Event::listen(MessageLogged::class, function (MessageLogged $logged): void {
+            $this->logged[] = [$logged->level, $logged->message];
+        });
+    }
+
+    private function holdUntilReleased(string $sql): string
+    {
+        $config = DB::connection()->getConfig();
+        $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
+        $process = proc_open(
+            command: [PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
+                .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "locked\n"; fflush(STDOUT);'
+                .' $released = [STDIN]; $written = null; $failed = null; stream_select($released, $written, $failed, 30);'
+                .' $pdo->commit(); echo "committed\n"; fflush(STDOUT);'],
+            descriptor_spec: [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            pipes: $pipes,
+        );
+
+        if ($process === false) {
+            $this->fail('The concurrent holder did not start.');
+        }
+
+        $this->concurrent = [$process, $pipes];
+
+        return (string) fgets($pipes[1]);
+    }
+
+    private function release(): string
+    {
+        if ($this->concurrent === null) {
+            $this->fail('No concurrent holder is running.');
+        }
+
+        fwrite($this->concurrent[1][0], "release\n");
+        fflush($this->concurrent[1][0]);
+
+        return (string) fgets($this->concurrent[1][1]);
     }
 
     private function fileOf(int $photo): mixed

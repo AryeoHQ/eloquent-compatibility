@@ -63,14 +63,16 @@ trait AssertsServedCompatibility
         $siblings = [];
 
         foreach ($served->all() as $sibling) {
-            try {
-                $siblings[] = $sibling === $model ? null : Compatibility::of($sibling)->resolve();
-            } catch (InvalidCompatibilityMap) {
+            if ($sibling === $model) {
                 continue;
             }
-        }
 
-        $siblings = array_values(array_filter($siblings));
+            try {
+                $siblings[] = Compatibility::of($sibling)->resolve();
+            } catch (InvalidCompatibilityMap $exception) {
+                Assert::fail("The map of {$sibling}, which compatibility:check reads beside {$model} to prove that no shared successor serves two legacy records, does not compile: {$exception->getMessage()}");
+            }
+        }
         $connection->beginTransaction();
 
         try {

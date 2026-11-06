@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Contracts\Database\Query\Expression;
+use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Str;
@@ -35,6 +36,10 @@ final readonly class RetainedRows
             bindings: $query->cleanBindings($row),
             useReadPdo: false,
         ))[$key] ?? null;
+
+        if ($this->connection instanceof Connection) {
+            $this->connection->recordsHaveBeenModified();
+        }
 
         return is_int($inserted) || is_string($inserted) ? $inserted : throw new LogicException(ViewCompiler::retainedTable($this->map)." returned no {$key} for the new ".class_basename($this->map->model).'.');
     }

@@ -99,7 +99,12 @@ final class StatementsTest extends TestCase
         $this->assertSame('CREATE VIEW "listings" AS', $leading[10]);
         $this->assertSame('ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID', $statements->transaction[count($statements->transaction) - 1]);
         $this->assertStringContainsString('DELETE FROM "compatibility_backfills" WHERE legacy_type = \'listings\'', $statements->transaction[count($statements->transaction) - 2]);
-        $this->assertSame([['listings', 'SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit'], ['jobs', "SHARE ROW EXCLUSIVE, from the foreign key, install's last statement, until commit"]], $statements->locks);
+        $this->assertSame([
+            ['listings', "SHARE UPDATE EXCLUSIVE from install's first statement, then SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit"],
+            ['jobs', "SHARE UPDATE EXCLUSIVE from install's first statement, then SHARE ROW EXCLUSIVE from the foreign key, install's last statement, until commit"],
+            ['places', "SHARE UPDATE EXCLUSIVE from install's first statement until commit"],
+            ['job_sites', "SHARE UPDATE EXCLUSIVE from install's first statement until commit"],
+        ], $statements->locks);
         $this->assertStringNotContainsString('ALTER TABLE "listing_photos"', implode(
             separator: "\n",
             array: $statements->transaction,
@@ -175,11 +180,6 @@ final class StatementsTest extends TestCase
         $this->assertSame([
             'LOCK TABLE "jobs", "places", "job_sites" IN SHARE ROW EXCLUSIVE MODE',
             'DROP VIEW "listings"',
-            <<<'SQL'
-            ALTER TABLE "listings_retained"
-              DROP CONSTRAINT IF EXISTS "listings_retained_job_id_foreign",
-              DROP CONSTRAINT IF EXISTS "listings_retained_job_id_not_null"
-            SQL,
             'ALTER TABLE "listings_retained" RENAME TO "listings"',
             <<<'SQL'
             ALTER TABLE "listings"
@@ -223,6 +223,12 @@ final class StatementsTest extends TestCase
             SQL,
             'CREATE INDEX listings_updated_at_index ON public.listings USING btree (updated_at)',
             'COMMENT ON TABLE "listings" IS NULL',
+            "SET LOCAL lock_timeout = '5000ms'",
+            <<<'SQL'
+            ALTER TABLE "listings"
+              DROP CONSTRAINT IF EXISTS "listings_retained_job_id_foreign",
+              DROP CONSTRAINT IF EXISTS "listings_retained_job_id_not_null"
+            SQL,
         ], array_values(array_filter(
             array: $statements->transaction,
             callback: fn (string $statement) => ! str_contains(

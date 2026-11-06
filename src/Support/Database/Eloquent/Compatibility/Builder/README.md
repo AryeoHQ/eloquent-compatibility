@@ -108,7 +108,7 @@ Comparing the stored column must return exactly what comparing the served value 
 
 A negated filter must keep SQL's NULL semantics. `NOT (price > 100)` excludes a listing with no price.
 
-`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. On the stored column, a negated filter translates only through each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. A negated filter whose complement does not translate stays on the view. On the rebuilt expression, the subquery negates the caller's filter directly. That keeps the view's NULL semantics, because the expression is the view's own. The outer membership test cancels the group's own `NOT`, because the legacy key is never NULL. The `status` filter in the example above shows the result.
+`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. On the stored column, a negated filter translates only through each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. A negated filter whose complement does not translate stays on the view. On the rebuilt expression, the subquery negates the caller's filter directly. That keeps the view's NULL semantics, because the expression is the view's own. The outer membership test cancels the group's own `NOT`, because the view serves no row whose successor key is NULL, and the subquery selects the root's primary key. The `status` filter in the example above shows the result.
 
 ## Refusals
 

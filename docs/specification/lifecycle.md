@@ -164,7 +164,7 @@ These whole-table proofs never run under the lock.
 9. `ManagesDependents::afterInstall()`.
 10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)).
 
-Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock.
+Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
 
 Declined: a per-statement timeout only. Nothing would then bound the hold, and PostgreSQL 14 has no `transaction_timeout`.
 
@@ -196,7 +196,7 @@ Inside a caller's transaction, a refusal loses nothing. The proofs write no ledg
 
 ### Dependent schema
 
-`prepare()`, `install()`, `rollback()` and `compatibility:sql` list every object that depends on the legacy table: views, materialized views, rules, policies and SQL functions.
+`prepare()`, `install()`, `rollback()` and `compatibility:sql` list every object that depends on the legacy table: views, materialized views, rules, policies and SQL functions. The operations write the list to the Laravel log, and `compatibility:sql` prints it in its header.
 
 `dependents()` names a `Contracts\ManagesDependents` class. Its `beforeInstall()` and `afterInstall()` run inside the install transaction. Its `beforeRollback()` and `afterRollback()` run inside the rollback. The package does not rebind dependent views itself.
 
@@ -231,11 +231,13 @@ final class ListingDependents implements ManagesDependents
 
 1. It runs `ManagesDependents::beforeRollback()`, which removes every object that depends on the view.
 2. It drops the view.
-3. It drops the successor key's foreign key and `CHECK (<key> IS NOT NULL)`. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback ([Storage](storage.md#the-successor-key)).
-4. It renames the retained table back to the legacy name.
-5. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
-6. It carries the view's grants back to the restored table.
-7. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
+3. It renames the retained table back to the legacy name.
+4. It restores the mapped columns, and refills them from the successors through the successor key. The refill calls no write scope and runs no key re-check. Rollback's table lock waits for in-flight writes to commit, so the refill reads only committed successors.
+5. It carries the view's grants back to the restored table.
+6. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
+7. It drops the successor key's foreign key and `CHECK (<key> IS NOT NULL)`, as its last statement. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback ([Storage](storage.md#the-successor-key)).
+
+Dropping the foreign key takes an `ACCESS EXCLUSIVE` lock on the root's table, which blocks every read of the root until rollback commits. Rollback therefore drops it last, under `SET LOCAL lock_timeout`. It treats a lock timeout or a `40P01` on that statement as install does: it rolls back and retries. No earlier step needs the constraints gone, because the rename keeps them and the refill does not write the key.
 
 `beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterInstall()` recreates it.
 
@@ -253,7 +255,7 @@ Install deleted this model's `compatibility_backfills` row. A re-install therefo
 - It drops `<legacy>_backfill`, and deletes the model's row from `compatibility_backfills` when one remains. Retire rules out the re-install that the ledger's `deleted` rows serve ([Re-install after rollback](#re-install-after-rollback)).
 - It leaves every successor untouched.
 - It refuses while any object depends on the view or the retained table, and lists each one. An inbound foreign key is one such object.
-- `compatibility:sql retire` prints the legacy-only data it would discard, and lists `<legacy>_backfill` and the model's `compatibility_backfills` row among that data. `retire()` runs in a migration, where nobody can confirm, so it asks nothing.
+- `compatibility:sql retire` prints the legacy-only data it would discard, and lists `<legacy>_backfill` and the model's `compatibility_backfills` row among that data. `retire()` runs in a migration, where nobody can confirm, so it asks nothing. It writes the same list to the Laravel log.
 - A second `retire()` changes nothing.
 
 ## Status and idempotence

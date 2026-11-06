@@ -19,13 +19,8 @@ final class Targets
      * @param  Closure(self): mixed  $targets
      * @return non-empty-array<class-string<Model>, Successor>
      */
-    public static function declare(string $map, Closure $choose, Closure $targets): array
+    public static function declare(string $map, Closure $targets): array
     {
-        ResolvedMap::refuseCaptures(
-            map: $map,
-            role: 'the relatedMorph() choose: closure',
-            closure: $choose,
-        );
         ResolvedMap::refuseCaptures(
             map: $map,
             role: 'the relatedMorph() targets: closure',
