@@ -31,26 +31,43 @@ Only the root has a successor key: the retained table's column that holds the ro
 - **An existing column is adopted.** Listing's `job_id` already references `jobs.id`, so `prepare()` adopts it.
 - **A missing column is added.** `floorplans` has no reference to its `PlaceAsset`, so `prepare()` adds `place_asset_id uuid`, and the backfill fills it.
 
-`prepare()` gives the successor key two constraints on the live legacy table:
+`prepare()` gives the successor key one constraint on the live legacy table:
 
 ```sql
 ALTER TABLE listings ADD CONSTRAINT listings_job_id_unique UNIQUE (job_id);
-ALTER TABLE listings ADD FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE NOT VALID;
 ```
 
-The unique constraint can also come from a unique index built `CONCURRENTLY`. The foreign key starts `NOT VALID`, and install validates it before it takes its lock.
+The unique constraint can also come from a unique index built `CONCURRENTLY`.
+
+The successor key is an identity. It names the root a legacy row maps to, and before install that root may not exist yet. A key that names no row means "no successor yet". The backfill then takes the create path, and creates the root with that key value, so the identity holds ([Lifecycle: a pass](lifecycle.md#a-pass)). Install's existence proof checks that every non-NULL key names an existing root row, whatever the legacy row's ledger state. Every test of whether a successor key names a root reads the root's table without global scopes, so a trashed root counts as existing. A test through a model with `SoftDeletes` would miss a trashed root, and the create path would then fail with `23505`. Install catches up each key the proof flags through the create path, which creates the root with the key value, and then proves that key again ([Lifecycle: the install gate](lifecycle.md#the-install-gate)).
 
 Under its lock, after the final pass, the NULL-key probe and the insert of retained rows for natively created roots, install adds the database's guarantee of a non-NULL key:
 
 ```sql
-ALTER TABLE listings_retained ADD CONSTRAINT listings_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
+ALTER TABLE listings_retained ADD CONSTRAINT listings_retained_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
 ```
 
-The check needs no scan, and it checks every later insert and update. Install runs no `SET NOT NULL`, which would scan the whole table under the lock. Prepare does not add the check: a `NOT VALID` check still applies to new rows, and before install the legacy model inserts natively with a NULL key that a pass fills later. Every such insert would fail with `23514`. Declined: a nullable key that relies on the probe alone.
+Install's last statement under the lock, after `ManagesDependents::afterInstall()`, adds the foreign key to the root:
 
-Rollback mirrors install. Before it renames the retained table back, it drops the check, because native legacy inserts with a NULL key resume after a rollback.
+```sql
+ALTER TABLE listings_retained ADD CONSTRAINT listings_retained_job_id_foreign FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE NOT VALID;
+```
 
-`ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key.
+Each constraint takes the name `<retained table>_<key>_not_null` or `<retained table>_<key>_foreign`, as Laravel names a foreign key on the table that carries it. Rollback drops both by name.
+
+Neither constraint needs a scan, and both check every later insert and update. Install runs no `SET NOT NULL` and no `VALIDATE CONSTRAINT`, because each would scan the whole table under the lock. The existence proof before the lock, with install's catch-up of the keys it flags, stands in for the validation, and [the writer boundary](lifecycle.md#the-writer-boundary) states the window it leaves.
+
+Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. The statement is last, so install holds the root's table for that one statement plus the commit. `compatibility:sql install` prints that lock.
+
+The lock also waits. It conflicts with the `ROW EXCLUSIVE` lock that every open transaction writing the root's table holds, so install waits for the longest of them while it still holds the legacy table. During that wait, every read of the legacy name blocks, and every later writer of the root's table queues behind install's request. A writer that holds the root's table and then waits on the legacy table deadlocks with install. A native create whose `Provides\CarriesLegacy` lock follows the successor's `INSERT` is one such writer. PostgreSQL then aborts one side with `40P01`. Install therefore runs the statement under `SET LOCAL lock_timeout`, and treats a lock timeout or a `40P01` as a lock it cannot take: it rolls back and retries. For a shared successor such as `place_assets`, the other legacy models' writes pause for the statement, its wait and the commit.
+
+Prepare adds neither constraint. A `NOT VALID` constraint still applies to new rows. Before install, the legacy model inserts natively with a NULL key that a pass fills later, and with a key whose root the backfill creates later. The check would fail every NULL-key insert with `23514`, and the foreign key would fail every insert whose root does not exist yet with `23503`. A foreign key at prepare would also cascade a successor delete into the live legacy row, which is still the source of truth. Placing the foreign key at install removes that cascade.
+
+Declined: a nullable key that relies on the probe alone. Declined: requiring a backfill, or the creation of every physical Job, before `prepare()`. Declined: keeping the foreign key at prepare as `NO ACTION`, which still rejects the same inserts ([0018](../decisions/0018-legacy-identity-stays-on-the-legacy-table.md)).
+
+Rollback mirrors install. Before it renames the retained table back, it drops the check and the foreign key. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback.
+
+From install onward, `ON DELETE CASCADE` carries a successor delete through the retained row. From there, the legacy schema's own rules govern every inbound key. Before install, a successor delete leaves the legacy row in place. Its key then names no row, and the backfill treats the row as having no successor yet. The delete leaves the legacy row's `updated_at` unchanged, so no incremental pass walks the row. Install's existence proof flags its key, and install's catch-up reaches the row and creates the root with the key value.
 
 ## The updated-at index
 
@@ -58,14 +75,6 @@ Rollback mirrors install. Before it renames the retained table back, it drops th
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "listings_updated_at_index" ON "listings" ("updated_at");
-```
-
-## The position index
-
-Each `position()` attribute needs an index on the legacy table: `(<legacyWithin>, <column>, <key>) WHERE deleted_at IS NULL`. The consumer creates it `CONCURRENTLY` before prepare. `prepare()` refuses without it, and `compatibility:sql prepare` prints the statement.
-
-```sql
-CREATE INDEX CONCURRENTLY floorplans_listing_id_index_id ON floorplans (listing_id, "index", id) WHERE deleted_at IS NULL;
 ```
 
 ## The view
@@ -97,7 +106,7 @@ The view is not automatically updatable. [Lifecycle](lifecycle.md#the-writer-bou
 
 ## `compatibility_backfills`
 
-One row per legacy model holds the state of its backfill. `prepare()` creates the table when it does not exist, and creates the legacy model's `<legacy>_backfill`.
+One row per legacy model holds the state of its backfill. `prepare()` creates the table when it does not exist, and inserts the legacy model's row when none exists. Install deletes that row, so a legacy table with its ledger and no row reads as `rolled back` in `compatibility:status`. `prepare()` creates the legacy model's `<legacy>_backfill` when that table does not exist, and otherwise reuses it.
 
 ```sql
 CREATE TABLE compatibility_backfills (
@@ -147,4 +156,8 @@ CREATE INDEX ON listings_backfill (status) WHERE status IN ('refused', 'failed')
 
 The partial index lets every pass find the `refused` and `failed` rows without a scan. The table's name obeys the identifier limit ([0009](../decisions/0009-map-names-fit-the-object-name-limit.md)).
 
-When install finishes, the package deletes the legacy model's row from `compatibility_backfills` and drops `<legacy>_backfill`. It never drops `compatibility_backfills`. The table holds one row per legacy model, so dropping it would erase the watermarks of models not yet installed. Each legacy model installs independently, and that rule needs those watermarks. `rollback()` needs neither, because it refills the legacy table from the successors through the successor key.
+When install finishes, the package deletes the legacy model's row from `compatibility_backfills`. It never drops `compatibility_backfills`. The table holds one row per legacy model, so dropping it would erase the watermarks of models not yet installed. Each legacy model installs independently, and that rule needs those watermarks.
+
+Install keeps the whole `<legacy>_backfill`, and deletes no ledger row. The `deleted` rows outlive install, a rollback and a re-install. `retire()` drops the table and deletes the model's `compatibility_backfills` row, because retire rules out a re-install. `prepare()` reuses the table on a re-install, so install still excludes the roots a pass trashed from its native-root inserts ([Lifecycle: re-install after rollback](lifecycle.md#re-install-after-rollback)). Declined: dropping `<legacy>_backfill` at install, which lets a re-install revive records whose legacy rows were hard-deleted. Declined: deleting the other rows at install, which writes nearly one row per legacy row inside install's transaction.
+
+`rollback()` needs neither table, because it refills the legacy table from the successors through the successor key.

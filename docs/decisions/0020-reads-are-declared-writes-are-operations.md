@@ -9,7 +9,7 @@ A legacy attribute write could only become one value in one column of one succes
 - A media position is a move through eloquent-ordering, not a column value.
 - One legacy `display_type` splits into two successor columns.
 
-The map had two partial escapes, transitions() and the write closure of `external()`. Neither one composed with a read.
+The map had two partial escapes, transitions() and the write closure of an external attribute. Neither one composed with a read.
 
 ## Decision
 
@@ -17,8 +17,8 @@ The map's read half declares each attribute's projection. Every legacy write int
 
 - An invertible attribute has a default operation that assigns the inverse.
 - `writtenBy()` names an operation class for any other write.
-- A `readOnly()` attribute's default operation refuses on an update. On a create, it assigns the inverse into a successor row the create creates ([0027](0027-the-view-is-driven-from-the-retained-table.md)).
-- A `readAs()` attribute with neither `writtenBy()` nor `readOnly()` fails map compilation.
+- A `readOnly()` attribute declared with `ignoreWrites: false` refuses an update. On a create, its default operation assigns the inverse into a successor row the create creates. With `ignoreWrites: true`, every path discards a write to it and reports the write ([0027](0027-the-view-is-driven-from-the-retained-table.md)).
+- An attribute with no inverse, such as a `readAs()` or `computedAs()` attribute, with neither `writtenBy()` nor `readOnly()` fails map compilation.
 
 `writtenBy()` replaces writeTo(), transitions(), the external write closure, and the consumer's use of `Applying::run()`.
 
@@ -26,9 +26,9 @@ The package runs a write as a unit of work. It opens its own transaction, calls 
 
 The scope runs inside the package's transaction, so its parent locks hold until the package's work commits, and a scope needs no transaction of its own.
 
-After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it.
+After a write, every written attribute must read back its new value. The round-trip check refuses and rolls back a write that fails it. A computed value is not in the view, so under the Live origin, for a `computedAs()` attribute with a `writtenBy()` operation, the check calls the read closure with the reloaded successor. Under the Backfill origin, no comparison checks a `computedAs()` attribute, and none checks a `readOnly()` attribute declared with `ignoreWrites: true` or one with no stored column ([Operations: what the comparisons skip](../specification/operations.md#what-the-comparisons-skip)).
 
-A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only.
+A create is a write of every supplied attribute against an empty original. The backfill creates with the Backfill origin, and catch-up runs the operations of changed values only. The `writtenBy()` operation of a `computedAs()` attribute is the exception: a pass runs it on every row it walks ([Operations: computed attributes under the backfill](../specification/operations.md#computed-attributes-under-the-backfill)).
 
 A mass write makes one unlocked read of every record's successors, then one scope call with all their keys. It then locks and re-checks once, and runs the remaining steps once per record. It forwards no legacy event, and successor events still fire. This amends the earlier design, which forwarded one legacy event sequence per record on the mass path. Declined: per-record legacy events on a mass write, which Eloquent's own mass writes never fire.
 
@@ -36,11 +36,9 @@ A mass write makes one unlocked read of every record's successors, then one scop
 
 An operation receives the change context: the record after the write, the original, the attribute and the origin. The original is a legacy model instance, empty on a create. During catch-up, the original is the record as the successors serve it before the pass writes, read through the view's compiled `SELECT`. An initializer receives a creation context instead, Write\Creation, with the record and the origin. On a native create, its record is the new legacy model, so the legacy initializer takes no separate legacy parameter. Declined: the change context with a null attribute and an empty original.
 
-Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position(legacyWithin:)` reads eloquent-ordering's published position expression, and its default operation moves the row. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
+Two projection helpers cover the common reads. `orFrom()` reads a related successor's column, named by class, when the attribute's own column is NULL. `position()` reads eloquent-ordering's published position expression, and its default operation moves the row. It takes no arguments: positions number within the successor's eloquent-ordering parent ([0030](0030-positions-number-within-the-ordering-parent.md)). This amends the earlier design, which named a legacy parent column as its argument. `readAs()` stays public as the escape hatch, for any projection the helpers do not cover. Declined: `position(rankedBy:, within:)`, and `equals()` or CASE helpers until a second caller exists.
 
-A legacy `orderBy('index')` on a `position()` attribute compiles to the successor's `rank_key` order. A `where('index', N)` across parents compiles without a count per candidate row.
-
-`prepare()` refuses a `position()` attribute without its position index on the legacy table.
+A legacy `orderBy('index')` on a `position()` attribute sorts by the position expression, because `rank_key` values from two parents share no order. A query that pins one parent sorts by `rank_key`. A `where('index', N)` across parents compiles without a count per candidate row.
 
 When `choose:` picks another target class for a record, the package moves the morph target. It deletes the old target through its model and creates the new one, in one unit of work. Declined: an operation that moves it.
 
@@ -50,6 +48,10 @@ The root's soft-delete column and a successor's updated-at column have default o
 
 `delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to the rule that every package path writes a successor through its model ([0017](0017-successors-are-written-through-their-models.md)), because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
 
+The floor plan example matches Aryeo's schema. `display_type` and `displays_on_property_websites` are `place_assets` columns. WriteDisplayType therefore writes the PlaceAsset whatever the morph target, and no longer refuses a Link. FloorPlan's membership filters `place_assets.legacy_type`, a column Aryeo adds to hold the media's morph alias ([AryeoHQ/aryeo#12349](https://github.com/AryeoHQ/aryeo/issues/12349)).
+
+The package evaluates `when()` only when it creates a legacy row: at a native successor create, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the row to its root. Membership must therefore be exclusive across the maps that share a root, and stable from creation. For a root that several legacy models share, the specification recommends an immutable discriminator column, such as `place_assets.legacy_type`. `successorsInitializedBy()` sets it for a root the package creates, and a creating listener on the successor sets it for a native create. A change of membership after creation is a consumer reclassification: delete through one legacy model, then create through the other. It is never a package action ([AryeoHQ/aryeo#12360](https://github.com/AryeoHQ/aryeo/issues/12360)). `compatibility:check` reports a served record whose root no longer matches its map's `when()`.
+
 Declined: a complete column specification, and one adapter class per legacy model.
 
 ## Consequences
@@ -57,9 +59,9 @@ Declined: a complete column specification, and one adapter class per legacy mode
 - Each changed successor produces one `UPDATE` and one each of `saving`, `updating`, `updated` and `saved`. A domain action queued after the save saves again, with its own events.
 - An operation's write must agree with its attribute's read, or the write refuses.
 - The map refuses to compile a legacy-only NOT NULL column with neither a default nor an initializer. `assertServesCompatibility()` exercises a native create.
-- The map's membership decides which native successor creates insert a legacy row.
+- The map's membership decides which native successor creates insert a legacy row. It decides nothing after that row exists.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.
-- A position() attribute reads eloquent-ordering's published position expression, and its default operation moves the row with Placement::at(). The package therefore requires eloquent-ordering. Before install, a pass converts each legacy value to its rank among the live rows of its legacy parent.
+- A position() attribute reads eloquent-ordering's published position expression. After install, a write moves the row with Placement::at(). A backfill row or catch-up row re-sequences its eloquent-ordering parent, so the parent's legacy rows end in legacy order ([Operations: positions](../specification/operations.md#positions)). The package therefore requires eloquent-ordering.
 - A legacy soft delete, restore and record delete fire the successor's `deleting`, `deleted`, `restoring` and `restored` events, so the package writes the successor through its model on the delete path too, apart from the deletion date's `UPDATE`. A backfilled trashed row keeps its original deletion date. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, keeps the legacy `updated_at`, and the round trip holds.
 - [Operations](../specification/operations.md) states the interfaces and the steps.

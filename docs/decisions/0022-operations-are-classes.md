@@ -14,7 +14,7 @@ The package resolves each operation and hook class from the container, so a cons
 
 The classes live in the consumer's entity namespace plus a final Compatibility segment, as a documented convention that no tool checks. Aryeo's is App\Entities\<Plural>\Compatibility. This amends the earlier design, which placed the classes in the model's own namespace plus a final Compatibility segment.
 
-The other closures in a map stay closures: `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `external()`. Each one selects rows, picks a class or computes a value, and none of them writes.
+The other closures in a map stay closures: `when()`, `choose:`, the scope of `hide()`, the condition of `guard()`, the value of `isNotNull()`, and the read of `computedAs()`. Each one selects rows, picks a class or computes a value, and none of them writes.
 
 Declined: closures for these five hooks, a class with its own interface for each declaration closure, and the literal `<model namespace>\Compatibility` rule.
 

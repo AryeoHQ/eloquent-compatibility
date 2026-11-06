@@ -27,5 +27,5 @@ Declined: a dependency on eloquent-concurrency, and a lock order taken from eloq
 - Listing's scope runs Aryeo's Job write transaction. Media's scope locks ordering parents first, through Aryeo's own use of eloquent-ordering.
 - A map over ordered successors without a scope can still deadlock. The package documents that risk and does not detect it.
 - eloquent-ordering must publish a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media scope needs it.
-- eloquent-ordering must also publish its position expression, and add Placement::at(int $position). The package's position() needs both.
+- eloquent-ordering must also publish its position expression and an ordered item's parent key columns, and add Placement::at(int $position). The package's position() needs all three ([0030](0030-positions-number-within-the-ordering-parent.md)).
 - [Operations](../specification/operations.md#the-write-scope) states the contract.

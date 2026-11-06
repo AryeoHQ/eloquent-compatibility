@@ -41,7 +41,7 @@ final class ListingMap
                 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
                 ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at')->inTimeZone('UTC'))
                 ->attribute(name: 'deleted_at', definition: fn (Attribute $attribute) => $attribute->from('deleted_at')->inTimeZone('UTC'))
-                ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.'))
+                ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A Job never changes company.', ignoreWrites: false))
                 ->attribute(name: 'is_draft', definition: fn (Attribute $attribute) => $attribute
                     ->readAs('"jobs"."lifecycle_status" = \'draft\'')
                     ->writtenBy(PublishOrDraftJob::class))
@@ -51,13 +51,13 @@ final class ListingMap
                     ->writtenBy(SetDownloadsPermission::class))
                 ->related(fn (Job $job) => $job->listingCompatibilityState())
                 ->related(relation: fn (Job $job) => $job->place(), successor: fn (Successor $place) => $place
-                    ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.'))
+                    ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A Place is replaced, never re-keyed.', ignoreWrites: false))
                     ->related(relation: fn (Place $place) => $place->address()->withTrashed(), successor: fn (Successor $address) => $address
                         ->attribute(name: 'address_id', definition: fn (Attribute $attribute) => $attribute
                             ->from(column: 'id')
                             ->writtenBy(ChangeListingAddress::class))))
                 ->related(relation: fn (Job $job) => $job->jobSite(), successor: fn (Successor $site) => $site
-                    ->attribute(name: 'job_site_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.'))))
+                    ->attribute(name: 'job_site_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A JobSite is replaced, never re-keyed.', ignoreWrites: false))))
             ->successorsInitializedBy(InitializeListingJob::class)
             ->legacyInitializedBy(InitializeLegacyListing::class)
             ->writesWithin(ListingWriteScope::class)
@@ -68,7 +68,7 @@ final class ListingMap
 
 `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the Job's `delete()`, and a legacy restore queues its `restore()`, so the Job's `deleting`, `deleted`, `restoring` and `restored` listeners run. A legacy `forceDelete()` runs the Job's `forceDelete()`. `PublishOrDraftJob`'s `publish()` saves the Job again under `Model::withoutTimestampsOn()`, so the Job keeps the legacy `updated_at`.
 
-`company_id`, `place_id` and `job_site_id` are `readOnly()`. `place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, each default operation assigns its key into the row the create creates, so a reserved id is honored. An update of any of the three refuses ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
+`company_id`, `place_id` and `job_site_id` are `readOnly()`, declared with `ignoreWrites: false`. `place_id` and `job_site_id` read the keys of the related Place and JobSite. On a create, each default operation assigns its key into the row the create creates, so a reserved id is honored. An update of any of the three refuses ([Operations: creates](../operations.md#creates)). `address_id` reads `from(column: 'id')` on the Address the Place points at, as `place_id` reads the Place's key. `writtenBy()` names `ChangeListingAddress`, which must satisfy that read for the round trip. The state row is a companion: the map declares no attributes on it, and `downloads_enabled` reads its fallback through `orFrom()`.
 
 ## The operations
 

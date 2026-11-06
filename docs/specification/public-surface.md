@@ -4,7 +4,7 @@ Status: Proposed
 
 A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
-Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, and `Targets` in `Definition\`. A different namespace is a deviation under [Deviations](README.md#deviations).
+Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, `Targets` in `Definition\`, and the event `WriteIgnored` in `Events\`. A different namespace is a deviation under [Deviations](README.md#deviations).
 
 Every parameter of a public constructor, function or method on this page is public, named and stable. A release may not rename one. The worked examples name every argument of a call that takes more than one value, and a variadic unpack stays positional.
 
@@ -29,6 +29,7 @@ Every parameter of a public constructor, function or method on this page is publ
 | `Write\Creation` | class | the context an initializer receives |
 | `Write\Origin` | enum | whether a write is live or comes from the backfill |
 | `Write\Refusal` | exception | refuses one write or one backfill row, and extends `Exceptions\CompatibilityException` |
+| `Events\WriteIgnored` | event | a discarded non-NULL write to a `readOnly()` attribute declared with `ignoreWrites: true`; its constructor is `__construct(Change $change, mixed $value)` |
 | `Exceptions\CompatibilityException` | abstract class | the one public base of every package exception |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
 
@@ -62,7 +63,7 @@ Every method returns the `Compatibility` it was called on.
 | `related(Closure $relation, null\|Closure $successor = null)` | a related successor: the closure returns its Eloquent relation, and `successor:` defines it |
 | `relatedMorph(Closure $relation, Closure $choose, Closure $targets)` | a `MorphTo`, the closure that picks its target class, and the targets over a `Definition\Targets` |
 | `atMostOne(string $because)` | a write refuses a second related row, with the reason; the view still uses a lateral join unless a unique index proves the relation |
-| `when(Closure $scope)` | membership: which successor rows the legacy model serves |
+| `when(Closure $scope)` | membership: which natively created successor rows gain a legacy row |
 
 ### `Definition\Attribute`
 
@@ -71,11 +72,13 @@ Every method returns the `Compatibility` it was called on.
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
 | `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
-| `position(string $legacyWithin)` | reads the row's one-based position through eloquent-ordering's published position expression for the successor; `legacyWithin` names the legacy parent column, and the default operation moves the row with `Placement::at()` |
+| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order ([Operations: positions](operations.md#positions)) |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
-| `readOnly(string $because)` | an attribute an update never writes, and the reason; on a create, its default operation assigns the inverse into a successor row the create creates |
-| `external(Closure $read)` | a value stored outside the database, which the closure reads; `writtenBy()` names its operation |
+| `readOnly(string $because, bool $ignoreWrites)` | an attribute no write changes, and the reason; `$ignoreWrites` has no default: `false` refuses an update, and `true` discards the write and dispatches `Events\WriteIgnored` ([Operations: read-only attributes](operations.md#read-only-attributes)) |
+| `computedAs(Closure $read)` | a value computed in PHP after the query, from an outside store such as ZML or from a successor model method such as a File accessor. `$read` is `Closure(Collection<array-key, Model>): array<array-key, mixed>`: it receives the successors the attribute sits under, once per query, and returns their values keyed by successor key. The value cannot be filtered or sorted in SQL. It has no inverse, so `writtenBy()` or `readOnly()` must name its operation |
+
+Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: counting writes since `prepare()` to gate install, because the legacy column is live storage until install, so that count never reaches zero ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)).
 
 ### `Definition\Targets`
 
@@ -86,7 +89,8 @@ Every method returns the `Compatibility` it was called on.
 ### Removed from today's map
 
 - `retainedIn(key:)`: the successor key moves to `servedFrom(key:)`.
-- `writeTo()`, `transitions()` and the write closure of `external()`: `writtenBy()` replaces them.
+- `writeTo()`, `transitions()` and the write closure of an external attribute: `writtenBy()` replaces them.
+- The external attribute's read: `computedAs()` replaces it, with the same `read` closure ([0028](../decisions/0028-the-public-surface-is-declared.md)).
 - `servedFrom(choose:, successors:)`: two-primary maps are retired.
 - `identifiedBy()` and `discriminatedBy()`: successor identity columns and the discriminator go away. Identity comes from the legacy table, and membership comes from the map's chooser and the successor key.
 - `timestamps()`: every worked map declares `created_at` and `updated_at` as plain attributes. Declined: keeping `timestamps()` as a shortcut.
@@ -96,10 +100,10 @@ Every method returns the `Compatibility` it was called on.
 
 | Method | Does |
 | :-- | :-- |
-| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's constraints, creates the backfill tables, and lists the objects that depend on the legacy table |
+| `Compatibility::prepare(class-string<Model> $model): void` | adds the successor key's unique constraint, creates the backfill tables, inserts the model's `compatibility_backfills` row, and lists the objects that depend on the legacy table |
 | `Compatibility::install(class-string<Model> $model, CarbonInterval $statementTimeout, int $passSize = 1000, null\|CarbonInterval $margin = null): void` | runs passes until one changes the outcome of fewer rows than `$passSize`, proves the install gate, then swaps the table for the view in one transaction; `$statementTimeout` sets `statement_timeout` for every statement under install's lock, and is the total budget for the lock hold, after which install rolls back and refuses, naming the step it reached; a null `$margin` means 5 minutes |
 | `Compatibility::rollback(class-string<Model> $model): void` | reverses an install, and makes the legacy table the source of truth again |
-| `Compatibility::retire(class-string<Model> $model): void` | drops the view and the retained table once a legacy model has no readers; refuses while any object depends on either |
+| `Compatibility::retire(class-string<Model> $model): void` | drops the view, the retained table and `<legacy>_backfill` once a legacy model has no readers; refuses while any object depends on either |
 | `Compatibility::update(class-string<Model> $model): void` | rebuilds an installed view after a map change |
 | `Compatibility::serves(class-string<Model> $model): bool` | answers whether the legacy name is the installed view on the model's connection |
 
@@ -116,7 +120,7 @@ Every method returns the `Compatibility` it was called on.
 | Command | Does |
 | :-- | :-- |
 | `compatibility:backfill {model} {--chunk=1000} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
-| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, and trashed rows separately |
+| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, served records whose root no longer matches the map's `when()`, and trashed rows separately |
 | `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
 | `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names; a backfilling model also shows its pass count, its watermark, and its refused and failed counts |
 | `compatibility:cache` | discovers the served models and caches the list |
@@ -134,13 +138,16 @@ The commands are public by name. Their classes are internal.
 
 ## Testing
 
-`AssertsServedCompatibility::assertServesCompatibility(class-string<Model> $model)` fails a test when:
+`AssertsServedCompatibility::assertServesCompatibility(class-string<Model> $model, Closure $nativeCreate)` fails a test when:
 
 - discovery does not find the model,
 - the map does not compile,
 - the installed view differs from the view the map compiles, and the message tells the developer to run `Compatibility::update()`,
-- a native create of the root successor fails, or
+- `$nativeCreate` fails, inserts no retained row of `$model`, or creates a root that also matches the `when()` of another discovered map with the same root class,
+- a membership query of `compatibility:check` finds a row: a served root outside its map's `when()`, or a shared successor that serves two legacy records, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.
+
+`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row and runs one `compatibility:backfill` pass catches an initializer that leaves the discriminator unset.
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A test that uses `RefreshDatabase` can therefore install a served model.
 

@@ -48,6 +48,8 @@ Each settled decision has one record. Records 0009 to 0015 stay in force, and no
 | [0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md) | the view is driven from the retained table |
 | [0028](../decisions/0028-the-public-surface-is-declared.md) | the public surface is declared |
 | [0029](../decisions/0029-two-primary-maps-are-retired.md) | two-primary maps are retired |
+| [0030](../decisions/0030-positions-number-within-the-ordering-parent.md) | positions number within the ordering parent |
+| [0031](../decisions/0031-legacy-only-values-are-projected-or-written-through-the-legacy-model.md) | legacy-only values are projected, or written through the legacy model |
 
 ## Adoption findings
 
@@ -72,7 +74,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 | M6. No supported install-state check | [Public surface: operations](public-surface.md#operations) |
 | M7. Related and expression filters cannot use indexes | [Storage: the view](storage.md#the-view) and [Public surface: commands](public-surface.md#commands) |
 | M8. Identifiers of different widths cannot share a successor | [Storage: the retained table](storage.md#the-retained-table) |
-| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install) |
+| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install). Writes to a shared successor through the other legacy models pause only for install's last statement, which adds the successor key's foreign key, plus its lock wait and the commit. That lock waits for every open writer of the successor's table, and install retries on a lock timeout or a deadlock ([Storage: the successor key](storage.md#the-successor-key)). A native create of a member root waits for the whole hold, because `Provides\CarriesLegacy` locks each legacy table whose `when()` the root matches |
 
 ## Not in this design
 
@@ -89,8 +91,9 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No two-primary maps.** A retained table may still hold two nullable root keys if a real split appears.
 - **Out of scope:** the audit findings not named here, `Event::fake()` suppressing forwarding, and guards on insert. Database-enforced exclusivity on shared successors and every change inside Aryeo are out of scope too.
 
-Three external dependencies on eloquent-ordering remain:
+Four external dependencies on eloquent-ordering remain:
 
 - It publishes its position expression as public API, which `position()` reads.
 - It adds `Placement::at(int $position)`, which the default operation of `position()` uses.
+- It publishes an ordered item's parent key columns, which the relative placement and install's order proof partition by. This is Requirement 3 of https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 - It publishes a routine that locks the parents of a set of models first, usable outside an order write. Aryeo's media write scope needs it.
