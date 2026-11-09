@@ -34,7 +34,8 @@
         "laravel/framework": "12.x || ^13",
         "ext-mbstring": "*",
         "phpstan/phpstan": "^2.1",
-        "nikic/php-parser": "^5.7"
+        "nikic/php-parser": "^5.7",
+        "nesbot/carbon": "^3.8.4"
     },
     "require-dev": {
         "aryeo/eloquent-state-machines": "0.0.34",
