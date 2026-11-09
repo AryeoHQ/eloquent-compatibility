@@ -19,7 +19,10 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityException;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 trait AssertsServedCompatibility
 {
@@ -72,6 +75,18 @@ trait AssertsServedCompatibility
                 Assert::fail("The map of {$sibling}, which compatibility:check reads beside {$model} to prove that no shared successor serves two legacy records, does not compile: {$exception->getMessage()}");
             }
         }
+        if ($map->legacyInitializer === null) {
+            $uninitialized = [];
+
+            foreach ((new ColumnCatalog($connection, throughSearchPath: true))->of($views === null ? $map->table : ViewCompiler::retainedTable($map)) as $name => $column) {
+                if ($column->needsAValue() && ! in_array($name, [(new $model)->getKeyName(), $map->successorKey], true) && $map->legacyOnly([$name]) !== []) {
+                    $uninitialized[] = $name;
+                }
+            }
+
+            Assert::assertSame([], $uninitialized, "The legacy-only column {$map->table}.".implode(', ', $uninitialized).' is NOT NULL with no default, and the map of '.class_basename($model).' declares no legacyInitializedBy(), so a native create cannot fill it.');
+        }
+
         $connection->beginTransaction();
 
         try {
@@ -88,6 +103,15 @@ trait AssertsServedCompatibility
             Assert::assertInstanceOf($map->primary->model, $root, "nativeCreate creates no {$map->primary->model} to serve as the root of a new {$model}; return the root it creates.");
             Assert::assertTrue($root->exists, "nativeCreate returns a {$map->primary->model} it never saved.");
             Assert::assertTrue(self::isMember($map, $root), 'nativeCreate creates a '.class_basename($map->primary->model).' outside the when() of '.class_basename($model).", so a native create inserts no {$map->table} row. Set its membership column at birth, through a Creating listener.");
+
+            Assert::assertTrue(
+                $connection->table(ViewCompiler::retainedTable($map))->where(
+                    column: $map->successorKey,
+                    operator: '=',
+                    value: $root->getKey(),
+                )->exists(),
+                'nativeCreate inserts no '.ViewCompiler::retainedTable($map).' row for the new '.class_basename($map->primary->model).'. Use '.CarriesLegacy::class.' on '.class_basename($map->primary->model).', and create it inside a transaction.',
+            );
 
             foreach ($siblings as $sibling) {
                 Assert::assertFalse(

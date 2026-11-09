@@ -128,7 +128,7 @@ final class ViewCompilerTest extends TestCase
                 )
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(Place::class)->where('city', "Coeur d'Alene")->whereIn('street', ['1 Oak St', '2 Oak St']),
-                    definition: fn (Successor $place) => $place
+                    successor: fn (Successor $place) => $place
                         ->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
                 ))
             ->hide(fn (Builder $jobs) => $jobs->where('price_cents', '>', 1000000)->orWhere('name', 'like', '%?%'), because: 'Too dear.'));
@@ -244,7 +244,7 @@ final class ViewCompilerTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                 ->attribute(
                     name: 'title',
-                    definition: fn (Attribute $attribute) => $attribute->external(read: fn (array $jobs) => $jobs, write: fn (Job $job, mixed $title) => $title),
+                    definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (array $jobs) => $jobs)->readOnly(because: 'The map reads it from outside the database.', ignoreWrites: false),
                 )
                 ->attribute(
                     name: 'company_id',
@@ -320,7 +320,7 @@ final class ViewCompilerTest extends TestCase
                 )
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', new DateTimeImmutable('2026-01-01 08:30:00', new DateTimeZone('Asia/Tokyo'))),
-                    definition: fn (Successor $place) => $place
+                    successor: fn (Successor $place) => $place
                         ->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
                 ))
             ->hide(fn (Builder $jobs) => $jobs->where('created_at', '<', new DateTimeImmutable('2020-01-01')), because: 'Too old.'));
@@ -353,7 +353,7 @@ final class ViewCompilerTest extends TestCase
             DB::statement('drop table job_sites');
         }, fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->related(
             relation: fn (Job $job) => $job->site(),
-            definition: fn (Successor $site) => $site,
+            successor: fn (Successor $site) => $site,
         )), 'the successor table job_sites does not exist'];
         yield 'no successor column' => [$prepare, fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
             name: 'title',

@@ -110,7 +110,7 @@ final class LegacyRecordTest extends TestCase
     }
 
     #[Test]
-    public function it_forwards_no_created_event_for_a_root_that_no_retained_row_holds(): void
+    public function it_forwards_the_creating_and_created_events_of_a_native_root_create_with_the_retained_row_it_carries(): void
     {
         $seen = [];
 
@@ -123,10 +123,10 @@ final class LegacyRecordTest extends TestCase
             );
         }
 
-        $job = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        $job = DB::transaction(fn () => Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]));
 
-        $this->assertSame([], $seen);
-        $this->assertSame(0, DB::table('listings_retained')->where(column: 'job_id', operator: '=', value: $job->id)->count());
+        $this->assertSame(['creating', 'created'], $seen);
+        $this->assertSame(1, DB::table('listings_retained')->where(column: 'job_id', operator: '=', value: $job->id)->count());
     }
 
     #[Test]

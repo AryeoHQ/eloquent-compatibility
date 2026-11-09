@@ -24,95 +24,26 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
-    public static function transitions(string $model, string $attribute): self
+    public static function roundTrip(string $model, string $attribute, int|string $key, mixed $written, mixed $served): self
     {
         return new self(
-            "{$model}::\${$attribute} cannot take a mass write",
-            "It is declared transitions(), so each record's change runs its successor's state-machine trigger, and a set-based statement cannot run a trigger per row.",
-            'Write the records one at a time through '.class_basename($model).'.',
-        );
-    }
-
-    public static function notAStateMachine(string $model, string $attribute, string $successor, string $column): self
-    {
-        $name = class_basename($successor);
-
-        return new self(
-            "{$model}::\${$attribute} cannot take a write",
-            "It is declared transitions(), and {$name}::\${$column} has no state-machine cast.",
-            "Cast {$column} on {$name} to a StateMachineable enum, or drop transitions() from the attribute.",
-        );
-    }
-
-    public static function noTransition(string $model, string $attribute, int|string $key, string $machine, null|string $from, null|string $to): self
-    {
-        $name = class_basename($machine);
-
-        return new self(
-            "{$model} record {$key} cannot change \${$attribute} from '{$from}' to '{$to}'",
-            "{$name} declares no transition from '{$from}' to '{$to}', so no trigger can make the change.",
-            "Change {$attribute} only along a transition {$name} declares.",
+            "{$model} record {$key} cannot take this write of \${$attribute}",
+            'The write stores '.self::shown($written).", and the view now serves {$attribute} as ".self::shown($served).', so the record would not read back what was written.',
+            "Make the operation of {$attribute} store a value its read serves back.",
         );
     }
 
     /**
-     * @param  non-empty-list<string>  $triggers
+     * @param  class-string<Model>  $successor
+     * @param  list<string>  $scoped
+     * @param  list<string>  $locked
      */
-    public static function severalTransitions(string $model, string $attribute, int|string $key, string $machine, string $from, string $to, array $triggers, string $successor): self
+    public static function successorsMoved(string $model, string $successor, array $scoped, array $locked): self
     {
         return new self(
-            "{$model} record {$key} cannot change \${$attribute} from '{$from}' to '{$to}'",
-            class_basename($machine).' declares '.count($triggers)." transitions from '{$from}' to '{$to}', through ".implode(' and ', array_map(class_basename(...), $triggers)).', so the write cannot choose one.',
-            'Run the trigger you mean on '.class_basename($successor).' directly.',
-        );
-    }
-
-    public static function byTransition(string $model, string $attribute, int|string $key, string $trigger, Throwable $refusal): self
-    {
-        $name = class_basename($trigger);
-
-        return new self(
-            "{$model} record {$key} cannot change \${$attribute}, because the trigger {$name} refused it",
-            $refusal->getMessage(),
-            "Make the change once {$name} allows it, or change {$attribute} along another transition.",
-            $refusal,
-        );
-    }
-
-    public static function notInitial(string $model, string $attribute, string $successor, string $column, null|string $value, null|string $initial): self
-    {
-        $name = class_basename($successor);
-
-        if ($initial === null) {
-            return new self(
-                "{$model} cannot insert a record whose \${$attribute} stores '{$value}'",
-                "{$name} declares no initial state for {$column}, so an insert cannot store a state without a transition.",
-                "Insert the record without {$attribute}, then set it through the state machine of {$name}.",
-            );
-        }
-
-        return new self(
-            "{$model} cannot insert a record whose \${$attribute} stores '{$value}'",
-            "A new {$name} starts in its initial state '{$initial}' on {$column}, and an insert runs no transition.",
-            "Insert the record with the {$attribute} that stores '{$initial}', then change it in a second write.",
-        );
-    }
-
-    public static function external(string $model, string $attribute): self
-    {
-        return new self(
-            "{$model}::\${$attribute} cannot take a mass write",
-            'It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system.',
-            'Write the records one at a time through '.class_basename($model).'.',
-        );
-    }
-
-    public static function declined(string $model, string $attribute, string $because): self
-    {
-        return new self(
-            "{$model}::\${$attribute} cannot take a write",
-            $because,
-            "Leave {$attribute} unchanged in writes through ".class_basename($model).'.',
+            "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran',
+            'The write scope received the keys ['.implode(', ', $scoped).'], and the package then locked ['.implode(', ', $locked).'], so it would write a row the scope never ordered.',
+            'Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
         );
     }
 
@@ -143,21 +74,21 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
-    /**
-     * @param  list<string>  $attributes
-     */
-    public static function noKeyDefault(string $model, array $attributes, string $table, string $column): self
-    {
-        return new self(
-            "{$model} cannot write \$".implode(', $', $attributes)." in one statement to records that have no {$table} row",
-            "A set-based write creates the missing {$table} rows in SQL, and {$table}.{$column} has no database default to key them.",
-            'Write the records one at a time through '.class_basename($model).", or give {$table}.{$column} a database default.",
-        );
-    }
-
     public static function byGuard(string $model, Guard $guard, int|string $key): self
     {
         return new self("{$model} record {$key} cannot take this write, because guard '{$guard->name}' refuses it", $guard->because, $guard->instead);
+    }
+
+    private static function shown(mixed $value): string
+    {
+        return match (true) {
+            $value === null => 'null',
+            is_bool($value) => $value ? 'true' : 'false',
+            is_scalar($value) => "'".$value."'",
+            $value instanceof \BackedEnum => "'".$value->value."'",
+            $value instanceof \Stringable => "'".$value."'",
+            default => get_debug_type($value),
+        };
     }
 
     public static function bySuccessorListener(string $model, Model $successor): self

@@ -51,6 +51,9 @@ final class LegacyBuilder extends Builder
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $restores = null;
 
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $touches = null;
+
     /** @var array<string, array<string, array{name: string, deterministic: bool, declared: bool}>> */
     private static array $collations = [];
 
@@ -100,6 +103,17 @@ final class LegacyBuilder extends Builder
             return $delete();
         } finally {
             $deletes->offsetUnset($model);
+        }
+    }
+
+    public static function touchOf(Model $model, bool $touches): void
+    {
+        $all = self::$touches ??= new WeakMap;
+
+        if ($touches) {
+            $all[$model] = true;
+        } else {
+            $all->offsetUnset($model);
         }
     }
 
@@ -229,9 +243,20 @@ final class LegacyBuilder extends Builder
 
         $deleting = self::$deletes?->offsetExists($model) ?? false;
         $restoring = self::$restores?->offsetExists($model) ?? false;
+        $touched = self::$touches?->offsetExists($model) ?? false;
         self::forgetRestoreOf($model);
+        self::touchOf(
+            model: $model,
+            touches: false,
+        );
 
-        return $this->own(fn (): int => parent::update($values), fn (): int => $this->writer()->update($model, $values, $deleting, $restoring));
+        return $this->own(fn (): int => parent::update($values), fn (): int => $this->writer()->update(
+            legacy: $model,
+            values: $values,
+            deleting: $deleting,
+            restoring: $restoring,
+            touched: $touched,
+        ));
     }
 
     public function delete(): mixed

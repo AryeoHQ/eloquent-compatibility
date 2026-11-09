@@ -569,11 +569,11 @@ final class CompileSqlTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'listed_wall',
-                            definition: fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.', ignoreWrites: false),
                         ));
             }
         };

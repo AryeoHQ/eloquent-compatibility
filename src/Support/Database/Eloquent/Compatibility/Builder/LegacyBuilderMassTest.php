@@ -44,7 +44,7 @@ final class LegacyBuilderMassTest extends TestCase
     }
 
     #[Test]
-    public function it_soft_deletes_restores_and_force_deletes_a_set_without_model_events(): void
+    public function it_soft_deletes_restores_and_force_deletes_a_set_through_the_successor_models_without_legacy_events(): void
     {
         $this->install();
         Date::setTestNow('2026-05-06 07:08:09');
@@ -58,7 +58,8 @@ final class LegacyBuilderMassTest extends TestCase
 
         $this->assertSame([2, [1, 2, 3], 2, 1], [$deleted, $trashed, $restored, $forced]);
         $this->assertSame([[1, null, '2026-05-06 07:08:09'], [3, null, '2026-05-06 07:08:09']], Job::withTrashed()->select('jobs.*')->selectSub(query: ListingTables::legacyId(), as: 'legacy_id')->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => [$job->getAttribute('legacy_id'), $job->deleted_at, $job->updated_at?->toDateTimeString()])->all());
-        $this->assertSame([], $dispatched);
+        $this->assertSame([], array_values(array_filter($dispatched, fn (string $event) => str_ends_with($event, Listing::class))));
+        $this->assertNotSame([], $dispatched);
     }
 
     #[Test]
@@ -73,11 +74,12 @@ final class LegacyBuilderMassTest extends TestCase
 
         $this->assertSame(1, $touched);
         $this->assertSame(['2026-05-06 07:08:09', '2026-01-05 08:00:00'], Job::query()->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => $job->updated_at?->toDateTimeString())->all());
-        $this->assertSame([], $dispatched);
+        $this->assertSame([], array_values(array_filter($dispatched, fn (string $event) => str_ends_with($event, Listing::class))));
+        $this->assertNotSame([], $dispatched);
     }
 
     #[Test]
-    public function it_increments_a_set_without_model_events(): void
+    public function it_increments_a_set_through_the_successor_models_without_legacy_events(): void
     {
         $this->install();
         $events = $this->fakeModelEvents();
@@ -87,7 +89,8 @@ final class LegacyBuilderMassTest extends TestCase
         $dispatched = $events();
 
         $this->assertSame([['Raised', 125150], ['Pine Flat', null], ['Raised', 10099]], Job::withTrashed()->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => [$job->name, $job->price_cents])->all());
-        $this->assertSame([], $dispatched);
+        $this->assertSame([], array_values(array_filter($dispatched, fn (string $event) => str_ends_with($event, Listing::class))));
+        $this->assertNotSame([], $dispatched);
     }
 
     #[Test]
@@ -153,14 +156,16 @@ final class LegacyBuilderMassTest extends TestCase
 
         $this->assertSame([
             [1, "select set_config('TimeZone', ?, true)"],
+            [1, 'select listings'],
             [1, 'select listings_retained'],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],
-            [1, 'select places'],
-            [1, 'select job_sites'],
+            [1, 'select places for update'],
+            [1, 'select job_sites for update'],
             [1, 'select listings'],
             [1, 'update jobs'],
             [1, 'select listings'],
+            [1, 'select cast(? as numeric) + cast(? as numeric)'],
         ], $statements);
     }
 

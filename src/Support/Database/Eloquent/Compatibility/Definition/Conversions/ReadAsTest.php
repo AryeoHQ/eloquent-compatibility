@@ -23,15 +23,9 @@ final class ReadAsTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_through_its_inverse(): void
+    public function it_refuses_a_write_because_its_operation_writes_it(): void
     {
-        $this->assertSame('seattle', (new ReadAs('upper("places"."city")', fn (mixed $value) => strtolower((string) $value)))->write('SEATTLE'));
-    }
-
-    #[Test]
-    public function it_refuses_a_write_without_an_inverse(): void
-    {
-        $this->expectExceptionObject(new LogicException('readAs(upper("places"."city")) has no writeTo(), so it reads only.'));
+        $this->expectExceptionObject(new LogicException('readAs(upper("places"."city")) has no inverse, so its writtenBy() operation writes it.'));
 
         (new ReadAs('upper("places"."city")'))->write('SEATTLE');
     }
@@ -39,7 +33,7 @@ final class ReadAsTest extends TestCase
     #[Test]
     public function it_cannot_filter_by_the_stored_column(): void
     {
-        $conversion = new ReadAs('upper("places"."city")', fn (mixed $value) => $value);
+        $conversion = new ReadAs('upper("places"."city")');
 
         $this->assertNull($conversion->filter('=', 'SEATTLE'));
     }

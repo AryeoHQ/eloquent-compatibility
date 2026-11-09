@@ -15,9 +15,11 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\Fixtures\Support\Listings\TransitionListingStatus;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\Image;
@@ -58,7 +60,7 @@ final class ResolvedMapTest extends TestCase
         ], array_map(fn (Attribute $attribute) => $attribute->read($map->owners[$attribute->name]->table), $map->attributes));
         $this->assertSame(['A job never changes company.', true, 'A listing has one address.'], [
             $map->attributes['company_id']->readOnlyBecause(),
-            $map->attributes['status']->runsTransitions(),
+            $map->attributes['status']->operation() === TransitionListingStatus::class,
             $map->related[0]->successor->atMostOneBecause(),
         ]);
     }
@@ -93,7 +95,7 @@ final class ResolvedMapTest extends TestCase
                 ))
                 ->attribute(
                     name: 'kind',
-                    definition: fn (Attribute $attribute) => $attribute->from('legacy_type')->readOnly(because: 'A legacy write never moves a record to another legacy model.'),
+                    definition: fn (Attribute $attribute) => $attribute->from('legacy_type')->readOnly(because: 'A legacy write never moves a record to another legacy model.', ignoreWrites: false),
                 ))
             ->resolve();
 
@@ -126,22 +128,22 @@ final class ResolvedMapTest extends TestCase
         )), "attribute 'job_id' maps the successor key that servedFrom() names, and the retained table holds it"];
         yield 'two relations to one table' => [fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->related(
             relation: fn (Job $job) => $job->rootPlace(),
-            definition: fn (Successor $place) => $place,
+            successor: fn (Successor $place) => $place,
         )->related(
             relation: fn (Job $job) => $job->hasOne(Place::class),
-            definition: fn (Successor $place) => $place,
+            successor: fn (Successor $place) => $place,
         )), 'the relation from Job to Place reaches the table places, which the relation from Job to Place already reaches; map each table through one relation'];
         yield 'a relation back to the primary table' => [fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->related(
             relation: fn (Job $job) => $job->rootPlace(),
-            definition: fn (Successor $place) => $place->related(
+            successor: fn (Successor $place) => $place->related(
                 relation: fn (Place $place) => $place->job(),
-                definition: fn (Successor $job) => $job,
+                successor: fn (Successor $job) => $job,
             ),
         )), 'the relation from Place to Job reaches the table jobs, which the successor Job already reaches; map each table through one relation'];
         yield 'a successor on the legacy table' => [fn (Compatibility $listing) => $listing->servedFrom(root: Listing::class, key: 'listing_id', successor: self::titled(...)), 'the successor Listing reaches the table listings, which the legacy model Listing already reaches; map each table through one relation'];
         yield 'an attribute in two successors' => [fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => self::titled($job)->related(
             relation: fn (Job $job) => $job->rootPlace(),
-            definition: fn (Successor $place) => $place->attribute(
+            successor: fn (Successor $place) => $place->attribute(
                 name: 'title',
                 definition: fn (Attribute $attribute) => $attribute->from('street'),
             ),
@@ -153,14 +155,14 @@ final class ResolvedMapTest extends TestCase
         yield 'raw sql that cannot be written' => [fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
             name: 'title',
             definition: fn (Attribute $attribute) => $attribute->readAs('upper(name)'),
-        )), "attribute 'title' reads as raw SQL with readAs(), and says neither writeTo() nor readOnly()"];
+        )), "attribute 'title' has no inverse, so its read says no write; declare writtenBy() or readOnly()"];
         yield 'an attribute without a column' => [fn (Compatibility $listing) => $listing->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
             name: 'title',
             definition: fn (Attribute $attribute) => $attribute,
-        )), "attribute 'title' names no column; give it from(), fixed(), readAs() or external()"];
+        )), "attribute 'title' names no column; give it from(), fixed(), readAs() or computedAs()"];
         yield 'retained in a successor table' => [fn (Compatibility $listing) => $listing->retainedIn('places')->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->related(
             relation: fn (Job $job) => $job->rootPlace(),
-            definition: fn (Successor $place) => $place,
+            successor: fn (Successor $place) => $place,
         )), 'retainedIn() names the table places, which the map already reads as another table'];
         yield 'retained in the legacy table' => [fn (Compatibility $listing) => $listing->retainedIn('listings')->servedFrom(root: Job::class, key: 'job_id', successor: self::titled(...)), 'retainedIn() names the table listings, which the map already reads as another table'];
     }
@@ -206,13 +208,12 @@ final class ResolvedMapTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
                 name: 'title',
                 definition: fn (Attribute $attribute) => $attribute
-                    ->from('name')
                     ->readAs('upper(name)')
-                    ->writeTo(fn (mixed $job) => strtolower((string) $job)),
+                    ->writtenBy(LeaveTitleUnchanged::class),
             ))
             ->resolve();
 
-        $this->assertSame('oak lane', $map->attributes['title']->write('OAK LANE'));
+        $this->assertSame(LeaveTitleUnchanged::class, $map->attributes['title']->operation());
     }
 
     #[Test]
@@ -252,9 +253,9 @@ final class ResolvedMapTest extends TestCase
         $map = (new Compatibility(Listing::class))
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => self::titled($job)->related(
                 relation: fn (Job $job) => $job->rootPlace(),
-                definition: fn (Successor $place) => $place->attribute(
+                successor: fn (Successor $place) => $place->attribute(
                     name: 'city',
-                    definition: fn (Attribute $attribute) => $attribute->external(read: fn (mixed $places) => $places, write: fn (mixed $place, mixed $city) => null),
+                    definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (mixed $places) => $places)->readOnly(because: 'The map reads it from elsewhere.', ignoreWrites: false),
                 ),
             ))
             ->resolve();
@@ -309,21 +310,21 @@ final class ResolvedMapTest extends TestCase
                         definition: fn (Attribute $attribute) => $attribute->from('filename'),
                     ))
                     ->as(target: AssetLink::class, successor: fn (Successor $link) => $link))),
-            "attribute 'original_file_name' is readable in the AssetFile target and not in the AssetLink target; give it from(), external() or fixed() there",
+            "attribute 'original_file_name' is readable in the AssetFile target and not in the AssetLink target; give it from(), computedAs() or fixed() there",
         ];
-        yield 'an external attribute another target reads from sql' => [
+        yield 'a computed attribute another target reads from sql' => [
             fn (Compatibility $video) => $video->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                 choose: fn (PlaceVideo $video): string => AssetFile::class,
                 targets: fn (Targets $targets) => $targets
                     ->as(target: AssetFile::class, successor: fn (Successor $file) => $file->attribute(
                         name: 'original_file_name',
-                        definition: fn (Attribute $attribute) => $attribute->external(read: fn (mixed $files) => $files, write: fn (mixed $file, mixed $value) => null),
+                        definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (mixed $files) => $files)->readOnly(because: 'The library names it.', ignoreWrites: false),
                     ))
                     ->as(target: AssetLink::class, successor: fn (Successor $link) => $link->attribute(
                         name: 'original_file_name',
                         definition: fn (Attribute $attribute) => $attribute->from('url'),
                     )))),
-            "attribute 'original_file_name' is external() in the AssetFile target and reads SQL in the AssetLink target, and the view serves an external attribute from no target; declare it external() or fixed() there",
+            "attribute 'original_file_name' is computedAs() in the AssetFile target and reads SQL in the AssetLink target, and the view serves a computed attribute from no target; declare it computedAs() or fixed() there",
         ];
         yield 'an attribute on the place asset and a target' => [
             fn (Compatibility $video) => $video->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset->attribute(
@@ -353,7 +354,7 @@ final class ResolvedMapTest extends TestCase
                     foreignKey: 'title',
                     localKey: 'name',
                 ),
-                definition: fn (Successor $asset) => $asset->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                successor: fn (Successor $asset) => $asset->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                     choose: fn (Model $legacy): string => AssetLink::class,
                     targets: fn (Targets $targets) => $targets->as(target: AssetLink::class, successor: fn (Successor $link) => $link)),
             )),

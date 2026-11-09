@@ -61,9 +61,8 @@ final class Photo extends Model implements Compatible
                 ->attribute(
                     name: 'mime_type',
                     definition: fn (Attribute $attribute) => $attribute
-                        ->external(
-                            read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                        ->computedAs(read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType))
+                        ->writtenBy(WriteFileMimeType::class),
                 )
                 ->attribute(
                     name: 'size_kb',

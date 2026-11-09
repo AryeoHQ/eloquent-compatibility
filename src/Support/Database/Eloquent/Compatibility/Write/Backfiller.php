@@ -8,6 +8,7 @@ use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
 use Exception;
+use Illuminate\Container\Container;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -17,6 +18,7 @@ use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Facades\Config;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\IsNotNull;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
@@ -742,8 +744,7 @@ final readonly class Backfiller
 
         foreach ($external as $name => $value) {
             if (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null)) {
-                $branch->attributes[$name]->writeExternally($successor, $value);
-                $written = true;
+                $written = $this->writeComputed($branch, $name, $successor, $value, $key) || $written;
             }
         }
 
@@ -758,6 +759,37 @@ final readonly class Backfiller
         }
 
         return 1;
+    }
+
+    private function writeComputed(ResolvedMap $branch, string $name, Model $successor, mixed $value, int|string $key): bool
+    {
+        $operation = $branch->attributes[$name]->operation();
+
+        if ($operation === null) {
+            return false;
+        }
+
+        $instance = Container::getInstance()->make($operation);
+
+        if (! $instance instanceof WritesAttribute) {
+            throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
+        }
+
+        $record = (new $this->map->model)->setConnection($this->connectionName)->newInstance([], true)->setRawAttributes([$this->key => $key, $name => $value], true);
+        $owner = $branch->owners[$name];
+        $instance->write(new Successors(
+            map: $branch,
+            root: $owner === $branch->primary ? $successor : (new $branch->primary->model)->setConnection($this->connectionName),
+            models: $owner === $branch->primary ? [] : [$owner->table => $successor],
+            forwarding: $successor,
+        ), $value, new Change(
+            record: $record,
+            original: $record,
+            attribute: $name,
+            origin: Origin::Backfill,
+        ));
+
+        return true;
     }
 
     /**
@@ -787,8 +819,7 @@ final readonly class Backfiller
 
         foreach ($external as $name => $value) {
             if ($variant->owners[$name]->table === $successor->getTable() && (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null))) {
-                $variant->attributes[$name]->writeExternally($successor, $value);
-                $written = true;
+                $written = $this->writeComputed($variant, $name, $successor, $value, $key) || $written;
             }
         }
 
@@ -917,7 +948,7 @@ final readonly class Backfiller
             $column = $attribute->column();
             $conversion = $attribute->conversions()[0] ?? null;
 
-            if ($conversion instanceof ReadAs && $conversion->inverse === null) {
+            if ($conversion instanceof ReadAs) {
                 continue;
             }
 
@@ -1042,8 +1073,7 @@ final readonly class Backfiller
 
             foreach (array_intersect_key($external[$key], $read) as $name => $value) {
                 if (! $successor->exists || ! ExternalAttributes::same($value, $read[$name][$successor->getKey()] ?? null)) {
-                    $branch->attributes[$name]->writeExternally($successor, $value);
-                    $written = true;
+                    $written = $this->writeComputed($branch, $name, $successor, $value, $key) || $written;
                 }
             }
 

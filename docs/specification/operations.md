@@ -97,7 +97,7 @@ Declined: `Change` with a null `attribute` and an empty `original`. An initializ
 One legacy write runs these steps, in this order:
 
 1. **Scope.** The package opens its transaction. It resolves the successors the write touches with an unlocked read, and calls the write scope with their keys inside that transaction. It takes no lock of its own before this step.
-2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
+2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root, its retained row and the touched related rows `FOR UPDATE`, parents first. The touched related rows are every related successor the map declares under the root, because an operation names the successors it writes only when it runs. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
 5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor.
@@ -108,7 +108,7 @@ A legacy record delete runs a delete step in place of steps 3 to 6 ([Eloquent-ma
 
 The scope runs inside the package's transaction, so the locks the scope takes hold until the package's work commits.
 
-`$listing->update(['is_draft' => false, 'downloads_enabled' => true, 'address_id' => 9])` therefore locks the Job, the Place, the JobSite and the state row. It runs `PublishOrDraftJob`, `SetDownloadsPermission` and `ChangeListingAddress`, and saves each changed row once. `publish()` then saves the Job again, as v2's own publish does.
+`$listing->update(['is_draft' => false, 'downloads_enabled' => true, 'address_id' => 9])` therefore locks the Job, the Place, its Address, the JobSite and the state row. It runs `PublishOrDraftJob`, `SetDownloadsPermission` and `ChangeListingAddress`, and saves each changed row once. `publish()` then saves the Job again, as v2's own publish does.
 
 ### Events
 
@@ -303,9 +303,9 @@ The reverse direction. An application creates a successor natively, and the succ
 
 `Provides\CarriesLegacy` takes an `ACCESS SHARE` lock on each legacy table whose `when()` the new root matches, before it checks whether that legacy model is installed. It locks no other legacy table. A native create therefore waits for the `ACCESS EXCLUSIVE` lock of an install it would join, and afterward it sees the installed state. A native floor plan create waits for FloorPlan's install, and not for Photo's.
 
-`Provides\CarriesLegacy` refuses a native create outside a transaction. An insert in a statement of its own could fail and leave a successor that no legacy reader sees, and nothing would report it. Every native create of a member successor therefore runs in a transaction.
+`Provides\CarriesLegacy` opens a transaction around the insert when the caller has none, for a root class that an installed map serves. The `creating` event, the root insert, the retained-row insert and the `created` event then commit or roll back together, so no successor survives without its legacy row. Inside a caller's transaction, the trait opens nothing. A successor that overrides `performInsert()` itself conflicts with the trait.
 
-When the map compiles, it refuses a legacy-only NOT NULL column that nothing initializes. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
+`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Map compilation reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
 
@@ -353,18 +353,7 @@ final class ListingWriteScope implements ScopesWrites
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
-- A difference refuses with a retryable error. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
+- A difference refuses with a retryable error, `CompatibilityWriteRefused::successorsMoved()`, which extends `Exceptions\CompatibilityException`. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
 - The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.
-
-## Open questions
-
-### 1. The error for moved successor keys
-
-The lock step refuses with a retryable error when the locked keys differ from the keys the scope received. The spec names no class for it. `Write\Refusal` is the refusal an operation or initializer throws, and nothing marks it retryable.
-
-- **A.** A new internal exception under `Exceptions\`.
-- **B.** `Write\Refusal`, with a flag that marks it retryable.
-
-The session did not settle this. Either one extends `Exceptions\CompatibilityException`, which [the public surface](public-surface.md#classes) publishes, so a caller catches it by that supported type.

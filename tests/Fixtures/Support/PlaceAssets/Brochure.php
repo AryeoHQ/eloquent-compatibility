@@ -44,6 +44,7 @@ final class Brochure extends Model implements Compatible
     {
         return $brochure
             ->retainedIn('place_brochures_retained')
+            ->successorsInitializedBy(ClassifyPlaceAsset::class)
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                 ->attribute(
@@ -57,9 +58,8 @@ final class Brochure extends Model implements Compatible
                 ->attribute(
                     name: 'title',
                     definition: fn (Attribute $attribute) => $attribute
-                        ->external(
-                            read: fn (Collection $assets): array => $assets->mapWithKeys(fn (PlaceAsset $asset) => [$asset->getKey() => $asset->title])->all(),
-                            write: fn (PlaceAsset $asset, null|string $title) => $asset->title = $title),
+                        ->computedAs(read: fn (Collection $assets): array => $assets->mapWithKeys(fn (PlaceAsset $asset) => [$asset->getKey() => $asset->title])->all())
+                        ->writtenBy(WriteAssetTitle::class),
                 )
                 ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                     choose: fn (Brochure $brochure): string => $brochure->hosted ? TrashableAssetFile::class : AssetLink::class,

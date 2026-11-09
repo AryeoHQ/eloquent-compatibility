@@ -43,6 +43,7 @@ final class Video extends Model implements Compatible
     {
         return $video
             ->retainedIn('place_videos_retained')
+            ->successorsInitializedBy(ClassifyPlaceAsset::class)
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_video'))
                 ->attribute(

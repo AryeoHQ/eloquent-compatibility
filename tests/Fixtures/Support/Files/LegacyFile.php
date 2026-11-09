@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Files;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Carbon;
@@ -44,6 +45,7 @@ final class LegacyFile extends Model implements Compatible
         return $legacyFile
             ->retainedIn('legacy_files_retained')
             ->servedFrom(root: File::class, key: 'file_id', successor: fn (Successor $file) => $file
+                ->when(fn (Builder $files) => $files->whereNull('embed_url')->where(fn (Builder $members) => $members->whereNull('mime_type')->orWhere(fn (Builder $documents) => $documents->where(column: 'mime_type', operator: 'not like', value: 'image/%')->where(column: 'mime_type', operator: 'not like', value: 'video/%'))))
                 ->attribute(
                     name: 'created_at',
                     definition: fn (Attribute $attribute) => $attribute->from('created_at'),

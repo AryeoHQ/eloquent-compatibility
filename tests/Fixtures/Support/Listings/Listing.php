@@ -74,7 +74,7 @@ final class Listing extends Model implements Compatible
                     name: 'company_id',
                     definition: fn (Attribute $attribute) => $attribute
                         ->from('company_id')
-                        ->readOnly(because: 'A job never changes company.'),
+                        ->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                 )
                 ->attribute(
                     name: 'price',
@@ -91,18 +91,18 @@ final class Listing extends Model implements Compatible
                             LifecycleStatus::Live->value => ListingStatus::Active,
                             LifecycleStatus::Closed->value => ListingStatus::Sold,
                         ])
-                        ->transitions(),
+                        ->writtenBy(TransitionListingStatus::class),
                 )
                 ->related(
                     relation: fn (Job $job) => $job->rootPlace(),
-                    definition: fn (Successor $place) => $place
+                    successor: fn (Successor $place) => $place
                         ->atMostOne(because: 'A listing has one address.')
                         ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                         ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                 )
                 ->related(
                     relation: fn (Job $job) => $job->site(),
-                    definition: fn (Successor $site) => $site
+                    successor: fn (Successor $site) => $site
                         ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
                 ))
             ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
@@ -112,6 +112,7 @@ final class Listing extends Model implements Compatible
                 because: 'A sold listing keeps the price it sold for.',
                 instead: 'Change the price before the sale.',
             )
-            ->withoutForwardingTo(SyncListingToMls::class, because: 'MLS sync follows only edits made through the Listing itself.');
+            ->withoutForwardingTo(SyncListingToMls::class, because: 'MLS sync follows only edits made through the Listing itself.')
+            ->legacyInitializedBy(InitializeLegacyListing::class);
     }
 }

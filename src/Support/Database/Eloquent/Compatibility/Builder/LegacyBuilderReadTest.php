@@ -150,7 +150,7 @@ final class LegacyBuilderReadTest extends TestCase
                     ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                         ->related(
                             relation: fn (Job $job) => $job->site(),
-                            definition: fn (Successor $site) => $site
+                            successor: fn (Successor $site) => $site
                                 ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')->multipliedBy(2)),
                         ));
             }
@@ -762,7 +762,7 @@ final class LegacyBuilderReadTest extends TestCase
                         )
                         ->attribute(
                             name: 'listed_wall',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'created_at',
@@ -822,7 +822,7 @@ final class LegacyBuilderReadTest extends TestCase
                         )
                         ->attribute(
                             name: 'listed_raw',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"jobs"."listed_at"')->readOnly(because: 'The successor records the instant.', ignoreWrites: false),
                         ));
             }
         };
@@ -1440,7 +1440,7 @@ final class LegacyBuilderReadTest extends TestCase
     {
         return $job
             ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-            ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'));
+            ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false));
     }
 
     private function install(): void

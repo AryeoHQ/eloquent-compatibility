@@ -389,7 +389,9 @@ final class LegacyRecord
     private function compute(Model $successor, array $values, array $nulls, bool $after): array
     {
         if ($this->dependent === null) {
-            return array_map(fn (object $row) => (array) $row, $this->select($successor, $values, $nulls, null));
+            $inserting = ! $successor->exists;
+
+            return array_map(fn (object $row) => $inserting ? [...(array) $row, $this->served->successorKey => $successor->getKey()] : (array) $row, $this->select($successor, $values, $nulls, null));
         }
 
         $filter = $this->filter($successor, $after);
@@ -424,6 +426,18 @@ final class LegacyRecord
         $key = SqlFragments::identifier($successor->getKeyName());
         $marker = SqlFragments::identifier(self::WRITTEN);
         $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
+        $retained = SqlFragments::identifier(ViewCompiler::retainedTable($this->served));
+        $probe = null;
+
+        if ($this->dependent === null && ! $successor->exists) {
+            $probe = $successor->getKey() ?? $this->placeholder($successor);
+        }
+
+        if ($probe !== null && ! array_key_exists($successor->getKeyName(), $values)) {
+            $values[$successor->getKeyName()] = json_encode($probe, JSON_THROW_ON_ERROR);
+        }
+
+        $standIn = $probe === null ? '' : ', '.$retained.' AS (SELECT * FROM '.$retained.' UNION ALL SELECT * FROM jsonb_populate_record(NULL::'.$retained.', CAST(? AS jsonb)))';
         $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
         $catalog = $nulls === [] ? [] : (new ColumnCatalog($connection))->of($successor->getTable());
         $columns = $catalog === [] ? 'populated.*' : implode(', ', array_map(
@@ -444,16 +458,16 @@ final class LegacyRecord
         }
 
         return $connection->select(
-            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(
+            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).')'.$standIn.' SELECT '.implode(
                 separator: ', ',
                 array: $select,
-            ).' FROM '.SqlFragments::identifier(ViewCompiler::retainedTable($this->served)).' '.ViewCompiler::root(
+            ).' FROM '.$retained.' '.ViewCompiler::root(
                 map: $this->served,
                 retained: ViewCompiler::retainedTable($this->served),
             )
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
-            [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
+            [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($probe === null ? [] : [json_encode([$this->served->successorKey => $probe], JSON_THROW_ON_ERROR)]), ...($filter === null ? [] : $filter[1])],
             false,
         );
     }
@@ -647,6 +661,17 @@ final class LegacyRecord
     private function legacyKey(): string
     {
         return (new $this->map->model)->getKeyName();
+    }
+
+    private function placeholder(Model $successor): string
+    {
+        $type = (new ColumnCatalog($successor->getConnection(), throughSearchPath: true))->type($successor->getTable(), $successor->getKeyName());
+
+        return match (true) {
+            $type === 'uuid' => '00000000-0000-0000-0000-000000000000',
+            in_array($type, ['integer', 'bigint', 'smallint', 'numeric'], true) => '0',
+            default => '',
+        };
     }
 
     private static function softDeletes(Model $successor): bool

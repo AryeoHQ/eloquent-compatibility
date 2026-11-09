@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -50,6 +51,7 @@ use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\RecordUpdated;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
+use Tests\Fixtures\Support\Listings\TransitionListingStatus;
 use Tests\Fixtures\Support\Listings\WritesWhileBooting;
 use Tests\TestCase;
 
@@ -133,19 +135,92 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
-    public function it_forwards_nothing_for_a_root_and_a_related_create_that_no_retained_row_holds(): void
+    public function it_forwards_a_job_create_and_then_a_place_create_as_the_events_of_a_listing_create_and_update(): void
     {
-        $this->listen(
-            model: Listing::class,
-            events: self::EVENTS,
-            describe: fn (Listing $listing) => [$listing->id],
-        );
+        $this->listen(Listing::class, ['saving', 'creating', 'created', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->street, $listing->exists]);
 
-        $job = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        $job = DB::transaction(fn () => Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]));
         Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
 
-        $this->assertSame([], $this->seen);
-        $this->assertNull(Listing::query()->find(4));
+        $this->assertSame([
+            ['saving', null, 'Birch House', null, false],
+            ['creating', null, 'Birch House', null, false],
+            ['created', 4, 'Birch House', null, true],
+            ['saved', 4, 'Birch House', null, true],
+            ['saving', 4, 'Birch House', '9 Birch St', true],
+            ['updating', 4, 'Birch House', '9 Birch St', true],
+            ['updated', 4, 'Birch House', '9 Birch St', true],
+            ['saved', 4, 'Birch House', '9 Birch St', true],
+        ], $this->seen);
+        $this->assertSame([$job->id, '9 Birch St'], [ListingTables::jobOf(4), Listing::query()->findOrFail(4)->street]);
+    }
+
+    #[Test]
+    public function it_keeps_the_record_of_an_outer_write_while_a_successor_listener_saves_the_same_instance_again(): void
+    {
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            $job->update(['price_cents' => 5]);
+        });
+        $this->listen(Listing::class, ['saving', 'creating', 'created', 'updating', 'updated', 'saved'], fn (Listing $listing) => [spl_object_id($listing), $listing->price]);
+
+        DB::transaction(fn () => Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]));
+
+        $instances = array_values(array_unique(array_column($this->seen, 1)));
+        $this->assertSame([
+            ['saving', 0, null], ['creating', 0, null], ['created', 0, null],
+            ['saving', 1, '0.05'], ['updating', 1, '0.05'], ['updated', 1, '0.05'], ['saved', 1, '0.05'],
+            ['saved', 0, '0.05'],
+        ], array_map(fn (array $seen) => [$seen[0], array_search($seen[1], $instances, true), $seen[2]], $this->seen));
+    }
+
+    #[Test]
+    public function it_writes_a_read_only_fact_a_legacy_listener_supplies_for_a_successor_create_as_a_legacy_create_does(): void
+    {
+        Event::listen('eloquent.creating: '.Listing::class, function (Listing $listing): void {
+            $listing->company_id = ListingTables::COMPANY;
+        });
+
+        $job = Job::query()->findOrFail(DB::transaction(fn () => Job::query()->create(['name' => 'Birch House']))->id);
+        $legacy = DB::table('listings_retained')->where('job_id', $job->id)->value('id');
+
+        $this->assertSame([ListingTables::COMPANY, ListingTables::COMPANY], [$job->company_id, Listing::query()->findOrFail($legacy)->company_id]);
+    }
+
+    #[Test]
+    public function it_keeps_a_computed_fact_a_legacy_saving_listener_assigns_for_the_later_events_of_a_successor_create(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
+            $photo->mime_type = 'image/webp';
+        });
+        $this->listen(Photo::class, ['creating', 'created', 'saved'], fn (Photo $photo) => [$photo->file_name, $photo->mime_type]);
+
+        DB::transaction(fn () => File::query()->create(['filename' => 'birch.png', 'mime_type' => 'image/png']));
+
+        $this->assertSame([['creating', 'birch.png', 'image/webp'], ['created', 'birch.png', 'image/webp'], ['saved', 'birch.png', 'image/webp']], $this->seen);
+        $this->assertSame('image/webp', Photo::query()->where('file_name', 'birch.png')->firstOrFail()->mime_type);
+    }
+
+    #[Test]
+    public function it_gives_the_after_events_of_a_successor_create_the_computed_fact_the_create_stored(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
+            $photo->mime_type = 'image/webp';
+        });
+        Event::listen('eloquent.creating: '.File::class, function (File $file): void {
+            FakeMediaLibrary::bound()->put((string) $file->zml_asset_id, new FileMetadata('image/avif'));
+        });
+        $this->listen(Photo::class, ['creating', 'created', 'saved'], fn (Photo $photo) => [$photo->mime_type]);
+
+        DB::transaction(fn () => File::query()->create(['filename' => 'birch.png', 'mime_type' => 'image/png']));
+
+        $this->assertSame([['creating', 'image/webp'], ['created', 'image/avif'], ['saved', 'image/avif']], $this->seen);
+        $this->assertSame('image/avif', Photo::query()->where('file_name', 'birch.png')->firstOrFail()->mime_type);
     }
 
     #[Test]
@@ -210,7 +285,7 @@ final class ForwarderTest extends TestCase
                         )
                         ->attribute(
                             name: 'mls_number',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.', ignoreWrites: false),
                         ));
             }
         };
@@ -469,7 +544,7 @@ final class ForwarderTest extends TestCase
             ['saving', fn (Listing $listing) => $listing->id = 9, 'id', 'It identifies the record, and a forwarded event cannot move it.'],
             ['saving', fn (Listing $listing) => $listing->company_id = 'a7c3e5f1-2b4d-4e6f-8a0b-1c2d3e4f5a6b', 'company_id', 'A job never changes company.'],
             ['saving', fn (Listing $listing) => $listing->price = 'cheap', 'price', "'cheap' is not a number, so it cannot be multiplied by 100."],
-            ['updating', fn (Listing $listing) => $listing->status = ListingStatus::Sold, 'status', 'It is declared transitions(), so only a write through Listing can run the trigger that changes it.'],
+            ['updating', fn (Listing $listing) => $listing->status = ListingStatus::Sold, 'status', 'It is writtenBy() TransitionListingStatus, and only a write through Listing runs its operation, which may stage other successors.'],
             ['deleting', fn (Listing $listing) => $listing->title = 'Gone', 'title', 'The forwarded event belongs to a delete, which writes no value.'],
         ];
         $refusals = [];
@@ -908,6 +983,7 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_no_write_a_job_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
     {
+        Date::setTestNow('2026-06-07 10:00:00');
         Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
             Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
             Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
@@ -923,6 +999,7 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_no_write_a_job_saved_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
     {
+        Date::setTestNow('2026-06-07 10:00:00');
         Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
             if ($job->wasRecentlyCreated && ! Place::query()->where('job_id', $job->id)->exists()) {
                 Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
@@ -983,7 +1060,7 @@ final class ForwarderTest extends TestCase
 
         $this->assertSame(['updating'], $assigned);
         $this->assertSame(array_map(
-            callback: fn (string $event) => 'A listener of a '.Photo::class." event that File forwarded cannot change \$mime_type. Why: It is declared external(), and File raised its {$event} event after its own saving listeners ran, so the write closure reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.",
+            callback: fn (string $event) => 'A listener of a '.Photo::class." event that File forwarded cannot change \$mime_type. Why: It is declared computedAs(), and File raised its {$event} event after its own saving listeners ran, so its operation reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.",
             array: ['updating'],
         ), $refusals);
         $this->assertSame(['oak-front.jpg', 'image/jpeg', 0], [File::query()->findOrFail($file->id)->filename, Photo::query()->findOrFail(1)->mime_type, File::query()->where('filename', 'birch.png')->count()]);
@@ -1943,7 +2020,7 @@ final class ForwarderTest extends TestCase
                         )
                         ->attribute(
                             name: 'mls_number',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.', ignoreWrites: false),
                         ));
             }
         };
@@ -2058,7 +2135,7 @@ final class ForwarderTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'price',
@@ -2069,18 +2146,18 @@ final class ForwarderTest extends TestCase
                             definition: fn (Attribute $attribute) => $attribute
                                 ->from('lifecycle_status')
                                 ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
-                                ->transitions(),
+                                ->writtenBy(TransitionListingStatus::class),
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->atMostOne(because: 'A listing has one address.')
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         )
                         ->related(
                             relation: fn (Job $job) => $job->site(),
-                            definition: fn (Successor $site) => $site
+                            successor: fn (Successor $site) => $site
                                 ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
                         ))
                     ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
@@ -2124,7 +2201,7 @@ final class ForwarderTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'price',
@@ -2135,18 +2212,18 @@ final class ForwarderTest extends TestCase
                             definition: fn (Attribute $attribute) => $attribute
                                 ->from('lifecycle_status')
                                 ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
-                                ->transitions(),
+                                ->writtenBy(TransitionListingStatus::class),
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->atMostOne(because: 'A listing has one address.')
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         )
                         ->related(
                             relation: fn (Job $job) => $job->site(),
-                            definition: fn (Successor $site) => $site
+                            successor: fn (Successor $site) => $site
                                 ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
                         ))
                     ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')

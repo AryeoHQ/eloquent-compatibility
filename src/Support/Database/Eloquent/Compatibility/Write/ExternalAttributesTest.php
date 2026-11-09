@@ -24,10 +24,14 @@ use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Files\StoreFileNamedMimeType;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Files\WriteFileMimeColumn;
+use Tests\Fixtures\Support\Files\WriteLowercaseFileMimeType;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\ListingTables;
-use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\StoreMlsNumber;
+use Tests\Fixtures\Support\Listings\WritePlaceCity;
 use Tests\TestCase;
 use TypeError;
 
@@ -126,11 +130,9 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                                ->attribute('city', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all(),
-                                    write: fn (Place $place, null|string $city) => $place->setAttribute('city', $city))),
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all())->writtenBy(WritePlaceCity::class)),
                         ));
             }
         };
@@ -195,11 +197,9 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                                ->attribute('city', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all(),
-                                    write: fn (Place $place, null|string $city) => $place->setAttribute('city', $city))),
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all())->writtenBy(WritePlaceCity::class)),
                         ));
             }
         };
@@ -261,11 +261,9 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace()->withTrashed(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                                ->attribute('city', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all(),
-                                    write: fn (Place $place, null|string $city) => $place->setAttribute('city', $city))),
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $places): array => $places->mapWithKeys(fn (Model $place) => [$place->getKey() => $place->getAttribute('city')])->all())->writtenBy(WritePlaceCity::class)),
                         ));
             }
         };
@@ -287,7 +285,7 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
-    public function it_serves_the_value_the_external_system_keeps_after_a_write_it_normalizes(): void
+    public function it_refuses_a_live_write_whose_computed_read_serves_a_normalized_value_and_changes_nothing(): void
     {
         $normalizing = new class extends Model implements Compatible
         {
@@ -321,9 +319,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType === null ? null : strtolower($mimeType)),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all())->writtenBy(WriteLowercaseFileMimeType::class),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -336,13 +332,27 @@ final class ExternalAttributesTest extends TestCase
             $seen[] = $photo->getAttribute('mime_type');
         });
 
-        $created = $normalizing::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'IMAGE/WEBP', 'caption' => 'Birch']);
-        $updated = $normalizing::query()->findOrFail(2);
-        $updated->update(['mime_type' => 'IMAGE/AVIF']);
+        $before = DB::select('select * from files order by id');
+        $refusals = [];
 
-        $this->assertSame(['image/webp', 'image/avif'], $seen);
-        $this->assertSame(['image/webp', 'image/avif'], [$created->getAttribute('mime_type'), $updated->getAttribute('mime_type')]);
-        $this->assertSame(['image/webp', 'image/avif'], [$created->getOriginal('mime_type'), $updated->getOriginal('mime_type')]);
+        foreach ([
+            fn () => $normalizing::query()->create(['file_name' => 'birch.jpg', 'mime_type' => 'IMAGE/WEBP', 'caption' => 'Birch']),
+            fn () => $normalizing::query()->findOrFail(2)->update(['mime_type' => 'IMAGE/AVIF']),
+        ] as $write) {
+            try {
+                $write();
+                $refusals[] = 'stored';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $refusals[] = $refusal->because;
+            }
+        }
+
+        $this->assertSame([
+            "The write stores 'IMAGE/WEBP', and the view now serves mime_type as 'image/webp', so the record would not read back what was written.",
+            "The write stores 'IMAGE/AVIF', and the view now serves mime_type as 'image/avif', so the record would not read back what was written.",
+        ], $refusals);
+        $this->assertSame([], $seen);
+        $this->assertEquals($before, DB::select('select * from files order by id'));
     }
 
     #[Test]
@@ -380,9 +390,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                write: Attribute::declined(because: 'The media library sets the type from the upload.')),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all())->readOnly(because: 'The media library sets the type from the upload.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -397,7 +405,7 @@ final class ExternalAttributesTest extends TestCase
             $photo->update(['file_name' => 'oak-front-2.jpg', 'mime_type' => 'image/png']);
             $this->fail('The declined write was stored.');
         } catch (CompatibilityWriteRefused $refusal) {
-            $this->assertSame(['The media library sets the type from the upload.', true], [$refusal->because, str_ends_with($refusal->refused, '::$mime_type cannot take a write')]);
+            $this->assertSame(['The media library sets the type from the upload.', true], [$refusal->because, str_ends_with($refusal->refused, ' record 1 cannot change $mime_type')]);
         }
 
         $this->assertEquals($before, DB::select('select * from files order by id'));
@@ -448,9 +456,8 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_of_an_external_attribute_and_changes_nothing(): void
+    public function it_writes_a_computed_attribute_through_its_operation_for_each_record_of_a_mass_write(): void
     {
-        $before = DB::select('select * from files order by id');
         $refusals = [];
 
         foreach ([
@@ -467,20 +474,15 @@ final class ExternalAttributesTest extends TestCase
             }
         }
 
-        $this->assertSame([
-            Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.',
-            Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.',
-            Video::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Video.',
-            Video::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Video.',
-        ], $refusals);
-        $this->assertEquals($before, DB::select('select * from files order by id'));
-        $this->assertSame([], FakeMediaLibrary::bound()->calls);
+        $this->assertSame(['stored', 'stored', 'stored', 'stored'], $refusals);
+        $this->assertSame(['oak.jpg', 'image/png'], [Photo::query()->findOrFail(1)->file_name, Photo::query()->findOrFail(1)->mime_type]);
+        $this->assertSame(['video/webm', null], [Video::query()->findOrFail(1)->mime_type, Video::query()->findOrFail(2)->mime_type]);
     }
 
     #[Test]
     public function it_refuses_a_raw_expression_for_an_external_attribute(): void
     {
-        $this->expectExceptionObject(CompatibilityWriteRefused::rawExpression(Photo::class, 'mime_type', 'It is declared external(), so its value lives outside the database, and no SQL computes it.'));
+        $this->expectExceptionObject(CompatibilityWriteRefused::rawExpression(Photo::class, 'mime_type', 'It is declared computedAs(), so its value is computed in PHP, and no SQL computes it.'));
 
         Photo::query()->findOrFail(1)->update(['mime_type' => new Expression("'image/png'")]);
     }
@@ -577,9 +579,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all(),
-                                write: fn (File $file, null|string $mimeType) => $file->mime_type = (string) $mimeType),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => $files->pluck('mime_type', 'id')->all())->writtenBy(WriteFileMimeColumn::class),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -653,12 +653,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => $files->pluck('filename', 'id')->map(fn (mixed $asset) => is_string($asset) ? FakeMediaLibrary::bound()->stored($asset)?->mimeType : null)->all(),
-                                write: function (File $file, null|string $mimeType): void {
-                                    $file->filename = strtolower($file->filename);
-                                    FakeMediaLibrary::bound()->put($file->filename, new FileMetadata($mimeType));
-                                }),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => $files->pluck('filename', 'id')->map(fn (mixed $asset) => is_string($asset) ? FakeMediaLibrary::bound()->stored($asset)?->mimeType : null)->all())->writtenBy(StoreFileNamedMimeType::class),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -677,10 +672,10 @@ final class ExternalAttributesTest extends TestCase
 
         $this->assertEquals(
             [new FileMetadata('image/avif'), new FileMetadata('image/webp'), new FileMetadata('image/jpeg'), new FileMetadata('image/png')],
-            [$library->stored('birch.jpg'), $library->stored('ash.png'), $library->stored('oak-back.jpg'), $library->stored('elm.png')],
+            [$library->stored('Birch.JPG'), $library->stored('Ash.PNG'), $library->stored('oak-back.jpg'), $library->stored('elm.png')],
         );
-        $this->assertSame(['birch.jpg', 'ash.png'], DB::table('files')->join(table: 'photos_retained', first: 'photos_retained.file_id', operator: '=', second: 'files.id')->whereIn(column: 'photos_retained.id', values: [2, 3])->orderBy('photos_retained.id')->pluck('files.filename')->all());
-        $this->assertSame([['birch.jpg', 'image/avif'], ['ash.png', 'image/webp', 1]], [[$updated->getAttribute('file_name'), $updated->getAttribute('mime_type')], [$incremented->getAttribute('file_name'), $incremented->getAttribute('mime_type'), $incremented->getAttribute('views')]]);
+        $this->assertSame(['Birch.JPG', 'Ash.PNG'], DB::table('files')->join(table: 'photos_retained', first: 'photos_retained.file_id', operator: '=', second: 'files.id')->whereIn(column: 'photos_retained.id', values: [2, 3])->orderBy('photos_retained.id')->pluck('files.filename')->all());
+        $this->assertSame([['Birch.JPG', 'image/avif'], ['Ash.PNG', 'image/webp', 1]], [[$updated->getAttribute('file_name'), $updated->getAttribute('mime_type')], [$incremented->getAttribute('file_name'), $incremented->getAttribute('mime_type'), $incremented->getAttribute('views')]]);
     }
 
     #[Test]
@@ -708,7 +703,7 @@ final class ExternalAttributesTest extends TestCase
             }
         }
 
-        $refusal = fn (string $model) => CompatibilityWriteRefused::rawExpression($model, 'mime_type', 'It is declared external(), so its value lives outside the database, and no SQL computes it.')->getMessage();
+        $refusal = fn (string $model) => CompatibilityWriteRefused::rawExpression($model, 'mime_type', 'It is declared computedAs(), so its value is computed in PHP, and no SQL computes it.')->getMessage();
 
         $this->assertSame([$refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Photo::class), $refusal(Video::class)], $refusals);
         $this->assertEquals($before, DB::select('select * from files order by id'));
@@ -754,9 +749,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mls_number',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $jobs): array => $jobs->pluck('id', 'id')->map(fn (mixed $job) => is_string($job) ? FakeMediaLibrary::bound()->stored('mls-'.$job)?->mimeType : null)->all(),
-                                write: fn (Job $job, null|string $number) => FakeMediaLibrary::bound()->put('mls-'.$job->getKey(), new FileMetadata($number))),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $jobs): array => $jobs->pluck('id', 'id')->map(fn (mixed $job) => is_string($job) ? FakeMediaLibrary::bound()->stored('mls-'.$job)?->mimeType : null)->all())->writtenBy(StoreMlsNumber::class),
                         ));
             }
         };

@@ -5,20 +5,26 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Closure;
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Write\Applying;
+use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
+use Support\Database\Eloquent\Compatibility\Write\Successors;
 use Throwable;
 use WeakMap;
 
@@ -535,9 +541,11 @@ final class Forwarder
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 ! $serves => 'The written '.class_basename($successor).' no longer serves this '.class_basename($legacy).', so the forwarded write cannot store it there.',
-                $attribute->runsTransitions() => 'It is declared transitions(), so only a write through '.class_basename($legacy).' can run the trigger that changes it.',
-                $attribute->isExternal() => $attribute->declinedBecause() ?? (in_array($event, self::STORED_BEFORE, true) ? null : 'It is declared external(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so the write closure reaches no save."),
-                ! $attribute->isWritable() && ! ($inserts && $attribute->readOnlyBecause() !== null && $attribute->column() !== null) => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
+                $attribute->ignoresWrites() => null,
+                $attribute->isExternal() && $attribute->operation() !== null => in_array($event, self::STORED_BEFORE, true) ? null : 'It is declared computedAs(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so its operation reaches no save.",
+                $attribute->operation() !== null => 'It is writtenBy() '.class_basename($attribute->operation()).', and only a write through '.class_basename($legacy).' runs its operation, which may stage other successors.',
+                $attribute->readOnlyBecause() !== null => $inserts && $attribute->storesColumn() && $attribute->invertible() ? null : $attribute->readOnlyBecause(),
+                ! $attribute->invertible() => 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
 
@@ -545,8 +553,39 @@ final class Forwarder
                 throw CompatibilityWriteRefused::byForwardedMutation($legacy::class, $name, $successor, (string) $because);
             }
 
-            if ($attribute->isExternal()) {
-                $attribute->writeExternally($successor, $value);
+            $change = new Change(
+                record: $legacy,
+                original: $legacy->newInstance([], true)->setRawAttributes($baseline, true),
+                attribute: $name,
+                origin: Origin::Live,
+            );
+
+            if ($attribute->ignoresWrites()) {
+                if ($value !== null) {
+                    Event::dispatch(new WriteIgnored(
+                        change: $change,
+                        value: $value,
+                    ));
+                }
+
+                continue;
+            }
+
+            $operation = $attribute->operation();
+
+            if ($operation !== null) {
+                $instance = Container::getInstance()->make($operation);
+
+                if (! $instance instanceof WritesAttribute) {
+                    throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
+                }
+
+                $instance->write(new Successors(
+                    map: $this->served,
+                    root: $this->dependent === null ? $successor : (new $this->served->primary->model)->setConnection($successor->getConnectionName()),
+                    models: $this->dependent === null ? [] : [$this->dependent->table => $successor],
+                    forwarding: $successor,
+                ), $value, $change);
 
                 continue;
             }

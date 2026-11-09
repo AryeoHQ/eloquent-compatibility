@@ -161,7 +161,7 @@ final class LegacyBuilderRolloutTest extends TestCase
             } catch (CompatibilityWriteRefused $refusal) {
                 return $refusal->getMessage();
             }
-        }, 'update photos', Photo::class.'::$mime_type cannot take a mass write. Why: It is declared external(), so its value lives outside the database, and no set-based statement can reach an external system. Instead: Write the records one at a time through Photo.'];
+        }, 'update photos', 'written'];
         yield 'a query builder insert' => [function (): string {
             Photo::query()->toBase()->insert(['file_name' => 'oak-side.jpg', 'mime_type' => 'image/webp', 'size_kb' => 256, 'caption' => 'Side']);
 

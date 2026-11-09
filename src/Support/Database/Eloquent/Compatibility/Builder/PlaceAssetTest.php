@@ -39,6 +39,7 @@ use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\Fixtures\Support\PlaceAssets\TrashablePlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\Video;
+use Tests\Fixtures\Support\PlaceAssets\WriteAssetFileMimeType;
 use Tests\TestCase;
 
 #[CoversClass(LegacyBuilder::class)]
@@ -300,26 +301,19 @@ final class PlaceAssetTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_that_changes_what_choose_picks_and_changes_nothing(): void
+    public function it_moves_each_record_of_a_mass_write_that_changes_what_choose_picks(): void
     {
         PlaceAssetTables::install();
-        $before = DB::table('place_assets')->orderBy('id')->get()->all();
 
-        try {
-            Video::query()->whereIn('id', [1, 2])->update(['youtube_embed_url' => 'https://youtu.be/all']);
-            $refusal = 'no refusal';
-        } catch (CompatibilityWriteRefused $exception) {
-            $refusal = $exception->getMessage();
-        }
+        $updated = Video::query()->whereIn('id', [1, 2])->update(['youtube_embed_url' => 'https://youtu.be/all']);
 
-        $this->assertStringContainsString('a mass write that changes what the relatedMorph() choose: closure picks', $refusal);
-        $this->assertStringContainsString('It would move record 1 from AssetFile to AssetLink', $refusal);
-        $this->assertEquals($before, DB::table('place_assets')->orderBy('id')->get()->all());
-        $this->assertSame([null, 'https://youtu.be/oak'], [Video::query()->findOrFail(1)->youtube_embed_url, Video::query()->findOrFail(2)->youtube_embed_url]);
+        $this->assertSame(2, $updated);
+        $this->assertSame(['https://youtu.be/all', 'https://youtu.be/all'], [Video::query()->findOrFail(1)->youtube_embed_url, Video::query()->findOrFail(2)->youtube_embed_url]);
+        $this->assertSame([[1, 'place_asset_link'], [2, 'place_asset_link'], [3, 'place_asset_file']], $this->assets('place_video'));
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_that_reaches_a_record_whose_place_asset_names_an_undeclared_alias_and_changes_nothing(): void
+    public function it_writes_a_mass_write_record_whose_place_asset_names_an_undeclared_alias_through_that_place_asset_alone(): void
     {
         PlaceAssetTables::install();
         DB::table('place_assets')->where(
@@ -331,23 +325,16 @@ final class PlaceAssetTest extends TestCase
                 value: 3,
             )->value('place_asset_id'),
         )->update(['asset_type' => 'retired_asset']);
-        $before = DB::table('place_assets')->orderBy('id')->get()->all();
 
-        try {
-            Video::query()->update(['title' => 'All']);
-            $refusal = 'no refusal';
-        } catch (CompatibilityWriteRefused $exception) {
-            $refusal = $exception->getMessage();
-        }
+        $updated = Video::query()->update(['title' => 'All']);
 
-        $this->assertStringContainsString("cannot run a mass write that reaches record 3, whose PlaceAsset stores asset_type 'retired_asset' through its compatibility map", $refusal);
-        $this->assertStringContainsString('targets: declares no target for it, so no target statement would write the record', $refusal);
-        $this->assertEquals($before, DB::table('place_assets')->orderBy('id')->get()->all());
-        $this->assertSame(['Tour', 'Oak walkthrough', null], Video::query()->orderBy('id')->pluck('title')->all());
+        $this->assertSame(3, $updated);
+        $this->assertSame(['All', 'All', 'All'], Video::query()->orderBy('id')->pluck('title')->all());
+        $this->assertSame([[1, 'place_asset_file'], [2, 'place_asset_link'], [3, 'retired_asset']], $this->assets('place_video'));
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_that_reaches_a_record_whose_place_asset_stores_no_morph_type_and_changes_nothing(): void
+    public function it_increments_a_mass_write_record_whose_place_asset_stores_no_morph_type(): void
     {
         PlaceAssetTables::install();
         DB::statement('alter table place_assets alter column asset_type drop not null');
@@ -361,15 +348,10 @@ final class PlaceAssetTest extends TestCase
             )->value('place_asset_id'),
         )->update(['asset_type' => null]);
 
-        try {
-            Video::query()->whereIn('id', [1, 2])->increment('views');
-            $refusal = 'no refusal';
-        } catch (CompatibilityWriteRefused $exception) {
-            $refusal = $exception->getMessage();
-        }
+        $incremented = Video::query()->whereIn('id', [1, 2])->increment('views');
 
-        $this->assertStringContainsString('cannot run a mass write that reaches record 2, whose PlaceAsset stores no asset_type through its compatibility map', $refusal);
-        $this->assertSame([5, 2, 0], Video::query()->orderBy('id')->pluck('views')->all());
+        $this->assertSame(2, $incremented);
+        $this->assertSame([6, 3, 0], Video::query()->orderBy('id')->pluck('views')->all());
     }
 
     #[Test]
@@ -380,8 +362,9 @@ final class PlaceAssetTest extends TestCase
         $second = DB::connection('second');
         $link = (string) $second->scalar("insert into asset_links (url, created_at, updated_at) values ('https://youtu.be/race', now(), now()) returning id");
         $blocked = null;
-        DB::listen(function (QueryExecuted $query) use (&$blocked, $second, $link): void {
-            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'CREATE TEMPORARY TABLE') || ! str_contains($query->sql, 'compatibility_pinned')) {
+        $selects = 0;
+        DB::listen(function (QueryExecuted $query) use (&$blocked, &$selects, $second, $link): void {
+            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_contains($query->sql, '"compatibility_keys"') || ++$selects < 2) {
                 return;
             }
 
@@ -742,9 +725,7 @@ final class PlaceAssetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'mime_type',
-                                        definition: fn (Attribute $attribute) => $attribute->external(
-                                            read: fn (Collection $files): array => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                            write: fn (AssetFile $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                                        definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all())->writtenBy(WriteAssetFileMimeType::class),
                                     ))));
             }
         };
@@ -874,7 +855,7 @@ final class PlaceAssetTest extends TestCase
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'original_file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->from('url')->readAs("split_part(\"asset_links\".\"url\", '/', 4)")->readOnly('A link takes its name from its URL.'),
+                                        definition: fn (Attribute $attribute) => $attribute->from('url')->readAs("split_part(\"asset_links\".\"url\", '/', 4)")->readOnly(because: 'A link takes its name from its URL.', ignoreWrites: false),
                                     )
                                     ->attribute(
                                         name: 'size_kb',

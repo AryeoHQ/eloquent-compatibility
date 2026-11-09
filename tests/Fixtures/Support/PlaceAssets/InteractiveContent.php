@@ -40,6 +40,7 @@ final class InteractiveContent extends Model implements Compatible
     {
         return $interactiveContent
             ->retainedIn('place_interactive_content_retained')
+            ->successorsInitializedBy(ClassifyPlaceAsset::class)
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_interactive_content'))
                 ->attribute(

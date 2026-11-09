@@ -15,12 +15,12 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Events\WriteIgnored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\AliasedPlace;
@@ -103,139 +103,55 @@ final class RecordWriterTest extends TestCase
         $this->assertEquals($wingBefore, DB::table('places')->where('id', $wing->id)->first());
     }
 
-    #[Test]
-    public function it_stores_the_value_a_successor_listener_sets(): void
+    /**
+     * @return iterable<string, array{Closure(): mixed}>
+     */
+    public static function recordWritePaths(): iterable
     {
-        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
-            $job->name = strtoupper($job->name);
-        });
-        $listing = Listing::query()->findOrFail(1);
+        yield 'an update' => [fn () => Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor'])];
+        yield 'an increment' => [fn () => Listing::query()->findOrFail(1)->increment('price', 1, ['title' => 'Oak Manor'])];
+        yield 'a save' => [function (): bool {
+            $listing = Listing::query()->findOrFail(3);
+            $listing->title = 'Elm Lodge';
 
-        $listing->update(['title' => 'Oak Manor']);
+            return $listing->save();
+        }];
+        yield 'a restore' => [function (): bool {
+            $listing = Listing::withTrashed()->findOrFail(2);
+            $listing->title = 'Pine Lodge';
 
-        $this->assertSame('OAK MANOR', Job::query()->whereKey(ListingTables::jobOf(1))->value('name'));
-        $this->assertSame('OAK MANOR', Listing::query()->findOrFail(1)->title);
+            return $listing->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        }];
+        yield 'a create' => [fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY])];
+        yield 'a first or create' => [fn () => Listing::query()->firstOrCreate(['title' => 'Birch House'], ['company_id' => ListingTables::COMPANY])];
+        yield 'an identifier change' => [fn () => Listing::withTrashed()->findOrFail(2)->update(['id' => 40, 'title' => 'Pine Manor'])];
     }
 
+    /**
+     * @param  Closure(): mixed  $write
+     */
+    #[DataProvider('recordWritePaths')]
     #[Test]
-    public function it_gives_the_legacy_record_the_values_its_successors_stored_before_its_own_events_run(): void
+    public function it_refuses_and_rolls_back_every_record_write_path_whose_successor_listener_changes_a_written_value(Closure $write): void
     {
         Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
             $job->name = strtoupper($job->name);
         });
-        $seen = [];
-
-        foreach (['created', 'updated', 'saved'] as $event) {
-            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
-                $seen[] = [$event, $listing->title, $listing->getOriginal('title'), $listing->getChanges()['title'] ?? null];
-            });
-        }
-
-        $updated = Listing::query()->findOrFail(1);
-        $updated->update(['title' => 'Oak Manor']);
-        $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
-
-        $this->assertSame([
-            ['updated', 'OAK MANOR', 'Oak House', 'OAK MANOR'],
-            ['saved', 'OAK MANOR', 'Oak House', 'OAK MANOR'],
-            ['created', 'BIRCH HOUSE', null, null],
-            ['saved', 'BIRCH HOUSE', null, null],
-        ], $seen);
-        $this->assertSame([['OAK MANOR', 'OAK MANOR', false], ['BIRCH HOUSE', 'BIRCH HOUSE', false]], [
-            [$updated->title, $updated->getOriginal('title'), $updated->isDirty()],
-            [$created->title, $created->getOriginal('title'), $created->isDirty()],
-        ]);
-    }
-
-    #[Test]
-    public function it_gives_the_legacy_record_the_stored_values_on_every_record_write_path_before_its_own_events_run(): void
-    {
-        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
-            $job->name = strtoupper($job->name);
-        });
-        $seen = [];
+        $after = [];
 
         foreach (['created', 'updated', 'saved', 'restored'] as $event) {
-            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
-                $seen[] = [$event, $listing->title];
+            Event::listen("eloquent.{$event}: ".Listing::class, function () use (&$after, $event): void {
+                $after[] = $event;
             });
         }
 
-        $incremented = Listing::query()->findOrFail(1);
-        $incremented->increment('price', 1, ['title' => 'Oak Manor']);
-        $saved = Listing::query()->findOrFail(3);
-        $saved->title = 'Elm Lodge';
-        $saved->save();
-        $restored = Listing::withTrashed()->findOrFail(2);
-        $restored->title = 'Pine Lodge';
-        $restored->restore(); // @phpstan-ignore staticMethod.dynamicCall
-        $created = Listing::query()->firstOrCreate(['title' => 'Birch House'], ['company_id' => ListingTables::COMPANY]);
+        $before = $this->snapshot();
+        $refusal = $this->refusal($write);
 
-        $this->assertSame([
-            ['updated', 'OAK MANOR'],
-            ['updated', 'ELM LODGE'],
-            ['saved', 'ELM LODGE'],
-            ['updated', 'PINE LODGE'],
-            ['saved', 'PINE LODGE'],
-            ['restored', 'PINE LODGE'],
-            ['created', 'BIRCH HOUSE'],
-            ['saved', 'BIRCH HOUSE'],
-        ], $seen);
-        $this->assertSame(['OAK MANOR', 'ELM LODGE', 'PINE LODGE', 'BIRCH HOUSE'], array_map(fn (Listing $listing) => $listing->getAttribute('title'), [$incremented, $saved, $restored, $created]));
-        $this->assertSame(['OAK MANOR', 'PINE LODGE', 'ELM LODGE', 'BIRCH HOUSE'], Listing::query()->orderBy('id')->pluck('title')->all());
-    }
-
-    #[RequiresMethod(Model::class, 'saveOrIgnore')]
-    #[Test]
-    public function it_gives_the_legacy_record_the_stored_values_of_a_save_or_ignore_before_its_own_events_run(): void
-    {
-        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
-            $job->name = strtoupper($job->name);
-        });
-        $seen = [];
-
-        foreach (['created', 'saved'] as $event) {
-            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
-                $seen[] = [$event, $listing->title];
-            });
-        }
-
-        $listing = new Listing(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
-        $listing->saveOrIgnore(); // @phpstan-ignore method.notFound
-
-        $this->assertSame([['created', 'BIRCH HOUSE'], ['saved', 'BIRCH HOUSE']], $seen);
-        $this->assertSame(['BIRCH HOUSE', false], [$listing->title, $listing->isDirty()]);
-    }
-
-    #[Test]
-    public function it_gives_the_legacy_record_the_values_its_successors_stored_when_the_write_changes_its_identifier(): void
-    {
-        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
-            $job->name = strtoupper($job->name);
-        });
-        $updated = Listing::query()->create(['title' => 'Pine House', 'company_id' => ListingTables::COMPANY]);
-        $incremented = Listing::query()->create(['title' => 'Elm House', 'company_id' => ListingTables::COMPANY]);
-        $seen = [];
-
-        foreach (['updated', 'saved'] as $event) {
-            Event::listen("eloquent.{$event}: ".Listing::class, function (Listing $listing) use (&$seen, $event): void {
-                $seen[] = [$event, $listing->id, $listing->title];
-            });
-        }
-
-        $updated->update(['id' => 99, 'title' => 'Pine Lodge']);
-        $incremented->increment('id', 95, ['title' => 'Elm Lodge']);
-
-        $this->assertSame([
-            ['updated', 99, 'PINE LODGE'],
-            ['saved', 99, 'PINE LODGE'],
-            ['updated', 100, 'ELM LODGE'],
-        ], $seen);
-        $this->assertSame([[99, 'PINE LODGE', false], [100, 'ELM LODGE', false]], [
-            [$updated->id, $updated->title, $updated->isDirty()],
-            [$incremented->id, $incremented->title, $incremented->isDirty('id')],
-        ]);
-        $this->assertSame([99 => 'PINE LODGE', 100 => 'ELM LODGE'], Listing::query()->whereIn('id', [99, 100])->orderBy('id')->pluck('title', 'id')->all());
+        $this->assertStringContainsString(' cannot take this write of $title. Why: The write stores ', $refusal->getMessage());
+        $this->assertStringContainsString(', so the record would not read back what was written.', $refusal->getMessage());
+        $this->assertSame([], $after);
+        $this->assertSame($before, $this->snapshot());
     }
 
     /**
@@ -506,7 +422,7 @@ final class RecordWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         ))
@@ -594,7 +510,7 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_runs_the_transition_of_a_state_write_before_the_other_successor_saves(): void
+    public function it_runs_the_transition_of_a_state_write_after_the_other_successor_saves(): void
     {
         $saves = [];
         Event::listen('eloquent.updated: *', function (string $event, array $models) use (&$saves): void {
@@ -606,7 +522,7 @@ final class RecordWriterTest extends TestCase
 
         $listing->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold, 'street' => '2 Oak St']);
 
-        $this->assertSame([['Job', ['lifecycle_status']], ['Job', ['name']], ['Place', ['street']], ['Listing', ['title', 'status', 'street']]], $saves);
+        $this->assertSame([['Job', ['name']], ['Place', ['street']], ['Job', ['lifecycle_status']], ['Listing', ['title', 'status', 'street']]], $saves);
         $this->assertSame([ListingStatus::Sold, 'Oak Manor', '2 Oak St'], [Listing::query()->findOrFail(1)->status, Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->street]);
     }
 
@@ -626,7 +542,7 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_declined_write_of_an_external_attribute_and_a_value_its_conversions_cannot_store(): void
+    public function it_refuses_a_write_of_a_read_only_computed_attribute_and_a_value_its_conversions_cannot_store(): void
     {
         $before = $this->snapshot();
         $listing = new class extends Model implements Compatible
@@ -650,7 +566,7 @@ final class RecordWriterTest extends TestCase
                         )
                         ->attribute(
                             name: 'mls_number',
-                            definition: fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: Attribute::declined(because: 'The MLS assigns its own numbers.')),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $jobs) => $jobs)->readOnly(because: 'The MLS assigns its own numbers.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'featured',
@@ -664,7 +580,7 @@ final class RecordWriterTest extends TestCase
         $externalRefusal = $this->refusal(fn () => $external->update(['title' => 'Elm House', 'mls_number' => 'MLS-3B']));
         $fixedRefusal = $this->refusal(fn () => $fixed->update(['title' => 'Elm House', 'featured' => true]));
 
-        $this->assertSame(['The MLS assigns its own numbers.', true], [$externalRefusal->because, str_ends_with($externalRefusal->refused, '::$mls_number cannot take a write')]);
+        $this->assertSame(['The MLS assigns its own numbers.', true], [$externalRefusal->because, str_ends_with($externalRefusal->refused, ' record 3 cannot change $mls_number')]);
         $this->assertStringStartsWith('Leave mls_number unchanged in writes through ', $externalRefusal->instead);
         $this->assertStringEndsWith('::$featured cannot take a write. Why: The attribute always reads false, so it cannot store true. Instead: Write a value its conversions can store, or write the stored column through the successor model.', $fixedRefusal->getMessage());
         $this->assertSame($before, $this->snapshot());
@@ -817,13 +733,13 @@ final class RecordWriterTest extends TestCase
                 )
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(AliasedPlace::class),
-                    definition: fn (Successor $place) => $place
+                    successor: fn (Successor $place) => $place
                         ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                         ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                 )
                 ->related(
                     relation: fn (Job $job) => $job->site(),
-                    definition: fn (Successor $site) => $site
+                    successor: fn (Successor $site) => $site
                         ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
                 ));
     }
@@ -857,6 +773,94 @@ final class RecordWriterTest extends TestCase
         $this->concurrent = null;
 
         return $failure;
+    }
+
+    #[Test]
+    public function it_discards_a_live_update_of_an_attribute_that_ignores_writes_and_dispatches_write_ignored_unless_the_value_is_null(): void
+    {
+        $listing = $this->companyIgnoringListing()::query()->findOrFail(1);
+        /** @var list<WriteIgnored> $ignored */
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = $event;
+        });
+        $other = '9f1e2d3c-4b5a-4678-9e0f-1a2b3c4d5e6f';
+
+        $listing->update(['company_id' => $other, 'title' => 'Oak Manor']);
+        $listing->update(['company_id' => null]);
+
+        $this->assertCount(1, $ignored);
+        $this->assertSame([Origin::Live, 'company_id', $other, ListingTables::COMPANY], [$ignored[0]->change->origin, $ignored[0]->change->attribute, $ignored[0]->value, $ignored[0]->change->original->getAttribute('company_id')]);
+        $this->assertSame([ListingTables::COMPANY, 'Oak Manor'], array_values((array) DB::table('jobs')->where('id', ListingTables::jobOf(1))->first(['company_id', 'name'])));
+
+        $refusal = $this->refusal(fn () => Listing::query()->findOrFail(1)->update(['company_id' => $other]));
+
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 1 cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $refusal->getMessage());
+        $this->assertSame(ListingTables::COMPANY, DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('company_id'));
+    }
+
+    #[Test]
+    public function it_writes_a_legacy_only_update_to_the_retained_row_with_one_legacy_event_sequence_and_no_successor_save(): void
+    {
+        $listing = Listing::query()->findOrFail(1);
+        $updatedAt = $listing->updated_at?->toDateTimeString();
+        $jobUpdatedAt = DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('updated_at');
+        $fired = [];
+
+        foreach (['saving', 'updating', 'updated', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Listing::class, function () use (&$fired, $event): void {
+                $fired[] = 'Listing '.$event;
+            });
+            Event::listen("eloquent.{$event}: ".Job::class, function () use (&$fired, $event): void {
+                $fired[] = 'Job '.$event;
+            });
+        }
+
+        $listing->update(['mls_number' => 'MLS-1B']);
+        $loud = $fired;
+        $fired = [];
+        $listing->mls_number = 'MLS-1C';
+        $listing->saveQuietly();
+
+        $this->assertSame([['Listing saving', 'Listing updating', 'Listing updated', 'Listing saved'], []], [$loud, $fired]);
+        $this->assertSame(['MLS-1C', $updatedAt, $updatedAt], [Listing::query()->findOrFail(1)->mls_number, Listing::query()->findOrFail(1)->updated_at?->toDateTimeString(), $listing->updated_at?->toDateTimeString()]);
+        $this->assertSame($jobUpdatedAt, DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('updated_at'));
+    }
+
+    #[Test]
+    public function it_creates_the_root_with_a_supplied_successor_key_that_names_no_root_and_refuses_one_that_names_an_existing_root(): void
+    {
+        $existing = (string) ListingTables::jobOf(1);
+        $reserved = '6a5b4c3d-2e1f-4a0b-9c8d-7e6f5a4b3c2d';
+
+        $refusal = $this->refusal(fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'job_id' => $existing]));
+        $created = Listing::query()->create(['title' => 'Cedar House', 'company_id' => ListingTables::COMPANY, 'job_id' => $reserved]);
+
+        $this->assertSame("Tests\Fixtures\Support\Listings\Listing cannot run a create that names the existing jobs row {$existing} as its job_id through its compatibility map. Why: A legacy create creates its own Job, and a successor key that names an existing one would bind a second record to it. Instead: Write each record through Listing, or write the successor models directly.", $refusal->getMessage());
+        $this->assertSame([$reserved, 'Cedar House'], [ListingTables::jobOf($created->id), DB::table('jobs')->where('id', $reserved)->value('name')]);
+        $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
+    }
+
+    private function companyIgnoringListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: true)));
+            }
+        };
     }
 
     /**

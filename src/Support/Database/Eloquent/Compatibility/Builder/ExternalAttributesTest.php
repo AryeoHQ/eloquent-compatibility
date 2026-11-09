@@ -778,9 +778,7 @@ final class ExternalAttributesTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => (self::$read ?? throw new LogicException('The test sets no read.'))($files),
-                                write: fn (File $file, null|string $mimeType) => null),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => (self::$read ?? throw new LogicException('The test sets no read.'))($files))->readOnly(because: 'The map reads it from outside the database.', ignoreWrites: false),
                         ));
             }
         };
@@ -822,8 +820,8 @@ final class ExternalAttributesTest extends TestCase
         )];
 
         $this->assertSame([
-            "The external() read closure of attribute 'mime_type' on photos returns no value for successor key {$third}; it returns one value, or null, for each successor it receives.",
-            "The external() read closure of attribute 'mime_type' on photos returns a value for successor key zml-unknown, which it did not receive; it returns one value, or null, for each successor it receives.",
+            "The computedAs() read closure of attribute 'mime_type' on photos returns no value for successor key {$third}; it returns one value, or null, for each successor it receives.",
+            "The computedAs() read closure of attribute 'mime_type' on photos returns a value for successor key zml-unknown, which it did not receive; it returns one value, or null, for each successor it receives.",
         ], $failures);
         $this->assertSame(['image/jpeg', 'image/jpeg', null], $mimeTypes());
     }

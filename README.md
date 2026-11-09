@@ -2,7 +2,7 @@
 Serve a previous Eloquent model from its current models, inside the application
 
 ## Status
-The package is under redesign. This release serves a legacy model's reads through a read-only view over its successors. A legacy model declares its map, and `Compatibility::prepare()` and `Compatibility::install()` replace its table with the view. `php artisan compatibility:sql` prints the SQL each operation runs. Writes through the legacy model translate into saves of its successors, and a legacy write of a `transitions()` attribute runs the successor's state-machine trigger.
+The package is under redesign. This release serves a legacy model's reads through a read-only view over its successors. A legacy model declares its map, and `Compatibility::prepare()` and `Compatibility::install()` replace its table with the view. `php artisan compatibility:sql` prints the SQL each operation runs. Each write through the legacy model runs as one unit of work: every changed attribute runs its operation, the package saves each changed successor once through its model, and the record must read back what was written.
 
 The new design writes compatibly in the application, and the database holds no function for it. Later releases add it one part at a time.
 

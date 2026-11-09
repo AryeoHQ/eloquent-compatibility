@@ -57,6 +57,11 @@ final class Applying
         return self::$writes !== null && self::$writes->offsetExists($successor);
     }
 
+    public static function legacyOf(Model $successor): null|Model
+    {
+        return self::holds($successor) ? self::$writes[$successor] ?? null : null;
+    }
+
     public static function identified(Model $legacy, int|string $key): void
     {
         $keys = self::$keys ??= new WeakMap;

@@ -17,16 +17,15 @@ use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
-use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\StoreAssetCaption;
 use Tests\Fixtures\Support\PlaceAssets\Video;
 use Tests\TestCase;
 
-#[CoversClass(MorphMove::class)]
 #[CoversClass(RecordWriter::class)]
 final class MorphMoveTest extends TestCase
 {
@@ -299,7 +298,7 @@ final class MorphMoveTest extends TestCase
     public function it_hands_the_external_write_of_an_updated_or_moved_record_the_place_asset_fields_the_same_write_changes(): void
     {
         $video = $this->guardedVideo();
-        $caption = fn (int $id) => FakeMediaLibrary::bound()->stored('caption-'.DB::table('place_assets')->where(
+        $caption = fn (int $id) => FakeMediaLibrary::bound()->stored('caption-title-'.DB::table('place_assets')->where(
             column: 'id',
             operator: '=',
             value: DB::table('place_videos')->where(
@@ -312,7 +311,8 @@ final class MorphMoveTest extends TestCase
         $video->newQuery()->findOrFail(1)->update(['title' => 'Tour v2', 'caption' => 'Tour caption']);
         $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'title' => 'Oak upload', 'caption' => 'Oak caption']);
 
-        $this->assertSame(['Tour v2: Tour caption', 'Oak upload: Oak caption'], [$caption(1), $caption(2)]);
+        $this->assertSame(['Tour v2', 'Oak upload'], [$caption(1), $caption(2)]);
+        $this->assertSame(['Tour caption', 'Oak caption'], [$video->newQuery()->findOrFail(1)->getAttribute('caption'), $video->newQuery()->findOrFail(2)->getAttribute('caption')]);
         $this->assertSame([['Tour v2', 'place_asset_file'], ['Oak upload', 'place_asset_file']], array_map(
             callback: fn (int $id) => [DB::table('place_assets')->where(
                 column: 'id',
@@ -355,7 +355,7 @@ final class MorphMoveTest extends TestCase
             }
         }
 
-        $refusal = CompatibilityWriteRefused::rawExpression($video::class, 'caption', 'It is declared external(), so its value lives outside the database, and no SQL computes it.')->getMessage();
+        $refusal = CompatibilityWriteRefused::rawExpression($video::class, 'caption', 'It is declared computedAs(), so its value is computed in PHP, and no SQL computes it.')->getMessage();
 
         $this->assertSame([$refusal, $refusal, $refusal], $refusals);
         $this->assertSame($before, $this->rows());
@@ -396,9 +396,7 @@ final class MorphMoveTest extends TestCase
                         )
                         ->attribute(
                             name: 'caption',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => FakeMediaLibrary::bound()->stored('caption-'.$asset->getKey())?->mimeType])->all(),
-                                write: fn (PlaceAsset $asset, null|string $caption) => FakeMediaLibrary::bound()->put('caption-'.$asset->getKey(), new FileMetadata($asset->title.': '.$caption))),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => FakeMediaLibrary::bound()->stored('caption-'.$asset->getKey())?->mimeType])->all())->writtenBy(StoreAssetCaption::class),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? AssetLink::class : AssetFile::class,

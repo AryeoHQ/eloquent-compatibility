@@ -99,6 +99,22 @@ trait ServesCompatibility
     }
 
     /**
+     * @return $this
+     */
+    public function updateTimestamps()
+    {
+        $column = $this->usesTimestamps() ? $this->getUpdatedAtColumn() : null;
+        $touches = $column !== null && ! $this->isDirty($column);
+        parent::updateTimestamps();
+        LegacyBuilder::touchOf(
+            model: $this,
+            touches: $touches,
+        );
+
+        return $this;
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function attributesToArray(): array

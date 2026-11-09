@@ -567,11 +567,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'title_upper',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.', ignoreWrites: false),
                         ));
             }
         };
@@ -766,13 +766,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => DB::table('photos')->where(
-                                    column: 'file_id',
-                                    operator: '=',
-                                    value: $file->getKey(),
-                                )->value('id') === 1 ? 'image/jpeg' : true])->all(),
-                                write: fn (File $file, mixed $value) => null),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => DB::table('photos')->where(
+                                column: 'file_id',
+                                operator: '=',
+                                value: $file->getKey(),
+                            )->value('id') === 1 ? 'image/jpeg' : true])->all())->readOnly(because: 'The map reads it from outside the database.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -1280,7 +1278,7 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         ))
                     ->hide(fn (Builder $jobs) => $jobs->where('score', 0.009999999999999998), because: 'A scored job is internal.');
             }
@@ -1362,7 +1360,7 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         ))
                     ->hide(self::$hide ?? fn (Builder $jobs) => $jobs, because: 'A marked job is internal.');
             }
@@ -1446,11 +1444,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'listed_wall',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."listed_before"')->readOnly(because: 'The legacy table keeps the first listing time.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."listed_before"')->readOnly(because: 'The legacy table keeps the first listing time.', ignoreWrites: false),
                         ));
             }
         };

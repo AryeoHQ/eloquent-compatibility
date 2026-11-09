@@ -4,15 +4,11 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
-use Closure;
 use LogicException;
 
 final readonly class ReadAs implements Conversion
 {
-    /**
-     * @param  null|Closure(mixed): mixed  $inverse
-     */
-    public function __construct(public string $sql, public null|Closure $inverse = null) {}
+    public function __construct(public string $sql) {}
 
     public function read(string $stored): string
     {
@@ -21,11 +17,7 @@ final readonly class ReadAs implements Conversion
 
     public function write(mixed $value): mixed
     {
-        if ($this->inverse === null) {
-            throw new LogicException('readAs('.$this->sql.') has no writeTo(), so it reads only.');
-        }
-
-        return ($this->inverse)($value);
+        throw new LogicException('readAs('.$this->sql.') has no inverse, so its writtenBy() operation writes it.');
     }
 
     public function filter(string $operator, mixed $value, null|string $type = null): null|array

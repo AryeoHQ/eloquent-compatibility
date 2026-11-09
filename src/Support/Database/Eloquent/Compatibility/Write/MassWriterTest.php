@@ -78,7 +78,7 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_each_owning_table_once_and_fires_no_model_events(): void
+    public function it_saves_each_changed_successor_of_each_record_once_and_forwards_no_legacy_event(): void
     {
         Event::fake();
 
@@ -115,23 +115,26 @@ final class MassWriterTest extends TestCase
             column: 'listings_retained.id',
             values: [1, 3],
         )->orderBy('listings_retained.id')->pluck('mls_number')->all());
-        $this->assertSame([], array_values(array_filter(array_keys(Event::dispatchedEvents()), fn (string $event) => str_starts_with($event, 'eloquent.'))));
+        $this->assertSame([], array_values(array_filter(array_keys(Event::dispatchedEvents()), fn (string $event) => str_starts_with($event, 'eloquent.') && str_ends_with($event, Listing::class))));
+        $this->assertSame([2, 2, 2], [count(Event::dispatched('eloquent.updated: '.Job::class)), count(Event::dispatched('eloquent.updated: '.Place::class)), count(Event::dispatched('eloquent.updated: '.JobSite::class))]);
     }
 
     #[Test]
-    public function it_runs_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
+    public function it_runs_the_unit_of_work_once_for_each_matching_record(): void
     {
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        DB::table('jobs')->insert(['name' => 'Single', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]);
-        self::serveNativeJobs();
+        self::createNativeJobs(count: 100, name: 'Bulk');
+        self::createNativeJobs(count: 1, name: 'Single');
         $write = ['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B'];
+        $saved = 0;
+        Event::listen('eloquent.saved: '.Job::class, function () use (&$saved): void {
+            $saved++;
+        });
 
-        $one = $this->statements(fn () => Listing::query()->where('title', 'Single')->update($write));
-        $hundred = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update($write));
+        $one = Listing::query()->where('title', 'Single')->update($write);
+        $single = $saved;
+        $hundred = Listing::query()->where('title', 'Bulk')->update($write);
 
-        $this->assertSame([1, 100], [$one[0], $hundred[0]]);
-        $this->assertSame($one[1], $hundred[1]);
+        $this->assertSame([1, 100, 1, 101], [$one, $hundred, $single, $saved]);
         $this->assertSame(101, DB::table('jobs')->where('price_cents', 200)->count());
         $this->assertSame(101, DB::table('places')->where('street', '5 Elm St')->whereNull('parent_id')->count());
         $this->assertSame(101, DB::table('job_sites')->where('latitude', 2.5)->count());
@@ -214,14 +217,14 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->hasOne(DefaultedPlace::class),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         ));
             }
         };
-        DB::table('jobs')->insert([['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Lodge', 'company_id' => ListingTables::COMPANY]]);
-        self::serveNativeJobs();
+        self::createNativeJobs(count: 1, name: 'Birch Lodge');
+        self::createNativeJobs(count: 1, name: 'Cedar Lodge');
         $legacyId = fn (string $name): int => (int) DB::table('listings_retained')->where(
             column: 'job_id',
             operator: '=',
@@ -273,7 +276,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         ));
@@ -311,7 +314,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
-                            definition: fn (Successor $company) => $company
+                            successor: fn (Successor $company) => $company
                                 ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
                                     ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
                         ));
@@ -366,7 +369,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
-                            definition: fn (Successor $company) => $company
+                            successor: fn (Successor $company) => $company
                                 ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
                                     ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
                         ));
@@ -686,7 +689,7 @@ final class MassWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => Listing::query()->whereKey(1)->update(['price->amount' => 5]));
 
-        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its conversions read the whole stored value, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
+        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its read is not a plain column, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
         $this->assertEquals($before, DB::table('jobs')->orderBy('id')->get()->all());
     }
 
@@ -741,7 +744,7 @@ final class MassWriterTest extends TestCase
         $readOnly = $this->refusal(fn () => Listing::query()->update(['company_id' => ListingTables::COMPANY]));
 
         $this->assertSame(Listing::class.'::$price cannot take a raw expression. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write the computed value, or write the stored column through the successor model.', $raw->getMessage());
-        $this->assertSame(Listing::class.' records cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
+        $this->assertSame(Listing::class.' record 1 cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
         $this->assertSame([125050, 9999], DB::table('jobs')->join(
             table: 'listings_retained',
             first: 'listings_retained.job_id',
@@ -783,12 +786,12 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_of_an_attribute_that_runs_transitions(): void
+    public function it_runs_the_operation_of_a_state_write_for_each_record_of_a_mass_write(): void
     {
-        $refused = $this->refusal(fn () => Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]));
+        $updated = Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]);
 
-        $this->assertSame(Listing::class.'::$status cannot take a mass write. Why: It is declared transitions(), so each record\'s change runs its successor\'s state-machine trigger, and a set-based statement cannot run a trigger per row. Instead: Write the records one at a time through Listing.', $refused->getMessage());
-        $this->assertSame([['Oak House', 'live'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->join(
+        $this->assertSame(1, $updated);
+        $this->assertSame([['Oak Manor', 'closed'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->join(
             table: 'listings_retained',
             first: 'listings_retained.job_id',
             operator: '=',
@@ -860,51 +863,39 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_create_a_missing_dependent_whose_key_has_no_database_default(): void
+    public function it_creates_a_missing_dependent_through_its_model_when_its_key_has_no_database_default(): void
     {
         DB::statement('alter table places alter column id drop default');
 
-        $refused = $this->refusal(fn () => Listing::withTrashed()->whereKey([1, 2])->update(['title' => 'Renamed', 'street' => '2 Pine St']));
+        $updated = Listing::withTrashed()->whereKey([1, 2])->update(['title' => 'Renamed', 'street' => '2 Pine St']);
         Listing::query()->whereKey(1)->update(['street' => '2 Oak St']);
 
-        $this->assertSame(Listing::class.' cannot write $street in one statement to records that have no places row. Why: A set-based write creates the missing places rows in SQL, and places.id has no database default to key them. Instead: Write the records one at a time through Listing, or give places.id a database default.', $refused->getMessage());
-        $this->assertSame(['Oak House', 'Pine Flat'], Job::withTrashed()->whereIn(
+        $this->assertSame(2, $updated);
+        $this->assertSame(['Renamed', 'Renamed'], Job::withTrashed()->whereIn(
             column: 'id',
             values: DB::table('listings_retained')->whereIn(
                 column: 'id',
                 values: [1, 2],
             )->select('job_id'),
         )->orderBy('name')->pluck('name')->all());
-        $this->assertSame(['2 Oak St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
+        $this->assertSame(['2 Oak St', '2 Pine St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
     }
 
     #[Test]
-    public function it_binds_no_matched_key_into_a_statement(): void
-    {
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        $keys = DB::table('jobs')->where('name', 'Bulk')->pluck('id')->all();
-
-        [$updated] = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update(['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B']));
-        $bound = (string) json_encode(array_column(DB::getQueryLog(), 'bindings'));
-
-        $this->assertSame(100, $updated);
-        $this->assertSame([], array_values(array_filter($keys, fn (mixed $key) => str_contains($bound, (string) $key))));
-    }
-
-    #[Test]
-    public function it_deletes_the_primary_rows_hard_in_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
+    public function it_force_deletes_the_root_of_each_matching_record_through_its_model(): void
     {
         $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        Listing::query()->where('price', '>', 1000)->get();
+        self::createNativeJobs(count: 100, name: 'Bulk');
+        $deleted = 0;
+        Event::listen('eloquent.forceDeleted: '.Job::class, function () use (&$deleted): void {
+            $deleted++;
+        });
 
-        $one = $this->statements(fn () => Listing::query()->where('price', '>', 1000)->forceDelete());
-        $hundred = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->forceDelete());
+        $one = Listing::query()->where('price', '>', 1000)->forceDelete();
+        $single = $deleted;
+        $hundred = Listing::query()->where('title', 'Bulk')->forceDelete();
 
-        $this->assertSame([1, 100], [$one[0], $hundred[0]]);
-        $this->assertSame($one[1], $hundred[1]);
+        $this->assertSame([1, 100, 1, 101], [$one, $hundred, $single, $deleted]);
         $this->assertSame([0, 0, 0], [Job::withTrashed()->whereKey($oak->id)->count(), DB::table('places')->where('job_id', $oak->id)->count(), DB::table('listings_retained')->where('job_id', $oak->id)->count()]);
         $this->assertSame(2, Job::withTrashed()->count());
     }
@@ -919,23 +910,6 @@ final class MassWriterTest extends TestCase
             $table->foreignUuid('company_id')->unique()->constrained('companies')->cascadeOnDelete();
             $table->string('tagline')->nullable();
         });
-    }
-
-    /**
-     * @return array{mixed, int}
-     */
-    private function statements(Closure $write): array
-    {
-        DB::flushQueryLog();
-        DB::enableQueryLog();
-
-        try {
-            $result = $write();
-        } finally {
-            DB::disableQueryLog();
-        }
-
-        return [$result, count(array_filter(DB::getQueryLog(), fn (array $query) => ! str_contains((string) $query['query'], 'pg_class')))];
     }
 
     private function lockConcurrently(string $sql): string
@@ -1028,7 +1002,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (ConfiguredJob $job) => $job->site(),
-                            definition: fn (Successor $site) => $site
+                            successor: fn (Successor $site) => $site
                                 ->attribute('options', fn (Attribute $attribute) => $attribute->from('options')),
                         ));
             }
@@ -1056,7 +1030,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
                                     ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))),
@@ -1065,8 +1039,12 @@ final class MassWriterTest extends TestCase
         };
     }
 
-    private static function serveNativeJobs(): void
+    private static function createNativeJobs(int $count, string $name): void
     {
-        DB::statement('insert into listings_retained (job_id) select jobs.id from jobs where not exists (select from listings_retained where listings_retained.job_id = jobs.id)');
+        DB::transaction(function () use ($count, $name): void {
+            for ($created = 0; $created < $count; $created++) {
+                Job::query()->create(['name' => $name, 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]);
+            }
+        });
     }
 }

@@ -12,6 +12,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use PHPUnit\Exception as PHPUnitException;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
@@ -19,6 +20,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Discovery\InheritedServed;
 use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
@@ -144,6 +146,41 @@ final class AssertsServedCompatibilityTest extends TestCase
             $this->failureOf(
                 model: FloorPlan::class,
                 nativeCreate: fn () => PlaceAsset::query()->create(['asset_type' => 'place_asset_file', 'asset_id' => AssetFile::query()->create(['filename' => 'pine-plan.pdf'])->getKey()]),
+            ),
+        );
+    }
+
+    #[Test]
+    public function it_fails_when_a_native_create_inserts_no_retained_row(): void
+    {
+        $this->install();
+
+        $this->assertStringStartsWith(
+            'nativeCreate inserts no listings_retained row for the new Job. Use '.CarriesLegacy::class.' on Job, and create it inside a transaction.',
+            $this->failureOf(
+                model: Listing::class,
+                nativeCreate: function (): Job {
+                    $id = (string) Str::uuid();
+                    DB::table('jobs')->insert(['id' => $id, 'name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+                    return Job::query()->findOrFail($id);
+                },
+            ),
+        );
+    }
+
+    #[Test]
+    public function it_fails_when_a_legacy_only_not_null_column_has_no_default_and_the_map_no_legacy_initializer(): void
+    {
+        $this->installFloorPlans(classified: true);
+        DB::statement("alter table floorplans_retained add column drawn_by text not null default 'v1'");
+        DB::statement('alter table floorplans_retained alter column drawn_by drop default');
+
+        $this->assertStringStartsWith(
+            'The legacy-only column floorplans.drawn_by is NOT NULL with no default, and the map of FloorPlan declares no legacyInitializedBy(), so a native create cannot fill it.',
+            $this->failureOf(
+                model: FloorPlan::class,
+                nativeCreate: fn () => PlaceAsset::query()->create(['legacy_type' => 'floorplan', 'asset_type' => 'place_asset_file', 'asset_id' => AssetFile::query()->create(['filename' => 'pine-plan.pdf'])->getKey()]),
             ),
         );
     }

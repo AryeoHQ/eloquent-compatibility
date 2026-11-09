@@ -4,20 +4,152 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Str;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
+use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesLegacy;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use WeakMap;
 
-final readonly class RetainedRows
+final class RetainedRows
 {
-    public function __construct(private ResolvedMap $map, private ConnectionInterface $connection) {}
+    /** @var null|WeakMap<ServedModels, array<class-string<Model>, list<class-string<Model>>>> */
+    private static null|WeakMap $carriers = null;
+
+    public function __construct(private readonly ResolvedMap $map, private readonly ConnectionInterface $connection) {}
+
+    public static function served(Model $root): bool
+    {
+        foreach (self::carriers($root) as $map) {
+            if (self::installed($root->getConnection(), $map)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static function carry(Model $root): void
+    {
+        $connection = $root->getConnection();
+        $writing = Applying::legacyOf($root);
+
+        foreach (self::carriers($root) as $map) {
+            if ($writing?->getTable() === $map->table || ! self::member($root, $map)) {
+                continue;
+            }
+
+            if ($connection->transactionLevel() > 0) {
+                $connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN ACCESS SHARE MODE');
+            }
+
+            if (! self::installed($connection, $map)) {
+                continue;
+            }
+
+            (new self($map, $connection))->carried($root);
+        }
+    }
+
+    private function carried(Model $root): void
+    {
+        $legacy = (new $this->map->model)->setConnection($root->getConnectionName());
+
+        if ($legacy->usesUniqueIds()) {
+            $legacy->setUniqueIds();
+        }
+
+        $initializer = $this->map->legacyInitializer;
+
+        if ($initializer !== null) {
+            $instance = Container::getInstance()->make($initializer);
+
+            if (! $instance instanceof InitializesLegacy) {
+                throw new LogicException("The initializer {$initializer} does not implement ".InitializesLegacy::class.'.');
+            }
+
+            $graphs = (new UnitOfWork(
+                map: $this->map,
+                connection: $root->getConnection(),
+            ))->graphs([[$this->map, $root]], lock: false);
+            $instance->initialize($graphs[0], new Creation(
+                record: $legacy,
+                origin: Origin::Live,
+            ));
+        }
+
+        $values = array_intersect_key($legacy->getAttributes(), array_flip($this->map->legacyOnly(array_keys($legacy->getAttributes()))));
+        unset($values[$this->map->successorKey]);
+
+        if ($legacy->getKey() === null) {
+            unset($values[$legacy->getKeyName()]);
+        }
+
+        $this->insert(
+            root: UnitOfWork::keyOf($root),
+            values: $values,
+        );
+    }
+
+    /**
+     * @return list<ResolvedMap>
+     */
+    private static function carriers(Model $root): array
+    {
+        $served = Container::getInstance()->make(ServedModels::class);
+        $carriers = self::$carriers ??= new WeakMap;
+        $known = $carriers[$served] ?? [];
+
+        if (! array_key_exists($root::class, $known)) {
+            $known[$root::class] = array_values(array_filter(
+                array: $served->all(),
+                callback: fn (string $model) => (Compatibility::of($model)->successors()[0] ?? null) === $root::class,
+            ));
+            $carriers[$served] = $known;
+        }
+
+        $maps = [];
+
+        foreach ($known[$root::class] as $model) {
+            $map = LegacyBuilder::mapOf($model);
+
+            if ($map->retainedTable !== null) {
+                $maps[] = $map;
+            }
+        }
+
+        return $maps;
+    }
+
+    private static function member(Model $root, ResolvedMap $map): bool
+    {
+        $when = $map->primary->membershipScope();
+
+        if ($when === null) {
+            return true;
+        }
+
+        $query = $root->newModelQuery()->useWritePdo()->whereKey($root->getKey());
+        $when($query);
+
+        return $query->exists();
+    }
+
+    private static function installed(ConnectionInterface $connection, ResolvedMap $map): bool
+    {
+        return $connection->scalar("select exists (select from pg_class where oid = to_regclass(?) and relkind = 'v')", [SqlFragments::identifier($map->table)]) === true;
+    }
 
     /**
      * @param  array<string, mixed>  $values
