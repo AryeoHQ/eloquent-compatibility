@@ -49,7 +49,10 @@ final readonly class Backfiller
     public function __construct(private ResolvedMap $map, private ConnectionInterface $connection)
     {
         $legacy = new $map->model;
-        $this->catalog = new ColumnCatalog($connection);
+        $this->catalog = new ColumnCatalog(
+            connection: $connection,
+            throughWriteConnection: true,
+        );
         $this->key = $legacy->getKeyName();
         $this->connectionName = $legacy->getConnectionName();
     }
@@ -101,7 +104,7 @@ final readonly class Backfiller
         return [$changed + $this->deleteGone(), $read, $updatedAt];
     }
 
-    public function refuseUnconvergeable(string $watermark): void
+    public function refuseUnconvergeable(): void
     {
         if ($this->updatedAt() === null) {
             throw InvalidCompatibilityMap::cannot($this->map->table, 'install', "{$this->map->table} has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock");
@@ -176,7 +179,10 @@ final readonly class Backfiller
      */
     public static function storage(ResolvedMap $map, ConnectionInterface $connection): array
     {
-        $catalog = new ColumnCatalog($connection);
+        $catalog = new ColumnCatalog(
+            connection: $connection,
+            throughWriteConnection: true,
+        );
         $key = (new $map->model)->getKeyName();
         $keyType = $catalog->type(
             table: $map->table,

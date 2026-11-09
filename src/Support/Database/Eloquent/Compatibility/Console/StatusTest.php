@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Carbon\CarbonInterval;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -32,6 +33,7 @@ final class StatusTest extends TestCase
 
     protected function tearDown(): void
     {
+        DB::statement('drop table if exists listings_retained');
         ListingTables::drop();
         PlaceAssetTables::drop();
 
@@ -86,6 +88,64 @@ final class StatusTest extends TestCase
             str: Listing::class,
             delimiter: '/',
         ).'\s*\|\s*listings\s*\|\s*discovered/', $output);
+        $this->assertMatchesRegularExpression('/'.preg_quote(
+            str: FloorPlan::class,
+            delimiter: '/',
+        ).'\s*\|\s*floorplans\s*\|\s*prepared/', $output);
+    }
+
+    #[Test]
+    public function it_refuses_a_legacy_table_beside_its_retained_table_and_still_prints_the_stage_of_another_model(): void
+    {
+        PlaceAssetTables::create();
+        Compatibility::prepare(FloorPlan::class);
+        DB::statement('create table listings_retained (id bigint)');
+
+        $exitCode = Artisan::call(
+            command: 'compatibility:status',
+            parameters: ['--model' => [Listing::class, FloorPlan::class]],
+        );
+        $output = Artisan::output();
+
+        $this->assertSame(1, $exitCode);
+        $this->assertStringContainsString(Listing::class.": Compatibility map 'listings' cannot report its stage: listings is a table and listings_retained is a table, which matches none of the six stages", $output);
+        $this->assertDoesNotMatchRegularExpression('/'.preg_quote(
+            str: Listing::class,
+            delimiter: '/',
+        ).'\s*\|/', $output);
+        $this->assertMatchesRegularExpression('/'.preg_quote(
+            str: FloorPlan::class,
+            delimiter: '/',
+        ).'\s*\|\s*floorplans\s*\|\s*prepared/', $output);
+    }
+
+    #[Test]
+    public function it_refuses_a_model_whose_prepare_did_not_finish_its_unique_index_and_still_prints_the_stage_of_another_model(): void
+    {
+        PlaceAssetTables::create();
+        Compatibility::prepare(FloorPlan::class);
+        DB::statement('update listings set job_id = gen_random_uuid() where id = 1');
+        DB::statement('update listings set job_id = (select job_id from listings where id = 1)');
+
+        try {
+            Compatibility::prepare(Listing::class);
+            $this->fail('prepare() built a unique index over duplicated job_id values.');
+        } catch (QueryException $exception) {
+            $this->assertSame('23505', $exception->getCode());
+        }
+
+        $exitCode = Artisan::call(
+            command: 'compatibility:status',
+            parameters: ['--model' => [Listing::class, FloorPlan::class]],
+        );
+        $output = Artisan::output();
+
+        $this->assertSame(1, $exitCode);
+        $this->assertStringContainsString(Listing::class.": Compatibility map 'listings' cannot report its stage: prepare() has not finished: listings_job_id_unique is missing or not a valid unique index on listings.job_id. Run Compatibility::prepare() again until it completes.", $output);
+        $this->assertDoesNotMatchRegularExpression('/'.preg_quote(
+            str: Listing::class,
+            delimiter: '/',
+        ).'\s*\|/', $output);
         $this->assertMatchesRegularExpression('/'.preg_quote(
             str: FloorPlan::class,
             delimiter: '/',

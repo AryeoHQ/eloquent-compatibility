@@ -428,45 +428,28 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_print_an_install_that_catches_up_a_backfill_and_deletes_the_successor_rows_of_hard_deleted_legacy_rows(): void
+    public function it_prints_an_install_after_a_pass_with_a_warning_that_the_printed_sql_omits_the_backfill_passes(): void
     {
-        $refusal = "Compatibility map 'listings' cannot install: the last compatibility:backfill of listings left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead.";
-        (new Backfiller(Compatibility::of(Listing::class)->resolve(), DB::connection()))->run();
-        DB::delete('delete from listings where id = 3');
-
-        $this->artisan(
-            command: 'compatibility:sql',
-            parameters: ['operation' => 'install', 'model' => Listing::class],
-        )
-            ->expectsOutputToContain($refusal)
-            ->doesntExpectOutputToContain('BEGIN;')
-            ->assertFailed();
-
-        Compatibility::install(
-            model: Listing::class,
-            statementTimeout: CarbonInterval::seconds(30),
-        );
-        Compatibility::rollback(Listing::class);
-        Compatibility::prepare(Listing::class);
         (new Backfiller(
             map: Compatibility::of(Listing::class)->resolve(),
             connection: DB::connection(),
         ))->run();
+        DB::update("update listings set title = 'Oak Manor' where id = 1");
 
-        $this->artisan(
+        $exitCode = Artisan::call(
             command: 'compatibility:sql',
             parameters: ['operation' => 'install', 'model' => Listing::class],
-        )
-            ->expectsOutputToContain($refusal)
-            ->doesntExpectOutputToContain('BEGIN;')
-            ->assertFailed();
-        $this->assertSame([1, 2], array_map(
-            callback: intval(...),
-            array: array_column(
-                array: DB::select('select listings.id from jobs join listings on listings.job_id = jobs.id order by listings.id'),
-                column_key: 'id',
-            ),
-        ));
+        );
+        $output = Artisan::output();
+
+        $this->assertSame(0, $exitCode);
+        $this->assertStringContainsString("\n-- Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.\n-- Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of listings. Run Compatibility::install() instead.\n", $output);
+        $this->assertStringContainsString("\n\nALTER TABLE \"listings\" RENAME TO \"listings_retained\"\n;\n\n", $output);
+        $this->assertStringEndsWith("\n;\n\nCOMMIT;\n", $output);
+        $this->assertSame(['r', 'Oak Manor'], [
+            DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"),
+            DB::table('listings')->where(column: 'id', operator: '=', value: 1)->value('title'),
+        ]);
     }
 
     #[Test]

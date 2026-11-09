@@ -94,18 +94,25 @@ final readonly class Installer
         );
         $backfiller = new Backfiller($map, $this->connection);
         $watermark = $backfiller->remembered();
-        $rolledBack = $watermark === null && $this->rolledBack($map);
 
-        if (($watermark !== null || $rolledBack) && ! $outside) {
+        if ($watermark !== null && ! $outside) {
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
-        if ($rolledBack) {
+        $fullPass = $watermark === null && Statements::kind(
+            connection: $this->connection,
+            table: $map->table,
+        ) === 'r';
+
+        if ($watermark !== null || $fullPass) {
+            $backfiller->refuseUnconvergeable();
+        }
+
+        if ($fullPass) {
             $watermark = $backfiller->run()['watermark'];
         }
 
         if ($watermark !== null) {
-            $backfiller->refuseUnconvergeable($watermark);
             $watermark = $this->converge(
                 map: $map,
                 backfiller: $backfiller,
@@ -164,24 +171,6 @@ final readonly class Installer
                 },
             ),
         );
-    }
-
-    private function rolledBack(ResolvedMap $map): bool
-    {
-        $relation = "to_regclass(quote_ident(current_schema()) || '.' || ?)";
-        $ledger = Backfiller::ledger($map->table);
-
-        if ($this->connection->scalar(
-            query: "select relkind::text from pg_class where oid = {$relation}",
-            bindings: [SqlFragments::identifier($map->table)],
-        ) !== 'r' || $this->connection->scalar(
-            query: "select {$relation} is not null",
-            bindings: [SqlFragments::identifier($ledger)],
-        ) !== true) {
-            return false;
-        }
-
-        return $this->connection->scalar('select exists (select from '.SqlFragments::identifier($ledger).')') === true;
     }
 
     private static function refuseSpent(ResolvedMap $map, int|float $started, int $budget, string $moment, string $statement): void

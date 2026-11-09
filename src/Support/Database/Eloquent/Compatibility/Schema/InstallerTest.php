@@ -645,6 +645,7 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_refuses_to_install_while_a_legacy_row_has_no_primary(): void
     {
+        $this->backfiller(Listing::class)->run();
         DB::delete('delete from jobs where id in (select job_id from listings where id in (1, 3))');
 
         try {
@@ -679,6 +680,7 @@ final class InstallerTest extends TestCase
     public function it_refuses_to_install_while_a_legacy_row_holds_an_external_value_its_read_does_not_return(): void
     {
         $this->prepareFiles();
+        $this->backfiller(Photo::class)->run();
         FakeMediaLibrary::bound()->put(
             asset: (string) DB::table('files')->where(
                 column: 'id',
@@ -711,6 +713,7 @@ final class InstallerTest extends TestCase
     public function it_refuses_to_install_while_a_legacy_row_holds_null_where_the_read_returns_a_value(): void
     {
         $this->prepareFiles();
+        $this->backfiller(Photo::class)->run();
         DB::statement('alter table photos alter column mime_type drop not null');
         DB::table('photos')->where('id', 3)->update(['mime_type' => null]);
 
@@ -815,6 +818,7 @@ final class InstallerTest extends TestCase
     public function it_refuses_to_install_an_external_attribute_over_a_legacy_column_that_owns_a_sequence(): void
     {
         $this->prepareFiles();
+        $this->backfiller(Photo::class)->run();
         DB::statement('drop sequence if exists photos_mime_type_seq cascade');
         DB::statement('create sequence photos_mime_type_seq owned by photos.mime_type');
         DB::statement("alter table photos alter column mime_type set default 'image/' || nextval('photos_mime_type_seq')");
@@ -1025,16 +1029,16 @@ final class InstallerTest extends TestCase
     public static function unfinishedPreparations(): array
     {
         return [
-            'a successor key without its unique index' => ['alter table listings drop constraint listings_job_id_unique', 'listings.job_id has no unique index of its own'],
-            'no backfill ledger' => ['drop table listings_backfill', 'listings_backfill does not exist'],
-            'no at-most-one index' => ['drop index places_listings_at_most_one', 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
-            'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", 'places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places'],
+            'a successor key without its unique index' => ['alter table listings drop constraint listings_job_id_unique', self::unfinished('listings.job_id has no unique index of its own')],
+            'no backfill ledger' => ['drop table listings_backfill', "Compatibility map 'listings' cannot backfill: Compatibility::prepare() adds listings.job_id and creates listings_backfill and compatibility_backfills, and it has not run; run Compatibility::prepare() first."],
+            'no at-most-one index' => ['drop index places_listings_at_most_one', self::unfinished('places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places')],
+            'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", self::unfinished('places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places')],
         ];
     }
 
     #[DataProvider('unfinishedPreparations')]
     #[Test]
-    public function it_refuses_to_install_over_a_preparation_that_has_not_finished_even_with_no_inbound_foreign_key(string $unfinished, string $what): void
+    public function it_refuses_to_install_over_a_preparation_that_has_not_finished_even_with_no_inbound_foreign_key(string $unfinished, string $refusal): void
     {
         DB::statement('drop table listing_photos, listing_shares');
         DB::statement($unfinished);
@@ -1045,11 +1049,16 @@ final class InstallerTest extends TestCase
                 statementTimeout: CarbonInterval::seconds(30),
             );
             $this->fail('install() did not refuse.');
-        } catch (QueryException $exception) {
-            $this->assertStringContainsString("Compatibility map 'listings' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.", $exception->getMessage());
+        } catch (InvalidCompatibilityMap|QueryException $exception) {
+            $this->assertStringContainsString($refusal, $exception->getMessage());
         }
 
         $this->assertSame('r', $this->kind('listings'));
+    }
+
+    private static function unfinished(string $what): string
+    {
+        return "Compatibility map 'listings' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.";
     }
 
     #[Test]
@@ -1057,9 +1066,17 @@ final class InstallerTest extends TestCase
     {
         config(['database.connections.compatibility_concurrent' => config('database.connections.pgsql')]);
         $concurrent = null;
+        $locked = false;
 
-        DB::listen(function (QueryExecuted $query) use (&$concurrent): void {
-            if ($concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'format_type(table_column.atttypid')) {
+        DB::listen(function (QueryExecuted $query) use (&$concurrent, &$locked): void {
+            if ($query->connectionName !== 'compatibility_concurrent' && str_starts_with(
+                haystack: $query->sql,
+                needle: 'LOCK TABLE listings',
+            )) {
+                $locked = true;
+            }
+
+            if (! $locked || $concurrent !== null || $query->connectionName === 'compatibility_concurrent' || ! str_contains($query->sql, 'format_type(table_column.atttypid')) {
                 return;
             }
 
@@ -1710,6 +1727,75 @@ final class InstallerTest extends TestCase
         $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
     }
 
+    #[Test]
+    public function it_catches_up_on_a_reinstall_the_legacy_edit_made_after_rolling_back_an_install_that_no_pass_preceded(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        Compatibility::rollback(Listing::class);
+        Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+        Compatibility::prepare(Listing::class);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->value('title')]);
+    }
+
+    #[Test]
+    public function it_serves_on_a_first_install_with_no_pass_a_mapped_value_written_to_the_legacy_table_after_prepare(): void
+    {
+        DB::table('listings')->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->update(['title' => 'Oak Manor']);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->value('title')]);
+    }
+
+    #[Test]
+    public function it_runs_the_full_pass_of_a_first_install_inside_a_caller_s_transaction(): void
+    {
+        DB::table('listings')->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->update(['title' => 'Oak Manor']);
+
+        $served = DB::transaction(function (): array {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            return [$this->kind('listings'), DB::table('listings')->where(
+                column: 'id',
+                operator: '=',
+                value: 1,
+            )->value('title')];
+        });
+
+        $this->assertSame(['v', 'Oak Manor'], $served);
+    }
+
     #[DataProvider('dependents')]
     #[Test]
     public function it_refuses_an_undeclared_dependent_before_its_catch_up_writes_a_successor_or_advances_the_pass(string $create, string $drop, string $dependent): void
@@ -2065,6 +2151,7 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_retries_the_install_when_the_foreign_key_cannot_take_its_lock_on_the_root_within_the_lock_timeout(): void
     {
+        $this->backfiller(Listing::class)->run();
         $holding = $this->holdUntilReleased("update jobs set name = name where name = 'Oak House'");
         $attempts = 0;
         $released = null;
@@ -2094,6 +2181,7 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_retries_a_lock_wait_on_the_root_under_a_statement_timeout_shorter_than_its_lock_timeout(): void
     {
+        $this->backfiller(Listing::class)->run();
         $holding = $this->holdUntilReleased("update jobs set name = name where name = 'Oak House'");
         $timeouts = [];
         $released = null;

@@ -182,24 +182,18 @@ final readonly class Preparer
     public function unfinished(ResolvedMap $map): array
     {
         $refusal = fn (string $what) => SqlFragments::literal("Compatibility map '{$map->table}' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.");
-        $legacy = $this->relation($map->table);
         $statements = ["DO \$compatibility\$\nBEGIN\n"
-            ."  IF NOT EXISTS (\n"
-            ."    SELECT FROM pg_attribute attribute\n"
-            ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
-            ."      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum\n"
-            ."    WHERE attribute.attrelid = {$legacy} AND attribute.attname = ".SqlFragments::literal($map->successorKey)." AND NOT attribute.attisdropped\n"
-            ."  ) THEN\n"
+            .'  IF NOT '.self::uniqueKey($map)." THEN\n"
             ."    RAISE EXCEPTION '%', ".$refusal("{$map->table}.{$map->successorKey} has no unique index of its own").";\n"
             ."  END IF;\n"
-            .'  IF '.$this->relation(Backfiller::ledger($map->table))." IS NULL THEN\n"
+            .'  IF '.self::relation(Backfiller::ledger($map->table))." IS NULL THEN\n"
             ."    RAISE EXCEPTION '%', ".$refusal(Backfiller::ledger($map->table).' does not exist').";\n"
             ."  END IF;\nEND\n\$compatibility\$"];
 
         foreach ($map->related as $related) {
             if ($related->successor->atMostOneBecause() !== null && ! $related->belongsTo) {
                 [$index, $columns] = $this->atMostOneIndex($map, $related);
-                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".$this->relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
+                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
                     .$this->definitions($related->table, $index, $columns, true)
                     ."  IF found IS DISTINCT FROM expected THEN\n"
                     ."    RAISE EXCEPTION '%', ".$refusal("{$index} is missing, not valid, or not the unique index prepare() builds on {$related->table}").";\n"
@@ -208,6 +202,16 @@ final readonly class Preparer
         }
 
         return $statements;
+    }
+
+    public static function uniqueKey(ResolvedMap $map): string
+    {
+        return "EXISTS (\n"
+            ."    SELECT FROM pg_attribute attribute\n"
+            ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
+            ."      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum\n"
+            .'    WHERE attribute.attrelid = '.self::relation($map->table).' AND attribute.attname = '.SqlFragments::literal($map->successorKey)." AND NOT attribute.attisdropped\n"
+            .'  )';
     }
 
     /**
@@ -223,7 +227,7 @@ final readonly class Preparer
         ];
     }
 
-    private function relation(string $name): string
+    private static function relation(string $name): string
     {
         return 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
     }
@@ -235,7 +239,7 @@ final readonly class Preparer
         return "  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($table).', current_schema(), '.SqlFragments::literal($table).");\n"
             .'  CREATE UNIQUE INDEX '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns.";\n"
             .'  SELECT '.$definition.' INTO expected FROM pg_index WHERE indrelid = '.SqlFragments::literal('pg_temp.'.SqlFragments::identifier($table))."::regclass;\n"
-            .'  SELECT '.$definition.' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique'.($valid ? ' AND indisvalid' : '').' AND indrelid = '.$this->relation($table).";\n"
+            .'  SELECT '.$definition.' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique'.($valid ? ' AND indisvalid' : '').' AND indrelid = '.self::relation($table).";\n"
             .'  DROP TABLE pg_temp.'.SqlFragments::identifier($table).";\n";
     }
 
@@ -246,7 +250,7 @@ final readonly class Preparer
     {
         $refusal = SqlFragments::literal("Compatibility map '{$map}' cannot prepare: {$index} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.");
         $statements = [
-            "DO \$compatibility\$\nDECLARE\n  existing regclass := {$this->relation($index)};\n  expected text;\n  found text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
                 ."  IF existing IS NULL THEN\n    RETURN;\n  END IF;\n"
                 .$this->definitions($table, $index, $columns, false)
                 ."  IF found IS DISTINCT FROM expected THEN\n"

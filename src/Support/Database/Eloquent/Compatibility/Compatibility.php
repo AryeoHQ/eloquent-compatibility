@@ -89,7 +89,6 @@ final class Compatibility
                     statements: Statements::install(
                         map: $map,
                         connection: $connection,
-                        catchingUp: true,
                     ),
                 ),
             );

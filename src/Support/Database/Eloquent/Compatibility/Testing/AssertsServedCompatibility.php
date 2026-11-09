@@ -45,7 +45,6 @@ trait AssertsServedCompatibility
                 Statements::install(
                     map: $map,
                     connection: $connection,
-                    catchingUp: true,
                 );
             }
         } catch (InvalidCompatibilityMap $exception) {

@@ -23,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
+use Tests\Fixtures\Support\Backfills\CompletedPass;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
@@ -358,6 +359,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
+        CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set price_mills = 1005 where id = (select job_id from listings where id = 1)');
         DB::update('update jobs set price_mills = 1010 where id = (select job_id from listings where id = 3)');
         Compatibility::install(

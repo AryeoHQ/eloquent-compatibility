@@ -28,6 +28,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provider;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Backfills\CompletedPass;
 use Tests\Fixtures\Support\Files\ArchiveLegacyFile;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
@@ -1652,6 +1653,7 @@ final class ForwarderTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
+        CompletedPass::recordHandBackfill(model: Listing::class);
         DB::statement('alter table places add column town text');
         DB::statement('update places set town = city');
         DB::statement('alter table places drop column city');

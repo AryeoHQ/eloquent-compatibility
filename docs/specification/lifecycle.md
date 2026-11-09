@@ -32,7 +32,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 
 - It adopts the successor key column `servedFrom(key:)` names, or adds it when the column does not exist.
 - It adds a unique constraint on the successor key, and no other constraint. The key is an identity that may name no root yet, and install adds the rest under its lock ([Storage: the successor key](storage.md#the-successor-key)).
-- It creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today, so a pass finds the rows at or after its lower bound without a scan.
+- It creates `<legacy>_updated_at_index` on `updated_at` `CONCURRENTLY`, as it does today, so a pass finds the rows at or after its lower bound without a scan. A served legacy table therefore needs an `updated_at` column that its legacy model writes. Install refuses a table without one before any write, because its catch-up under the lock would otherwise walk every legacy row.
 - It lists every object that depends on the legacy table.
 - It creates `compatibility_backfills` when the table does not exist, and inserts this legacy model's row when none exists. It creates this legacy model's `<legacy>_backfill` when that table does not exist, and otherwise reuses the one an earlier install kept. `compatibility:sql prepare` therefore prints every statement the package runs before install.
 
@@ -145,9 +145,10 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 
 1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`. It also refuses when `<legacy>_backfill` is missing, and the refusal names `prepare()`.
 2. It takes the advisory lock that every pass takes, and holds it until install ends. Install's own passes run under it, and any other pass of this model refuses.
-3. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them.
-4. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
-5. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail.
+3. When no pass has completed, so the model's watermark is NULL, it runs one full pass first. That holds for a model that was never backfilled, for an empty ledger, and for a re-install after a rollback. A first install therefore never drops a mapped value that no pass has written, and a re-install keeps the legacy edits made after the rollback. Before that pass, install refuses a legacy table without an `updated_at` column its legacy model writes, so the refusal comes before any write. An installed model runs no pass.
+4. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them.
+5. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
+6. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail.
 
 These whole-table proofs never run under the lock.
 
@@ -190,7 +191,7 @@ A trashed row reads a NULL `index` after install, because a trashed record has n
 
 ### Inside a caller's transaction
 
-`Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A test that uses `RefreshDatabase` can therefore install a served model.
+`Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install inside a caller's transaction runs its full pass inside that transaction, through nested savepoints. A test that uses `RefreshDatabase` can therefore install a served model. Install still refuses a caller's transaction once a pass has left a watermark, because its catch-up passes commit in transactions of their own before it takes the lock.
 
 Inside a caller's transaction, a refusal loses nothing. The proofs write no ledger row, and the next install's existence proof and value proof flag the same keys again.
 
@@ -245,7 +246,7 @@ The legacy model is then the source of truth again.
 
 ### Re-install after rollback
 
-Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. Passes then run, starting with a first pass, and then install. Install refuses when the ledger is missing, and the refusal names `prepare()`.
+Install deleted this model's `compatibility_backfills` row. A re-install therefore runs `prepare()` again, which inserts that row with no watermark. `prepare()` is idempotent, and it reuses the ledger. With no watermark, install runs one full pass before its catch-up, whether or not `compatibility:backfill` ran since the rollback, so it keeps every legacy edit made after the rollback. Install refuses when the ledger is missing, and the refusal names `prepare()`.
 
 ## Retire
 
@@ -260,7 +261,12 @@ Install deleted this model's `compatibility_backfills` row. A re-install therefo
 
 ## Status and idempotence
 
-`compatibility:status` prints each legacy model's stage: one of the six stages in the table at the top of this page, read from the catalog and the ledger. `prepare()` inserts the model's `compatibility_backfills` row, and install deletes it. A legacy table with its `<legacy>_backfill` but no `compatibility_backfills` row therefore reads as `rolled back`. A catalog that matches no stage, such as a legacy table beside its retained table, reads as `unknown`, and the status names both tables. A model that is still backfilling also shows its pass count, its watermark, and its counts of refused and failed rows. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The package has no public `Compatibility::state()`.
+`compatibility:status` prints each legacy model's stage: one of the six stages in the table at the top of this page, read from the catalog and the ledger. `prepare()` inserts the model's `compatibility_backfills` row, and install deletes it. A legacy table with its `<legacy>_backfill` but no `compatibility_backfills` row therefore reads as `rolled back`. Two states match none of the six stages, and status prints a refusal for that model instead of a stage:
+
+- **A catalog that matches no stage,** such as a legacy table beside its retained table. A schema change outside the package caused it, and the refusal names both tables.
+- **A `compatibility_backfills` row without the successor key's unique index.** `prepare()` failed, or it is still building `<legacy>_<key>_unique`. Status runs the check that install runs: a valid unique index of its own on the successor key. The refusal says that `prepare()` has not finished, and names the index.
+
+Status still prints the stage of every other model, and it exits non-zero when it refused any model. A model that is still backfilling also shows its pass count, its watermark, and its counts of refused and failed rows. `prepare()`, `install()`, `rollback()` and `retire()` are idempotent: a second run changes nothing. The package has no public `Compatibility::state()`.
 
 ## The writer boundary
 

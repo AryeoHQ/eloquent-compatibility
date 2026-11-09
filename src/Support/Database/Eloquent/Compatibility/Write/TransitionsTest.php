@@ -277,14 +277,12 @@ final class TransitionsTest extends TestCase
     #[Test]
     public function it_runs_the_trigger_of_an_integer_backed_state_machine_and_refuses_a_move_it_does_not_declare(): void
     {
-        DB::statement('create table stages (id serial primary key, stage integer not null default 1)');
+        DB::statement('create table stages (id serial primary key, stage integer not null default 1, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table staged_jobs (id uuid primary key default gen_random_uuid(), stage integer not null default 1)');
         DB::table('stages')->insert([['stage' => 1], ['stage' => 1]]);
         $staged = new class extends Model implements Compatible
         {
             use ServesCompatibility;
-
-            public $timestamps = false;
 
             protected $table = 'stages';
 

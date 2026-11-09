@@ -73,6 +73,10 @@ final class CompileSql extends Command
                 "compatibility:sql {$for} {$model}: the statements Compatibility::{$for}() runs for {$map->table}",
                 "Read from database {$server['database']}, schema {$server['schema']} (search path {$server['search_path']}), on PostgreSQL {$server['version']}",
                 'Compiled at '.Date::now()->toIso8601String(),
+                ...($for === 'install' ? [
+                    'Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.',
+                    "Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of {$map->table}. Run Compatibility::install() instead.",
+                ] : []),
                 ...$statements->notes,
                 ...array_map(
                     callback: fn (array $lock) => "Locks {$lock[0]} in {$lock[1]}",

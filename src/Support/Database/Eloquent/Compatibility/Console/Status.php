@@ -10,6 +10,8 @@ use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Schema\Preparer;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -113,10 +115,34 @@ final class Status extends Command
             useReadPdo: false,
         );
 
+        if ($legacy === 'v' && $retained === 'r') {
+            return ['installed', ''];
+        }
+
+        if ($legacy === null && $retained === null) {
+            return ['retired', ''];
+        }
+
+        if ($legacy !== 'r' || $retained !== null) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'report its stage',
+                because: "{$map->table} ".self::described($legacy).' and '.ViewCompiler::retainedTable($map).' '.self::described($retained).', which matches none of the six stages, so a schema change outside the package touched one of them. Restore the pair to one stage before you run another operation',
+            );
+        }
+
+        if ($pass !== null && $connection->scalar(
+            query: 'select '.Preparer::uniqueKey($map),
+            useReadPdo: false,
+        ) !== true) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'report its stage',
+                because: 'prepare() has not finished: '.Preparer::uniqueName($map)." is missing or not a valid unique index on {$map->table}.{$map->successorKey}. Run Compatibility::prepare() again until it completes",
+            );
+        }
+
         return match (true) {
-            $legacy === 'v' && $retained === 'r' => ['installed', ''],
-            $legacy === null && $retained === null => ['retired', ''],
-            $legacy !== 'r' || $retained !== null => ['unknown', "{$map->table} and ".ViewCompiler::retainedTable($map).' match no stage'],
             $pass === null && ! $ledger => ['discovered', ''],
             $pass === null => ['rolled back', ''],
             (int) $pass === 0 => ['prepared', ''],
@@ -126,6 +152,17 @@ final class Status extends Command
                 pass: (int) $pass,
                 ledger: $ledger,
             )],
+        };
+    }
+
+    private static function described(null|string $kind): string
+    {
+        return match ($kind) {
+            null => 'does not exist',
+            'r' => 'is a table',
+            'v' => 'is a view',
+            'm' => 'is a materialized view',
+            default => "is a relation of kind {$kind}",
         };
     }
 
