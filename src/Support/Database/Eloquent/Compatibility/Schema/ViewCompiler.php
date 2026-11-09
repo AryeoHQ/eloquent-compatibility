@@ -17,14 +17,16 @@ final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}
 
-    /**
-     * @param  list<string>  $omitted
-     */
-    public function create(ResolvedMap $map, array $omitted = []): string
+    public function create(ResolvedMap $map): string
     {
-        $legacy = array_diff_key($this->columnCatalog->of($map->table), array_flip($omitted));
+        $legacy = $this->columnCatalog->of($map->table);
 
-        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $legacy, $map->table, $legacy);
+        return 'CREATE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select(
+            map: $map,
+            shape: $legacy,
+            defaultsOn: $map->table,
+            retained: $legacy,
+        );
     }
 
     public function replace(ResolvedMap $map): string
@@ -32,7 +34,12 @@ final readonly class ViewCompiler
         $shape = $this->columnCatalog->of($map->table);
         $retained = $this->columnCatalog->of(self::retainedTable($map));
 
-        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->union($map, $shape, self::retainedTable($map), $retained);
+        return 'CREATE OR REPLACE VIEW '.SqlFragments::identifier($map->table)." AS\n".$this->select(
+            map: $map,
+            shape: $shape,
+            defaultsOn: self::retainedTable($map),
+            retained: $retained,
+        );
     }
 
     /**
@@ -49,10 +56,6 @@ final readonly class ViewCompiler
         $external = [...$external, ...$map->externals()];
         $this->check($map, $shape, $external);
         $reads = [];
-
-        foreach ($map->identifiers as $name => $identifier) {
-            $reads[$name] = [SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $identifier->column()), null, false];
-        }
 
         foreach ($map->attributes as $name => $attribute) {
             if (! in_array($name, $external, true)) {
@@ -150,10 +153,10 @@ final readonly class ViewCompiler
     public static function primary(ResolvedMap $map): string
     {
         $table = SqlFragments::identifier($map->primary->table);
-        $conditions = [
-            ...($map->membership === null ? [] : [$map->membership->of($map->primary->table)]),
-            ...array_map(fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)', self::hidden($map)),
-        ];
+        $conditions = array_map(
+            callback: fn (string $condition) => 'NOT COALESCE(('.$condition.'), false)',
+            array: self::hidden($map),
+        );
 
         return $conditions === [] ? $table : '(SELECT * FROM '.$table.' WHERE '.implode(' AND ', $conditions).') AS '.$table;
     }
@@ -202,31 +205,27 @@ final readonly class ViewCompiler
         return $conditions;
     }
 
-    /**
-     * @param  array<string, Column>  $shape
-     * @param  array<string, Column>  $retained
-     */
-    private function union(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    public static function root(ResolvedMap $map, string $retained): string
     {
-        return implode("\nUNION ALL\n", array_map(fn (ResolvedMap $served) => $this->select($served, $shape, $defaultsOn, $retained, $map->externals()), $map->branches === [] ? [$map] : array_values($map->branches)));
+        return 'JOIN '.self::primary($map).' ON '.SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier($map->primary->key).' = '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($map->successorKey);
     }
 
     /**
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
      * @param  list<string>  $external
+     * @return array<string, string>
      */
-    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, array $external): string
+    public function columns(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, array $external = []): array
     {
         $served = $this->served($map, $shape, $external, $defaultsOn);
         $retainedTable = self::retainedTable($map);
         $legacyOnly = $map->legacyOnly(array_keys($shape));
-        $volatile = $this->volatileDefaults($defaultsOn);
         $columns = [];
 
         foreach ($shape as $name => $column) {
             if (array_key_exists($name, $served)) {
-                $columns[] = $served[$name].' AS '.SqlFragments::identifier($name);
+                $columns[$name] = $served[$name];
 
                 continue;
             }
@@ -239,34 +238,51 @@ final readonly class ViewCompiler
                 throw InvalidCompatibilityMap::because($map->table, "{$retainedTable} has no column {$name}, which {$map->table} keeps as a legacy-only column");
             }
 
-            $read = SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier($name);
-            $default = $retained[$name]->default;
-
-            if ($retained[$name]->generated) {
-                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated or identity column, so the view cannot compute its value for a {$map->primary->table} row without a {$retainedTable} row");
-            }
-
-            if ($retained[$name]->needsAValue()) {
-                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is NOT NULL and has no default, so the view has no value to serve for a {$map->primary->table} row without a {$retainedTable} row");
-            }
-
-            if ($default !== null && in_array($name, $volatile, true)) {
-                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} defaults to {$default}, which is not immutable, so the view would serve a new value on each read of a {$map->primary->table} row without a {$retainedTable} row");
-            }
-
-            if ($default !== null) {
-                $read = 'CASE WHEN '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' IS NULL THEN '.$default.' ELSE '.$read.' END';
-            }
-
-            $columns[] = 'CAST('.$read.' AS '.$column->type.') AS '.SqlFragments::identifier($name);
+            $columns[$name] = 'CAST('.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier($name).' AS '.$column->type.')';
         }
 
-        $primary = SqlFragments::identifier($map->primary->table);
-        $retainedBy = $map->branch ? (string) $map->identifiers[(new $map->model)->getKeyName()]->column() : $map->primary->key;
+        return $columns;
+    }
+
+    /**
+     * @param  array<string, Column>  $shape
+     * @param  array<string, Column>  $retained
+     */
+    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    {
+        $retainedTable = self::retainedTable($map);
+
+        if ($shape === []) {
+            throw InvalidCompatibilityMap::because(
+                map: $map->table,
+                problem: "the legacy table {$map->table} does not exist",
+            );
+        }
+
+        if (! array_key_exists(
+            key: $map->successorKey,
+            array: $shape,
+        )) {
+            throw InvalidCompatibilityMap::because(
+                map: $map->table,
+                problem: "{$map->table} has no column {$map->successorKey}, the successor key servedFrom() names; Compatibility::prepare() adds it before install()",
+            );
+        }
+
+        $reads = $this->columns(
+            map: $map,
+            shape: $shape,
+            defaultsOn: $defaultsOn,
+            retained: $retained,
+        );
+        $columns = array_map(fn (string $read, string $name) => $read.' AS '.SqlFragments::identifier($name), $reads, array_keys($reads));
 
         return "SELECT\n  ".implode(",\n  ", $columns)
-            ."\nFROM ".self::primary($map)
-            ."\nLEFT JOIN ".SqlFragments::identifier($retainedTable).' ON '.SqlFragments::identifier($retainedTable).'.'.SqlFragments::identifier((string) $map->retainedKey).' = '.$primary.'.'.SqlFragments::identifier($retainedBy)
+            ."\nFROM ".SqlFragments::identifier($retainedTable)
+            ."\n".self::root(
+                map: $map,
+                retained: $retainedTable,
+            )
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
     }
 
@@ -290,44 +306,6 @@ final readonly class ViewCompiler
     }
 
     /**
-     * @return list<string>
-     */
-    private function volatileDefaults(string $table): array
-    {
-        $rows = $this->connection->select(
-            "select attribute.attname as name
-             from pg_attribute attribute
-             left join pg_attrdef column_default on column_default.adrelid = attribute.attrelid and column_default.adnum = attribute.attnum
-             cross join lateral (
-                 select coalesce(cast(column_default.adbin as text), (
-                     with recursive domain_chain(type, depth) as (
-                         select attribute.atttypid, 0
-                         union all
-                         select declared.typbasetype, domain_chain.depth + 1
-                         from domain_chain join pg_type declared on declared.oid = domain_chain.type
-                         where declared.typtype = 'd'
-                     )
-                     select cast(declared.typdefaultbin as text)
-                     from domain_chain join pg_type declared on declared.oid = domain_chain.type
-                     where declared.typtype = 'd' and declared.typdefaultbin is not null
-                     order by domain_chain.depth
-                     limit 1
-                 )) as tree
-             ) column_default_tree
-             where attribute.attrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and attribute.attnum > 0 and not attribute.attisdropped
-               and (column_default_tree.tree ~ '\\{(SQLVALUEFUNCTION|NEXTVALUEEXPR) '
-                    or exists (
-                        select from regexp_matches(column_default_tree.tree, ':(funcid|opfuncid) (\\d+)', 'g') as found (ids)
-                        join pg_proc called on called.oid = cast(found.ids[2] as oid)
-                        where called.provolatile <> 'i'
-                    ))",
-            [SqlFragments::identifier($table)],
-        );
-
-        return array_values(array_map(fn (object $row) => (string) $row->name, $rows));
-    }
-
-    /**
      * @param  array<string, Column>  $shape
      * @param  list<string>  $external
      */
@@ -339,14 +317,19 @@ final readonly class ViewCompiler
             throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
         }
 
-        $this->columnsOf($map, $map->primary->table, [$map->primary->key, ...($map->membership === null ? [] : [$map->membership->column]), ...array_map(fn ($identifier) => (string) $identifier->column(), array_values($map->identifiers))], 'Compatibility::prepare() adds it before install()');
+        $this->columnsOf(
+            map: $map,
+            table: $map->primary->table,
+            columns: [$map->primary->key],
+            because: 'the view joins it on the successor key',
+        );
 
         foreach ($map->related as $related) {
             $this->columnsOf($map, $related->parentTable, array_values(array_filter([$related->parentKey, $related->morphType], is_string(...))), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' joins on it');
             $this->columnsOf($map, $related->table, array_values(array_filter([$related->relatedKey, $related->deletedAt], fn (null|string $column) => $column !== null)), 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model).' reads it');
         }
 
-        foreach ([...array_keys($map->identifiers), ...array_diff(array_keys($map->attributes), $external)] as $name) {
+        foreach (array_diff(array_keys($map->attributes), $external) as $name) {
             if (! array_key_exists($name, $shape)) {
                 throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so the view cannot serve it");
             }

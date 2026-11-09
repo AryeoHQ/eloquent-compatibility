@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\PlaceAssets;
 
+use Carbon\CarbonInterval;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -11,10 +13,13 @@ use Illuminate\Support\Facades\Schema;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Tests\Fixtures\Support\Files\FloorPlan;
 
 final class PlaceAssetTables
 {
-    public const array MODELS = [Image::class, Video::class, InteractiveContent::class];
+    public const array MODELS = [Image::class, Video::class, InteractiveContent::class, FloorPlan::class];
+
+    public const int TIMEOUT = 30;
 
     public static function create(): void
     {
@@ -22,6 +27,7 @@ final class PlaceAssetTables
 
         Schema::create('place_assets', function (Blueprint $table): void {
             $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->string('legacy_type')->nullable();
             $table->string('asset_type');
             $table->uuid('asset_id');
             $table->string('title')->nullable();
@@ -64,6 +70,19 @@ final class PlaceAssetTables
             $table->timestamps();
         });
 
+        Schema::create(
+            table: 'floorplans',
+            callback: function (Blueprint $table): void {
+                $table->bigIncrements('id');
+                $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
+                $table->string('file_name')->nullable();
+                $table->string('mime_type')->nullable();
+                $table->string('url')->nullable();
+                $table->integer('level')->nullable();
+                $table->timestamps();
+            },
+        );
+
         Schema::create('place_interactive_content', function (Blueprint $table): void {
             $table->increments('id');
             $table->uuid('uuid')->unique()->default(new Expression('gen_random_uuid()'));
@@ -88,6 +107,11 @@ final class PlaceAssetTables
 
         DB::table('place_interactive_content')->insert([
             ['title' => 'Oak tour', 'url' => 'https://tour.example/oak', 'created_at' => '2026-03-06 10:00:00', 'updated_at' => '2026-03-06 10:00:00'],
+        ]);
+
+        DB::table('floorplans')->insert([
+            ['file_name' => 'oak-plan.pdf', 'mime_type' => 'application/pdf', 'url' => null, 'level' => 1, 'created_at' => '2026-03-09 10:00:00', 'updated_at' => '2026-03-09 10:00:00'],
+            ['file_name' => null, 'mime_type' => null, 'url' => 'https://plans.example/elm', 'level' => null, 'created_at' => '2026-03-10 10:00:00', 'updated_at' => '2026-03-10 10:00:00'],
         ]);
     }
 
@@ -128,7 +152,20 @@ final class PlaceAssetTables
     {
         foreach (self::MODELS as $model) {
             (new Backfiller(Compatibility::of($model)->resolve(), DB::connection()))->run();
+            self::classify($model);
         }
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function classify(string $model): void
+    {
+        $legacy = new $model;
+        DB::table('place_assets')->whereIn(
+            column: 'id',
+            values: DB::table($legacy->getTable())->select('place_asset_id'),
+        )->update(['legacy_type' => $legacy->getMorphClass()]);
     }
 
     public static function install(): void
@@ -137,20 +174,30 @@ final class PlaceAssetTables
         self::backfill();
 
         foreach (self::MODELS as $model) {
-            Compatibility::install($model);
+            Compatibility::install(
+                model: $model,
+                statementTimeout: CarbonInterval::seconds(self::TIMEOUT),
+            );
         }
+    }
+
+    public static function assetOf(string $table, int $id): mixed
+    {
+        return DB::table(Schema::hasTable("{$table}_retained") ? "{$table}_retained" : $table)
+            ->where(column: 'id', operator: '=', value: $id)
+            ->value('place_asset_id');
     }
 
     public static function drop(): void
     {
-        foreach (['place_images', 'place_videos', 'place_interactive_content', 'place_brochures'] as $view) {
+        foreach (['place_images', 'place_videos', 'place_interactive_content', 'place_brochures', 'floorplans'] as $view) {
             if (Schema::hasView($view)) {
                 DB::statement("drop view {$view}");
             }
         }
 
-        DB::statement('drop table if exists place_images, place_images_retained, place_images_backfilled, place_videos, place_videos_retained, place_videos_backfilled, place_interactive_content, place_interactive_content_retained, place_interactive_content_backfilled, place_brochures, place_brochures_retained, place_brochures_backfilled, place_assets, asset_files, asset_links, trashable_asset_files cascade');
-        DB::statement('drop sequence if exists compatibility_legacy_id_seq');
+        DB::statement('drop table if exists place_images, place_images_retained, place_images_backfill, place_videos, place_videos_retained, place_videos_backfill, place_interactive_content, place_interactive_content_retained, place_interactive_content_backfill, place_brochures, place_brochures_retained, place_brochures_backfill, floorplans, floorplans_retained, floorplans_backfill, place_assets, asset_files, asset_links, trashable_asset_files cascade');
+        DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('place_images', 'place_videos', 'place_interactive_content', 'place_brochures', 'floorplans'); IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
         LegacyBuilder::forgetViews();
     }
 }

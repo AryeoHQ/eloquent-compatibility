@@ -20,7 +20,7 @@ final class ColumnCatalog
     /**
      * @param  array<string, list<string>>  $hidden
      */
-    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, public readonly bool $throughSearchPath = false, private readonly array $hidden = []) {}
+    public function __construct(private readonly ConnectionInterface $connection, private readonly null|string $searchPath = null, public readonly bool $throughSearchPath = false, private readonly array $hidden = [], private readonly bool $throughWriteConnection = false) {}
 
     /**
      * @return array<string, Column>
@@ -58,7 +58,7 @@ final class ColumnCatalog
     private function columns(string $table): array
     {
         return $this->connection->select(
-            'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
+            query: 'select table_column.attname as name, format_type(table_column.atttypid, table_column.atttypmod) as type,
                     case when table_column.attidentity = \'d\' then format(\'pg_catalog.nextval(pg_catalog.pg_get_serial_sequence(%L, %L)::regclass)\', format(\'%I.%I\', table_schema.nspname, table_relation.relname), table_column.attname)
                          when table_column.attgenerated = \'\' then coalesce(pg_get_expr(column_default.adbin, column_default.adrelid), column_domain.inherited_default) end as "default",
                     table_column.attnotnull or column_domain.inherited_not_null as not_null,
@@ -84,7 +84,8 @@ final class ColumnCatalog
              ) column_domain
              where table_column.attrelid = '.($this->throughSearchPath ? 'to_regclass(?)' : "to_regclass(quote_ident(current_schema()) || '.' || ?)").' and table_column.attnum > 0 and not table_column.attisdropped
              order by table_column.attnum',
-            [SqlFragments::identifier($table)],
+            bindings: [SqlFragments::identifier($table)],
+            useReadPdo: ! $this->throughWriteConnection,
         );
     }
 
@@ -118,14 +119,15 @@ final class ColumnCatalog
     public function leadsAnIndex(string $table, string $column): bool
     {
         return $this->connection->scalar(
-            "select exists (
+            query: "select exists (
                  select from pg_index table_index
                  join pg_attribute attribute on attribute.attrelid = table_index.indrelid and attribute.attnum = table_index.indkey[0]
                  join pg_class index_relation on index_relation.oid = table_index.indexrelid
                  join pg_am access_method on access_method.oid = index_relation.relam and access_method.amname = 'btree'
                  where table_index.indrelid = to_regclass(quote_ident(current_schema()) || '.' || ?) and table_index.indisvalid and table_index.indpred is null and attribute.attname = ?
              )",
-            [SqlFragments::identifier($table), $column],
+            bindings: [SqlFragments::identifier($table), $column],
+            useReadPdo: ! $this->throughWriteConnection,
         ) === true;
     }
 
@@ -137,7 +139,7 @@ final class ColumnCatalog
 
         return $this->baseTypes[$type] ??= (function () use ($type): string {
             $base = $this->connection->scalar(
-                "with recursive domain_chain(type, depth) as (
+                query: "with recursive domain_chain(type, depth) as (
                      select to_regtype(?)::oid, 0
                      union all
                      select declared.typbasetype, domain_chain.depth + 1
@@ -148,7 +150,8 @@ final class ColumnCatalog
                  from domain_chain join pg_type declared on declared.oid = domain_chain.type and declared.typtype = 'd'
                  order by domain_chain.depth desc
                  limit 1",
-                [$type],
+                bindings: [$type],
+                useReadPdo: ! $this->throughWriteConnection,
             );
 
             return is_string($base) ? $base : $type;
@@ -158,7 +161,7 @@ final class ColumnCatalog
     public function equatable(string $type): bool
     {
         return $this->equatable[$type] ??= $this->connection->scalar(
-            "with recursive underlying(type) as (
+            query: "with recursive underlying(type) as (
                  select to_regtype(?)::oid
                  union all
                  select case when declared.typtype = 'd' then declared.typbasetype else declared.typelem end
@@ -177,7 +180,8 @@ final class ColumnCatalog
                     or (operator_class.opcintype = 'anyrange'::regtype and compared.typtype = 'r')
                     or (operator_class.opcintype = 'anymultirange'::regtype and compared.typtype = 'm')
              )",
-            [$type],
+            bindings: [$type],
+            useReadPdo: ! $this->throughWriteConnection,
         ) === true;
     }
 }

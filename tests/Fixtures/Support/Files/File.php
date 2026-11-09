@@ -12,11 +12,9 @@ use Illuminate\Support\Collection as Values;
 
 /**
  * @property string $id
- * @property null|string $legacy_type
- * @property int $legacy_id
- * @property string $legacy_uuid
- * @property string $filename
- * @property string $mime_type
+ * @property null|string $filename
+ * @property null|string $mime_type
+ * @property null|string $embed_url
  * @property null|int $size_bytes
  * @property null|string $zml_asset_id
  * @property null|Carbon $created_at

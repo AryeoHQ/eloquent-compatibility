@@ -28,7 +28,7 @@ final readonly class RelatedMorph
         public string $parentTable,
         public string $typeColumn,
         public string $idColumn,
-        public null|Closure $choose,
+        public Closure $choose,
         array $declared,
     ) {
         $targets = [];
@@ -42,9 +42,9 @@ final readonly class RelatedMorph
 
     /**
      * @param  class-string<Model>  $parent
-     * @param  Closure(Successors): mixed  $successors
+     * @param  Closure(Targets): mixed  $targets
      */
-    public static function compile(string $map, string $parent, Closure $relation, Closure $successors, null|Closure $choose): self
+    public static function compile(string $map, string $parent, Closure $relation, Closure $choose, Closure $targets): self
     {
         ResolvedMap::refuseCaptures($map, 'a relatedMorph() relation closure on '.class_basename($parent), $relation);
 
@@ -64,14 +64,27 @@ final readonly class RelatedMorph
 
         $declared = [];
 
-        foreach (Successors::declare($map, 'relatedMorph()', $choose, $successors, 'drop choose:, and relatedMorph() reads %s for every record') as $model => $branch) {
+        ResolvedMap::refuseCaptures(
+            map: $map,
+            role: 'the relatedMorph() choose: closure',
+            closure: $choose,
+        );
+
+        foreach (Targets::declare(
+            map: $map,
+            targets: $targets,
+        ) as $model => $successor) {
             $key = (new $model)->getKeyName();
 
             if (! in_array($compiled->getOwnerKeyName(), [null, $key], true)) {
                 throw InvalidCompatibilityMap::because($map, 'the relatedMorph() relation from '.class_basename($parent).' through '.$compiled->getRelationName().'() matches each target on the owner key '.$compiled->getOwnerKeyName().', and '.class_basename($model)." keys its rows by {$key}; drop the owner key, because the view and the writers join each target on its key");
             }
 
-            $declared[$model] = [$branch->successor, self::refuseTarget($map, $parent, $compiled->getParent()->getTable(), $branch->successor)];
+            $declared[$model] = [$successor, self::refuseTarget(
+                map: $map,
+                parent: $parent,
+                target: $successor,
+            )];
         }
 
         return new self($relation, $parent, $compiled->getParent()->getTable(), $compiled->getMorphType(), $compiled->getForeignKeyName(), $choose, $declared);
@@ -96,12 +109,15 @@ final readonly class RelatedMorph
             || (new ReflectionProperty($relation, 'morphableConstraints'))->getValue($relation) !== [];
     }
 
-    private static function refuseTarget(string $map, string $parent, string $parentTable, Successor $target): null|string
+    private static function refuseTarget(string $map, string $parent, Successor $target): null|string
     {
         $name = class_basename($target->model).', which relatedMorph() reaches,';
 
         if ($target->membershipScope() !== null) {
-            throw InvalidCompatibilityMap::because($map, "when() on {$name} decides membership through a CHECK on {$parentTable}, and a CHECK cannot read {$target->table}; declare when() on ".class_basename($parent).', whose discriminator column keys membership');
+            throw InvalidCompatibilityMap::because(
+                map: $map,
+                problem: "when() on {$name} decides membership, and only the root ".class_basename($parent).' carries when()',
+            );
         }
 
         if ($target->atMostOneBecause() !== null) {

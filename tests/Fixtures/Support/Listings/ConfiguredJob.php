@@ -10,7 +10,6 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 
 /**
  * @property string $id
- * @property int $legacy_id
  * @property string $name
  * @property null|array<string, mixed> $settings
  */

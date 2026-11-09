@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -18,9 +19,8 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
@@ -77,7 +77,13 @@ final class MorphTargetTest extends TestCase
 
         $this->assertTrue($updated);
         $this->assertSame(['New', null], [Image::query()->findOrFail(1)->title, Image::query()->findOrFail(1)->file_name]);
-        $this->assertSame([$asset['asset_type'], $asset['asset_id'], 3], [$this->asset('place_image', 1)['asset_type'], $this->asset('place_image', 1)['asset_id'], DB::table('asset_files')->count()]);
+        $this->assertSame([$asset['asset_type'], $asset['asset_id'], 4], [$this->asset(
+            legacyType: 'place_image',
+            id: 1,
+        )['asset_type'], $this->asset(
+            legacyType: 'place_image',
+            id: 1,
+        )['asset_id'], DB::table('asset_files')->count()]);
     }
 
     #[Test]
@@ -90,7 +96,10 @@ final class MorphTargetTest extends TestCase
 
         $this->assertSame(1, $incremented);
         $this->assertSame([3, null, 'Oak walkthrough'], [Video::query()->findOrFail(2)->views, Video::query()->findOrFail(2)->youtube_embed_url, Video::query()->findOrFail(2)->title]);
-        $this->assertSame([$asset, 1], [$this->asset('place_video', 2), DB::table('asset_links')->count()]);
+        $this->assertSame([$asset, 2], [$this->asset(
+            legacyType: 'place_video',
+            id: 2,
+        ), DB::table('asset_links')->count()]);
     }
 
     #[Test]
@@ -103,13 +112,27 @@ final class MorphTargetTest extends TestCase
 
         $this->assertTrue($updated);
         $this->assertSame(['Oak v2', 4, null, null], [Video::query()->findOrFail(2)->title, Video::query()->findOrFail(2)->views, Video::query()->findOrFail(2)->youtube_embed_url, Video::query()->findOrFail(2)->original_file_name]);
-        $this->assertSame([$asset['asset_type'], $asset['asset_id'], 4, 1], [$this->asset('place_video', 2)['asset_type'], $this->asset('place_video', 2)['asset_id'], DB::table('asset_files')->count(), DB::table('asset_links')->count()]);
+        $this->assertSame([$asset['asset_type'], $asset['asset_id'], 5, 2], [$this->asset(
+            legacyType: 'place_video',
+            id: 2,
+        )['asset_type'], $this->asset(
+            legacyType: 'place_video',
+            id: 2,
+        )['asset_id'], DB::table('asset_files')->count(), DB::table('asset_links')->count()]);
     }
 
     #[Test]
     public function it_updates_a_video_whose_place_asset_names_an_undeclared_alias_through_that_place_asset_alone(): void
     {
-        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_type' => 'retired_asset']);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->update(['asset_type' => 'retired_asset']);
         $files = DB::table('asset_files')->count();
 
         $updated = Video::query()->findOrFail(3)->update(['title' => 'Drone']);
@@ -123,7 +146,15 @@ final class MorphTargetTest extends TestCase
     #[Test]
     public function it_refuses_to_move_a_video_from_an_undeclared_alias_without_the_values_its_new_target_requires_and_changes_nothing(): void
     {
-        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_type' => 'retired_asset']);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->update(['asset_type' => 'retired_asset']);
         $before = $this->rows();
 
         try {
@@ -134,7 +165,7 @@ final class MorphTargetTest extends TestCase
         }
 
         $this->assertStringContainsString("cannot run a write that moves record 3, whose PlaceAsset stores asset_type 'retired_asset', into AssetFile without \$original_file_name", $refusal);
-        $this->assertStringContainsString('asset_files.filename needs a value', $refusal);
+        $this->assertStringContainsString('targets: declares no target for that asset_type, so the view serves no value for the move to keep, and asset_files.filename needs a value', $refusal);
         $this->assertSame($before, $this->rows());
     }
 
@@ -142,7 +173,15 @@ final class MorphTargetTest extends TestCase
     public function it_reads_and_writes_a_video_whose_place_asset_stores_no_morph_type(): void
     {
         DB::statement('alter table place_assets alter column asset_type drop not null');
-        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_type' => null]);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->update(['asset_type' => null]);
         $files = DB::table('asset_files')->count();
 
         $read = Video::query()->findOrFail(3);
@@ -173,14 +212,30 @@ final class MorphTargetTest extends TestCase
     public function it_reads_an_external_attribute_of_the_place_asset_for_a_record_whose_alias_no_target_declares(): void
     {
         $this->installBrochures();
-        DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->update(['asset_type' => 'retired_asset']);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_brochures')->where(
+                column: 'id',
+                operator: '=',
+                value: 1,
+            )->value('place_asset_id'),
+        )->update(['asset_type' => 'retired_asset']);
 
         $titles = Brochure::query()->orderBy('id')->get()->map(fn (Brochure $brochure) => [$brochure->id, $brochure->title, $brochure->file_name])->all();
         $brochure = Brochure::query()->findOrFail(1);
         $updated = $brochure->update(['title' => 'Guide v2']);
 
         $this->assertSame([[1, 'Guide', null], [2, 'Map', null]], $titles);
-        $this->assertSame([true, 'Guide v2', 'Guide v2', 'Guide v2'], [$updated, $brochure->title, Brochure::query()->findOrFail(1)->title, DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->value('title')]);
+        $this->assertSame([true, 'Guide v2', 'Guide v2', 'Guide v2'], [$updated, $brochure->title, Brochure::query()->findOrFail(1)->title, DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_brochures')->where(
+                column: 'id',
+                operator: '=',
+                value: 1,
+            )->value('place_asset_id'),
+        )->value('title')]);
     }
 
     #[Test]
@@ -230,7 +285,10 @@ final class MorphTargetTest extends TestCase
         TrashableAssetFile::query()->findOrFail($trashed)->delete();
 
         $run = $backfiller->run();
-        Compatibility::install(Brochure::class);
+        Compatibility::install(
+            model: Brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         $live = (string) $this->asset('place_brochure', 1)['asset_id'];
         $this->assertSame([2, 2], [$run['read'], $run['changed']]);
@@ -240,7 +298,7 @@ final class MorphTargetTest extends TestCase
     }
 
     #[Test]
-    public function it_moves_the_place_asset_of_a_legacy_row_whose_key_changed_onto_the_new_key_by_its_other_identifier_and_keeps_its_target(): void
+    public function it_keeps_the_place_asset_and_the_target_of_a_legacy_row_whose_key_changed(): void
     {
         PlaceAssetTables::brochures();
         Compatibility::prepare(Brochure::class);
@@ -249,10 +307,13 @@ final class MorphTargetTest extends TestCase
         $before = $this->asset('place_brochure', 1);
         DB::update('update place_brochures set id = 99, updated_at = localtimestamp(0) where id = 1');
 
-        $backfiller->run(since: $watermark['updatedAt']);
-        Compatibility::install(Brochure::class);
+        $backfiller->run(since: $watermark);
+        Compatibility::install(
+            model: Brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertSame([2, 99], DB::table('place_assets')->where('legacy_type', 'place_brochure')->orderBy('legacy_id')->pluck('legacy_id')->map(fn (mixed $id) => (int) $id)->all());
+        $this->assertSame([2, 99], DB::table('place_brochures_retained')->orderBy('id')->pluck('id')->map(fn (mixed $id) => (int) $id)->all());
         $this->assertSame($before, $this->asset('place_brochure', 99));
         $this->assertSame([[2, 'Map', null, 'https://maps.example/oak'], [99, 'Guide', 'guide.pdf', null]], Brochure::query()->orderBy('id')->get()->map(fn (Brochure $brochure) => [$brochure->id, $brochure->title, $brochure->file_name, $brochure->url])->all());
     }
@@ -302,7 +363,15 @@ final class MorphTargetTest extends TestCase
     #[Test]
     public function it_writes_only_the_records_that_still_match_the_mass_write_once_it_holds_their_place_assets(): void
     {
-        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['title' => 'Tour']);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->update(['title' => 'Tour']);
         config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
         $second = DB::connection('second');
         $renamed = null;
@@ -314,7 +383,7 @@ final class MorphTargetTest extends TestCase
             try {
                 $second->transaction(function () use ($second): void {
                     $second->statement("SET LOCAL lock_timeout = '1s'");
-                    $second->update("update place_assets set title = 'Changed' where legacy_type = 'place_video' and legacy_id = 1");
+                    $second->update("update place_assets set title = 'Changed' where id = (select place_asset_id from place_videos_retained where id = 1)");
                 });
                 $renamed = true;
             } catch (QueryException) {
@@ -554,7 +623,7 @@ final class MorphTargetTest extends TestCase
                 Schema::table('place_assets', fn (Blueprint $table) => $table->uuid('note_id')->nullable());
             });
             $note = (string) DB::table('asset_notes')->insertGetId(['pins' => 5]);
-            DB::table('place_assets')->where('legacy_type', 'place_brochure')->update(['note_id' => $note]);
+            DB::table('place_assets')->whereIn(column: 'id', values: DB::table('place_brochures_retained')->select('place_asset_id'))->update(['note_id' => $note]);
 
             $updated = $brochure->newQuery()->whereKey([1, 2])->increment('pins', 1);
             $written = [$updated, DB::table('asset_notes')->where('id', $note)->value('pins'), $brochure->newQuery()->orderBy('id')->pluck('pins')->all(), $this->asset('place_brochure', 1)['asset_type'], $this->asset('place_brochure', 2)['asset_type']];
@@ -624,7 +693,15 @@ final class MorphTargetTest extends TestCase
                 Schema::table('place_assets', fn (Blueprint $table) => $table->uuid('note_id')->nullable());
             });
             $note = (string) DB::table('asset_notes')->insertGetId(['pins' => 5]);
-            DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->update(['note_id' => $note]);
+            DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_brochures')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: 1,
+                )->value('place_asset_id'),
+            )->update(['note_id' => $note]);
 
             $updated = $brochure->newQuery()->whereKey(1)->increment('pins', 1, ['id' => 30]);
             $written = [$updated, DB::table('asset_notes')->where('id', $note)->value('pins'), $brochure->newQuery()->orderBy('id')->pluck('pins', 'id')->all(), $this->asset('place_brochure', 30)['asset_type']];
@@ -680,7 +757,15 @@ final class MorphTargetTest extends TestCase
         try {
             $brochure = $this->installed($this->annotatedBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
             DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
-            DB::table('place_assets')->where('legacy_type', 'place_brochure')->where('legacy_id', 1)->update(['title' => 'Embed']);
+            DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_brochures')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: 1,
+                )->value('place_asset_id'),
+            )->update(['title' => 'Embed']);
 
             $updated = $brochure->newQuery()->whereKey(1)->update(['pages' => 3]);
             $written = [$updated, $brochure->newQuery()->findOrFail(1)->getAttribute('pages'), $this->asset('place_brochure', 1)['asset_type']];
@@ -710,24 +795,43 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => $asset->getAttribute('title')])->all(),
-                            write: fn (PlaceAsset $asset, null|string $title) => $asset->title = $title))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => $asset->getAttribute('title')])->all(),
+                                write: fn (PlaceAsset $asset, null|string $title) => $asset->title = $title),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (int) $brochure->getAttribute('pages') >= 10 ? TrashableAssetFile::class : AssetLink::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -750,24 +854,49 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $video): Compatibility
             {
                 return $video
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_videos_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null || (float) $video->getAttribute('size_kb') > 512 && (float) $video->getAttribute('size_kb') < 600 ? AssetLink::class : AssetFile::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(AssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000))
-                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: AssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'original_file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'size_kb',
+                                        definition: fn (Attribute $attribute) => $attribute->from('size_bytes')->dividedBy(1000),
+                                    )
+                                    ->attribute(
+                                        name: 'youtube_embed_url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'original_file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'size_kb',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'youtube_embed_url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -797,7 +926,10 @@ final class MorphTargetTest extends TestCase
         $shape();
         Compatibility::prepare($brochure::class);
         (new Backfiller(Compatibility::of($brochure::class)->resolve(), DB::connection()))->run();
-        Compatibility::install($brochure::class);
+        Compatibility::install(
+            model: $brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
         return $brochure;
     }
@@ -822,22 +954,41 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => data_get($brochure->getAttribute('metadata'), 'hosted') === true ? TrashableAssetFile::class : AssetLink::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -860,26 +1011,48 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->related(fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'), fn (Successor $note) => $note
-                            ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $notes): array => MorphTargetTest::read($notes),
-                                write: fn (AssetNote $note, null|string $body) => $note->body = $body)))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
+                            definition: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $notes): array => MorphTargetTest::read($notes),
+                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body)),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -902,22 +1075,41 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title')->readAs('upper("place_assets"."title")')->writeTo(fn (mixed $title): mixed => $title))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title')->readAs('upper("place_assets"."title")')->writeTo(fn (mixed $title): mixed => $title),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'EMBED' || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -940,24 +1132,46 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->related(fn (PlaceAsset $asset) => $asset->belongsTo(AssetNote::class, 'note_id'), fn (Successor $note) => $note
-                            ->attribute('pins', fn (Attribute $attribute) => $attribute->from('pins')))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->belongsTo(AssetNote::class, 'note_id'),
+                            definition: fn (Successor $note) => $note
+                                ->attribute('pins', fn (Attribute $attribute) => $attribute->from('pins')),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -980,30 +1194,52 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->related(fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'), fn (Successor $note) => $note
-                            ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
-                                write: fn (AssetNote $note, null|string $body) => $note->body = $body))
-                            ->related(fn (AssetNote $note) => $note->hasOne(NoteAuthor::class, 'asset_note_id'), fn (Successor $author) => $author
-                                ->attribute('author', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $authors): array => $authors->mapWithKeys(fn (Model $author) => [$author->getKey() => $author->getAttribute('name')])->all(),
-                                    write: fn (NoteAuthor $author, null|string $name) => $author->name = $name))))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
+                            definition: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
+                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body))
+                                ->related(fn (AssetNote $note) => $note->hasOne(NoteAuthor::class, 'asset_note_id'), fn (Successor $author) => $author
+                                    ->attribute('author', fn (Attribute $attribute) => $attribute->external(
+                                        read: fn (Collection $authors): array => $authors->mapWithKeys(fn (Model $author) => [$author->getKey() => $author->getAttribute('name')])->all(),
+                                        write: fn (NoteAuthor $author, null|string $name) => $author->name = $name))),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -1026,26 +1262,48 @@ final class MorphTargetTest extends TestCase
             public static function compatibility(Compatibility $brochure): Compatibility
             {
                 return $brochure
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_brochures_retained')
-                    ->timestamps()
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->related(fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'), fn (Successor $note) => $note
-                            ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
-                                write: fn (AssetNote $note, null|string $body) => $note->body = $body)))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
+                            definition: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
+                                    read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
+                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body)),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'Embed' && $brochure->getAttribute('note') !== null || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(TrashableAssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }
@@ -1055,7 +1313,10 @@ final class MorphTargetTest extends TestCase
         PlaceAssetTables::brochures();
         Compatibility::prepare(Brochure::class);
         (new Backfiller(Compatibility::of(Brochure::class)->resolve(), DB::connection()))->run();
-        Compatibility::install(Brochure::class);
+        Compatibility::install(
+            model: Brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     /**
@@ -1063,7 +1324,9 @@ final class MorphTargetTest extends TestCase
      */
     private function asset(string $legacyType, int $id): array
     {
-        return (array) DB::table('place_assets')->where('legacy_type', $legacyType)->where('legacy_id', $id)->first(['id', 'asset_type', 'asset_id', 'title']);
+        $table = ['place_image' => 'place_images', 'place_video' => 'place_videos', 'place_brochure' => 'place_brochures', 'place_interactive_content' => 'place_interactive_content'][$legacyType];
+
+        return (array) DB::table('place_assets')->where(column: 'id', operator: '=', value: PlaceAssetTables::assetOf(table: $table, id: $id))->first(['id', 'asset_type', 'asset_id', 'title']);
     }
 
     /**

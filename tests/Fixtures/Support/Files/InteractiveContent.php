@@ -10,7 +10,6 @@ use Illuminate\Support\Carbon;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
@@ -37,16 +36,19 @@ final class InteractiveContent extends Model implements Compatible
     public static function compatibility(Compatibility $interactiveContent): Compatibility
     {
         return $interactiveContent
-            ->discriminatedBy('legacy_type')
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier
-                ->integer()
-                ->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier
-                ->uuid()
-                ->from('legacy_uuid'))
             ->retainedIn('interactive_content_retained')
-            ->timestamps()
-            ->servedFrom(Link::class, fn (Successor $link) => $link
-                ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')));
+            ->servedFrom(root: Link::class, key: 'link_id', successor: fn (Successor $link) => $link
+                ->attribute(
+                    name: 'created_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                )
+                ->attribute(
+                    name: 'updated_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                )
+                ->attribute(
+                    name: 'url',
+                    definition: fn (Attribute $attribute) => $attribute->from('url'),
+                ));
     }
 }

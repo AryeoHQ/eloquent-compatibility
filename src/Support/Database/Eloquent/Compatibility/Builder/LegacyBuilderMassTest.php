@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -50,13 +51,13 @@ final class LegacyBuilderMassTest extends TestCase
         $events = $this->fakeModelEvents();
 
         $deleted = Listing::query()->where('price', '<', 2000)->delete();
-        $trashed = Job::onlyTrashed()->orderBy('legacy_id')->pluck('legacy_id')->all();
+        $trashed = DB::table('listings_retained')->whereIn(column: 'job_id', values: Job::onlyTrashed()->select('id'))->orderBy('id')->pluck('id')->all();
         $restored = Listing::onlyTrashed()->where('title', '!=', 'Pine Flat')->restore(); // @phpstan-ignore staticMethod.dynamicCall
         $forced = Listing::withTrashed()->whereKey(2)->forceDelete();
         $dispatched = $events();
 
         $this->assertSame([2, [1, 2, 3], 2, 1], [$deleted, $trashed, $restored, $forced]);
-        $this->assertSame([[1, null, '2026-05-06 07:08:09'], [3, null, '2026-05-06 07:08:09']], Job::withTrashed()->orderBy('legacy_id')->get()->map(fn (Job $job) => [$job->legacy_id, $job->deleted_at, $job->updated_at?->toDateTimeString()])->all());
+        $this->assertSame([[1, null, '2026-05-06 07:08:09'], [3, null, '2026-05-06 07:08:09']], Job::withTrashed()->select('jobs.*')->selectSub(query: ListingTables::legacyId(), as: 'legacy_id')->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => [$job->getAttribute('legacy_id'), $job->deleted_at, $job->updated_at?->toDateTimeString()])->all());
         $this->assertSame([], $dispatched);
     }
 
@@ -71,7 +72,7 @@ final class LegacyBuilderMassTest extends TestCase
         $dispatched = $events();
 
         $this->assertSame(1, $touched);
-        $this->assertSame(['2026-05-06 07:08:09', '2026-01-05 08:00:00'], Job::query()->orderBy('legacy_id')->get()->map(fn (Job $job) => $job->updated_at?->toDateTimeString())->all());
+        $this->assertSame(['2026-05-06 07:08:09', '2026-01-05 08:00:00'], Job::query()->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => $job->updated_at?->toDateTimeString())->all());
         $this->assertSame([], $dispatched);
     }
 
@@ -85,7 +86,7 @@ final class LegacyBuilderMassTest extends TestCase
         Listing::query()->decrementEach(['price' => 1]);
         $dispatched = $events();
 
-        $this->assertSame([['Raised', 125150], ['Pine Flat', null], ['Raised', 10099]], Job::withTrashed()->orderBy('legacy_id')->get()->map(fn (Job $job) => [$job->name, $job->price_cents])->all());
+        $this->assertSame([['Raised', 125150], ['Pine Flat', null], ['Raised', 10099]], Job::withTrashed()->orderBy(ListingTables::legacyId())->get()->map(fn (Job $job) => [$job->name, $job->price_cents])->all());
         $this->assertSame([], $dispatched);
     }
 
@@ -103,13 +104,13 @@ final class LegacyBuilderMassTest extends TestCase
         $listing->increment('price', 2.5, ['mls_number' => 'MLS-1B']);
         $listing->decrement('latitude', 0.25);
 
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $this->assertSame(125300, $job->price_cents);
         $this->assertSame([47.3562], JobSite::query()->where('job_id', $job->id)->pluck('latitude')->all());
         $this->assertSame([['MLS-1B', true]], DB::table('listings_retained')->where('job_id', $job->id)->get(['mls_number', 'featured'])->map(fn (object $row) => array_values((array) $row))->all());
         $this->assertSame(['1253.00', 47.3562], [$listing->price, $listing->latitude]);
         $this->assertSame([Job::class, JobSite::class], array_values(array_filter($saved, fn (string $model) => $model !== Listing::class)));
-        $this->assertSame(9999, Job::query()->where('legacy_id', 3)->value('price_cents'));
+        $this->assertSame(9999, Job::query()->whereKey(ListingTables::jobOf(3))->value('price_cents'));
     }
 
     #[RequiresMethod(Model::class, 'incrementEach')]
@@ -126,12 +127,12 @@ final class LegacyBuilderMassTest extends TestCase
         $listing->incrementEach(['price' => 2, 'latitude' => 2]); // @phpstan-ignore staticMethod.dynamicCall
         $listing->decrementEach(['price' => 1, 'latitude' => 1]); // @phpstan-ignore staticMethod.dynamicCall
 
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $this->assertSame(125150, $job->price_cents);
         $this->assertSame([48.6062], JobSite::query()->where('job_id', $job->id)->pluck('latitude')->all());
         $this->assertSame(['1251.50', 48.6062], [$listing->price, $listing->latitude]);
         $this->assertSame([Job::class, JobSite::class, Job::class, JobSite::class], array_values(array_filter($saved, fn (string $model) => $model !== Listing::class)));
-        $this->assertSame(9999, Job::query()->where('legacy_id', 3)->value('price_cents'));
+        $this->assertSame(9999, Job::query()->whereKey(ListingTables::jobOf(3))->value('price_cents'));
     }
 
     #[Test]
@@ -152,6 +153,7 @@ final class LegacyBuilderMassTest extends TestCase
 
         $this->assertSame([
             [1, "select set_config('TimeZone', ?, true)"],
+            [1, 'select listings_retained'],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],
             [1, 'select places'],
@@ -178,7 +180,10 @@ final class LegacyBuilderMassTest extends TestCase
     {
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     /**

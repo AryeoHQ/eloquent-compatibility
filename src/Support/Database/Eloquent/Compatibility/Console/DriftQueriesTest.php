@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -13,13 +15,13 @@ use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
+use Tests\Fixtures\Support\Files\LegacyFile;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
@@ -79,10 +81,10 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Listing|Photo|Video|Image>  $model
      */
     #[Test]
-    #[TestWith([Listing::class, "insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')", 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'])]
-    #[TestWith([Photo::class, "delete from files where legacy_type = 'photo' and legacy_id = 2", 'photos#2', "no files row whose legacy_type is 'photo' holds its id and uuid, so install() refuses it"])]
-    #[TestWith([Video::class, "insert into videos (original_file_name, title) values ('porch.mp4', 'Porch')", 'videos#4', "no files or links row whose legacy_type is 'video' holds its id and uuid, so install() refuses it"])]
-    #[TestWith([Image::class, "delete from place_assets where legacy_type = 'place_image' and legacy_id = 1", 'place_images#1', "no place_assets row whose legacy_type is 'place_image' holds its id and uuid, so install() refuses it"])]
+    #[TestWith([Listing::class, 'delete from jobs where id = (select job_id from listings where id = 2)', 'listings#2', 'its job_id names no jobs row, so install() refuses it'])]
+    #[TestWith([Photo::class, 'delete from files where id = (select file_id from photos where id = 2)', 'photos#2', 'its file_id names no files row, so install() refuses it'])]
+    #[TestWith([Video::class, 'delete from files where id = (select file_id from videos where id = 3)', 'videos#3', 'its file_id names no files row, so install() refuses it'])]
+    #[TestWith([Image::class, 'delete from place_assets where id = (select place_asset_id from place_images where id = 1)', 'place_images#1', 'its place_asset_id names no place_assets row, so install() refuses it'])]
     public function it_names_each_legacy_row_no_primary_holds_before_install(string $model, string $drift, string $record, string $detail): void
     {
         $this->backfilled($model);
@@ -118,10 +120,10 @@ final class DriftQueriesTest extends TestCase
         DB::unprepared("update listings set title = 'Oak Home' where id = 1");
         DB::unprepared("update listings set title = 'Pine Loft', updated_at = localtimestamp(0) where id = 2");
         DB::unprepared("insert into listings (title, company_id, updated_at) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21', '2026-01-01 00:00:00')");
-        DB::unprepared('delete from jobs where legacy_id in (2, 3)');
+        DB::unprepared('delete from jobs where id in (select job_id from listings where id in (2, 3))');
 
         $this->assertSame([
-            [Listing::class, 'no primary', 'listings#3', 'no jobs row holds its id and uuid, so install() refuses it'],
+            [Listing::class, 'no primary', 'listings#3', 'its job_id names no jobs row, so install() refuses it'],
             [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
         ], $this->find(Listing::class));
     }
@@ -142,12 +144,16 @@ final class DriftQueriesTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
             }
         };
         Compatibility::prepare($listing::class);
@@ -156,21 +162,9 @@ final class DriftQueriesTest extends TestCase
         DB::unprepared("insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')");
 
         $this->assertSame([
-            [$listing::class, 'no primary', 'listings#4', 'no jobs row holds its id and uuid, so install() refuses it'],
+            [$listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
             [$listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
         ], $this->find($listing::class));
-    }
-
-    #[Test]
-    public function it_names_a_legacy_row_whose_hidden_primary_holds_its_key_and_not_its_other_identifiers(): void
-    {
-        $this->backfilled(Listing::class);
-        DB::update('update jobs set merged_into_job_id = (select id from jobs where legacy_id = 3) where legacy_id = 1');
-        DB::update('update listings set uuid = gen_random_uuid() where id = 1');
-
-        $this->assertSame([
-            [Listing::class, 'no primary', 'listings#1', 'no jobs row holds its id and uuid, so install() refuses it'],
-        ], $this->find(Listing::class));
     }
 
     #[Test]
@@ -194,15 +188,32 @@ final class DriftQueriesTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->timestamps()
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
-                        ->attribute('details', fn (Attribute $attribute) => $attribute->from('details'))
-                        ->attribute('location', fn (Attribute $attribute) => $attribute->from('location')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'details',
+                            definition: fn (Attribute $attribute) => $attribute->from('details'),
+                        )
+                        ->attribute(
+                            name: 'location',
+                            definition: fn (Attribute $attribute) => $attribute->from('location'),
+                        ));
             }
         };
         Compatibility::prepare($listing::class);
@@ -253,7 +264,6 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Video|PlaceVideo>  $model
      */
     #[Test]
-    #[TestWith([Video::class, "update videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'videos#1', 'videos holds other values for youtube_embed_url than the view would serve from files', "its servedFrom() selector chooses links, and no links row whose legacy_type is 'video' holds its id, so install() refuses it"])]
     #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'place_videos holds other values for youtube_embed_url than the view would serve from place_assets', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() refuses it'])]
     public function it_names_a_legacy_row_that_sits_in_another_successor_than_its_selector_chooses_before_install(string $model, string $drift, string $record, string $differs, string $misplaced): void
     {
@@ -271,7 +281,7 @@ final class DriftQueriesTest extends TestCase
     {
         $this->installed(Image::class);
         DB::statement('alter table place_assets alter column asset_type drop not null');
-        DB::update("update place_assets set asset_type = null where legacy_type = 'place_image' and legacy_id = 1");
+        DB::update('update place_assets set asset_type = null where id = (select place_asset_id from place_images where id = 1)');
 
         $this->assertSame([
             [Image::class, 'no morph target', 'place_images#1', 'its asset_type is NULL, which names no target relatedMorph() declares'],
@@ -282,7 +292,7 @@ final class DriftQueriesTest extends TestCase
     public function it_names_a_primary_whose_morph_target_row_is_soft_deleted(): void
     {
         $this->installed(Brochure::class);
-        DB::update("update trashable_asset_files set deleted_at = now() where id = (select asset_id from place_assets where legacy_type = 'place_brochure' and legacy_id = 1)");
+        DB::update('update trashable_asset_files set deleted_at = now() where id = (select asset_id from place_assets where id = (select place_asset_id from place_brochures where id = 1))');
 
         $this->assertSame([
             [Brochure::class, 'no morph target', 'place_brochures#1', 'its trashable_asset_files row does not exist or is deleted'],
@@ -302,65 +312,78 @@ final class DriftQueriesTest extends TestCase
         $this->installed($model);
         $this->editView($view);
 
-        $this->assertSame([[$model, 'stale view', $view, 'the installed view differs from the view the map compiles; run Compatibility::recompile()']], $this->find($model));
+        $this->assertSame([[$model, 'stale view', $view, 'the installed view differs from the view the map compiles; run Compatibility::update()']], $this->find($model));
     }
 
     #[Test]
     public function it_names_a_retained_row_whose_primary_a_raw_delete_removed(): void
     {
         $this->installed(Listing::class);
-        $job = DB::scalar('select id from jobs where legacy_id = 2');
         DB::transaction(function (): void {
             DB::statement('set local session_replication_role = replica');
-            DB::delete('delete from jobs where legacy_id = 2');
+            DB::delete('delete from jobs where id = (select job_id from listings_retained where id = 2)');
         });
 
         $this->assertSame([
-            [Listing::class, 'retained without primary', "listings_retained#{$job}", 'no jobs row holds it, so the view serves none of its legacy-only values'],
+            [Listing::class, 'retained without primary', 'listings_retained#2', 'its job_id names no jobs row, so the view serves none of it'],
         ], $this->find(Listing::class));
-    }
-
-    /**
-     * @param  class-string<Photo|Image>  $model
-     */
-    #[Test]
-    #[TestWith([Photo::class, 'files', "update files set legacy_type = null where legacy_type = 'photo' and legacy_id = 2", 'photos_retained', "its files row no longer has legacy_type 'photo', so the view serves none of its legacy-only values"])]
-    #[TestWith([Image::class, 'place_assets', "update place_assets set legacy_type = null where legacy_type = 'place_image' and legacy_id = 2", 'place_images_retained', "its place_assets row no longer has legacy_type 'place_image', so the view serves none of its legacy-only values"])]
-    public function it_names_a_retained_row_whose_primary_a_raw_write_reclassified_and_counts_the_row_it_left_unclassified(string $model, string $successor, string $drift, string $retained, string $detail): void
-    {
-        $this->installed($model);
-        $primary = DB::scalar("select id from {$successor} where legacy_id = 2 and legacy_type = ?", [(new $model)->getMorphClass()]);
-        DB::unprepared($drift);
-
-        $this->assertSame([
-            [$model, 'retained without primary', "{$retained}#{$primary}", $detail],
-            [$model, 'unclassified rows', $successor, '1 row has no legacy_type, so no legacy model serves it'],
-        ], $this->find($model));
-    }
-
-    #[Test]
-    public function it_names_a_retained_row_of_a_two_primary_map_whose_legacy_id_no_successor_holds(): void
-    {
-        $this->installed(Video::class);
-        DB::delete("delete from files where legacy_type = 'video' and legacy_id = 1");
-
-        $this->assertSame([
-            [Video::class, 'retained without primary', 'videos_retained#1', "no files or links row whose legacy_type is 'video' holds it, so the view serves none of its legacy-only values"],
-        ], $this->find(Video::class));
     }
 
     #[Test]
     #[TestWith([false])]
     #[TestWith([true])]
-    public function it_names_a_legacy_id_both_successors_of_a_two_primary_map_hold(bool $install): void
+    public function it_names_a_record_whose_root_no_longer_matches_the_when_of_its_map(bool $install): void
     {
-        $install ? $this->installed(Video::class) : $this->backfilled(Video::class);
-        DB::insert("insert into links (legacy_type, legacy_id, url, created_at, updated_at) values ('video', 1, 'https://youtu.be/tour', now(), now())");
+        $install ? $this->installed(Image::class) : $this->backfilled(Image::class);
+        DB::update("update place_assets set legacy_type = 'place_video' where id = (select place_asset_id from place_images where id = 2)");
 
         $this->assertSame([
-            ...($install ? [] : [[Video::class, 'values differ', 'videos#1', 'videos holds other values for uuid, original_file_name, size_kb, youtube_embed_url, created_at, updated_at than the view would serve from links']]),
-            [Video::class, 'held twice', 'videos#1', 'files and links both hold its id, so the view serves the record twice'],
-        ], $this->find(Video::class));
+            [Image::class, 'outside when()', 'place_images#2', 'its place_assets row no longer matches the when() of Image'],
+        ], $this->find(Image::class));
+    }
+
+    #[Test]
+    public function it_plans_the_membership_check_as_an_anti_join_that_tests_each_legacy_row_once(): void
+    {
+        $this->backfilled(Image::class);
+        $queries = [];
+        DB::listen(function (QueryExecuted $query) use (&$queries): void {
+            $queries[] = $query;
+        });
+
+        (new DriftQueries(DB::connection()))->membership(
+            map: Compatibility::of(Image::class)->resolve(),
+            siblings: [],
+            limit: 100,
+        );
+        $this->assertCount(1, $queries);
+        $plan = implode(
+            separator: "\n",
+            array: array_map(
+                callback: fn (object $row) => (string) (((array) $row)['QUERY PLAN'] ?? ''),
+                array: DB::select(
+                    query: 'EXPLAIN '.$queries[0]->sql,
+                    bindings: $queries[0]->bindings,
+                ),
+            ),
+        );
+
+        $this->assertStringContainsString('Anti Join', $plan);
+        $this->assertStringNotContainsString('SubPlan', $plan);
+    }
+
+    #[Test]
+    public function it_names_a_record_whose_root_also_serves_a_record_of_a_sibling_map(): void
+    {
+        $this->backfilled(Photo::class);
+        DB::update('update legacy_files set file_id = (select file_id from photos where id = 1) where id = 1');
+
+        $this->assertSame([
+            [Photo::class, 'held twice', 'photos#1', 'its files row also serves a LegacyFile record, so one shared successor serves two legacy records'],
+        ], $this->find(
+            model: Photo::class,
+            siblings: [LegacyFile::class],
+        ));
     }
 
     #[Test]
@@ -369,8 +392,8 @@ final class DriftQueriesTest extends TestCase
     public function it_names_a_primary_whose_morph_type_names_no_declared_target_or_whose_target_row_is_missing(bool $install): void
     {
         $install ? $this->installed(Image::class) : $this->backfilled(Image::class);
-        DB::update("update place_assets set asset_type = 'place_brochure' where legacy_type = 'place_image' and legacy_id = 1");
-        DB::delete("delete from asset_files where id = (select asset_id from place_assets where legacy_type = 'place_image' and legacy_id = 2)");
+        DB::update("update place_assets set asset_type = 'place_brochure' where id = (select place_asset_id from place_images where id = 1)");
+        DB::delete('delete from asset_files where id = (select asset_id from place_assets where id = (select place_asset_id from place_images where id = 2))');
 
         $this->assertSame([
             ...($install ? [] : [
@@ -384,32 +407,16 @@ final class DriftQueriesTest extends TestCase
         ], $this->find(Image::class));
     }
 
-    /**
-     * @param  class-string<Photo|Video|Image>  $model
-     * @param  list<array{string, string}>  $counted
-     */
-    #[Test]
-    #[TestWith([Photo::class, "insert into files (filename, mime_type) values ('stray.jpg', 'image/jpeg'), ('stray.png', 'image/png')", [['files', '2 rows have no legacy_type, so no legacy model serves them']]])]
-    #[TestWith([Video::class, "insert into files (filename, mime_type) values ('stray.mp4', 'video/mp4'); insert into links (url) values ('https://youtu.be/stray'), ('https://youtu.be/lost')", [['files', '1 row has no legacy_type, so no legacy model serves it'], ['links', '2 rows have no legacy_type, so no legacy model serves them']]])]
-    #[TestWith([Image::class, "insert into place_assets (asset_type, asset_id) values ('place_asset_file', gen_random_uuid())", [['place_assets', '1 row has no legacy_type, so no legacy model serves it']]])]
-    public function it_counts_the_successor_rows_no_legacy_model_claims_per_table(string $model, string $drift, array $counted): void
-    {
-        $this->installed($model);
-        DB::unprepared($drift);
-
-        $this->assertSame(array_map(fn (array $count) => [$model, 'unclassified rows', ...$count], $counted), $this->find($model));
-    }
-
     #[Test]
     #[TestWith([false, "update videos set youtube_embed_url = 'https://vimeo.com/oak' where id = 2"])]
-    #[TestWith([true, "update links set url = 'https://vimeo.com/oak' where legacy_type = 'video' and legacy_id = 2"])]
+    #[TestWith([true, "update files set embed_url = 'https://vimeo.com/oak' where id = (select file_id from videos where id = 2)"])]
     public function it_names_each_record_a_guard_refuses_as_it_stands(bool $install, string $drift): void
     {
         $install ? $this->installed(Video::class) : $this->backfilled(Video::class);
         DB::unprepared($drift);
 
         $this->assertSame([
-            ...($install ? [] : [[Video::class, 'values differ', 'videos#2', 'videos holds other values for youtube_embed_url than the view would serve from links']]),
+            ...($install ? [] : [[Video::class, 'values differ', 'videos#2', 'videos holds other values for youtube_embed_url than the view would serve from files']]),
             [Video::class, 'guard refuses', 'videos#2', "guard 'embed host' refuses the record as it stands: The listing page plays embeds from YouTube only."],
         ], $this->find(Video::class));
     }
@@ -496,6 +503,7 @@ final class DriftQueriesTest extends TestCase
                 PlaceAssetTables::brochures();
                 Compatibility::prepare(Brochure::class);
                 (new Backfiller(Compatibility::of(Brochure::class)->resolve(), DB::connection()))->run();
+                PlaceAssetTables::classify(Brochure::class);
             })(),
         };
     }
@@ -506,7 +514,10 @@ final class DriftQueriesTest extends TestCase
     private function installed(string $model): void
     {
         $this->backfilled($model);
-        Compatibility::install($model);
+        Compatibility::install(
+            model: $model,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     /**
@@ -529,13 +540,17 @@ final class DriftQueriesTest extends TestCase
 
     /**
      * @param  class-string<Model>  $model
+     * @param  list<class-string<Model>>  $siblings
      * @return list<array{string, string, string, string}>
      */
-    private function find(string $model, int $limit = 100): array
+    private function find(string $model, int $limit = 100, array $siblings = []): array
     {
         return array_map(
             fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
-            (new DriftQueries(DB::connection()))->find(Compatibility::of($model)->resolve(), $limit),
+            (new DriftQueries(DB::connection()))->find(map: Compatibility::of($model)->resolve(), limit: $limit, siblings: array_map(
+                callback: fn (string $sibling) => Compatibility::of($sibling)->resolve(),
+                array: $siblings,
+            )),
         );
     }
 }

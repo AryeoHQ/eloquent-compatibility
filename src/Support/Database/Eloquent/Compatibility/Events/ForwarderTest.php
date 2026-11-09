@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Events;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Broadcasting\BroadcastEvent;
 use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
@@ -23,22 +24,20 @@ use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provider;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Backfills\CompletedPass;
 use Tests\Fixtures\Support\Files\ArchiveLegacyFile;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
-use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\LegacyFile;
 use Tests\Fixtures\Support\Files\LegacyFileSaving;
 use Tests\Fixtures\Support\Files\LegacyFileUpdated;
-use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
@@ -107,7 +106,10 @@ final class ForwarderTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -131,23 +133,19 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
-    public function it_forwards_a_job_create_and_then_a_place_create_as_the_events_of_a_listing_create_and_update(): void
+    public function it_forwards_nothing_for_a_root_and_a_related_create_that_no_retained_row_holds(): void
     {
-        $this->listen(Listing::class, ['saving', 'creating', 'created', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->title, $listing->street, $listing->exists]);
+        $this->listen(
+            model: Listing::class,
+            events: self::EVENTS,
+            describe: fn (Listing $listing) => [$listing->id],
+        );
 
         $job = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
         Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
 
-        $this->assertSame([
-            ['saving', null, 'Birch House', null, false],
-            ['creating', null, 'Birch House', null, false],
-            ['created', 4, 'Birch House', null, true],
-            ['saved', 4, 'Birch House', null, true],
-            ['saving', 4, 'Birch House', '9 Birch St', true],
-            ['updating', 4, 'Birch House', '9 Birch St', true],
-            ['updated', 4, 'Birch House', '9 Birch St', true],
-            ['saved', 4, 'Birch House', '9 Birch St', true],
-        ], $this->seen);
+        $this->assertSame([], $this->seen);
+        $this->assertNull(Listing::query()->find(4));
     }
 
     #[Test]
@@ -159,7 +157,7 @@ final class ForwarderTest extends TestCase
 
         try {
             DB::select("select set_config('search_path', ?, false)", ['compatibility_empty, '.$searchPath]);
-            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+            Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
         } finally {
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             DB::statement('drop schema compatibility_empty');
@@ -176,11 +174,12 @@ final class ForwarderTest extends TestCase
         DB::statement('create schema compatibility_tenant');
         DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
         $searchPath = DB::scalar("select current_setting('search_path')");
+        $oak = ListingTables::jobOf(1);
 
         try {
             DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
-            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Tenant Lodge']);
-            $tenant = DB::scalar('select name from compatibility_tenant.jobs where legacy_id = 1');
+            Job::query()->whereKey($oak)->firstOrFail()->update(['name' => 'Tenant Lodge']);
+            $tenant = DB::table('compatibility_tenant.jobs')->where(column: 'id', operator: '=', value: $oak)->value('name');
         } finally {
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             DB::statement('drop schema compatibility_tenant cascade');
@@ -203,12 +202,16 @@ final class ForwarderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'mls_number',
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.'),
+                        ));
             }
         };
         Forwarder::register($this->app->make('events'), $retained::class);
@@ -221,7 +224,7 @@ final class ForwarderTest extends TestCase
 
         try {
             DB::select("select set_config('search_path', ?, false)", ['compatibility_tenant, '.$searchPath]);
-            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+            Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
         } finally {
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             DB::statement('drop schema compatibility_tenant cascade');
@@ -236,13 +239,14 @@ final class ForwarderTest extends TestCase
     public function it_runs_no_query_of_its_own_when_no_listing_listener_takes_the_event(): void
     {
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $site = JobSite::query()->where('job_id', $job->id)->firstOrFail();
+        $pine = ListingTables::jobOf(2);
         DB::enableQueryLog();
 
         $job->update(['name' => 'Oak Lodge']);
         $site->update(['latitude' => 1.5]);
-        Place::query()->create(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id'), 'street' => '2 Pine St']);
+        Place::query()->create(['job_id' => Job::withTrashed()->whereKey($pine)->value('id'), 'street' => '2 Pine St']);
 
         $this->assertSame(
             ['update "jobs"', 'update "job_sites"', 'select "id" from "jobs"', 'insert into "places"'],
@@ -284,6 +288,23 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
+    public function it_forwards_no_change_a_successor_listener_makes_to_the_record_a_legacy_write_is_writing_when_the_instance_swaps_its_key_name(): void
+    {
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            Place::query()->where('job_id', $job->id)->firstOrFail()->update(['city' => 'Tacoma']);
+        });
+        $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->getAttribute('id')]);
+        $listing = Listing::query()->findOrFail(1);
+        $listing->setKeyName('uuid');
+        $listing->setKeyType('string');
+
+        $listing->update(['title' => 'Oak Lodge']);
+
+        $this->assertSame([['saving', 1], ['updating', 1], ['updated', 1], ['saved', 1]], $this->seen);
+        $this->assertSame(['Oak Lodge', 'Tacoma'], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->city]);
+    }
+
+    #[Test]
     public function it_forwards_no_save_a_successor_listener_makes_through_another_instance_of_the_primary_a_legacy_write_is_writing(): void
     {
         Event::listen('eloquent.saved: '.Place::class, function (Place $place): void {
@@ -308,7 +329,7 @@ final class ForwarderTest extends TestCase
         FileTables::seed();
         FileTables::install();
         Event::listen('eloquent.saved: '.Job::class, function (): void {
-            File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'oak-porch.jpg']);
+            File::query()->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail()->update(['filename' => 'oak-porch.jpg']);
         });
         $this->listen(Photo::class, ['updated'], fn (Photo $photo) => [$photo->id, $photo->file_name]);
 
@@ -321,7 +342,7 @@ final class ForwarderTest extends TestCase
     public function it_gives_every_event_of_one_successor_write_the_same_listing_instance(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [spl_object_id($listing)]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $writes = [];
 
         foreach ([fn () => $job->update(['name' => 'Oak Lodge']), fn () => $job->delete(), fn () => $job->restore(), fn () => $job->forceDelete()] as $write) { // @phpstan-ignore staticMethod.dynamicCall
@@ -338,7 +359,7 @@ final class ForwarderTest extends TestCase
     {
         Event::fake(['eloquent.updated: '.Listing::class]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         Event::assertDispatchedTimes('eloquent.updated: '.Listing::class, 1);
         Event::assertDispatched('eloquent.updated: '.Listing::class, fn (string $event, Listing $listing) => [$listing->id, $listing->title] === [1, 'Oak Lodge']);
@@ -348,15 +369,15 @@ final class ForwarderTest extends TestCase
     public function it_forwards_nothing_for_a_mass_write_or_a_quiet_write_of_a_successor(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $place = Place::query()->where('job_id', $job->id)->firstOrFail();
 
-        Job::query()->where('legacy_id', 1)->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->update(['name' => 'Oak Lodge']);
         Place::query()->whereKey($place->id)->update(['street' => '5 Oak St']);
         $job->fill(['price_cents' => 1])->saveQuietly();
         $place->fill(['city' => 'Tacoma'])->saveQuietly();
         $place->deleteQuietly();
-        Job::query()->where('legacy_id', 3)->firstOrFail()->deleteQuietly();
+        Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail()->deleteQuietly();
 
         $this->assertSame([], $this->seen);
         $this->assertSame(['Oak Lodge', '0.01', null, null], [Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->price, Listing::query()->findOrFail(1)->street, Listing::query()->find(3)]);
@@ -366,7 +387,7 @@ final class ForwarderTest extends TestCase
     public function it_forwards_the_delete_restore_and_force_delete_of_a_job_as_the_same_listing_events(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->deleted_at !== null, $listing->exists]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $job->delete();
         $job->restore(); // @phpstan-ignore staticMethod.dynamicCall
@@ -385,7 +406,7 @@ final class ForwarderTest extends TestCase
     {
         $this->listen(Listing::class, ['deleting', 'trashed', 'deleted'], fn (Listing $listing) => [$listing->deleted_at !== null]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->delete();
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->delete();
 
         $this->assertSame([['deleting', false], ['trashed', true], ['deleted', true]], $this->seen);
     }
@@ -394,21 +415,19 @@ final class ForwarderTest extends TestCase
     public function it_cancels_the_successor_write_a_legacy_listener_refuses(): void
     {
         $before = $this->snapshot();
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $place = Place::query()->where('job_id', $job->id)->firstOrFail();
 
         Event::listen('eloquent.saving: '.Listing::class, fn (Listing $listing) => $listing->title !== 'Refused');
-        Event::listen('eloquent.creating: '.Listing::class, fn () => false);
         Event::listen('eloquent.updating: '.Listing::class, fn (Listing $listing) => $listing->street !== 'Refused');
         Event::listen('eloquent.deleting: '.Listing::class, fn () => false);
         Event::listen('eloquent.restoring: '.Listing::class, fn () => false);
 
-        $this->assertSame([false, false, false, false, false], [
+        $this->assertSame([false, false, false, false], [
             $job->fill(['name' => 'Refused'])->save(),
-            (new Job(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]))->save(),
             $place->fill(['street' => 'Refused'])->save(),
             $job->refresh()->delete(),
-            Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->restore(), // @phpstan-ignore staticMethod.dynamicCall
+            Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail()->restore(), // @phpstan-ignore staticMethod.dynamicCall
         ]);
         $this->assertSame($before, $this->snapshot());
     }
@@ -431,7 +450,7 @@ final class ForwarderTest extends TestCase
         Event::listen('eloquent.updated: '.Listing::class, function (Listing $listing) use (&$seen): void {
             $seen[] = [$listing->title, $listing->price, $listing->street, $listing->city];
         });
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $job->update(['name' => 'Oak Lodge']);
         Place::query()->where('job_id', $job->id)->firstOrFail()->update(['street' => '5 Oak St']);
@@ -459,7 +478,7 @@ final class ForwarderTest extends TestCase
         foreach ($cases as [$event, $change, $attribute, $because]) {
             Event::forget("eloquent.{$event}: ".Listing::class);
             Event::listen("eloquent.{$event}: ".Listing::class, $change);
-            $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+            $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
             try {
                 $event === 'deleting' ? $job->delete() : $job->update(['name' => 'Oak Lodge']);
@@ -486,7 +505,7 @@ final class ForwarderTest extends TestCase
         Event::listen('eloquent.updated: '.Listing::class, new SyncListingToMls);
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
         $forwarded = SyncListingToMls::$synced;
         Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
 
@@ -498,7 +517,7 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_write_only_when_it_changes_a_value_the_listing_serves(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street, $listing->latitude]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $root = Place::query()->where('job_id', $job->id)->firstOrFail();
         $site = JobSite::query()->where('job_id', $job->id)->firstOrFail();
 
@@ -521,9 +540,13 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_that_moves_to_another_record_to_both_records(): void
     {
         $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
-        $elm = Place::query()->where('job_id', Job::query()->where('legacy_id', 3)->value('id'))->firstOrFail();
+        $elm = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(3))->value('id'),
+        )->firstOrFail();
 
-        $elm->update(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id')]);
+        $elm->update(['job_id' => Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id')]);
 
         $this->assertSame([
             ['updating', 2, null, '3 Elm St'], ['updating', 3, '3 Elm St', null],
@@ -532,36 +555,32 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
-    public function it_forwards_a_write_of_a_shared_successor_only_to_the_legacy_model_its_legacy_type_names(): void
+    public function it_forwards_a_write_of_a_shared_root_only_to_the_legacy_model_whose_retained_table_holds_it(): void
     {
         FileTables::create();
         FileTables::seed();
         FileTables::install();
         $describe = fn (Model $legacy) => [class_basename($legacy), $legacy->getAttribute('id'), $legacy->getAttribute('file_name')];
 
-        foreach ([Photo::class, FloorPlan::class, LegacyFile::class] as $model) {
+        foreach ([Photo::class, LegacyFile::class] as $model) {
             $this->listen($model, self::EVENTS, $describe);
         }
 
-        $photo = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $photo = File::query()->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail();
         DB::enableQueryLog();
         $photo->update(['filename' => 'oak-porch.jpg']);
         $read = implode("\n", array_column(DB::getQueryLog(), 'query'));
         DB::disableQueryLog();
-        File::query()->create(['legacy_type' => 'floorplan', 'filename' => 'birch-plan.pdf', 'mime_type' => 'application/pdf']);
-        File::query()->create(['filename' => 'unclassified.bin', 'mime_type' => 'application/octet-stream']);
 
-        $this->assertStringContainsString('"photos"', $read);
-        $this->assertStringNotContainsString('"floorplans"', $read);
-        $this->assertStringNotContainsString('"legacy_files"', $read);
+        $this->assertStringContainsString('"photos_retained"', $read);
+        $this->assertStringNotContainsString('"legacy_files_retained"', $read);
         $this->assertSame([
             ['saving', 'Photo', 1, 'oak-porch.jpg'], ['updating', 'Photo', 1, 'oak-porch.jpg'], ['updated', 'Photo', 1, 'oak-porch.jpg'], ['saved', 'Photo', 1, 'oak-porch.jpg'],
-            ['saving', 'FloorPlan', null, 'birch-plan.pdf'], ['creating', 'FloorPlan', null, 'birch-plan.pdf'], ['created', 'FloorPlan', 4, 'birch-plan.pdf'], ['saved', 'FloorPlan', 4, 'birch-plan.pdf'],
         ], $this->seen);
     }
 
     #[Test]
-    public function it_forwards_a_write_of_either_successor_of_a_video_to_the_video_it_serves(): void
+    public function it_forwards_a_write_of_the_file_of_a_video_to_the_video_it_serves(): void
     {
         FileTables::create();
         FileTables::seed();
@@ -571,8 +590,8 @@ final class ForwarderTest extends TestCase
         $this->listen(Video::class, ['updating', 'updated'], fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url, $video->getOriginal('youtube_embed_url')]);
         $this->listen(InteractiveContent::class, self::EVENTS, fn (InteractiveContent $content) => [$content->id]);
 
-        Link::query()->where('legacy_type', 'video')->where('legacy_id', 2)->firstOrFail()->update(['url' => 'https://youtu.be/oak-2']);
-        File::query()->where('legacy_type', 'video')->where('legacy_id', 3)->firstOrFail()->update(['filename' => 'drone-2.mov']);
+        File::query()->whereKey(FileTables::fileOf(table: 'videos', id: 2))->firstOrFail()->update(['embed_url' => 'https://youtu.be/oak-2']);
+        File::query()->whereKey(FileTables::fileOf(table: 'videos', id: 3))->firstOrFail()->update(['filename' => 'drone-2.mov']);
 
         $this->assertSame([
             ['updating', 2, null, 'https://youtu.be/oak-2', 'https://youtu.be/oak'], ['updated', 2, null, 'https://youtu.be/oak-2', 'https://youtu.be/oak'],
@@ -589,7 +608,7 @@ final class ForwarderTest extends TestCase
         ListingTables::backfill();
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
         Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
 
         $this->assertSame([], $this->seen);
@@ -602,7 +621,7 @@ final class ForwarderTest extends TestCase
     {
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame(['staging', [['updated', 1, 'Oak Lodge']]], [$this->app->environment(), $this->seen]);
     }
@@ -637,65 +656,34 @@ final class ForwarderTest extends TestCase
     }
 
     #[Test]
-    public function it_keeps_the_record_of_an_outer_write_while_a_successor_listener_saves_the_same_instance_again(): void
-    {
-        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
-            $job->update(['price_cents' => 5]);
-        });
-        $this->listen(Listing::class, ['saving', 'creating', 'created', 'updating', 'updated', 'saved'], fn (Listing $listing) => [spl_object_id($listing), $listing->price]);
-
-        Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
-
-        $instances = array_values(array_unique(array_column($this->seen, 1)));
-        $this->assertSame([
-            ['saving', 0, null], ['creating', 0, null], ['created', 0, null],
-            ['saving', 1, '0.05'], ['updating', 1, '0.05'], ['updated', 1, '0.05'], ['saved', 1, '0.05'],
-            ['saved', 0, '0.05'],
-        ], array_map(fn (array $seen) => [$seen[0], array_search($seen[1], $instances, true), $seen[2]], $this->seen));
-    }
-
-    #[Test]
     public function it_reads_a_fresh_record_for_the_next_write_of_an_instance_after_a_legacy_listener_refuses_one(): void
     {
         Event::listen('eloquent.restoring: '.Listing::class, fn () => false);
         $this->listen(Listing::class, ['updating'], fn (Listing $listing) => [$listing->getOriginal('title'), $listing->title]);
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $restored = $pine->restore(); // @phpstan-ignore staticMethod.dynamicCall
-        DB::table('jobs')->where('legacy_id', 2)->update(['name' => 'Pine Lodge']);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(2),
+        )->update(['name' => 'Pine Lodge']);
         $pine->fill(['price_cents' => 7])->save();
 
         $this->assertSame([false, [['updating', 'Pine Lodge', 'Pine Lodge']]], [$restored, $this->seen]);
     }
 
     #[Test]
-    public function it_forwards_nothing_for_a_successor_write_that_moves_a_record_into_or_out_of_the_legacy_shape(): void
+    public function it_forwards_nothing_for_a_successor_write_that_moves_a_record_into_or_out_of_a_hide_rule(): void
     {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
-        foreach ([Photo::class, FloorPlan::class, LegacyFile::class] as $model) {
-            $this->listen($model, self::EVENTS, fn (Model $legacy) => [class_basename($legacy), $legacy->getKey()]);
-        }
-
-        $file = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png']);
-        $this->seen = [];
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
-
-        $oak->update(['merged_into_job_id' => Job::query()->where('legacy_id', 3)->value('id')]);
+        $oak->update(['merged_into_job_id' => Job::query()->whereKey(ListingTables::jobOf(3))->value('id')]);
+        $hidden = Listing::query()->find(1);
         $oak->update(['merged_into_job_id' => null]);
-        DB::enableQueryLog();
-        $file->update(['legacy_type' => 'floorplan']);
-        $reclassified = implode("\n", array_column(DB::getQueryLog(), 'query'));
-        DB::disableQueryLog();
-        $file->update(['legacy_type' => null]);
-        $file->update(['legacy_type' => 'legacy_file']);
 
-        $this->assertSame([], $this->seen);
-        $this->assertSame([true, false], [str_contains($reclassified, '"photos"'), str_contains($reclassified, '"floorplans"')]);
-        $this->assertSame([true, 'birch.png'], [Listing::query()->find(1) !== null, LegacyFile::query()->findOrFail(File::query()->whereKey($file->id)->value('legacy_id'))->file_name]);
+        $this->assertSame([[], null, true], [$this->seen, $hidden, Listing::query()->find(1) !== null]);
     }
 
     #[Test]
@@ -709,7 +697,7 @@ final class ForwarderTest extends TestCase
                 $photo->mime_type = 'image/webp';
             }
         });
-        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $file = File::query()->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail();
 
         $file->update(['filename' => 'oak-porch.jpg']);
 
@@ -730,7 +718,7 @@ final class ForwarderTest extends TestCase
             $seen[] = [$event->legacyFile->id, $event->legacyFile->file_name];
         });
 
-        File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-2.pdf']);
+        File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->update(['filename' => 'contract-2.pdf']);
 
         $this->assertSame([[1, 'contract-2.pdf']], $seen);
     }
@@ -750,7 +738,7 @@ final class ForwarderTest extends TestCase
         Event::listen('eloquent.saving: '.LegacyFile::class, function (LegacyFile $legacyFile) use (&$seen): void {
             $seen[] = ['saving', $legacyFile->file_name];
         });
-        $file = File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail();
+        $file = File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail();
 
         $saved = [$file->fill(['filename' => 'contract-2.pdf'])->save(), $file->fill(['filename' => 'refused.pdf'])->save()];
 
@@ -766,7 +754,7 @@ final class ForwarderTest extends TestCase
         Event::listen('eloquent.updated: '.Listing::class, SyncListingToMls::class);
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([[], [['updated', 1]]], [SyncListingToMls::$synced, $this->seen]);
     }
@@ -779,7 +767,11 @@ final class ForwarderTest extends TestCase
             $place->city = 'Tacoma';
         });
 
-        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->touch();
+        Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->touch();
 
         $this->assertSame([['saving', 1, 'Tacoma'], ['updating', 1, 'Tacoma'], ['updated', 1, 'Tacoma'], ['saved', 1, 'Tacoma']], $this->seen);
     }
@@ -791,7 +783,11 @@ final class ForwarderTest extends TestCase
             $listing->price = '1250.5';
         });
 
-        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->update(['street' => '5 Oak St']);
+        Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->update(['street' => '5 Oak St']);
 
         $this->assertSame(['5 Oak St', '1250.50'], [Listing::query()->findOrFail(1)->street, Listing::query()->findOrFail(1)->price]);
     }
@@ -801,8 +797,8 @@ final class ForwarderTest extends TestCase
     {
         $this->listen(Listing::class, ['forceDeleting', 'deleting', 'deleted', 'forceDeleted'], fn (Listing $listing) => [$listing->id, $listing->isForceDeleting()]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->forceDelete();
-        Job::query()->where('legacy_id', 3)->firstOrFail()->delete();
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->forceDelete();
+        Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail()->delete();
 
         $this->assertSame([
             ['forceDeleting', 1, false], ['deleting', 1, true], ['deleted', 1, true], ['forceDeleted', 1, false],
@@ -816,19 +812,15 @@ final class ForwarderTest extends TestCase
         config(['database.connections.tenant_b' => config('database.connections.'.DB::getDefaultConnection())]);
         $this->listen(Listing::class, ['saving', 'created', 'updated', 'saved'], fn (Listing $listing) => [$listing->getConnectionName()]);
 
-        Job::on('tenant_b')->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
-        (new Job(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]))->setConnection('tenant_b')->save();
+        Job::on('tenant_b')->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
-        $this->assertSame([
-            ['saving', 'tenant_b'], ['updated', 'tenant_b'], ['saved', 'tenant_b'],
-            ['saving', 'tenant_b'], ['created', 'tenant_b'], ['saved', 'tenant_b'],
-        ], $this->seen);
+        $this->assertSame([['saving', 'tenant_b'], ['updated', 'tenant_b'], ['saved', 'tenant_b']], $this->seen);
     }
 
     #[Test]
     public function it_gives_the_saved_event_of_a_job_write_to_its_own_listing_after_an_updated_listener_increments_the_job(): void
     {
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $incremented = false;
         Event::listen('eloquent.updated: '.Job::class, function () use ($job, &$incremented): void {
             if (! $incremented) {
@@ -851,7 +843,7 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_the_saved_event_of_a_job_write_whose_updated_listener_increments_the_job_without_a_listing_listener_for_the_increment(): void
     {
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $incremented = false;
         Event::listen('eloquent.updated: '.Job::class, function () use ($job, &$incremented): void {
             if (! $incremented) {
@@ -870,7 +862,7 @@ final class ForwarderTest extends TestCase
     public function it_runs_no_query_of_its_own_for_a_job_increment_when_the_only_listing_listener_takes_the_saved_event_an_increment_never_raises(): void
     {
         $this->listen(Listing::class, ['saved'], fn (Listing $listing) => [$listing->id]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         DB::enableQueryLog();
 
         $job->increment('price_cents', 5);
@@ -885,11 +877,11 @@ final class ForwarderTest extends TestCase
         Event::listen('eloquent.restoring: '.Job::class, fn () => false);
         Event::listen('eloquent.forceDeleting: '.Job::class, fn () => false);
         $this->listen(Listing::class, ['restoring', 'forceDeleting', 'deleting', 'updating'], fn (Listing $listing) => [$listing->getOriginal('title'), $listing->title]);
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $refused = [$pine->restore(), $oak->forceDelete()]; // @phpstan-ignore staticMethod.dynamicCall
-        DB::table('jobs')->whereIn('legacy_id', [1, 2])->update(['name' => DB::raw("name || ' II'")]);
+        DB::table('jobs')->whereIn(column: 'id', values: [ListingTables::jobOf(1), ListingTables::jobOf(2)])->update(['name' => DB::raw("name || ' II'")]);
         $pine->fill(['price_cents' => 7])->save();
         $oak->delete();
 
@@ -904,11 +896,11 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_write_only_to_the_records_whose_served_values_it_changes(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $root = Place::query()->where('job_id', $oak->id)->firstOrFail();
         $unit = Place::query()->create(['job_id' => $oak->id, 'parent_id' => $root->id, 'street' => 'Unit 2']);
 
-        $unit->update(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id'), 'parent_id' => null]);
+        $unit->update(['job_id' => Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id'), 'parent_id' => null]);
 
         $this->assertSame([['saving', 2, 'Unit 2'], ['updating', 2, 'Unit 2'], ['updated', 2, 'Unit 2'], ['saved', 2, 'Unit 2']], $this->seen);
     }
@@ -977,10 +969,10 @@ final class ForwarderTest extends TestCase
             });
         }
 
-        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $file = File::query()->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail();
         $refusals = [];
 
-        foreach ([fn () => $file->update(['filename' => 'oak-porch.jpg']), fn () => File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])] as $write) {
+        foreach ([fn () => $file->update(['filename' => 'oak-porch.jpg'])] as $write) {
             try {
                 $write();
                 $refusals[] = null;
@@ -989,32 +981,27 @@ final class ForwarderTest extends TestCase
             }
         }
 
-        $this->assertSame(['updating', 'creating'], $assigned);
-        $this->assertSame(array_map(fn (string $event) => 'A listener of a '.Photo::class." event that File forwarded cannot change \$mime_type. Why: It is declared external(), and File raised its {$event} event after its own saving listeners ran, so the write closure reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.", ['updating', 'creating']), $refusals);
+        $this->assertSame(['updating'], $assigned);
+        $this->assertSame(array_map(
+            callback: fn (string $event) => 'A listener of a '.Photo::class." event that File forwarded cannot change \$mime_type. Why: It is declared external(), and File raised its {$event} event after its own saving listeners ran, so the write closure reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.",
+            array: ['updating'],
+        ), $refusals);
         $this->assertSame(['oak-front.jpg', 'image/jpeg', 0], [File::query()->findOrFail($file->id)->filename, Photo::query()->findOrFail(1)->mime_type, File::query()->where('filename', 'birch.png')->count()]);
     }
 
     #[Test]
-    public function it_raises_no_after_event_for_a_record_a_later_successor_listener_moves_out_of_the_legacy_shape(): void
+    public function it_raises_no_after_event_for_a_record_a_later_successor_listener_moves_into_a_hide_rule(): void
     {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        $elm = Job::query()->where('legacy_id', 3)->value('id');
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->value('id');
         Event::listen('eloquent.updating: '.Job::class, function (Job $job) use ($elm): void {
             $job->merged_into_job_id = $elm;
         });
-        Event::listen('eloquent.updating: '.File::class, function (File $file): void {
-            $file->legacy_type = null;
-        });
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id]);
-        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
-        File::query()->where('legacy_type', 'photo')->where('legacy_id', 2)->firstOrFail()->update(['filename' => 'oak-porch.jpg']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
-        $this->assertSame([['saving', 1], ['updating', 1], ['saving', 2], ['updating', 2]], $this->seen);
-        $this->assertSame([null, null], [Listing::query()->find(1), Photo::query()->find(2)]);
+        $this->assertSame([['saving', 1], ['updating', 1]], $this->seen);
+        $this->assertNull(Listing::query()->find(1));
     }
 
     #[DefineEnvironment('listensForJobUpdatesFirst')]
@@ -1022,7 +1009,7 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_job_update_once_ahead_of_the_listeners_of_its_event_object_whatever_they_return(): void
     {
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $job->update(['name' => 'Oak Lodge']);
         $this->jobUpdatedReturns = true;
@@ -1039,7 +1026,7 @@ final class ForwarderTest extends TestCase
     {
         Event::listen('eloquent.updated: *', SyncListingToMls::class.'@every');
         Event::listen('eloquent.updated: *', [new SyncListingToMls, 'every']);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         DB::enableQueryLog();
 
         $job->update(['name' => 'Oak Lodge']);
@@ -1069,14 +1056,17 @@ final class ForwarderTest extends TestCase
             ListingTables::seed();
             Compatibility::prepare(Listing::class);
             ListingTables::backfill();
-            Compatibility::install(Listing::class);
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
         } finally {
             DB::setDefaultConnection($default);
         }
 
         Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
             if ($job->getConnection()->getName() !== 'tenant_b') {
-                Job::on('tenant_b')->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+                Job::on('tenant_b')->whereKey(DB::connection('tenant_b')->table('listings_retained')->where(column: 'id', operator: '=', value: 1)->value('job_id'))->firstOrFail()->update(['name' => 'Oak Lodge']);
             }
         });
         $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->getConnection()->getName(), $listing->id, $listing->title]);
@@ -1094,7 +1084,7 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_each_update_once_when_a_listener_of_the_event_object_of_a_job_update_increments_the_job(): void
     {
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $incremented = false;
         Event::listen(JobUpdated::class, function (JobUpdated $event) use (&$incremented): void {
             if (! $incremented) {
@@ -1117,7 +1107,7 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_job_update_whose_event_object_is_faked_after_a_listener_of_that_object_answered_an_earlier_update(): void
     {
         $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $this->jobUpdatedReturns = true;
 
         $job->update(['name' => 'Oak Lodge']);
@@ -1132,49 +1122,16 @@ final class ForwarderTest extends TestCase
     {
         DB::statement('alter table places add column note text');
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         $root->update(['street' => DB::raw("'5 Oak St'")]);
         $root->update(['note' => DB::raw("'gate code 4411'")]);
 
         $this->assertSame([['saving', 1, '1 Oak St'], ['updating', 1, '1 Oak St'], ['updated', 1, '5 Oak St'], ['saved', 1, '5 Oak St']], $this->seen);
-    }
-
-    #[Test]
-    public function it_keeps_an_external_fact_a_legacy_saving_listener_assigns_for_the_later_events_of_a_successor_create(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
-            $photo->mime_type = 'image/webp';
-        });
-        $this->listen(Photo::class, ['creating', 'created', 'saved'], fn (Photo $photo) => [$photo->file_name, $photo->mime_type]);
-
-        File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png']);
-
-        $this->assertSame([['creating', 'birch.png', 'image/webp'], ['created', 'birch.png', 'image/webp'], ['saved', 'birch.png', 'image/webp']], $this->seen);
-        $this->assertSame('image/webp', Photo::query()->where('file_name', 'birch.png')->firstOrFail()->mime_type);
-    }
-
-    #[Test]
-    public function it_gives_the_after_events_of_a_successor_create_the_external_fact_the_create_stored(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
-            $photo->mime_type = 'image/webp';
-        });
-        Event::listen('eloquent.creating: '.File::class, function (File $file): void {
-            FakeMediaLibrary::bound()->put((string) $file->zml_asset_id, new FileMetadata('image/avif'));
-        });
-        $this->listen(Photo::class, ['creating', 'created', 'saved'], fn (Photo $photo) => [$photo->mime_type]);
-
-        File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png']);
-
-        $this->assertSame([['creating', 'image/webp'], ['created', 'image/avif'], ['saved', 'image/avif']], $this->seen);
-        $this->assertSame('image/avif', Photo::query()->where('file_name', 'birch.png')->firstOrFail()->mime_type);
     }
 
     #[Test]
@@ -1186,9 +1143,16 @@ final class ForwarderTest extends TestCase
         DB::statement('alter table places alter column city type jsonb using to_jsonb(city)');
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $this->listen(Listing::class, ['saving', 'saved'], fn (Listing $listing) => [$listing->id, $listing->city]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         $root->update(['city' => '{"n": 9223372036854775808123456789}']);
 
@@ -1204,9 +1168,16 @@ final class ForwarderTest extends TestCase
         DB::statement('alter table places alter column city type jsonb using to_jsonb(city)');
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('city'), $listing->city]);
-        $elm = Place::query()->where('job_id', Job::query()->where('legacy_id', 3)->value('id'))->firstOrFail();
+        $elm = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(3))->value('id'),
+        )->firstOrFail();
 
         $elm->update(['city' => 'null']);
 
@@ -1218,11 +1189,19 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_write_of_a_record_loaded_without_its_relationship_key_to_the_records_it_leaves_and_reaches(): void
     {
         $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
-        $oak = Place::query()->select(['id', 'street'])->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
-        $elm = Place::query()->select(['id', 'street'])->where('job_id', Job::query()->where('legacy_id', 3)->value('id'))->firstOrFail();
+        $oak = Place::query()->select(['id', 'street'])->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
+        $elm = Place::query()->select(['id', 'street'])->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(3))->value('id'),
+        )->firstOrFail();
 
         $oak->update(['street' => '5 Oak St']);
-        $elm->update(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id')]);
+        $elm->update(['job_id' => Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id')]);
 
         $this->assertSame([
             ['updating', 1, '1 Oak St', '5 Oak St'], ['updated', 1, '1 Oak St', '5 Oak St'],
@@ -1239,7 +1218,11 @@ final class ForwarderTest extends TestCase
             $place->city = 'Tacoma';
         });
 
-        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->touch();
+        Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->touch();
 
         $this->assertSame([['updated', 1, 'Seattle', 'Tacoma'], ['saved', 1, 'Seattle', 'Tacoma']], $this->seen);
     }
@@ -1257,7 +1240,7 @@ final class ForwarderTest extends TestCase
         Event::listen(LegacyFileUpdated::class, function (LegacyFileUpdated $event) use (&$seen): void {
             $seen[] = $event->legacyFile->file_name;
         });
-        $file = fn (): File => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail();
+        $file = fn (): File => File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail();
 
         try {
             DB::transaction(function () use ($file): void {
@@ -1280,12 +1263,16 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_write_to_the_record_a_later_saving_listener_moves_it_to(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
-        $pine = Job::withTrashed()->where('legacy_id', 2)->value('id');
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id');
         Event::listen('eloquent.saving: '.Place::class, function (Place $place) use ($pine): void {
             $place->job_id = (string) $pine;
         });
 
-        Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->touch();
+        Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->touch();
 
         $this->assertSame([
             ['saving', 1, null], ['saving', 2, '1 Oak St'], ['updating', 1, null], ['updating', 2, '1 Oak St'],
@@ -1304,7 +1291,11 @@ final class ForwarderTest extends TestCase
                 $place->city = 'Withheld';
             }
         });
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         $root->update(['city' => 'Withheld']);
         $root->update(['city' => 'Seattle']);
@@ -1319,7 +1310,11 @@ final class ForwarderTest extends TestCase
         $withheld = $this->withheldListing();
         Forwarder::register($this->app->make('events'), $withheld::class);
         $this->listen($withheld::class, self::EVENTS, fn (Model $listing) => [$listing->getAttribute('id'), $listing->getAttribute('street'), $listing->getAttribute('city')]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
         Event::listen('eloquent.updating: '.Place::class, function (Place $place) use ($root): void {
             DB::table('places')->where('id', $root->id)->update(['city' => 'Withheld']);
         });
@@ -1333,7 +1328,7 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_gives_the_saved_event_of_a_job_write_the_values_an_updated_listener_saves_quietly_to_the_same_instance(): void
     {
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         Event::listen('eloquent.updated: '.Job::class, function (Job $updated): void {
             $updated->price_cents = (int) $updated->price_cents + 5;
             $updated->saveQuietly();
@@ -1357,7 +1352,7 @@ final class ForwarderTest extends TestCase
             $listing->isDirty(['deleted_at', 'updated_at']),
         ]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->delete();
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->delete();
 
         $this->assertSame([['trashed', true, true, true, false], ['deleted', true, true, true, false]], $this->seen);
     }
@@ -1369,7 +1364,7 @@ final class ForwarderTest extends TestCase
         FileTables::seed();
         FileTables::install();
         $this->listen(Photo::class, ['updated'], fn (Photo $photo) => [$photo->mime_type, $photo->getOriginal('mime_type'), $photo->wasChanged('mime_type')]);
-        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $file = File::query()->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail();
 
         $file->update(['zml_asset_id' => FakeMediaLibrary::bound()->store(new FileMetadata('image/webp'))]);
 
@@ -1380,10 +1375,14 @@ final class ForwarderTest extends TestCase
     public function it_forwards_a_dependent_write_of_an_expression_to_its_relationship_key_to_the_records_it_leaves_and_reaches(): void
     {
         $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         $root->update(['job_id' => DB::raw('job_id')]);
-        $root->update(['job_id' => DB::raw('(select id from jobs where legacy_id = 2)')]);
+        $root->update(['job_id' => DB::raw('(select job_id from listings_retained where id = 2)')]);
 
         $this->assertSame([
             ['updating', 1, '1 Oak St', '1 Oak St'], ['updated', 1, '1 Oak St', '1 Oak St'],
@@ -1416,8 +1415,12 @@ final class ForwarderTest extends TestCase
                 $listing->street = '9 Elm St';
             }
         });
-        $elm = Place::query()->where('job_id', Job::query()->where('legacy_id', 3)->value('id'))->firstOrFail();
-        $pine = (string) Job::withTrashed()->where('legacy_id', 2)->value('id');
+        $elm = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(3))->value('id'),
+        )->firstOrFail();
+        $pine = (string) Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id');
 
         try {
             $elm->update(['job_id' => $pine]);
@@ -1431,34 +1434,22 @@ final class ForwarderTest extends TestCase
         Place::query()->findOrFail($elm->id)->update(['job_id' => $pine]);
 
         $this->assertSame('A listener of a '.Listing::class.' event that Place forwarded cannot change $street. Why: The written Place no longer serves this Listing, so the forwarded write cannot store it there. Instead: Write street through Listing, or change Place or the model that stores street directly.', $refused);
-        $this->assertSame([(string) Job::query()->where('legacy_id', 3)->value('id'), '3 Elm St'], $unmoved);
+        $this->assertSame([(string) Job::query()->whereKey(ListingTables::jobOf(3))->value('id'), '3 Elm St'], $unmoved);
         $this->assertSame(['9 Elm St', null], [Listing::withTrashed()->findOrFail(2)->street, Listing::query()->findOrFail(3)->street]);
     }
 
     #[Test]
-    public function it_forwards_a_write_of_a_successor_loaded_without_its_discriminator_to_the_legacy_model_the_stored_discriminator_names(): void
+    public function it_forwards_a_write_of_a_root_loaded_with_some_columns_to_the_legacy_model_whose_retained_table_holds_it(): void
     {
         FileTables::create();
         FileTables::seed();
         FileTables::install();
         $this->listen(Photo::class, ['updated'], fn (Photo $photo) => [$photo->id, $photo->file_name]);
-        $file = File::query()->select(['id', 'filename'])->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
+        $file = File::query()->select(['id', 'filename'])->whereKey(FileTables::fileOf(table: 'photos', id: 1))->firstOrFail();
 
-        $file->fill(['legacy_type' => 'photo', 'filename' => 'oak-porch.jpg'])->save();
+        $file->fill(['filename' => 'oak-porch.jpg'])->save();
 
         $this->assertSame([['updated', 1, 'oak-porch.jpg']], $this->seen);
-    }
-
-    #[Test]
-    public function it_writes_a_read_only_fact_a_legacy_listener_supplies_for_a_successor_create_as_a_legacy_create_does(): void
-    {
-        Event::listen('eloquent.creating: '.Listing::class, function (Listing $listing): void {
-            $listing->company_id = ListingTables::COMPANY;
-        });
-
-        $job = Job::query()->findOrFail(Job::query()->create(['name' => 'Birch House'])->id);
-
-        $this->assertSame([ListingTables::COMPANY, ListingTables::COMPANY], [$job->company_id, Listing::query()->findOrFail($job->legacy_id)->company_id]);
     }
 
     #[Test]
@@ -1482,11 +1473,11 @@ final class ForwarderTest extends TestCase
             $native[$event] = [Listing::withTrashed()->findOrFail(2)->restore()]; // @phpstan-ignore staticMethod.dynamicCall
             $native[$event][] = $this->seen;
             $this->seen = [];
-            $forwarded[$event] = [Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->restore(), $this->seen]; // @phpstan-ignore staticMethod.dynamicCall
+            $forwarded[$event] = [Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail()->restore(), $this->seen]; // @phpstan-ignore staticMethod.dynamicCall
         }
 
         $this->assertSame($native, $forwarded);
-        $this->assertTrue(Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->trashed()); // @phpstan-ignore staticMethod.dynamicCall
+        $this->assertTrue(Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail()->trashed()); // @phpstan-ignore staticMethod.dynamicCall
     }
 
     #[Test]
@@ -1504,35 +1495,25 @@ final class ForwarderTest extends TestCase
             $seen[] = $event instanceof LegacyFileUpdated ? 'interface' : $event::class;
         });
 
-        File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-2.pdf']);
+        File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->update(['filename' => 'contract-2.pdf']);
 
         $this->assertSame([['contract-2.pdf', 'interface'], []], [$seen, ArchiveLegacyFile::$archived]);
     }
 
     #[Test]
-    public function it_gives_the_after_events_of_a_successor_write_that_changes_the_legacy_id_the_external_fact_the_new_key_reads(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        $this->listen(Photo::class, ['updated', 'saved'], fn (Photo $photo) => [$photo->id, $photo->getOriginal('id'), $photo->mime_type, $photo->getOriginal('mime_type')]);
-
-        File::query()->where('legacy_type', 'photo')->where('legacy_id', 2)->firstOrFail()->update(['legacy_id' => 20]);
-
-        $this->assertSame([['updated', 20, 2, 'image/jpeg', 'image/jpeg'], ['saved', 20, 2, 'image/jpeg', 'image/jpeg']], $this->seen);
-        $this->assertSame('image/jpeg', Photo::query()->findOrFail(20)->mime_type);
-    }
-
-    #[Test]
     public function it_evaluates_an_expression_on_a_dependent_relationship_key_once_and_forwards_the_write_to_the_record_it_stores(): void
     {
-        $pine = Job::withTrashed()->where('legacy_id', 2)->value('id'); // @phpstan-ignore staticMethod.dynamicCall
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id'); // @phpstan-ignore staticMethod.dynamicCall
         DB::statement('create temporary sequence forwarding_probe');
         $this->listen(Listing::class, ['updating', 'updated'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         try {
-            $root->update(['job_id' => DB::raw("(select id from jobs order by legacy_id offset nextval('forwarding_probe') limit 1)")]);
+            $root->update(['job_id' => DB::raw("(select job_id from listings_retained order by id offset nextval('forwarding_probe') limit 1)")]);
             $probe = DB::scalar('select last_value from forwarding_probe');
         } finally {
             DB::statement('drop sequence forwarding_probe');
@@ -1548,7 +1529,11 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_reads_the_relationship_key_a_dependent_was_loaded_without_from_the_write_connection(): void
     {
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
         DB::statement('create schema compatibility_replica');
         DB::statement('create table compatibility_replica.places as table public.places');
 
@@ -1556,7 +1541,11 @@ final class ForwarderTest extends TestCase
             DB::statement("create view compatibility_replica.{$table} as select * from public.{$table}");
         }
 
-        DB::table('compatibility_replica.places')->where('id', $root->id)->update(['job_id' => Job::query()->where('legacy_id', 3)->value('id')]);
+        DB::table('compatibility_replica.places')->where(
+            column: 'id',
+            operator: '=',
+            value: $root->id,
+        )->update(['job_id' => Job::query()->whereKey(ListingTables::jobOf(3))->value('id')]);
         config(['database.connections.compatibility_replicated' => [...(array) config('database.connections.'.DB::getDefaultConnection()), 'read' => ['search_path' => 'compatibility_replica'], 'write' => [], 'sticky' => false]]);
         $this->listen(Listing::class, ['saving', 'updated'], fn (Listing $listing) => [$listing->id, $listing->street]);
 
@@ -1607,7 +1596,7 @@ final class ForwarderTest extends TestCase
         $native = $this->seen;
         Listing::query()->findOrFail(2)->delete();
         $this->seen = [];
-        Job::withTrashed()->where('legacy_id', 2)->firstOrFail()->restore(); // @phpstan-ignore staticMethod.dynamicCall
+        Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail()->restore(); // @phpstan-ignore staticMethod.dynamicCall
 
         $this->assertSame([['restored', true, false, true]], $native);
         $this->assertSame($native, $this->seen);
@@ -1618,7 +1607,7 @@ final class ForwarderTest extends TestCase
     {
         DB::statement("alter table places alter column street set default '2 Pine St'");
         $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->street]);
-        $place = new Place(['job_id' => Job::withTrashed()->where('legacy_id', 2)->value('id')]); // @phpstan-ignore staticMethod.dynamicCall
+        $place = new Place(['job_id' => Job::withTrashed()->whereKey(ListingTables::jobOf(2))->value('id')]); // @phpstan-ignore staticMethod.dynamicCall
         $place->timestamps = false;
 
         $place->save();
@@ -1635,10 +1624,14 @@ final class ForwarderTest extends TestCase
                 $listing->street = '9 Pine St';
             }
         });
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         try {
-            $root->update(['job_id' => DB::raw('(select id from jobs where legacy_id = 2)')]);
+            $root->update(['job_id' => DB::raw('(select job_id from listings_retained where id = 2)')]);
             $refused = null;
         } catch (CompatibilityWriteRefused $refusal) {
             $refused = $refusal->getMessage();
@@ -1646,10 +1639,10 @@ final class ForwarderTest extends TestCase
 
         $unmoved = [Place::query()->findOrFail($root->id)->job_id, Place::query()->findOrFail($root->id)->street];
         $assigns = 2;
-        Place::query()->findOrFail($root->id)->update(['job_id' => DB::raw('(select id from jobs where legacy_id = 2)')]);
+        Place::query()->findOrFail($root->id)->update(['job_id' => DB::raw('(select job_id from listings_retained where id = 2)')]);
 
         $this->assertSame('A listener of a '.Listing::class.' event that Place forwarded cannot change $street. Why: The written Place no longer serves this Listing, so the forwarded write cannot store it there. Instead: Write street through Listing, or change Place or the model that stores street directly.', $refused);
-        $this->assertSame([(string) Job::query()->where('legacy_id', 1)->value('id'), '1 Oak St'], $unmoved);
+        $this->assertSame([(string) Job::query()->whereKey(ListingTables::jobOf(1))->value('id'), '1 Oak St'], $unmoved);
         $this->assertSame(['9 Pine St', null], [Listing::withTrashed()->findOrFail(2)->street, Listing::query()->findOrFail(1)->street]); // @phpstan-ignore staticMethod.dynamicCall
     }
 
@@ -1660,34 +1653,26 @@ final class ForwarderTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
+        CompletedPass::recordHandBackfill(model: Listing::class);
         DB::statement('alter table places add column town text');
         DB::statement('update places set town = city');
         DB::statement('alter table places drop column city');
         DB::statement('alter table places add column city text generated always as (town) stored');
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $this->listen(Listing::class, ['saving', 'updating', 'updated', 'saved'], fn (Listing $listing) => [$listing->id, $listing->getOriginal('city'), $listing->city]);
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
         $root->timestamps = false;
 
         $root->update(['town' => 'Tacoma']);
 
         $this->assertSame([['updated', 1, 'Seattle', 'Tacoma'], ['saved', 1, 'Seattle', 'Tacoma']], $this->seen);
-    }
-
-    #[Test]
-    public function it_forwards_the_after_events_of_a_file_create_whose_discriminator_comes_from_a_database_default(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        DB::statement("alter table files alter column legacy_type set default 'legacy_file'");
-        $this->listen(LegacyFile::class, ['saving', 'creating', 'created', 'saved'], fn (LegacyFile $legacyFile) => [$legacyFile->id, $legacyFile->wasRecentlyCreated, $legacyFile->file_name]);
-        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id]);
-
-        $file = File::query()->create(['filename' => 'lease.pdf', 'mime_type' => 'application/pdf']);
-        $id = File::query()->findOrFail($file->id)->legacy_id;
-
-        $this->assertSame([['created', $id, true, 'lease.pdf'], ['saved', $id, true, 'lease.pdf']], $this->seen);
     }
 
     #[Test]
@@ -1697,8 +1682,8 @@ final class ForwarderTest extends TestCase
         Forwarder::register($this->app->make('events'), $outpriced::class);
         $this->listen($outpriced::class, self::EVENTS, fn (Model $listing) => [$listing->getAttribute('id'), $listing->getAttribute('price')]);
 
-        Job::query()->where('legacy_id', 3)->firstOrFail()->update(['price_cents' => 1000]);
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail()->update(['price_cents' => 1000]);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([['saving', 1, '1250.50'], ['updating', 1, '1250.50'], ['updated', 1, '1250.50'], ['saved', 1, '1250.50']], $this->seen);
     }
@@ -1720,54 +1705,22 @@ final class ForwarderTest extends TestCase
         });
 
         DB::transaction(fn () => LegacyFile::query()->findOrFail(1)->update(['file_name' => 'contract-2.pdf']));
-        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->update(['filename' => 'contract-3.pdf']));
+        DB::transaction(fn () => File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->update(['filename' => 'contract-3.pdf']));
         DB::transaction(fn () => Listing::query()->findOrFail(3)->update(['street' => '4 Elm St']));
-        DB::transaction(fn () => Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail()->delete());
+        DB::transaction(fn () => Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail()->delete());
 
         $this->assertSame([['contract-2.pdf', false, true], ['contract-3.pdf', false, true]], $files);
         $this->assertSame([[3, '4 Elm St', false, true], [1, null, false, true]], array_map(fn (Listing $listing) => [$listing->id, $listing->getOriginal('street'), $listing->isDirty('street'), $listing->wasChanged('street')], $listings));
     }
 
     #[Test]
-    public function it_forwards_a_write_that_keeps_the_discriminator_through_an_expression_to_the_legacy_model_the_discriminator_names(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        $birch = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])->refresh();
-        $this->listen(Photo::class, ['saving', 'updating', 'updated', 'saved'], fn (Photo $photo) => [$photo->id, $photo->file_name]);
-        $this->listen(FloorPlan::class, self::EVENTS, fn (FloorPlan $floorPlan) => [$floorPlan->id]);
-        Event::listen('eloquent.saving: '.Photo::class, fn (Photo $photo) => $photo->file_name === 'refused.jpg' ? false : null);
-        $file = File::query()->where('legacy_type', 'photo')->where('legacy_id', 1)->firstOrFail();
-
-        $file->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'renamed.jpg']);
-        $file->update(['filename' => 'renamed-again.jpg']);
-        $refused = File::query()->findOrFail($file->id)->update(['legacy_type' => DB::raw('legacy_type'), 'filename' => 'refused.jpg']);
-        DB::statement('create temporary sequence discriminator_probe');
-
-        try {
-            $birch->update(['legacy_type' => DB::raw("(case when nextval('discriminator_probe') = 1 then legacy_type else 'floorplan' end)"), 'filename' => 'birch-porch.png']);
-            $probe = DB::scalar('select last_value from discriminator_probe');
-        } finally {
-            DB::statement('drop sequence discriminator_probe');
-        }
-
-        $kept = File::query()->findOrFail($birch->id)->legacy_type;
-        $birch->update(['legacy_type' => DB::raw("'floorplan'")]);
-
-        $this->assertSame([
-            ['saving', 1, 'renamed.jpg'], ['updating', 1, 'renamed.jpg'], ['updated', 1, 'renamed.jpg'], ['saved', 1, 'renamed.jpg'],
-            ['saving', 1, 'renamed-again.jpg'], ['updating', 1, 'renamed-again.jpg'], ['updated', 1, 'renamed-again.jpg'], ['saved', 1, 'renamed-again.jpg'],
-            ['saving', 1, 'refused.jpg'],
-            ['saving', $birch->legacy_id, 'birch-porch.png'], ['updating', $birch->legacy_id, 'birch-porch.png'], ['updated', $birch->legacy_id, 'birch-porch.png'], ['saved', $birch->legacy_id, 'birch-porch.png'],
-        ], $this->seen);
-        $this->assertSame([false, 'renamed-again.jpg', 1, 'photo', 'floorplan'], [$refused, File::query()->findOrFail($file->id)->filename, $probe, $kept, File::query()->findOrFail($birch->id)->legacy_type]);
-    }
-
-    #[Test]
     public function it_forwards_a_job_write_to_the_listing_a_later_job_listener_keeps_in_the_legacy_shape(): void
     {
-        $elm = Job::query()->where('legacy_id', 3)->value('id');
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->value('id');
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->getOriginal('title'), $listing->title]);
         $resets = 'saving';
 
@@ -1779,54 +1732,15 @@ final class ForwarderTest extends TestCase
             });
         }
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Lodge']);
         $resets = 'updating';
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Cabin']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['merged_into_job_id' => $elm, 'name' => 'Oak Cabin']);
 
         $this->assertSame([
             ['saving', 1, 'Oak House', 'Oak Lodge'], ['updating', 1, 'Oak House', 'Oak Lodge'], ['updated', 1, 'Oak House', 'Oak Lodge'], ['saved', 1, 'Oak House', 'Oak Lodge'],
             ['updated', 1, 'Oak Lodge', 'Oak Cabin'], ['saved', 1, 'Oak Lodge', 'Oak Cabin'],
         ], $this->seen);
-        $this->assertSame([null, 'Oak Cabin'], [Job::query()->where('legacy_id', 1)->value('merged_into_job_id'), Listing::query()->findOrFail(1)->title]);
-    }
-
-    #[Test]
-    public function it_forwards_a_file_write_to_the_photo_a_later_file_listener_keeps_in_its_legacy_type(): void
-    {
-        FileTables::create();
-        FileTables::seed();
-        FileTables::install();
-        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => [$photo->id, $photo->getOriginal('file_name'), $photo->file_name]);
-        $this->listen(FloorPlan::class, self::EVENTS, fn (FloorPlan $floorPlan) => [$floorPlan->id]);
-        $restores = 'saving';
-
-        foreach (['saving', 'updating'] as $event) {
-            Event::listen("eloquent.{$event}: ".File::class, function (File $file) use ($event, &$restores): void {
-                if ($event === $restores) {
-                    $file->legacy_type = 'photo';
-                }
-            });
-        }
-
-        $file = File::query()->create(['legacy_type' => 'photo', 'filename' => 'birch.png', 'mime_type' => 'image/png'])->refresh();
-        $this->seen = [];
-
-        $file->update(['legacy_type' => 'floorplan', 'filename' => 'restored.jpg']);
-        $restores = 'updating';
-        $file->update(['legacy_type' => 'floorplan', 'filename' => 'restored-late.jpg']);
-        $restores = null;
-        $file->update(['legacy_type' => 'floorplan', 'filename' => 'moved.jpg']);
-        $restores = 'saving';
-        $aspen = File::query()->create(['legacy_type' => 'floorplan', 'filename' => 'aspen.png', 'mime_type' => 'image/png'])->refresh();
-
-        $this->assertSame([
-            ['saving', $file->legacy_id, 'birch.png', 'restored.jpg'], ['updating', $file->legacy_id, 'birch.png', 'restored.jpg'], ['updated', $file->legacy_id, 'birch.png', 'restored.jpg'], ['saved', $file->legacy_id, 'birch.png', 'restored.jpg'],
-            ['updated', $file->legacy_id, 'restored.jpg', 'restored-late.jpg'], ['saved', $file->legacy_id, 'restored.jpg', 'restored-late.jpg'],
-            ['saving', null],
-            ['saving', null, null, 'aspen.png'], ['creating', null, null, 'aspen.png'], ['created', $aspen->legacy_id, null, 'aspen.png'], ['saved', $aspen->legacy_id, null, 'aspen.png'],
-        ], $this->seen);
-        $this->assertSame('photo', $aspen->legacy_type);
-        $this->assertSame(['floorplan', 'moved.jpg'], [File::query()->findOrFail($file->id)->legacy_type, File::query()->findOrFail($file->id)->filename]);
+        $this->assertSame([null, 'Oak Cabin'], [Job::query()->whereKey(ListingTables::jobOf(1))->value('merged_into_job_id'), Listing::query()->findOrFail(1)->title]);
     }
 
     #[Test]
@@ -1845,7 +1759,11 @@ final class ForwarderTest extends TestCase
             });
         }
 
-        $root = Place::query()->where('job_id', Job::query()->where('legacy_id', 1)->value('id'))->firstOrFail();
+        $root = Place::query()->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->whereKey(ListingTables::jobOf(1))->value('id'),
+        )->firstOrFail();
 
         $root->update(['city' => 'Withheld', 'street' => '7 Oak St']);
         $restores = 'updating';
@@ -1865,7 +1783,7 @@ final class ForwarderTest extends TestCase
     public function it_lets_a_listing_listener_refuse_an_expression_write_only_of_a_dependent_row_that_serves_the_listing(): void
     {
         $this->listen(Listing::class, self::EVENTS, fn (Listing $listing) => [$listing->id, $listing->street]);
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $root = Place::query()->where('job_id', $oak->id)->firstOrFail();
         $unit = Place::query()->create(['job_id' => $oak->id, 'parent_id' => $root->id, 'street' => 'Unit 2']);
         Event::listen('eloquent.saving: '.Listing::class, fn (Listing $listing) => false);
@@ -1908,11 +1826,12 @@ final class ForwarderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(self::$successor, fn (Successor $successor) => $successor
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: self::$successor, key: 'job_id', successor: fn (Successor $successor) => $successor
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        ));
             }
         };
         $listing::$successor = $job::class;
@@ -1923,11 +1842,11 @@ final class ForwarderTest extends TestCase
             $seen[] = [$successor ? 'job' : 'listing', $event->model->getAttribute($successor ? 'name' : 'title')];
 
             if (! $successor && $event->model->getAttribute('id') === 1) {
-                $job::query()->where('legacy_id', 3)->firstOrFail()->update(['name' => 'Elm Lodge']);
+                $job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail()->update(['name' => 'Elm Lodge']);
             }
         });
 
-        $job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        $job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([['listing', 'Oak Lodge'], ['listing', 'Elm Lodge'], ['job', 'Elm Lodge'], ['job', 'Oak Lodge']], $seen);
         $this->assertSame(4, RecordUpdated::$constructed);
@@ -1954,9 +1873,19 @@ final class ForwarderTest extends TestCase
         });
 
         DB::transaction(fn () => Listing::query()->findOrFail(1)->increment('price', 5));
-        DB::transaction(fn () => Job::query()->where('legacy_id', 1)->firstOrFail()->increment('price_cents', 500));
-        DB::transaction(fn () => Job::query()->where('legacy_id', 1)->firstOrFail()->decrement('price_cents', 1000));
-        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->increment('size_bytes', 1, ['filename' => 'contract-4.pdf']));
+        DB::transaction(fn () => Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->increment(
+            column: 'price_cents',
+            amount: 500,
+        ));
+        DB::transaction(fn () => Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->decrement(
+            column: 'price_cents',
+            amount: 1000,
+        ));
+        DB::transaction(fn () => File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->increment(
+            column: 'size_bytes',
+            amount: 1,
+            extra: ['filename' => 'contract-4.pdf'],
+        ));
 
         $this->assertSame([
             ['1250.50', '1255.50', true, true], ['1255.50', '1260.50', true, true], ['1260.50', '1250.50', true, true],
@@ -1980,8 +1909,14 @@ final class ForwarderTest extends TestCase
             $files[] = [$event->legacyFile->getOriginal('file_name'), $event->legacyFile->isDirty('file_name'), $event->legacyFile->wasChanged('file_name')];
         });
 
-        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->incrementEach(['size_bytes' => 1], ['filename' => 'contract-4.pdf']));
-        DB::transaction(fn () => File::query()->where('legacy_type', 'legacy_file')->where('legacy_id', 1)->firstOrFail()->decrementEach(['size_bytes' => 1], ['filename' => 'contract-5.pdf']));
+        DB::transaction(fn () => File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->incrementEach(
+            columns: ['size_bytes' => 1],
+            extra: ['filename' => 'contract-4.pdf'],
+        ));
+        DB::transaction(fn () => File::query()->whereKey(FileTables::fileOf(table: 'legacy_files', id: 1))->firstOrFail()->decrementEach(
+            columns: ['size_bytes' => 1],
+            extra: ['filename' => 'contract-5.pdf'],
+        ));
 
         $this->assertSame([['contract-4.pdf', false, true], ['contract-5.pdf', false, true]], $files);
     }
@@ -2000,23 +1935,27 @@ final class ForwarderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'mls_number',
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."mls_number"')->readOnly(because: 'The legacy table keeps the MLS number.'),
+                        ));
             }
         };
         Forwarder::register($this->app->make('events'), $retained::class);
         $this->listen($retained::class, self::EVENTS, fn (Model $listing) => [$listing->getAttribute('id'), $listing->getAttribute('title'), $listing->getAttribute('mls_number')]);
 
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([
             ['saving', 1, 'Oak Lodge', 'MLS-1'], ['updating', 1, 'Oak Lodge', 'MLS-1'], ['updated', 1, 'Oak Lodge', 'MLS-1'], ['saved', 1, 'Oak Lodge', 'MLS-1'],
         ], $this->seen);
-        $this->assertSame('Oak Lodge', Job::query()->where('legacy_id', 1)->value('name'));
+        $this->assertSame('Oak Lodge', Job::query()->whereKey(ListingTables::jobOf(1))->value('name'));
     }
 
     /**
@@ -2041,7 +1980,7 @@ final class ForwarderTest extends TestCase
         $app['config']->set("database.connections.{$connection}.database", $database);
         WritesWhileBooting::$writes = function (): void {
             $this->listen(Listing::class, ['updated'], fn (Listing $listing) => [$listing->id, $listing->title]);
-            Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+            Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
         };
     }
 
@@ -2103,24 +2042,47 @@ final class ForwarderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->timestamps()
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
-                        ->attribute('status', fn (Attribute $attribute) => $attribute
-                            ->from('lifecycle_status')
-                            ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
-                            ->transitions())
-                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
-                            ->atMostOne(because: 'A listing has one address.')
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')))
-                        ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
-                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))))
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                        )
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100),
+                        )
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute
+                                ->from('lifecycle_status')
+                                ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
+                                ->transitions(),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            definition: fn (Successor $place) => $place
+                                ->atMostOne(because: 'A listing has one address.')
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->site(),
+                            definition: fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                        ))
                     ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
                     ->hide(fn (Builder $jobs) => $jobs->whereHas('rootPlace', fn (Builder $places) => $places->where('city', 'Withheld')), because: 'A withheld address keeps its listing off the site.');
             }
@@ -2146,24 +2108,47 @@ final class ForwarderTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->timestamps()
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
-                        ->attribute('status', fn (Attribute $attribute) => $attribute
-                            ->from('lifecycle_status')
-                            ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
-                            ->transitions())
-                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
-                            ->atMostOne(because: 'A listing has one address.')
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')))
-                        ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
-                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))))
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                        )
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100),
+                        )
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute
+                                ->from('lifecycle_status')
+                                ->mapping([LifecycleStatus::Drafting->value => ListingStatus::Draft, LifecycleStatus::Live->value => ListingStatus::Active, LifecycleStatus::Closed->value => ListingStatus::Sold])
+                                ->transitions(),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            definition: fn (Successor $place) => $place
+                                ->atMostOne(because: 'A listing has one address.')
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->site(),
+                            definition: fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                        ))
                     ->hide(fn (Builder $jobs) => $jobs->whereNotNull('merged_into_job_id'), because: 'A merged job lives on as the job it merged into.')
                     ->hide(fn (Builder $jobs) => $jobs->whereRaw('exists (select 1 from jobs as siblings where siblings.company_id = jobs.company_id and siblings.price_cents > jobs.price_cents * 100)'), because: 'A job priced under a hundredth of a sibling job is a placeholder.');
             }
@@ -2185,7 +2170,7 @@ final class ForwarderTest extends TestCase
     {
         $snapshot = [];
 
-        foreach (['jobs' => 'legacy_id', 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'mls_number'] as $table => $order) {
+        foreach (['jobs' => ListingTables::legacyId(), 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'mls_number'] as $table => $order) {
             $snapshot[$table] = array_map(fn (object $row) => (array) $row, DB::table($table)->orderBy($order)->get()->all());
         }
 

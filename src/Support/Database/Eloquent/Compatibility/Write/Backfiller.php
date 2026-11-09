@@ -30,7 +30,7 @@ final readonly class Backfiller
 {
     public const int CHUNK = 1000;
 
-    private const string MARKER = 'compatibility backfill';
+    public const string BACKFILLS = 'compatibility_backfills';
 
     private const int BINDINGS = 65535;
 
@@ -49,60 +49,65 @@ final readonly class Backfiller
     public function __construct(private ResolvedMap $map, private ConnectionInterface $connection)
     {
         $legacy = new $map->model;
-        $this->catalog = new ColumnCatalog($connection);
+        $this->catalog = new ColumnCatalog(
+            connection: $connection,
+            throughWriteConnection: true,
+        );
         $this->key = $legacy->getKeyName();
         $this->connectionName = $legacy->getConnectionName();
     }
 
     /**
      * @param  null|Closure(list<int|string>, int): void  $chunked
-     * @return array{read: int, changed: int, watermark: array{key: null|int|string, updatedAt: string}}
+     * @return array{read: int, changed: int, watermark: string}
      */
     public function run(int $chunk = self::CHUNK, null|string $since = null, null|Closure $chunked = null): array
     {
         $this->refuseUnwalkable($chunk);
         $previous = $this->remembered();
 
-        if ($since !== null && $previous !== null && new DateTimeImmutable($since) > new DateTimeImmutable($previous['updatedAt'])) {
-            throw new LogicException("--since takes a watermark no later than {$previous['updatedAt']}, which the last backfill of {$this->map->table} remembers, not ".(new DateTimeImmutable($since))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z').'; a later one skips the legacy rows updated in between.');
+        if ($since !== null && $previous !== null && new DateTimeImmutable($since) > new DateTimeImmutable($previous)) {
+            throw new LogicException("--since takes a watermark no later than {$previous}, which the last backfill of {$this->map->table} remembers, not ".(new DateTimeImmutable($since))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z').'; a later one skips the legacy rows updated in between.');
         }
 
         $updatedAt = $this->now('backfill');
-        $this->track();
-        [$read, $changed, $last] = $this->walk($chunk, $since === null ? null : $this->updatedSince(self::watermark($since)), $chunked);
-        $watermark = ['key' => $since === null ? $last : $previous['key'] ?? null, 'updatedAt' => $updatedAt];
-        $this->remember($watermark);
+        [$read, $changed] = $this->walk(
+            chunk: $chunk,
+            scope: $since === null ? null : $this->updatedSince(self::watermark($since)),
+            chunked: $chunked,
+        );
+        $changed += $this->deleteGone();
+        $this->remember(
+            watermark: $updatedAt,
+            rows: $read,
+        );
 
-        return ['read' => $read, 'changed' => $changed, 'watermark' => $watermark];
+        return ['read' => $read, 'changed' => $changed, 'watermark' => $updatedAt];
     }
 
     /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     * @return array{int, int, array{key: null|int|string, updatedAt: string}}
+     * @return array{int, int, string}
      */
-    public function catchUp(array $watermark): array
+    public function catchUp(string $watermark): array
     {
         $this->refuseUnwalkable(self::CHUNK);
         $updatedAt = $this->now('install');
-        $this->track();
-        $updated = $this->updatedAt() === null ? null : $this->updatedSince($watermark['updatedAt']);
-        $scope = $watermark['key'] === null || $updated === null ? null : fn (QueryBuilder $query) => $query->where($this->key, '>', $watermark['key'])->orWhere($updated);
-        [$read, $changed, $last] = $this->walk(self::CHUNK, $scope, null);
+        $updated = $this->updatedAt();
+        $since = $updated === null ? null : $this->updatedSince($watermark);
+        $scope = $since === null ? null : fn (QueryBuilder $query) => $query->where($since)->orWhereNull($updated)->orWhereNull($this->map->successorKey);
+        [$read, $changed] = $this->walk(
+            chunk: self::CHUNK,
+            scope: $scope,
+            chunked: null,
+        );
 
-        return [$changed + $this->deleteGone(), $read, ['key' => self::greater($watermark['key'], $last), 'updatedAt' => $updatedAt]];
+        return [$changed + $this->deleteGone(), $read, $updatedAt];
     }
 
-    /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     */
-    public function refuseUnconvergeable(array $watermark): void
+    public function refuseUnconvergeable(): void
     {
         if ($this->updatedAt() === null) {
             throw InvalidCompatibilityMap::cannot($this->map->table, 'install', "{$this->map->table} has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock");
-        }
-
-        if ($watermark['key'] === null && $this->connection->table($this->map->table)->useWritePdo()->exists()) {
-            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', 'the watermark of the last backfill records no legacy key it walked, so install() would walk every legacy row while it holds the lock. Run php artisan compatibility:backfill '.$this->map->model.' without --since, then install()');
         }
     }
 
@@ -127,13 +132,14 @@ final readonly class Backfiller
             }
 
             foreach ($chosen as $model => $keys) {
-                $branch = $this->map->branches[$model] ?? $this->map->morphs[$model];
+                $branch = $this->map->morphs[$model];
                 $primary = SqlFragments::identifier($branch->primary->table);
+                $legacy = SqlFragments::identifier($this->map->table);
                 $target = $branch->target === null ? '' : ' AND EXISTS (SELECT FROM '.SqlFragments::identifier($branch->target->table).' WHERE '.implode(' AND ', ViewCompiler::conditions($branch->target, true)).')';
                 $misplaced = [...$misplaced, ...array_column($this->connection->select(
                     "SELECT CAST(chosen.key AS {$type}) AS key FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS chosen (key)"
-                        ." WHERE NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = CAST(chosen.key AS {$type})"
-                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table)).$target.')',
+                        ." JOIN {$legacy} ON {$legacy}.".SqlFragments::identifier($this->key)." = CAST(chosen.key AS {$type})"
+                        ." WHERE NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($branch->primary->key)." = {$legacy}.".SqlFragments::identifier($this->map->successorKey).$target.')',
                     [json_encode($keys, JSON_THROW_ON_ERROR)],
                     false,
                 ), 'key')];
@@ -145,85 +151,95 @@ final readonly class Backfiller
         if ($misplaced !== []) {
             sort($misplaced);
 
-            throw InvalidCompatibilityMap::cannot($this->map->table, 'install', count($misplaced)." {$this->map->table} rows ".($this->map->morphs === [] ? 'sit in a successor their servedFrom() selector does not choose' : 'point at no target their relatedMorph() choose: closure picks')."; the first are {$this->key} ".implode(', ', array_slice($misplaced, 0, 5)).'. Run php artisan compatibility:backfill '.$this->map->model.', then install()');
+            throw InvalidCompatibilityMap::cannot(
+                map: $this->map->table,
+                operation: 'install',
+                because: count($misplaced)." {$this->map->table} rows point at no target their relatedMorph() choose: closure picks; the first are {$this->key} ".implode(
+                    separator: ', ',
+                    array: array_slice(
+                        array: $misplaced,
+                        offset: 0,
+                        length: 5,
+                    ),
+                ).'. Run php artisan compatibility:backfill '.$this->map->model.', then install()',
+            );
         }
     }
 
-    public static function rememberNow(string $table, null|string $comment, null|int|string $key): string
+    public static function ledger(string $table): string
     {
-        return "DO \$compatibility\$\nDECLARE\n  watermark text;\n  hidden bigint;\nBEGIN\n"
-            ."  SELECT to_char(least(now(), min(xact_start) FILTER (WHERE backend_type = 'client backend')) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), count(*) FILTER (WHERE state IS NULL AND backend_type IS NULL)\n"
-            ."    INTO watermark, hidden FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid();\n"
-            ."  IF hidden > 0 THEN\n"
-            ."    RAISE EXCEPTION 'pg_stat_activity hides from % whether % other sessions of this database hold a transaction open, so no watermark can start before a write they have not committed yet. Grant pg_read_all_stats to %, then uninstall again.', current_user, hidden, current_user;\n"
-            ."  END IF;\n"
-            ."  EXECUTE format('COMMENT ON TABLE %s IS %L', ".SqlFragments::literal($table).', CAST(json_build_object('
-            .SqlFragments::literal('backfilled').', '.SqlFragments::literal(self::MARKER).', '
-            .SqlFragments::literal('comment').', CAST('.($comment === null ? 'NULL' : SqlFragments::literal($comment)).' AS text), '
-            .SqlFragments::literal('key').', CAST('.SqlFragments::literal(json_encode($key, JSON_THROW_ON_ERROR)).' AS json), '
-            .SqlFragments::literal('updatedAt').", watermark) AS text));\n"
-            ."END\n\$compatibility\$";
-    }
-
-    /**
-     * @return null|array{key: null|int|string, updatedAt: string}
-     */
-    public function remembered(): null|array
-    {
-        $remembered = self::decoded(self::commentOn($this->connection, $this->map->table));
-
-        if ($remembered === null || ! is_string($remembered['updatedAt'] ?? null)) {
-            return null;
-        }
-
-        $key = $remembered['key'] ?? null;
-
-        return ['key' => is_int($key) || is_string($key) ? $key : null, 'updatedAt' => $remembered['updatedAt']];
-    }
-
-    /**
-     * @param  array{key: null|int|string, updatedAt: string}  $watermark
-     */
-    public function remember(array $watermark): void
-    {
-        $this->connection->statement('COMMENT ON TABLE '.SqlFragments::identifier($this->map->table).' IS '.SqlFragments::literal(json_encode([
-            'backfilled' => self::MARKER,
-            'comment' => self::comment($this->connection, $this->map->table),
-            'key' => $watermark['key'],
-            'updatedAt' => $watermark['updatedAt'],
-        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)));
+        return SqlFragments::objectName(
+            map: $table,
+            name: $table.'_backfill',
+        );
     }
 
     /**
      * @return list<string>
      */
-    public static function refill(string $table, string $key, string $type): array
+    public static function storage(ResolvedMap $map, ConnectionInterface $connection): array
     {
-        $column = SqlFragments::identifier($key);
+        $catalog = new ColumnCatalog(
+            connection: $connection,
+            throughWriteConnection: true,
+        );
+        $key = (new $map->model)->getKeyName();
+        $keyType = $catalog->type(
+            table: $map->table,
+            column: $key,
+        ) ?? throw InvalidCompatibilityMap::because(
+            map: $map->table,
+            problem: "{$map->table} has no column {$key}, the key of ".class_basename($map->model),
+        );
+        $rootType = $catalog->type(
+            table: $map->primary->table,
+            column: $map->primary->key,
+        ) ?? throw InvalidCompatibilityMap::because(
+            map: $map->table,
+            problem: "the successor table {$map->primary->table} has no column {$map->primary->key}",
+        );
+        $ledger = self::ledger($map->table);
 
         return [
-            self::create($table, $key, $type),
-            'INSERT INTO '.SqlFragments::identifier(self::backfilledTable($table))." ({$column}) SELECT {$column} FROM ".SqlFragments::identifier($table).' ON CONFLICT DO NOTHING',
+            'CREATE TABLE IF NOT EXISTS '.SqlFragments::identifier(self::BACKFILLS)." (\n  legacy_type text PRIMARY KEY,\n  watermark_at timestamptz,\n  pass integer NOT NULL DEFAULT 0,\n  pass_started_at timestamptz,\n  pass_finished_at timestamptz,\n  pass_rows bigint\n)",
+            'INSERT INTO '.SqlFragments::identifier(self::BACKFILLS).' (legacy_type) VALUES ('.SqlFragments::literal($map->table).') ON CONFLICT (legacy_type) DO NOTHING',
+            'CREATE TABLE IF NOT EXISTS '.SqlFragments::identifier($ledger)." (\n  legacy_id {$keyType} PRIMARY KEY,\n  successor_id {$rootType},\n  status text NOT NULL,\n  reason text,\n  attempts integer NOT NULL DEFAULT 0,\n  attempted_at timestamptz NOT NULL\n)",
+            'CREATE INDEX IF NOT EXISTS '.SqlFragments::identifier(SqlFragments::objectName(
+                map: $map->table,
+                name: $ledger.'_status_index',
+            )).' ON '.SqlFragments::identifier($ledger)." (status) WHERE status IN ('refused', 'failed')",
         ];
     }
 
-    public function forget(): void
+    public static function forgetStatement(ResolvedMap $map): string
     {
-        if ($this->tracked()) {
-            $this->connection->statement('DROP TABLE '.SqlFragments::identifier(self::backfilledTable($this->map->table)));
-        }
+        return "DO \$compatibility\$\nBEGIN\n"
+            ."  IF to_regclass(quote_ident(current_schema()) || '.' || ".SqlFragments::literal(self::BACKFILLS).") IS NOT NULL THEN\n"
+            .'    DELETE FROM '.SqlFragments::identifier(self::BACKFILLS).' WHERE legacy_type = '.SqlFragments::literal($map->table).";\n"
+            ."  END IF;\nEND\n\$compatibility\$";
     }
 
-    public static function comment(ConnectionInterface $connection, string $table): null|string
+    public function remembered(): null|string
     {
-        $comment = self::commentOn($connection, $table);
-        $remembered = self::decoded($comment);
-
-        if ($remembered !== null) {
-            return is_string($remembered['comment'] ?? null) ? $remembered['comment'] : null;
+        if (! $this->exists(self::BACKFILLS)) {
+            return null;
         }
 
-        return $comment;
+        $watermark = $this->connection->scalar(
+            query: "select to_char(watermark_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') from ".SqlFragments::identifier(self::BACKFILLS).' where legacy_type = ?',
+            bindings: [$this->map->table],
+            useReadPdo: false,
+        );
+
+        return is_string($watermark) ? $watermark : null;
+    }
+
+    public function remember(string $watermark, int $rows): void
+    {
+        $this->connection->update(
+            query: 'update '.SqlFragments::identifier(self::BACKFILLS).' set watermark_at = cast(? as timestamptz), pass = pass + 1, pass_started_at = cast(? as timestamptz), pass_finished_at = now(), pass_rows = ? where legacy_type = ?',
+            bindings: [$watermark, $watermark, $rows, $this->map->table],
+        );
     }
 
     public static function watermark(string $since): string
@@ -238,7 +254,7 @@ final readonly class Backfiller
     /**
      * @param  null|Closure(QueryBuilder): mixed  $scope
      * @param  null|Closure(list<int|string>, int): void  $chunked
-     * @return array{int, int, null|int|string}
+     * @return array{int, int}
      */
     private function walk(int $chunk, null|Closure $scope, null|Closure $chunked): array
     {
@@ -265,7 +281,6 @@ final readonly class Backfiller
                 if ($rows !== []) {
                     $written = $this->write($rows);
                     $changed += $written;
-                    $this->record($keys);
 
                     if ($chunked !== null) {
                         $chunked($keys, $written);
@@ -281,7 +296,7 @@ final readonly class Backfiller
             $last = $rows === [] ? $last : self::keyOf(end($rows)[$this->key] ?? null);
         } while (count($rows) === $chunk);
 
-        return [$read, $changed, $last];
+        return [$read, $changed];
     }
 
     /**
@@ -289,43 +304,202 @@ final readonly class Backfiller
      */
     private function write(array $rows): int
     {
-        if ($this->map->morphs !== []) {
-            return $this->writeMorphs($rows);
-        }
-
-        if ($this->map->branches === []) {
-            return $this->writeBranch($this->map, $rows);
-        }
-
-        $routed = [];
-
-        foreach ($rows as $row) {
-            $routed[$this->map->branchFor($this->probe($row))->primary->model][] = $row;
-        }
-
-        $changed = 0;
-
-        foreach ($this->map->branches as $model => $branch) {
-            $elsewhere = array_merge(...array_values(array_diff_key($routed, [$model => true])));
-
-            if ($elsewhere !== []) {
-                $changed += $this->moveOut($branch, $elsewhere);
-            }
-        }
-
-        foreach ($this->map->branches as $model => $branch) {
-            if (array_key_exists($model, $routed)) {
-                $changed += $this->writeBranch($branch, $routed[$model]);
-            }
-        }
+        $roots = $this->roots($rows);
+        $changed = $this->map->morphs === [] ? $this->writeBranch(
+            branch: $this->map,
+            rows: $rows,
+            roots: $roots,
+        ) : $this->writeMorphs(
+            rows: $rows,
+            roots: $roots,
+        );
+        $this->record($roots);
 
         return $changed;
     }
 
     /**
      * @param  non-empty-list<array<string, mixed>>  $rows
+     * @return array<int|string, array{int|string, bool}>
      */
-    private function writeMorphs(array $rows): int
+    private function roots(array $rows): array
+    {
+        $primary = $this->map->primary;
+        $named = [];
+        $unkeyed = [];
+
+        foreach ($rows as $row) {
+            $key = self::keyOf($row[$this->key] ?? null);
+            $root = $row[$this->map->successorKey] ?? null;
+
+            if (is_int($root) || is_string($root)) {
+                $named[$key] = $root;
+            } else {
+                $unkeyed[] = $key;
+            }
+        }
+
+        $allocated = $unkeyed === [] ? [] : array_combine(
+            keys: $unkeyed,
+            values: $this->allocate(count($unkeyed)),
+        );
+
+        foreach (array_chunk(
+            array: $allocated === [] ? [] : $this->fillKeys($allocated),
+            length: self::BINDINGS - 2,
+        ) as $batch) {
+            foreach ($this->connection->table($this->map->table)->useWritePdo()->whereIn(
+                column: $this->key,
+                values: $batch,
+            )->whereNotNull($this->map->successorKey)->pluck(
+                column: $this->map->successorKey,
+                key: $this->key,
+            ) as $key => $root) {
+                if (is_int($root) || is_string($root)) {
+                    $named[$key] = $root;
+                    unset($allocated[$key]);
+                }
+            }
+        }
+
+        $existing = [];
+
+        foreach (array_chunk(
+            array: array_values($named),
+            length: self::BINDINGS - 2,
+        ) as $batch) {
+            foreach ($this->connection->table($primary->table)->useWritePdo()->whereIn(
+                column: $primary->key,
+                values: $batch,
+            )->pluck($primary->key) as $found) {
+                $existing[(string) $found] = true;
+            }
+        }
+
+        $roots = [];
+
+        foreach ($rows as $row) {
+            $key = self::keyOf($row[$this->key] ?? null);
+            $root = $named[$key] ?? $allocated[$key];
+            $roots[$key] = [$root, array_key_exists(
+                key: $key,
+                array: $named,
+            ) && array_key_exists(
+                key: (string) $root,
+                array: $existing,
+            )];
+        }
+
+        return $roots;
+    }
+
+    /**
+     * @return non-empty-list<int|string>
+     */
+    private function allocate(int $count): array
+    {
+        $root = new $this->map->primary->model;
+
+        if ($root->usesUniqueIds() && in_array(
+            needle: $root->getKeyName(),
+            haystack: $root->uniqueIds(),
+            strict: true,
+        )) {
+            return array_map(
+                callback: fn () => $root->newUniqueId(),
+                array: range(
+                    start: 1,
+                    end: $count,
+                ),
+            );
+        }
+
+        $default = $this->catalog->of($this->map->primary->table)[$this->map->primary->key]->default ?? null;
+
+        if ($default === null) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $this->map->table,
+                operation: 'backfill',
+                because: "{$this->map->table} rows hold no {$this->map->successorKey}, and {$this->map->primary->table}.{$this->map->primary->key} has no default and ".class_basename($this->map->primary->model).' generates no unique id, so the backfill has no key to create their roots with',
+            );
+        }
+
+        $keys = array_values(array_map(
+            callback: self::keyOf(...),
+            array: array_column(
+                array: $this->connection->select(
+                    query: "select {$default} as key from generate_series(1, ?)",
+                    bindings: [$count],
+                    useReadPdo: false,
+                ),
+                column_key: 'key',
+            ),
+        ));
+
+        return $keys === [] ? throw new LogicException("{$this->map->primary->table} allocated no key.") : $keys;
+    }
+
+    /**
+     * @param  array<int|string, int|string>  $allocated
+     * @return list<int|string>
+     */
+    private function fillKeys(array $allocated): array
+    {
+        $types = [(string) $this->catalog->type(
+            table: $this->map->table,
+            column: $this->key,
+        ), (string) $this->catalog->type(
+            table: $this->map->primary->table,
+            column: $this->map->primary->key,
+        )];
+        $legacy = SqlFragments::identifier($this->map->table);
+        $successorKey = SqlFragments::identifier($this->map->successorKey);
+        $pairs = array_map(fn (int|string $legacyKey, int|string $root) => [$legacyKey, $root], array_keys($allocated), $allocated);
+        $unfilled = array_fill_keys(
+            keys: array_map(
+                callback: strval(...),
+                array: array_keys($allocated),
+            ),
+            value: true,
+        );
+
+        foreach ($this->batches(
+            rows: $pairs,
+            width: 2,
+        ) as $batch) {
+            foreach ($this->connection->select(
+                query: "UPDATE {$legacy} SET {$successorKey} = source.compatibility_root"
+                    ."\nFROM (VALUES ".implode(
+                        separator: ', ',
+                        array: array_fill(
+                            start_index: 0,
+                            count: count($batch),
+                            value: "(CAST(? AS {$types[0]}), CAST(? AS {$types[1]}))",
+                        ),
+                    ).') AS source (compatibility_legacy, compatibility_root)'
+                    ."\nWHERE {$legacy}.".SqlFragments::identifier($this->key)." = source.compatibility_legacy AND {$legacy}.{$successorKey} IS NULL"
+                    ."\nRETURNING {$legacy}.".SqlFragments::identifier($this->key).' AS '.SqlFragments::identifier(self::KEY),
+                bindings: array_merge(...$batch),
+                useReadPdo: false,
+            ) as $filled) {
+                unset($unfilled[(string) self::keyOf(((array) $filled)[self::KEY] ?? null)]);
+            }
+        }
+
+        return array_values(array_filter(
+            array: array_keys($allocated),
+            callback: fn (int|string $legacyKey) => array_key_exists(
+                key: (string) $legacyKey,
+                array: $unfilled,
+            ),
+        ));
+    }
+
+    /**
+     * @param  non-empty-list<array<string, mixed>>  $rows
+     * @param  array<int|string, array{int|string, bool}>  $roots
+     */
+    private function writeMorphs(array $rows, array $roots): int
     {
         $routed = [];
 
@@ -337,7 +511,11 @@ final readonly class Backfiller
 
         foreach ($this->map->morphs as $target => $variant) {
             if (array_key_exists($target, $routed)) {
-                $changed += $this->writeMorph($variant, $routed[$target]);
+                $changed += $this->writeMorph(
+                    variant: $variant,
+                    rows: $routed[$target],
+                    roots: $roots,
+                );
             }
         }
 
@@ -346,8 +524,9 @@ final readonly class Backfiller
 
     /**
      * @param  non-empty-list<array<string, mixed>>  $rows
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function writeMorph(ResolvedMap $variant, array $rows): int
+    private function writeMorph(ResolvedMap $variant, array $rows, array $roots): int
     {
         $morph = $variant->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' backfills a relatedMorph() target of no relatedMorph().");
         $related = $variant->target ?? throw new LogicException("Compatibility map '{$this->map->table}' backfills no relatedMorph() target.");
@@ -360,8 +539,14 @@ final readonly class Backfiller
             [$stored[$key], $external[$key]] = $this->split($variant, $row, $key);
         }
 
-        $changed = $this->rekey($variant, $stored);
-        $existing = $this->held($variant, array_keys($stored))->keyBy((string) $variant->identifiers[$this->key]->column());
+        $changed = 0;
+        $existing = $this->held(
+            branch: $variant,
+            keys: $this->rootsOf(
+                roots: $roots,
+                keys: array_keys($stored),
+            ),
+        )->keyBy(fn (Model $root) => self::keyOf($root->getKey()));
         $targets = $this->targets($related, $morph->typeColumn, $morph->idColumn, $existing);
         $read = [];
 
@@ -380,7 +565,10 @@ final readonly class Backfiller
 
         foreach ($rows as $row) {
             $key = self::keyOf($row[$this->key] ?? null);
-            $primary = $existing[$key] ?? (new $variant->primary->model)->setConnection($this->connectionName);
+            $primary = $existing[$roots[$key][0]] ?? (new $variant->primary->model)->setConnection($this->connectionName)->setAttribute(
+                key: $variant->primary->key,
+                value: $roots[$key][0],
+            );
             $type = $primary->getAttributes()[$morph->typeColumn] ?? null;
             $held = $primary->getAttributes()[$morph->idColumn] ?? null;
             $target = $type === $related->morphAlias ? $targets[is_scalar($held) ? (string) $held : ''] ?? null : null;
@@ -398,18 +586,29 @@ final readonly class Backfiller
 
         foreach ($variant->related as $dependent) {
             if ($dependent !== $related) {
-                $changed += $this->writeRelated($variant, $dependent, $stored);
+                $changed += $this->writeRelated(
+                    branch: $variant,
+                    related: $dependent,
+                    stored: $stored,
+                    roots: $roots,
+                );
             }
         }
 
-        return $changed + $this->writeRelatedExternals($variant, $stored, $external);
+        return $changed + $this->writeRelatedExternals(
+            branch: $variant,
+            stored: $stored,
+            external: $external,
+            roots: $roots,
+        );
     }
 
     /**
      * @param  array<int|string, array<string, array<string, mixed>>>  $stored
      * @param  array<int|string, array<string, mixed>>  $external
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function writeRelatedExternals(ResolvedMap $branch, array $stored, array $external): int
+    private function writeRelatedExternals(ResolvedMap $branch, array $stored, array $external, array $roots): int
     {
         $owned = [];
 
@@ -447,8 +646,20 @@ final readonly class Backfiller
 
         $models = [];
 
-        foreach ($this->held($branch, array_keys($stored)) as $primary) {
-            $models[self::keyOf($primary->getAttribute((string) $branch->identifiers[$this->key]->column()))] = [$branch->primary->table => $primary];
+        $legacyOf = [];
+
+        foreach (array_keys($stored) as $key) {
+            $legacyOf[(string) $roots[$key][0]] = $key;
+        }
+
+        foreach ($this->held(
+            branch: $branch,
+            keys: $this->rootsOf(
+                roots: $roots,
+                keys: array_keys($stored),
+            ),
+        ) as $primary) {
+            $models[$legacyOf[(string) self::keyOf($primary->getKey())]] = [$branch->primary->table => $primary];
         }
 
         $changed = 0;
@@ -618,13 +829,14 @@ final readonly class Backfiller
      */
     private function chosen(array $row): string
     {
-        return $this->map->morphs === [] ? $this->map->branchFor($this->probe($row))->primary->model : (string) $this->map->morphFor($this->probe($row))->target?->model;
+        return (string) $this->map->morphFor($this->probe($row))->target?->model;
     }
 
     /**
      * @param  non-empty-list<array<string, mixed>>  $rows
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function writeBranch(ResolvedMap $branch, array $rows): int
+    private function writeBranch(ResolvedMap $branch, array $rows, array $roots): int
     {
         $stored = [];
         $external = [];
@@ -634,53 +846,52 @@ final readonly class Backfiller
             [$stored[$key], $external[$key]] = $this->split($branch, $row, $key);
         }
 
-        $changed = $this->rekey($branch, $stored);
-        $changed += array_filter($branch->attributes, fn ($attribute, string $name) => $attribute->isExternal() && $branch->owners[$name] === $branch->primary, ARRAY_FILTER_USE_BOTH) === []
-            ? $this->upsert($branch, $stored)
-            : $this->saveEach($branch, $rows, $stored, $external);
+        $changed = array_filter(
+            array: $branch->attributes,
+            callback: fn ($attribute, string $name) => $attribute->isExternal() && $branch->owners[$name] === $branch->primary,
+            mode: ARRAY_FILTER_USE_BOTH,
+        ) === []
+            ? $this->upsert(
+                branch: $branch,
+                stored: $stored,
+                roots: $roots,
+            )
+            : $this->saveEach(
+                branch: $branch,
+                rows: $rows,
+                stored: $stored,
+                external: $external,
+                roots: $roots,
+            );
 
         foreach ($branch->related as $related) {
-            $changed += $this->writeRelated($branch, $related, $stored);
+            $changed += $this->writeRelated(
+                branch: $branch,
+                related: $related,
+                stored: $stored,
+                roots: $roots,
+            );
         }
 
-        return $changed + $this->writeRelatedExternals($branch, $stored, $external);
+        return $changed + $this->writeRelatedExternals(
+            branch: $branch,
+            stored: $stored,
+            external: $external,
+            roots: $roots,
+        );
     }
 
     /**
-     * @param  non-empty-array<int|string, array<string, array<string, mixed>>>  $stored
+     * @param  array<int|string, array{int|string, bool}>  $roots
+     * @param  list<int|string>  $keys
+     * @return list<int|string>
      */
-    private function rekey(ResolvedMap $branch, array $stored): int
+    private function rootsOf(array $roots, array $keys): array
     {
-        $table = $branch->primary->table;
-        $keyColumn = (string) $branch->identifiers[$this->key]->column();
-        $target = SqlFragments::identifier(self::TARGET);
-        $source = SqlFragments::identifier(self::SOURCE);
-        $legacy = SqlFragments::identifier($this->map->table);
-        $changed = 0;
-
-        foreach ($branch->identifiers as $name => $identifier) {
-            $other = $identifier->column();
-
-            if ($name === $this->key || $other === null) {
-                continue;
-            }
-
-            $types = $this->typesOf($table, [$keyColumn, $other]);
-            $pairs = array_values(array_filter(array_map(fn (array $values) => [$values[$table][$keyColumn] ?? null, $values[$table][$other] ?? null], $stored), fn (array $pair) => $pair[0] !== null && $pair[1] !== null));
-
-            foreach ($this->batches($pairs, 2) as $batch) {
-                $changed += $this->connection->affectingStatement(
-                    'UPDATE '.SqlFragments::identifier($table)." AS {$target} SET ".SqlFragments::identifier($keyColumn)." = {$source}.compatibility_key"
-                        ."\nFROM (VALUES ".implode(', ', array_fill(0, count($batch), '(CAST(? AS '.$types[$keyColumn].'), CAST(? AS '.$types[$other].'))')).") AS {$source} (compatibility_key, compatibility_other)"
-                        ."\nWHERE {$target}.".SqlFragments::identifier($other)." = {$source}.compatibility_other AND {$target}.".SqlFragments::identifier($keyColumn)." IS DISTINCT FROM {$source}.compatibility_key"
-                        .($branch->membership === null ? '' : ' AND '.$branch->membership->of(self::TARGET))
-                        ." AND NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.".SqlFragments::identifier($this->key)." = {$target}.".SqlFragments::identifier($keyColumn).')',
-                    array_merge(...$batch),
-                );
-            }
-        }
-
-        return $changed;
+        return array_values(array_map(
+            callback: fn (int|string $key) => $roots[$key][0],
+            array: $keys,
+        ));
     }
 
     /**
@@ -691,10 +902,6 @@ final readonly class Backfiller
     {
         $stored = [$branch->primary->table => []];
         $external = [];
-
-        foreach ($branch->identifiers as $name => $identifier) {
-            $stored[$branch->primary->table][(string) $identifier->column()] = $row[$name] ?? null;
-        }
 
         foreach ($branch->related as $related) {
             $stored[$related->table] = [];
@@ -725,39 +932,61 @@ final readonly class Backfiller
             }
         }
 
-        if ($branch->membership !== null) {
-            $stored[$branch->primary->table][$branch->membership->column] = $branch->membership->alias;
-        }
-
         return [$stored, $external];
     }
 
     /**
      * @param  non-empty-array<int|string, array<string, array<string, mixed>>>  $stored
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function upsert(ResolvedMap $branch, array $stored): int
+    private function upsert(ResolvedMap $branch, array $stored, array $roots): int
     {
         $table = $branch->primary->table;
         $successor = new $branch->primary->model;
-        $columns = array_keys(reset($stored)[$table]);
-        $conflict = [...($branch->membership === null ? [] : [$branch->membership->column]), (string) $branch->identifiers[$this->key]->column()];
-        $generated = $successor->usesUniqueIds() ? array_values(array_diff($successor->uniqueIds(), $columns)) : [];
+        $key = $branch->primary->key;
+        $columns = array_values(array_diff(array_keys(reset($stored)[$table]), [$key]));
+        $generated = $successor->usesUniqueIds() ? array_values(array_diff($successor->uniqueIds(), $columns, [$key])) : [];
         [$created, $updated] = $this->stamps($successor, $columns);
         $stamp = $created === null && $updated === null ? [] : [$successor->freshTimestampString()];
-        $inserted = [...$columns, ...$generated, ...array_filter([$created, $updated], is_string(...))];
+        $inserted = [$key, ...$columns, ...$generated, ...array_filter(
+            array: [$created, $updated],
+            callback: is_string(...),
+        )];
         $types = $this->typesOf($table, $inserted);
-        $changing = array_values(array_diff($columns, $conflict));
         $presence = $this->presence($branch, $table);
         $target = SqlFragments::identifier(self::TARGET);
-        $action = $changing === [] ? 'DO NOTHING' : 'DO UPDATE SET '.implode(', ', [
-            ...array_map(fn (string $column) => SqlFragments::identifier($column).' = '.$this->kept($column, $presence, $target, 'excluded'), $changing),
-            ...($updated === null ? [] : [SqlFragments::identifier($updated).' = excluded.'.SqlFragments::identifier($updated)]),
-        ])
-            .' WHERE '.$this->distinct($changing, $types, $target, 'excluded', $presence);
+        $action = $columns === [] ? 'DO NOTHING' : 'DO UPDATE SET '.implode(
+            separator: ', ',
+            array: [
+                ...array_map(
+                    callback: fn (string $column) => SqlFragments::identifier($column).' = '.$this->kept(
+                        column: $column,
+                        presence: $presence,
+                        before: $target,
+                        after: 'excluded',
+                    ),
+                    array: $columns,
+                ),
+                ...($updated === null ? [] : [SqlFragments::identifier($updated).' = excluded.'.SqlFragments::identifier($updated)]),
+            ],
+        )
+            .' WHERE '.$this->distinct(
+                columns: $columns,
+                types: $types,
+                before: $target,
+                after: 'excluded',
+                presence: $presence,
+            );
         $rows = [];
 
-        foreach ($stored as $values) {
-            $rows[] = [...array_values($values[$table]), ...array_map(fn () => $successor->newUniqueId(), $generated), ...($created === null ? [] : $stamp), ...($updated === null ? [] : $stamp)];
+        foreach ($stored as $legacyKey => $values) {
+            $rows[] = [$roots[$legacyKey][0], ...array_map(
+                callback: fn (string $column) => $values[$table][$column],
+                array: $columns,
+            ), ...array_map(
+                callback: fn () => $successor->newUniqueId(),
+                array: $generated,
+            ), ...($created === null ? [] : $stamp), ...($updated === null ? [] : $stamp)];
         }
 
         $changed = 0;
@@ -766,7 +995,7 @@ final readonly class Backfiller
             $changed += count($this->connection->select(
                 'INSERT INTO '.SqlFragments::identifier($table)." AS {$target} (".implode(', ', array_map(SqlFragments::identifier(...), $inserted)).')'
                     .' VALUES '.implode(', ', array_fill(0, count($batch), '('.implode(', ', array_map(fn (string $column) => 'CAST(? AS '.$types[$column].')', $inserted)).')'))
-                    .' ON CONFLICT ('.implode(', ', array_map(SqlFragments::identifier(...), $conflict)).') '.$action
+                    .' ON CONFLICT ('.SqlFragments::identifier($key).') '.$action
                     .' RETURNING 1',
                 array_merge(...$batch),
                 false,
@@ -780,12 +1009,18 @@ final readonly class Backfiller
      * @param  non-empty-list<array<string, mixed>>  $rows
      * @param  array<int|string, array<string, array<string, mixed>>>  $stored
      * @param  array<int|string, array<string, mixed>>  $external
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function saveEach(ResolvedMap $branch, array $rows, array $stored, array $external): int
+    private function saveEach(ResolvedMap $branch, array $rows, array $stored, array $external, array $roots): int
     {
         $table = $branch->primary->table;
-        $column = (string) $branch->identifiers[$this->key]->column();
-        $existing = $this->held($branch, array_keys($stored))->keyBy($column);
+        $existing = $this->held(
+            branch: $branch,
+            keys: $this->rootsOf(
+                roots: $roots,
+                keys: array_keys($stored),
+            ),
+        )->keyBy(fn (Model $root) => self::keyOf($root->getKey()));
         $read = [];
 
         foreach ($branch->externals() as $name) {
@@ -798,7 +1033,10 @@ final readonly class Backfiller
 
         foreach ($rows as $row) {
             $key = self::keyOf($row[$this->key] ?? null);
-            $successor = $existing[$key] ?? (new $branch->primary->model)->setConnection($this->connectionName);
+            $successor = $existing[$roots[$key][0]] ?? (new $branch->primary->model)->setConnection($this->connectionName)->setAttribute(
+                key: $branch->primary->key,
+                value: $roots[$key][0],
+            );
             $successor->setRawAttributes(array_replace($successor->getAttributes(), $this->present($branch, $successor, $stored[$key][$table])));
             $written = false;
 
@@ -826,28 +1064,10 @@ final readonly class Backfiller
     }
 
     /**
-     * @param  non-empty-list<array<string, mixed>>  $rows
-     */
-    private function moveOut(ResolvedMap $branch, array $rows): int
-    {
-        $column = (string) $branch->identifiers[$this->key]->column();
-        $moved = 0;
-
-        foreach ($this->held($branch, array_map(fn (array $row) => self::keyOf($row[$this->key] ?? null), $rows)) as $successor) {
-            if ($successor->forceDelete() === false) {
-                throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', 'a '.class_basename($successor).' listener refused the delete that moves '.$this->map->table.' row '.$this->key.' '.self::keyOf($successor->getAttribute($column)).' to another successor');
-            }
-
-            $moved++;
-        }
-
-        return $moved;
-    }
-
-    /**
      * @param  array<int|string, array<string, array<string, mixed>>>  $stored
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function writeRelated(ResolvedMap $branch, Related $related, array $stored): int
+    private function writeRelated(ResolvedMap $branch, Related $related, array $stored, array $roots): int
     {
         $table = $related->table;
         $columns = array_keys(reset($stored)[$table] ?? []);
@@ -866,25 +1086,38 @@ final readonly class Backfiller
         $fixed = array_diff_key($related->attributes, array_flip([...$columns, $related->relatedKey]));
         [$created, $updated] = $this->stamps($successor, [...$columns, ...array_map(strval(...), array_keys($fixed))]);
         $generated = ! $related->belongsTo && $successor->usesUniqueIds() ? array_values(array_diff($successor->uniqueIds(), $columns, array_keys($fixed), [$related->relatedKey])) : [];
-        $identifier = (string) $branch->identifiers[$this->key]->column();
+        $rootKey = $branch->primary->key;
         $types = $this->typesOf($table, [$related->relatedKey, ...array_keys($fixed), ...$columns, ...$generated, ...array_filter([$created, $updated], is_string(...))]);
         $sourceColumns = [self::KEY, ...$columns, ...array_map(fn (string $column) => 'compatibility_new_'.$column, $generated)];
-        $sourceTypes = [(string) $this->catalog->type($branch->primary->table, $identifier), ...array_map(fn (string $column) => $types[$column], $columns), ...array_map(fn (string $column) => $types[$column], $generated)];
+        $sourceTypes = [(string) $this->catalog->type(
+            table: $branch->primary->table,
+            column: $rootKey,
+        ), ...array_map(
+            callback: fn (string $column) => $types[$column],
+            array: $columns,
+        ), ...array_map(
+            callback: fn (string $column) => $types[$column],
+            array: $generated,
+        )];
         $set = $wrapped === [] ? 'false' : implode(' OR ', array_map(fn (string $column) => "{$source}.{$column} IS NOT NULL", $wrapped));
         $missing = "{$alias}.{$relatedKey} IS NULL AND ({$set})";
         $stamp = $successor->freshTimestampString();
         $rows = [];
+        $legacyKeys = [];
 
         foreach ($stored as $key => $values) {
-            $rows[] = [$key, ...array_values($values[$table]), ...array_map(fn () => $successor->newUniqueId(), $generated)];
+            $rows[] = [$roots[$key][0], ...array_values($values[$table]), ...array_map(
+                callback: fn () => $successor->newUniqueId(),
+                array: $generated,
+            )];
+            $legacyKeys[(string) $roots[$key][0]] = $key;
         }
 
         $changed = 0;
 
         foreach ($this->batches($rows, count($sourceColumns) + 2) as $batch) {
             $from = '(VALUES '.implode(', ', array_fill(0, count($batch), '('.implode(', ', array_map(fn (string $type) => "CAST(? AS {$type})", $sourceTypes)).')')).") AS {$source} (".implode(', ', array_map(SqlFragments::identifier(...), $sourceColumns)).')'
-                ."\nJOIN ".SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($identifier).' = '.$source.'.'.SqlFragments::identifier(self::KEY)
-                .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table))
+                ."\nJOIN ".SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($rootKey).' = '.$source.'.'.SqlFragments::identifier(self::KEY)
                 .implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($branch, $table)));
             $bindings = array_merge(...$batch);
 
@@ -915,12 +1148,34 @@ final readonly class Backfiller
                 );
             }
 
-            $unreached = array_column($this->connection->select('SELECT '.$source.'.'.SqlFragments::identifier(self::KEY)." AS key FROM {$from}\nWHERE {$missing} ORDER BY 1 LIMIT 5", $bindings, false), 'key');
+            $unreached = array_map(
+                callback: fn (mixed $root) => $legacyKeys[(string) $root] ?? $root,
+                array: array_column(
+                    array: $this->connection->select(
+                        query: 'SELECT '.$source.'.'.SqlFragments::identifier(self::KEY)." AS key FROM {$from}\nWHERE {$missing}",
+                        bindings: $bindings,
+                        useReadPdo: false,
+                    ),
+                    column_key: 'key',
+                ),
+            );
+            sort($unreached);
 
             if ($unreached !== []) {
-                throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} rows {$this->key} ".implode(', ', $unreached)." hold values for {$table}, and ".($related->belongsTo
-                    ? "the related() relation from {$related->parentTable} reaches {$table} through a BelongsTo, which the backfill does not create"
-                    : "the related() relation from {$related->parentTable} reads no {$table} row the backfill can create for them; its parent row is missing, or its conditions need withAttributes()"));
+                throw InvalidCompatibilityMap::cannot(
+                    map: $this->map->table,
+                    operation: 'backfill',
+                    because: "{$this->map->table} rows {$this->key} ".implode(
+                        separator: ', ',
+                        array: array_slice(
+                            array: $unreached,
+                            offset: 0,
+                            length: 5,
+                        ),
+                    )." hold values for {$table}, and ".($related->belongsTo
+                        ? "the related() relation from {$related->parentTable} reaches {$table} through a BelongsTo, which the backfill does not create"
+                        : "the related() relation from {$related->parentTable} reads no {$table} row the backfill can create for them; its parent row is missing, or its conditions need withAttributes()"),
+                );
             }
         }
 
@@ -1009,23 +1264,25 @@ final readonly class Backfiller
     private function deleteGone(): int
     {
         $legacy = SqlFragments::identifier($this->map->table);
-        $backfilled = SqlFragments::identifier(self::backfilledTable($this->map->table));
+        $ledger = SqlFragments::identifier(self::ledger($this->map->table));
         $key = SqlFragments::identifier($this->key);
-        $deletes = [];
-
-        foreach (array_values($this->map->branches === [] ? [$this->map] : $this->map->branches) as $index => $branch) {
-            $primary = SqlFragments::identifier($branch->primary->table);
-            $deletes[] = "compatibility_deleted_{$index} AS (DELETE FROM {$primary} USING compatibility_gone WHERE {$primary}.".SqlFragments::identifier((string) $branch->identifiers[$this->key]->column())." = compatibility_gone.{$key}"
-                .($branch->membership === null ? '' : ' AND '.$branch->membership->of($branch->primary->table))
-                .implode('', array_map(fn (string $condition) => ' AND NOT COALESCE(('.$condition.'), false)', ViewCompiler::hidden($branch)))
-                .' RETURNING 1)';
-        }
+        $primary = SqlFragments::identifier($this->map->primary->table);
+        $successorKey = SqlFragments::identifier($this->map->successorKey);
 
         $deleted = $this->connection->scalar(
-            "WITH compatibility_gone AS (SELECT backfilled.{$key} FROM {$backfilled} AS backfilled WHERE NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$key} = backfilled.{$key})),\n"
-                .implode(",\n", $deletes).",\n"
-                ."compatibility_forgotten AS (DELETE FROM {$backfilled} AS backfilled USING compatibility_gone WHERE backfilled.{$key} = compatibility_gone.{$key})\n"
-                .'SELECT '.implode(' + ', array_map(fn (int $index) => "(SELECT count(*) FROM compatibility_deleted_{$index})", array_keys($deletes))),
+            "WITH compatibility_gone AS (SELECT ledger.legacy_id, ledger.successor_id FROM {$ledger} AS ledger WHERE ledger.status <> 'deleted' AND NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$key} = ledger.legacy_id)),\n"
+                ."compatibility_deleted AS (DELETE FROM {$primary} USING compatibility_gone WHERE {$primary}.".SqlFragments::identifier($this->map->primary->key).' = compatibility_gone.successor_id'
+                ." AND NOT EXISTS (SELECT FROM {$legacy} WHERE {$legacy}.{$successorKey} = compatibility_gone.successor_id)"
+                .implode(
+                    separator: '',
+                    array: array_map(
+                        callback: fn (string $condition) => ' AND NOT COALESCE(('.$condition.'), false)',
+                        array: ViewCompiler::hidden($this->map),
+                    ),
+                )
+                ." RETURNING 1),\n"
+                ."compatibility_forgotten AS (UPDATE {$ledger} AS ledger SET status = 'deleted', attempts = ledger.attempts + 1, attempted_at = now() FROM compatibility_gone WHERE ledger.legacy_id = compatibility_gone.legacy_id)\n"
+                .'SELECT count(*) FROM compatibility_deleted',
             [],
             false,
         );
@@ -1033,38 +1290,39 @@ final readonly class Backfiller
         return is_int($deleted) ? $deleted : 0;
     }
 
-    private function track(): void
-    {
-        if (! $this->tracked()) {
-            $this->connection->statement(self::create($this->map->table, $this->key, $this->catalog->type($this->map->table, $this->key) ?? throw InvalidCompatibilityMap::because($this->map->table, "{$this->map->table} has no column {$this->key}")));
-        }
-    }
-
-    private function tracked(): bool
-    {
-        return $this->connection->scalar("select to_regclass(quote_ident(current_schema()) || '.' || ?) is not null", [SqlFragments::identifier(self::backfilledTable($this->map->table))], false) === true;
-    }
-
     /**
-     * @param  list<int|string>  $keys
+     * @param  array<int|string, array{int|string, bool}>  $roots
      */
-    private function record(array $keys): void
+    private function record(array $roots): void
     {
-        $type = (string) $this->catalog->type($this->map->table, $this->key);
+        $types = [(string) $this->catalog->type(
+            table: $this->map->table,
+            column: $this->key,
+        ), (string) $this->catalog->type(
+            table: $this->map->primary->table,
+            column: $this->map->primary->key,
+        )];
+        $rows = array_map(fn (int|string $key, array $root) => [$key, $root[0], $root[1] ? 'updated' : 'created'], array_keys($roots), $roots);
+        $ledger = SqlFragments::identifier(self::ledger($this->map->table));
 
-        foreach ($this->batches(array_map(fn (int|string $key) => [$key], $keys), 1) as $batch) {
-            $this->connection->insert('INSERT INTO '.SqlFragments::identifier(self::backfilledTable($this->map->table)).' VALUES '.implode(', ', array_fill(0, count($batch), "(CAST(? AS {$type}))")).' ON CONFLICT DO NOTHING', array_merge(...$batch));
+        foreach ($this->batches(
+            rows: $rows,
+            width: 3,
+        ) as $batch) {
+            $this->connection->insert(
+                query: "INSERT INTO {$ledger} AS ledger (legacy_id, successor_id, status, attempts, attempted_at) VALUES "
+                    .implode(
+                        separator: ', ',
+                        array: array_fill(
+                            start_index: 0,
+                            count: count($batch),
+                            value: "(CAST(? AS {$types[0]}), CAST(? AS {$types[1]}), ?, 1, now())",
+                        ),
+                    )
+                    .' ON CONFLICT (legacy_id) DO UPDATE SET successor_id = excluded.successor_id, status = excluded.status, reason = NULL, attempts = ledger.attempts + 1, attempted_at = excluded.attempted_at',
+                bindings: array_merge(...$batch),
+            );
         }
-    }
-
-    private static function backfilledTable(string $table): string
-    {
-        return SqlFragments::objectName($table, $table.'_backfilled');
-    }
-
-    private static function create(string $table, string $key, string $type): string
-    {
-        return 'CREATE TABLE IF NOT EXISTS '.SqlFragments::identifier(self::backfilledTable($table)).' ('.SqlFragments::identifier($key)." {$type} PRIMARY KEY)";
     }
 
     /**
@@ -1076,13 +1334,7 @@ final readonly class Backfiller
         $held = (new $branch->primary->model)->newCollection();
 
         foreach (array_chunk($keys, self::BINDINGS - 2) as $batch) {
-            $query = (new $branch->primary->model)->setConnection($this->connectionName)->newModelQuery()->useWritePdo()->whereIn((string) $branch->identifiers[$this->key]->column(), $batch);
-
-            if ($branch->membership !== null) {
-                $query->where($branch->membership->column, $branch->membership->alias);
-            }
-
-            $held = $held->concat($query->get());
+            $held = $held->concat((new $branch->primary->model)->setConnection($this->connectionName)->newModelQuery()->useWritePdo()->whereKey($batch)->get());
         }
 
         return $held;
@@ -1122,7 +1374,13 @@ final readonly class Backfiller
         $types = [];
 
         foreach ($columns as $column) {
-            $types[$column] = array_key_exists($column, $catalog) ? $catalog[$column]->type : throw InvalidCompatibilityMap::because($this->map->table, "{$table} has no column {$column}, which the backfill writes; Compatibility::prepare() adds the identifier and discriminator columns");
+            $types[$column] = array_key_exists(
+                key: $column,
+                array: $catalog,
+            ) ? $catalog[$column]->type : throw InvalidCompatibilityMap::because(
+                map: $this->map->table,
+                problem: "{$table} has no column {$column}, which the backfill writes",
+            );
         }
 
         return $types;
@@ -1153,13 +1411,36 @@ final readonly class Backfiller
             throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} is already installed as a view, and the backfill walks the legacy table while it is still a table");
         }
 
-        foreach ($this->map->branches === [] ? ($this->map->morphs === [] ? [$this->map] : $this->map->morphs) : $this->map->branches as $branch) {
-            foreach ([...array_keys($branch->identifiers), ...array_keys(array_filter($branch->attributes, fn ($attribute) => $attribute->column() !== null || $attribute->isExternal()))] as $name) {
+        if (! array_key_exists(
+            key: $this->map->successorKey,
+            array: $legacy,
+        ) || ! $this->exists(self::ledger($this->map->table)) || ! $this->exists(self::BACKFILLS)) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $this->map->table,
+                operation: 'backfill',
+                because: "Compatibility::prepare() adds {$this->map->table}.{$this->map->successorKey} and creates ".self::ledger($this->map->table).' and '.self::BACKFILLS.', and it has not run; run Compatibility::prepare() first',
+            );
+        }
+
+        foreach ($this->map->morphs === [] ? [$this->map] : $this->map->morphs as $branch) {
+            foreach (array_keys(array_filter(
+                array: $branch->attributes,
+                callback: fn ($attribute) => $attribute->column() !== null || $attribute->isExternal(),
+            )) as $name) {
                 if (! array_key_exists($name, $legacy)) {
                     throw InvalidCompatibilityMap::because($this->map->table, "{$this->map->table} has no column {$name}, so the backfill has no value to write for it");
                 }
             }
         }
+    }
+
+    private function exists(string $table): bool
+    {
+        return $this->connection->scalar(
+            query: "select to_regclass(quote_ident(current_schema()) || '.' || ?) is not null",
+            bindings: [SqlFragments::identifier($table)],
+            useReadPdo: false,
+        ) === true;
     }
 
     private function updatedAt(): null|string
@@ -1226,33 +1507,6 @@ final readonly class Backfiller
         $legacy->setRawAttributes($row, true);
 
         return $legacy;
-    }
-
-    private static function commentOn(ConnectionInterface $connection, string $table): null|string
-    {
-        $comment = $connection->scalar("select obj_description(to_regclass(quote_ident(current_schema()) || '.' || ?), 'pg_class')", [SqlFragments::identifier($table)], false);
-
-        return is_string($comment) ? $comment : null;
-    }
-
-    /**
-     * @return null|array<array-key, mixed>
-     */
-    private static function decoded(null|string $comment): null|array
-    {
-        $decoded = $comment === null ? null : json_decode($comment, true);
-
-        return is_array($decoded) && ($decoded['backfilled'] ?? null) === self::MARKER ? $decoded : null;
-    }
-
-    private static function greater(null|int|string $remembered, null|int|string $last): null|int|string
-    {
-        return match (true) {
-            $remembered === null => $last,
-            $last === null => $remembered,
-            is_int($remembered) && is_int($last) => max($remembered, $last),
-            default => strcmp((string) $remembered, (string) $last) >= 0 ? $remembered : $last,
-        };
     }
 
     private static function keyOf(mixed $key): int|string

@@ -22,5 +22,5 @@ Declined: string names, an add() method for undeclared rows, and disambiguation 
 
 - The type checker and the PHPStan rule check every reference an operation makes.
 - A map that relates one class twice under one root cannot compile.
-- The terms change: "primary" becomes "root", and the `Definition\Successors` builder becomes the targets that a morph's chooser picks between.
+- The terms change: "primary" becomes "root", and the Definition\Successors builder becomes the targets that a morph's chooser picks between.
 - [The map](../specification/the-map.md#related-successors) states the declarations.

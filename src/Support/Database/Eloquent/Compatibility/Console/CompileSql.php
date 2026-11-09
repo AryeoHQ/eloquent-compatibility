@@ -15,8 +15,8 @@ use Support\Database\Eloquent\Compatibility\Schema\Statements;
 final class CompileSql extends Command
 {
     protected $signature = 'compatibility:sql
+        {operation : The operation whose statements to print: prepare, install, update, rollback or retire}
         {model : The class of the legacy model that declares the map}
-        {--for=install : Print the statements of prepare, install, recompile or uninstall}
         {--output= : Write the statements to this file instead of stdout}';
 
     protected $description = 'Print the SQL statements a compatibility operation runs, running only catalog reads.';
@@ -24,19 +24,20 @@ final class CompileSql extends Command
     public function handle(Filesystem $files): int
     {
         $model = (string) $this->argument('model');
-        $for = (string) $this->option('for');
+        $for = (string) $this->argument('operation');
         $file = $this->option('output');
 
         $statementsFor = match ($for) {
             'prepare' => Statements::prepare(...),
             'install' => Statements::install(...),
-            'recompile' => Statements::recompile(...),
-            'uninstall' => Statements::uninstall(...),
+            'update' => Statements::update(...),
+            'rollback' => Statements::rollback(...),
+            'retire' => Statements::retire(...),
             default => null,
         };
 
         if ($statementsFor === null) {
-            return $this->refuse("--for must be prepare, install, recompile or uninstall, not {$for}.");
+            return $this->refuse("The operation must be prepare, install, update, rollback or retire, not {$for}.");
         }
 
         if (! class_exists($model)) {
@@ -61,20 +62,58 @@ final class CompileSql extends Command
             return $this->refuse("Compatibility::{$for}() reads the external() ".(count($externals) === 1 ? 'attribute ' : 'attributes ').implode(', ', $externals)." of {$map->table} through PHP between its statements, and no printed SQL runs that step. Run Compatibility::{$for}() instead.");
         }
 
-        $header = array_map(fn (string $line) => str_replace(["\r", "\n"], ['\\r', '\\n'], $line), [
-            "-- compatibility:sql {$model} --for={$for}: the statements Compatibility::{$for}() runs for {$map->table}",
-            "-- Read from database {$server['database']}, schema {$server['schema']} (search path {$server['search_path']}), on PostgreSQL {$server['version']}",
-            '-- Compiled at '.Date::now()->toIso8601String(),
-        ]);
+        $comment = fn (string $line) => '-- '.str_replace(
+            search: ["\r", "\n"],
+            replace: ['\\r', '\\n'],
+            subject: $line,
+        );
+        $header = array_map(
+            callback: $comment,
+            array: [
+                "compatibility:sql {$for} {$model}: the statements Compatibility::{$for}() runs for {$map->table}",
+                "Read from database {$server['database']}, schema {$server['schema']} (search path {$server['search_path']}), on PostgreSQL {$server['version']}",
+                'Compiled at '.Date::now()->toIso8601String(),
+                ...($for === 'install' ? [
+                    'Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.',
+                    "Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of {$map->table}. Run Compatibility::install() instead.",
+                ] : []),
+                ...$statements->notes,
+                ...array_map(
+                    callback: fn (array $lock) => "Locks {$lock[0]} in {$lock[1]}",
+                    array: $statements->locks,
+                ),
+            ],
+        );
         $terminate = fn (string $statement) => $statement."\n;";
-        $sql = implode("\n", $header)."\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, [...$guard, ...$statements->transaction]))."\n\nCOMMIT;\n";
+        $body = array_map(
+            callback: $terminate,
+            array: $guard,
+        );
 
-        if ($statements->afterwards !== []) {
-            $sql .= "\n-- After the transaction commits, outside any transaction\n\n".implode("\n\n", array_map($terminate, $statements->afterwards))."\n";
+        foreach ($statements->transaction as $index => $statement) {
+            $body[] = $terminate($statement);
+
+            foreach ($statements->hooks[$index] ?? [] as [$hook]) {
+                $body[] = $comment("{$hook} runs here, inside the transaction");
+            }
         }
 
-        if ($statements->exclusive !== []) {
-            $sql .= "\n-- Then in one transaction of their own\n\nBEGIN;\n\n".implode("\n\n", array_map($terminate, $statements->exclusive))."\n\nCOMMIT;\n";
+        $sql = implode(
+            separator: "\n",
+            array: $header,
+        )."\n\nBEGIN;\n\n".implode(
+            separator: "\n\n",
+            array: $body,
+        )."\n\nCOMMIT;\n";
+
+        if ($statements->afterwards !== []) {
+            $sql .= "\n-- After the transaction commits, outside any transaction\n\n".implode(
+                separator: "\n\n",
+                array: array_map(
+                    callback: $terminate,
+                    array: $statements->afterwards,
+                ),
+            )."\n";
         }
 
         if (! is_string($file) || $file === '') {

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\NullDispatcher;
@@ -19,7 +20,6 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -49,7 +49,10 @@ final class RecordWriterTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -84,7 +87,7 @@ final class RecordWriterTest extends TestCase
     #[Test]
     public function it_keeps_a_legacy_only_fact_through_a_successor_write_and_a_successor_only_fact_through_a_legacy_write(): void
     {
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         $root = Place::query()->where('job_id', $job->id)->firstOrFail();
         DB::table('places')->where('id', $root->id)->update(['created_at' => '2026-01-01 00:00:00+00']);
         $wing = Place::query()->create(['job_id' => $job->id, 'parent_id' => $root->id, 'street' => '1 Oak St, wing']);
@@ -110,7 +113,7 @@ final class RecordWriterTest extends TestCase
 
         $listing->update(['title' => 'Oak Manor']);
 
-        $this->assertSame('OAK MANOR', Job::query()->where('legacy_id', 1)->value('name'));
+        $this->assertSame('OAK MANOR', Job::query()->whereKey(ListingTables::jobOf(1))->value('name'));
         $this->assertSame('OAK MANOR', Listing::query()->findOrFail(1)->title);
     }
 
@@ -312,7 +315,7 @@ final class RecordWriterTest extends TestCase
         yield 'an already-trashed record' => [fn (): Listing => Listing::withTrashed()->findOrFail(2)];
         yield 'a stale record whose successor a concurrent writer trashed' => [function (): Listing {
             $listing = Listing::query()->findOrFail(1);
-            Job::query()->where('legacy_id', 1)->firstOrFail()->delete();
+            Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->delete();
 
             return $listing;
         }];
@@ -348,14 +351,18 @@ final class RecordWriterTest extends TestCase
 
         $this->assertTrue($listing->delete());
         $this->assertSame(['retrieved', 'deleting', 'trashed', 'deleted'], $fired->slice(2)->values()->all());
-        $this->assertSame($listing->deleted_at?->toDateTimeString(), Job::withTrashed()->where('legacy_id', $listing->id)->firstOrFail()->deleted_at?->toDateTimeString());
+        $this->assertSame($listing->deleted_at?->toDateTimeString(), Job::withTrashed()->whereKey(ListingTables::jobOf($listing->id))->firstOrFail()->deleted_at?->toDateTimeString());
     }
 
     #[Test]
     public function it_runs_the_successor_restore_and_its_veto_when_a_stale_legacy_record_restores_a_successor_another_writer_restored(): void
     {
         $listing = Listing::withTrashed()->findOrFail(2);
-        DB::table('jobs')->where('legacy_id', 2)->update(['deleted_at' => null]);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(2),
+        )->update(['deleted_at' => null]);
         $before = $this->snapshot();
         /** @var Collection<int, string> $fired */
         $fired = new Collection;
@@ -379,14 +386,18 @@ final class RecordWriterTest extends TestCase
 
         $this->assertTrue($listing->restore()); // @phpstan-ignore staticMethod.dynamicCall
         $this->assertSame(['retrieved', 'restoring', 'saving', 'updating', 'updated', 'saved', 'restored'], $fired->slice(2)->values()->all());
-        $this->assertSame(['Pine Lodge', null], [Job::query()->where('legacy_id', 2)->value('name'), Job::query()->where('legacy_id', 2)->value('deleted_at')]);
+        $this->assertSame(['Pine Lodge', null], [Job::query()->whereKey(ListingTables::jobOf(2))->value('name'), Job::query()->whereKey(ListingTables::jobOf(2))->value('deleted_at')]);
     }
 
     #[Test]
     public function it_saves_the_successor_without_its_restore_events_when_a_legacy_listener_refused_the_restore_before_the_save(): void
     {
         $listing = Listing::withTrashed()->findOrFail(2);
-        DB::table('jobs')->where('legacy_id', 2)->update(['deleted_at' => null]);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(2),
+        )->update(['deleted_at' => null]);
         /** @var Collection<int, string> $fired */
         $fired = new Collection;
         Event::listen('eloquent.*: '.Job::class, function (string $name) use ($fired): void {
@@ -401,7 +412,7 @@ final class RecordWriterTest extends TestCase
 
         $this->assertSame([false, true], [$restored, $saved]);
         $this->assertSame(['retrieved', 'saving', 'updating', 'updated', 'saved'], $fired->all());
-        $this->assertSame('Pine Lodge', Job::query()->where('legacy_id', 2)->value('name'));
+        $this->assertSame('Pine Lodge', Job::query()->whereKey(ListingTables::jobOf(2))->value('name'));
     }
 
     #[Test]
@@ -483,14 +494,22 @@ final class RecordWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
-                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))))
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            definition: fn (Successor $place) => $place
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                        ))
                     ->guard(
                         'held listing named',
                         fn (Model $after, Model $before) => $before->getAttribute('city') === 'Portland' || $before->getAttribute('mls_number') === 'MLS-HELD',
@@ -506,7 +525,7 @@ final class RecordWriterTest extends TestCase
 
         $this->assertSame(["locked\n", ''], [$locked, $this->concurrentFailure()]);
         $this->assertStringEndsWith(" record 1 cannot take this write, because guard 'held listing named' refuses it. Why: A held listing keeps its name. Instead: Release the hold first.", $refusal->getMessage());
-        $this->assertSame(['Oak House', 125050], [Job::query()->where('legacy_id', 1)->value('name'), Job::query()->where('legacy_id', 1)->value('price_cents')]);
+        $this->assertSame(['Oak House', 125050], [Job::query()->whereKey(ListingTables::jobOf(1))->value('name'), Job::query()->whereKey(ListingTables::jobOf(1))->value('price_cents')]);
     }
 
     #[Test]
@@ -525,9 +544,11 @@ final class RecordWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name')))
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    ))
                     ->guard('mls number kept', fn (Model $after) => $after->getAttribute('mls_number') === '', because: 'A listing keeps an MLS number.', instead: 'Write the new MLS number.');
             }
         };
@@ -548,7 +569,15 @@ final class RecordWriterTest extends TestCase
         Listing::query()->findOrFail(1)->increment('price', 0.005);
         Listing::query()->whereKey(3)->increment('price', 0.005);
 
-        $this->assertSame([125051, 10000], DB::table('jobs')->whereIn('legacy_id', [1, 3])->orderBy('legacy_id')->pluck('price_cents')->all());
+        $this->assertSame([125051, 10000], [DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->value('price_cents'), DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(3),
+        )->value('price_cents')]);
     }
 
     #[Test]
@@ -593,7 +622,7 @@ final class RecordWriterTest extends TestCase
 
         $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 3 cannot take this write, because guard \'sold price frozen\' refuses it. Why: A sold listing keeps the price it sold for. Instead: Change the price before the sale.', $refusal->getMessage());
         $this->assertSame($before['jobs'][2], $this->snapshot()['jobs'][2]);
-        $this->assertSame(130000, Job::query()->where('legacy_id', 1)->value('price_cents'));
+        $this->assertSame(130000, Job::query()->whereKey(ListingTables::jobOf(1))->value('price_cents'));
     }
 
     #[Test]
@@ -613,12 +642,20 @@ final class RecordWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: Attribute::declined(because: 'The MLS assigns its own numbers.')))
-                        ->attribute('featured', fn (Attribute $attribute) => $attribute->fixed(false)));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'mls_number',
+                            definition: fn (Attribute $attribute) => $attribute->external(read: fn (Collection $jobs) => $jobs, write: Attribute::declined(because: 'The MLS assigns its own numbers.')),
+                        )
+                        ->attribute(
+                            name: 'featured',
+                            definition: fn (Attribute $attribute) => $attribute->fixed(false),
+                        ));
             }
         };
         $external = $listing->newQuery()->findOrFail(3);
@@ -637,9 +674,9 @@ final class RecordWriterTest extends TestCase
     public function it_creates_a_dependent_only_when_one_of_its_values_is_set(): void
     {
         $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => null, 'city' => null, 'latitude' => null]);
-        $createdJob = Job::query()->where('legacy_id', $created->id)->firstOrFail();
+        $createdJob = Job::query()->whereKey(ListingTables::jobOf($created->id))->firstOrFail();
         $listing = Listing::withTrashed()->findOrFail(2);
-        $job = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $job = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $listing->update(['street' => '2 Pine St']);
 
@@ -657,7 +694,7 @@ final class RecordWriterTest extends TestCase
         });
 
         $listing = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'city' => 'Tacoma']);
-        $job = Job::query()->where('legacy_id', $listing->id)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf($listing->id))->firstOrFail();
 
         $this->assertSame([['9 Birch St', 'Tacoma']], DB::table('places')->where('job_id', $job->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
     }
@@ -673,7 +710,7 @@ final class RecordWriterTest extends TestCase
         $listing = Listing::withTrashed()->findOrFail(2);
 
         $listing->update(['title' => 'Pine Lodge', 'street' => '2 Pine St']);
-        $job = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $job = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $this->assertSame([['2 Pine St', null]], DB::table('places')->where('job_id', $job->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
         $this->assertSame(['Pine Lodge', '2 Pine St'], [Listing::withTrashed()->findOrFail(2)->title, Listing::withTrashed()->findOrFail(2)->street]);
@@ -689,7 +726,7 @@ final class RecordWriterTest extends TestCase
         $listing = Listing::query()->findOrFail(1);
 
         $listing->update(['title' => 'Oak Manor', 'deleted_at' => Date::now()]);
-        $job = Job::withTrashed()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::withTrashed()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $this->assertSame([['Oak Manor', true]], $saved);
         $this->assertSame(['Oak Manor', true], [$job->name, $job->trashed()]);
@@ -700,8 +737,8 @@ final class RecordWriterTest extends TestCase
     public function it_writes_nothing_for_a_record_its_primary_no_longer_serves(): void
     {
         $listing = Listing::query()->findOrFail(1);
-        $merged = Job::query()->where('legacy_id', 3)->firstOrFail();
-        Job::query()->where('legacy_id', 1)->update(['merged_into_job_id' => $merged->id]);
+        $merged = Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail();
+        Job::query()->whereKey(ListingTables::jobOf(1))->update(['merged_into_job_id' => $merged->id]);
         $before = $this->snapshot();
 
         $saved = $listing->update(['title' => 'Oak Manor', 'mls_number' => 'MLS-1B']);
@@ -722,7 +759,7 @@ final class RecordWriterTest extends TestCase
         $listing = Listing::query()->findOrFail(1);
 
         $listing->update(['title' => 'Oak Manor', 'street' => '2 Oak St']);
-        Job::query()->where('legacy_id', 1)->firstOrFail()->update(['name' => 'Oak Lodge']);
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
 
         $this->assertSame([['Listing', false], ['Job', true], ['Place', true], ['Listing', false], ['Job', false]], $held);
     }
@@ -768,16 +805,27 @@ final class RecordWriterTest extends TestCase
     public static function aliasedMap(Compatibility $listing): Compatibility
     {
         return $listing
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-            ->retainedIn('listings_retained', key: 'job_id')
-            ->servedFrom(Job::class, fn (Successor $job) => $job
-                ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
-                ->related(fn (Job $job) => $job->hasOne(AliasedPlace::class), fn (Successor $place) => $place
-                    ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                    ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')))
-                ->related(fn (Job $job) => $job->site(), fn (Successor $site) => $site
-                    ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))));
+            ->retainedIn('listings_retained')
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('name'),
+                )
+                ->attribute(
+                    name: 'company_id',
+                    definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->hasOne(AliasedPlace::class),
+                    definition: fn (Successor $place) => $place
+                        ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                        ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->site(),
+                    definition: fn (Successor $site) => $site
+                        ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                ));
     }
 
     private function lockConcurrently(string $sql): string
@@ -832,7 +880,7 @@ final class RecordWriterTest extends TestCase
     {
         $tables = [];
 
-        foreach (['jobs' => 'legacy_id', 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'job_id'] as $table => $order) {
+        foreach (['jobs' => 'name', 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'id'] as $table => $order) {
             $tables[$table] = DB::table($table)->orderBy($order)->get()->map(fn (object $row) => (array) $row)->all();
         }
 

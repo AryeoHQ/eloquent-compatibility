@@ -11,5 +11,5 @@ Registration checks only what the declaration and the model classes say. It read
 ## Consequences
 
 - Two owners of one column fail at registration.
-- A missing table or column fails when the map compiles, during the install or a recompile.
+- A missing table or column fails when the map compiles, during install() or update().
 - A model class must be constructible without arguments.

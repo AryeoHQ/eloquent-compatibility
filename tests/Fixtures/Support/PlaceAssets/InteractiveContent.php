@@ -4,15 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\PlaceAssets;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Carbon;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
 /**
@@ -39,20 +39,28 @@ final class InteractiveContent extends Model implements Compatible
     public static function compatibility(Compatibility $interactiveContent): Compatibility
     {
         return $interactiveContent
-            ->discriminatedBy('legacy_type')
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier
-                ->integer()
-                ->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier
-                ->uuid()
-                ->from('legacy_uuid'))
             ->retainedIn('place_interactive_content_retained')
-            ->timestamps()
-            ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
-                    successors: fn (Successors $successors) => $successors
-                        ->as(AssetLink::class, fn (Successor $link) => $link
-                            ->attribute('url', fn (Attribute $attribute) => $attribute->from('url')))));
+            ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_interactive_content'))
+                ->attribute(
+                    name: 'created_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                )
+                ->attribute(
+                    name: 'updated_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                )
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('title'),
+                )
+                ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                    choose: fn (InteractiveContent $content): string => AssetLink::class,
+                    targets: fn (Targets $targets) => $targets
+                        ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                            ->attribute(
+                                name: 'url',
+                                definition: fn (Attribute $attribute) => $attribute->from('url'),
+                            ))));
     }
 }

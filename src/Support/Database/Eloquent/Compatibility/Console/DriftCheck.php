@@ -20,12 +20,7 @@ enum DriftCheck: string
 
     case NoMorphTarget = 'no morph target';
 
-    case Unclassified = 'unclassified rows';
+    case OutsideMembership = 'outside when()';
 
     case GuardRefuses = 'guard refuses';
-
-    public function informational(): bool
-    {
-        return $this === self::Unclassified;
-    }
 }

@@ -49,7 +49,7 @@ final class Backfill extends Command
             return $this->refuse($exception->getMessage());
         }
 
-        $watermark = $backfilled['watermark']['updatedAt'];
+        $watermark = $backfilled['watermark'];
         $this->line("Backfilled {$backfilled['read']} {$map->table} rows, which changed {$backfilled['changed']} successor rows.");
         $this->line("Watermark: {$watermark}");
         $this->line("Catch up with: php artisan compatibility:backfill {$models[0]} --since={$watermark}");

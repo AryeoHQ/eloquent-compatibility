@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Date;
@@ -15,7 +16,6 @@ use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -46,7 +46,10 @@ final class TransitionsTest extends TestCase
         ListingTables::seed();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -68,7 +71,7 @@ final class TransitionsTest extends TestCase
         Listing::query()->findOrFail(1)->update(['status' => ListingStatus::Sold]);
         Listing::withTrashed()->findOrFail(2)->update(['status' => ListingStatus::Active]);
 
-        $this->assertSame(['closed', 'live', 'closed'], DB::table('jobs')->orderBy('legacy_id')->pluck('lifecycle_status')->all());
+        $this->assertSame(['closed', 'live', 'closed'], DB::table('jobs')->orderBy(ListingTables::legacyId())->pluck('lifecycle_status')->all());
         $this->assertSame([ListingStatus::Sold, ListingStatus::Active], [Listing::query()->findOrFail(1)->status, Listing::withTrashed()->findOrFail(2)->status]);
         $this->assertSame([['closed', true], ['live', true]], $held);
         Event::assertDispatchedTimes(EnteringClosed::class, 1);
@@ -111,7 +114,7 @@ final class TransitionsTest extends TestCase
         $this->assertSame([['closed', null], [null, 'Oak Manor']], $saves);
         $this->assertSame(
             ['2026-03-04 05:06:07', '2026-03-04 05:06:07', '2026-03-04 05:06:07'],
-            [$listing->updated_at?->format('Y-m-d H:i:s'), Listing::query()->findOrFail(1)->updated_at?->format('Y-m-d H:i:s'), Job::query()->where('legacy_id', 1)->firstOrFail()->updated_at?->format('Y-m-d H:i:s')],
+            [$listing->updated_at?->format('Y-m-d H:i:s'), Listing::query()->findOrFail(1)->updated_at?->format('Y-m-d H:i:s'), Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->updated_at?->format('Y-m-d H:i:s')],
         );
     }
 
@@ -120,12 +123,16 @@ final class TransitionsTest extends TestCase
     {
         Event::fake([EnteringLive::class, EnteredLive::class, EnteringClosed::class, EnteredClosed::class]);
         $stale = Listing::query()->findOrFail(1);
-        DB::table('jobs')->where('legacy_id', 1)->update(['lifecycle_status' => 'closed']);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->update(['lifecycle_status' => 'closed']);
 
         $stale->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]);
         Listing::query()->findOrFail(3)->update(['title' => 'Elm House']);
 
-        $this->assertSame([['Oak Manor', 'closed'], ['Pine Flat', 'drafting'], ['Elm House', 'closed']], DB::table('jobs')->orderBy('legacy_id')->get(['name', 'lifecycle_status'])->map(fn (object $job) => array_values((array) $job))->all());
+        $this->assertSame([['Oak Manor', 'closed'], ['Pine Flat', 'drafting'], ['Elm House', 'closed']], DB::table('jobs')->orderBy(ListingTables::legacyId())->get(['name', 'lifecycle_status'])->map(fn (object $job) => array_values((array) $job))->all());
         Event::assertNotDispatched(EnteringClosed::class);
         Event::assertNotDispatched(EnteredClosed::class);
         Event::assertNotDispatched(EnteringLive::class);
@@ -157,7 +164,11 @@ final class TransitionsTest extends TestCase
     #[Test]
     public function it_refuses_the_whole_write_when_the_trigger_refuses_the_move(): void
     {
-        DB::table('jobs')->where('legacy_id', 1)->update(['price_cents' => null]);
+        DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->update(['price_cents' => null]);
         $before = $this->snapshot();
 
         $refusal = $this->refusal(fn () => Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor', 'street' => '2 Oak St', 'status' => ListingStatus::Sold]));
@@ -196,9 +207,12 @@ final class TransitionsTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name')->transitions()));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name')->transitions(),
+                        ));
             }
         };
 
@@ -241,12 +255,15 @@ final class TransitionsTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->servedFrom(self::$successor, fn (Successor $job) => $job
-                        ->attribute('status', fn (Attribute $attribute) => $attribute
-                            ->from('lifecycle_status')
-                            ->mapping(['drafting' => ListingStatus::Draft, 'live' => ListingStatus::Active, 'closed' => ListingStatus::Sold])
-                            ->transitions()));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: self::$successor, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute
+                                ->from('lifecycle_status')
+                                ->mapping(['drafting' => ListingStatus::Draft, 'live' => ListingStatus::Active, 'closed' => ListingStatus::Sold])
+                                ->transitions(),
+                        ));
             }
         };
         $listing::$successor = $job::class;
@@ -260,14 +277,12 @@ final class TransitionsTest extends TestCase
     #[Test]
     public function it_runs_the_trigger_of_an_integer_backed_state_machine_and_refuses_a_move_it_does_not_declare(): void
     {
-        DB::statement('create table stages (id serial primary key, stage integer not null default 1)');
+        DB::statement('create table stages (id serial primary key, stage integer not null default 1, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table staged_jobs (id uuid primary key default gen_random_uuid(), stage integer not null default 1)');
         DB::table('stages')->insert([['stage' => 1], ['stage' => 1]]);
         $staged = new class extends Model implements Compatible
         {
             use ServesCompatibility;
-
-            public $timestamps = false;
 
             protected $table = 'stages';
 
@@ -276,24 +291,31 @@ final class TransitionsTest extends TestCase
             public static function compatibility(Compatibility $stage): Compatibility
             {
                 return $stage
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('stages_retained', key: 'staged_job_id')
-                    ->servedFrom(StagedJob::class, fn (Successor $job) => $job
-                        ->attribute('stage', fn (Attribute $attribute) => $attribute->from('stage')->transitions()));
+                    ->retainedIn('stages_retained')
+                    ->servedFrom(root: StagedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'stage',
+                            definition: fn (Attribute $attribute) => $attribute->from('stage')->transitions(),
+                        ));
             }
         };
 
         try {
             Compatibility::prepare($staged::class);
-            DB::statement('insert into staged_jobs (legacy_id, stage) select id, stage from stages');
-            Compatibility::install($staged::class);
+            DB::statement('update stages set job_id = gen_random_uuid()');
+            DB::statement('insert into staged_jobs (id, stage) select job_id, stage from stages');
+            Compatibility::install(
+                model: $staged::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
 
             $staged->newQuery()->findOrFail(1)->update(['stage' => LifecycleStage::Live]);
             $refusal = $this->refusal(fn () => $staged->newQuery()->findOrFail(1)->update(['stage' => LifecycleStage::Drafting]));
-            $stages = DB::table('staged_jobs')->orderBy('legacy_id')->pluck('stage')->all();
+            $stages = DB::table('staged_jobs')->orderBy(DB::table('stages_retained')->whereColumn(first: 'job_id', operator: '=', second: 'staged_jobs.id')->select('id'))->pluck('stage')->all();
         } finally {
             DB::statement('drop view if exists stages');
-            DB::statement('drop table if exists stages, stages_retained, staged_jobs cascade');
+            DB::statement('drop table if exists stages, stages_retained, stages_backfill, staged_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'stages'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
@@ -309,7 +331,11 @@ final class TransitionsTest extends TestCase
 
         $refusal = $this->refusal(fn () => Listing::query()->create(['title' => 'Cedar Cabin', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Active]));
 
-        $this->assertSame('drafting', DB::table('jobs')->where('legacy_id', $listing->id)->value('lifecycle_status'));
+        $this->assertSame('drafting', DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf($listing->id),
+        )->value('lifecycle_status'));
         $this->assertSame(Listing::class.' cannot insert a record whose $status stores \'live\'. Why: A new Job starts in its initial state \'drafting\' on lifecycle_status, and an insert runs no transition. Instead: Insert the record with the status that stores \'drafting\', then change it in a second write.', $refusal->getMessage());
         $this->assertSame($before, $this->snapshot());
     }
@@ -330,21 +356,34 @@ final class TransitionsTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->servedFrom(LaunchedJob::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
-                        ->attribute('status', fn (Attribute $attribute) => $attribute
-                            ->from('lifecycle_status')
-                            ->mapping(['drafting' => ListingStatus::Draft, 'live' => ListingStatus::Active, 'closed' => ListingStatus::Sold])
-                            ->transitions()));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: LaunchedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'status',
+                            definition: fn (Attribute $attribute) => $attribute
+                                ->from('lifecycle_status')
+                                ->mapping(['drafting' => ListingStatus::Draft, 'live' => ListingStatus::Active, 'closed' => ListingStatus::Sold])
+                                ->transitions(),
+                        ));
             }
         };
 
         $launched = $listing->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Active]);
         $refusal = $this->refusal(fn () => $listing->newQuery()->create(['title' => 'Cedar Cabin', 'company_id' => ListingTables::COMPANY, 'status' => ListingStatus::Draft]));
 
-        $this->assertSame('live', DB::table('jobs')->where('legacy_id', $launched->getKey())->value('lifecycle_status'));
+        $this->assertSame('live', DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf($launched->getKey()),
+        )->value('lifecycle_status'));
         $this->assertSame($listing::class.' cannot insert a record whose $status stores \'drafting\'. Why: A new LaunchedJob starts in its initial state \'live\' on lifecycle_status, and an insert runs no transition. Instead: Insert the record with the status that stores \'live\', then change it in a second write.', $refusal->getMessage());
     }
 
@@ -364,7 +403,11 @@ final class TransitionsTest extends TestCase
             DB::statement('drop schema compatibility_tenant cascade');
         }
 
-        $this->assertSame(['compatibility_tenant', 'drafting'], [$schema, DB::table('jobs')->where('legacy_id', $listing->id)->value('lifecycle_status')]);
+        $this->assertSame(['compatibility_tenant', 'drafting'], [$schema, DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf($listing->id),
+        )->value('lifecycle_status')]);
     }
 
     #[Test]
@@ -400,7 +443,7 @@ final class TransitionsTest extends TestCase
     {
         $tables = [];
 
-        foreach (['jobs' => 'legacy_id', 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'job_id'] as $table => $order) {
+        foreach (['jobs' => ListingTables::legacyId(), 'places' => 'street', 'job_sites' => 'latitude', 'listings_retained' => 'job_id'] as $table => $order) {
             $tables[$table] = DB::table($table)->orderBy($order)->get()->map(fn (object $row) => (array) $row)->all();
         }
 

@@ -18,12 +18,12 @@ Listing::query()
 
 ```sql
 select * from "listings"
-where "listings"."id" in (select "jobs"."legacy_id" from "jobs" where ("jobs"."price_cents" > 10000))
-  and not ("listings"."id" not in (select "jobs"."legacy_id" from "jobs" where ("jobs"."lifecycle_status" = 'closed')))
+where "listings"."job_id" in (select "jobs"."id" from "jobs" where ("jobs"."price_cents" > 10000))
+  and not ("listings"."job_id" not in (select "jobs"."id" from "jobs" where ("jobs"."lifecycle_status" = 'closed')))
   and "listings"."deleted_at" is null
 ```
 
-Each translated filter becomes a membership test on the legacy key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own lateral joins.
+Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own lateral joins.
 
 Everything that does not touch a converted attribute passes through to Laravel unchanged. So does every query before install, while the legacy name is still a table.
 
@@ -72,7 +72,7 @@ Eloquent forwards most query methods straight to the query builder, so an overri
 - **`LegacyBuilder::converted()`** returns the attribute name only for a map attribute with conversions, or one stored outside the database, once the view is installed. Every other column passes through. `LegacyBuilder::attributeOf()` strips this model's table prefix first.
 - **`LegacyBuilder::relation()`** reads once per builder the current schema, whether the legacy name is a view, and whether the role can read the successors. A legacy name that is still a table is cached for the process.
 - **`LegacyBuilder::map()`** caches the resolved map per model class. `LegacyBuilder::collations()` caches collations per connection, schema and table.
-- **`LegacyBuilder::forgetViews()`** clears the column, collation and still-a-table caches. `Compatibility::prepare()`, `Compatibility::install()`, `Compatibility::recompile()` and `Compatibility::uninstall()` call it after they run. A builder created before the operation keeps its own relation.
+- **`LegacyBuilder::forgetViews()`** clears the column, collation and still-a-table caches. `Compatibility::prepare()`, `Compatibility::install()`, `Compatibility::update()`, `Compatibility::rollback()` and `Compatibility::retire()` call it after they run. A builder created before the operation keeps its own relation.
 
 ## Which filters translate
 
@@ -108,7 +108,7 @@ Comparing the stored column must return exactly what comparing the served value 
 
 A negated filter must keep SQL's NULL semantics. `NOT (price > 100)` excludes a listing with no price.
 
-`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. On the stored column, a negated filter translates only through each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. A negated filter whose complement does not translate stays on the view. On the rebuilt expression, the subquery negates the caller's filter directly. That keeps the view's NULL semantics, because the expression is the view's own. The outer membership test cancels the group's own `NOT`, because the legacy key is never NULL. The `status` filter in the example above shows the result.
+`LegacyBuilder` therefore pushes negation into the value predicate. It counts the enclosing `whereNot()` groups, carrying the count into each nested builder. On the stored column, a negated filter translates only through each operator's complement, so `>` becomes `<=`, and `and` and `or` swap by De Morgan's law. A negated filter whose complement does not translate stays on the view. On the rebuilt expression, the subquery negates the caller's filter directly. That keeps the view's NULL semantics, because the expression is the view's own. The outer membership test cancels the group's own `NOT`, because the view serves no row whose successor key is NULL, and the subquery selects the root's primary key. The `status` filter in the example above shows the result.
 
 ## Refusals
 

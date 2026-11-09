@@ -11,11 +11,8 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Expression as RawExpression;
-use Illuminate\Support\Str;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -37,22 +34,6 @@ final readonly class RecordWriter
     {
         Applying::unidentified($legacy);
 
-        if ($this->map->branches !== []) {
-            $this->refuseRaw($values);
-            $writer = new MassWriter($this->map, $this->connection);
-
-            return $writer->transaction(function () use ($writer, $legacy, $values): int|string {
-                $values = $this->evaluateRetained($legacy, null, $this->withRetainedDefaults($values));
-                $branch = $this->choose($legacy, [], $values, null);
-                $writer->claim($values, $branch);
-                $key = $this->through($branch)->insert($legacy, $values);
-                $writer->claim($this->allocated($legacy, $branch, $key), $branch);
-                $this->refuseStoredBranch($legacy, null, $key, $branch);
-
-                return $key;
-            });
-        }
-
         if ($this->map->morphs !== []) {
             $this->refuseRaw($values);
 
@@ -70,9 +51,18 @@ final readonly class RecordWriter
             [$stored, $retained, $states, $external] = $this->split($legacy, $values, null);
             $primary = $this->successor($this->map->primary->model);
             $table = $this->map->primary->table;
+            $supplied = $retained[$this->map->successorKey] ?? null;
+            unset($retained[$this->map->successorKey]);
 
-            if ($this->map->membership !== null) {
-                $stored[$table][$this->map->membership->column] = $this->map->membership->alias;
+            if ($supplied !== null) {
+                $this->refuseNamedRoot(
+                    legacy: $legacy,
+                    root: $supplied,
+                );
+                $primary->setAttribute(
+                    key: $this->map->primary->key,
+                    value: $supplied,
+                );
             }
 
             $stored = $this->transition($legacy, null, [$table => $primary], array_intersect_key($states, [$table => true]), $stored);
@@ -80,15 +70,17 @@ final readonly class RecordWriter
             $this->writeExternal($primary, $external);
             $known = $this->createTarget($legacy, $primary, $stored, $external, array_filter([$this->map->target]));
             $this->save($legacy, $primary, fn () => $primary->save());
-            $key = $this->identify($legacy, $primary);
+            $key = $this->identify(
+                legacy: $legacy,
+                primary: $primary,
+                retained: $retained,
+            );
             [$models, $existing, $missing] = $this->locate($primary, $stored + $states + $this->reachedBy($external), $known);
             $stored = $this->transition($legacy, $key, $models, array_diff_key($states, [$table => true]), $stored);
             $this->assignEach($models, $stored);
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
-            $this->refuseReclassified($legacy, $primary, null);
             $this->refuseRepointed($legacy, $primary, null, $known, []);
-            (new RetainedRows($this->map, $this->connection))->upsert($this->map->branch ? $key : self::keyOf($primary), $retained);
             $this->readBack($legacy, $key, array_keys($values));
             $this->readBackExternal($legacy, $key, array_keys($external));
             ExternalAttributes::refreshed($legacy, $key);
@@ -102,10 +94,6 @@ final readonly class RecordWriter
      */
     public function update(Model $legacy, array $values, bool $deleting = false, bool $restoring = false): int
     {
-        if ($this->map->branches !== []) {
-            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateBranch($legacy, $values, $deleting, $restoring));
-        }
-
         if ($this->map->morphs !== []) {
             return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->updateMorph($legacy, $values, $deleting, $restoring));
         }
@@ -130,9 +118,12 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $original, $pending, $deleting, $restoring, $touched);
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
-            $this->refuseReclassified($legacy, $primary, $key);
             $this->refuseRepointed($legacy, $primary, $key, $created, $original);
-            $after = $this->rekey($legacy, $primary, $key, $values);
+            $after = self::keyAfter(
+                legacy: $legacy,
+                key: $key,
+                values: $values,
+            );
             $this->readBack($legacy, $after, array_keys($values));
             $this->readBackExternal($legacy, $after, array_keys($external));
             self::rebind($legacy, $key, $after);
@@ -147,10 +138,6 @@ final readonly class RecordWriter
      */
     public function increment(Model $legacy, array $amounts, array $extra): int
     {
-        if ($this->map->branches !== []) {
-            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->incrementBranch($legacy, $amounts, $extra));
-        }
-
         if ($this->map->morphs !== []) {
             return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->incrementMorph($legacy, $amounts, $extra));
         }
@@ -177,9 +164,15 @@ final readonly class RecordWriter
             $this->savePrimary($legacy, $primary, $original, $pending, false, false, $touched);
             $this->saveRelated($legacy, $existing, $external);
             $this->create($legacy, $key, $models, $missing, $stored, $states, $external);
-            $this->refuseReclassified($legacy, $primary, $key);
             $this->refuseRepointed($legacy, $primary, $key, $created, $original);
-            $after = $this->rekey($legacy, $primary, $key, $extra + $amounts);
+            $after = self::keyAfter(
+                legacy: $legacy,
+                key: $key,
+                values: array_key_exists(
+                    key: $legacy->getKeyName(),
+                    array: $amounts,
+                ) && is_int($key) ? [$legacy->getKeyName() => $key + (int) $amounts[$legacy->getKeyName()]] : $extra,
+            );
             $this->readBack($legacy, $after, [...array_keys($amounts), ...array_keys($extra)]);
             $this->readBackExternal($legacy, $after, array_keys($external));
             self::rebind($legacy, $key, $after);
@@ -190,10 +183,6 @@ final readonly class RecordWriter
 
     public function delete(Model $legacy): int
     {
-        if ($this->map->branches !== []) {
-            return (new MassWriter($this->map, $this->connection))->transaction(fn (): int => $this->deleteBranch($legacy));
-        }
-
         return (new MassWriter($this->map, $this->connection))->transaction(function () use ($legacy): int {
             $primary = $this->lock($legacy, self::keyOf($legacy));
 
@@ -206,44 +195,6 @@ final readonly class RecordWriter
 
             return 1;
         });
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     */
-    private function updateBranch(Model $legacy, array $values, bool $deleting, bool $restoring = false): int
-    {
-        $this->refuseRaw($values);
-        $key = self::keyOf($legacy);
-        [$current, $primary] = $this->holding($legacy, $key);
-
-        if ($current === null || $primary === null) {
-            return 0;
-        }
-
-        $values = $this->evaluateRetained($legacy, $key, $values);
-        $before = $this->before($legacy, $key);
-        $target = $this->choose($legacy, $before, $values, $current);
-
-        if ($target === $current) {
-            (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($values, $this->map->identifiers), $current);
-            $updated = $this->through($current)->update($legacy, $values, $deleting, $restoring);
-            $this->refuseStoredBranch($legacy, $key, $this->settle($legacy, $current, $primary, $key, $values, array_keys($values)), $current);
-
-            return $updated;
-        }
-
-        $this->through($target)->split($legacy, $values, $key);
-        $values = $this->through($current)->guard($legacy, $primary, $key, $values, [], $values, $target);
-        $this->rekey($legacy, null, $key, $values);
-        $stored = (new BranchMove($this->map, $this->connection))->run($legacy, $primary, $target, $before, $values);
-        $this->confirm($legacy, $target, $key, $values, $this->allocated($legacy, $target, $stored));
-        $this->refuseStoredBranch($legacy, $key, $stored, $target);
-        $this->readBack($legacy, $stored, array_keys(array_intersect_key($before, $legacy->getAttributes() + $values)));
-        $this->readBackExternal($legacy, $stored, [...array_keys($legacy->getAttributes()), ...array_keys($values)]);
-        ExternalAttributes::refreshed($legacy, $stored);
-
-        return 1;
     }
 
     /**
@@ -359,7 +310,7 @@ final readonly class RecordWriter
             $column = (string) $this->map->morph?->typeColumn;
             $stores = $type === null ? 'no '.$column : $column.' '.self::quoted($type);
 
-            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'successors: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
+            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'targets: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
         }
     }
 
@@ -494,29 +445,6 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function rekey(Model $legacy, null|Model $primary, int|string $key, array $values): int|string
-    {
-        $name = $legacy->getKeyName();
-        $moved = match (true) {
-            ! in_array($name, array_map(fn (int|string $column) => Str::afterLast((string) $column, '.'), array_keys($values)), true) => $key,
-            $primary !== null => $this->identify($legacy, $primary),
-            default => self::keyAfter($legacy, $key, $values),
-        };
-
-        if ($moved === $key) {
-            return $key;
-        }
-
-        if ($this->map->branches !== [] && $this->map->retainedTable !== null) {
-            $this->connection->table($this->map->retainedTable)->where((string) $this->map->retainedKey, $key)->update([(string) $this->map->retainedKey => $moved]);
-        }
-
-        return $moved;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     */
     private static function keyAfter(Model $legacy, int|string $key, array $values): int|string
     {
         $moved = $values[$legacy->getKeyName()] ?? null;
@@ -537,7 +465,13 @@ final readonly class RecordWriter
      */
     private function evaluateRetained(Model $legacy, null|int|string $key, array $values): array
     {
-        return array_replace($values, (new MassWriter($this->map, $this->connection))->typed(array_diff_key($values, $this->map->identifiers, $this->map->attributes), $key));
+        return array_replace($values, (new MassWriter(
+            map: $this->map,
+            connection: $this->connection,
+        ))->typed(
+            values: array_diff_key($values, $this->map->attributes),
+            key: $key,
+        ));
     }
 
     /**
@@ -553,7 +487,10 @@ final readonly class RecordWriter
         $defaults = [];
 
         foreach ((new ColumnCatalog($this->connection, throughSearchPath: true))->of($this->map->retainedTable) as $name => $column) {
-            if ($column->default !== null && $name !== $this->map->retainedKey && ! array_key_exists($name, $values) && $this->map->legacyOnly([$name]) !== []) {
+            if ($column->default !== null && $name !== $this->map->successorKey && ! array_key_exists(
+                key: $name,
+                array: $values,
+            ) && $this->map->legacyOnly([$name]) !== []) {
                 $defaults[$name] = new RawExpression('CAST(('.$column->default.') AS '.$column->type.')');
             }
         }
@@ -569,155 +506,13 @@ final readonly class RecordWriter
         foreach ($values as $name => $value) {
             $name = (string) $name;
 
-            if (array_key_exists($name, $this->map->identifiers) || (array_key_exists($name, $this->map->attributes) && ! $this->map->attributes[$name]->isExternal())) {
+            if (array_key_exists(
+                key: $name,
+                array: $this->map->attributes,
+            ) && ! $this->map->attributes[$name]->isExternal()) {
                 MassWriter::refuseRaw($this->map, $name, $value);
             }
         }
-    }
-
-    /**
-     * @param  array<string, float|int|numeric-string>  $amounts
-     * @param  array<string, mixed>  $extra
-     */
-    private function incrementBranch(Model $legacy, array $amounts, array $extra): int
-    {
-        $this->refuseRaw($extra);
-        MassWriter::refuseIdentifierAmounts($this->map, $amounts);
-        $key = self::keyOf($legacy);
-        [$current, $primary] = $this->holding($legacy, $key);
-
-        if ($current === null || $primary === null) {
-            return 0;
-        }
-
-        $extra = $this->evaluateRetained($legacy, $key, $extra);
-        $added = array_diff_key($amounts, $extra);
-        $sums = [];
-
-        foreach (array_diff_key($added, $this->map->attributes) as $name => $amount) {
-            $sums[$name] = new RawExpression(SqlFragments::identifier($this->map->table).'.'.SqlFragments::identifier($name).' + '.($amount + 0));
-        }
-
-        $exact = count($sums) === count($added);
-
-        if ($exact) {
-            $this->refuseIncrementMove($legacy, $key, $current, array_replace($this->before($legacy, $key), $extra, (new MassWriter($current, $this->connection))->served($extra) ?? [], (new MassWriter($this->map, $this->connection))->typed($sums, $key)));
-        }
-
-        (new MassWriter($this->map, $this->connection))->claim(array_intersect_key($extra, $this->map->identifiers), $current);
-        $incremented = $this->through($current)->increment($legacy, $amounts, $extra);
-        $moved = $this->settle($legacy, $current, $primary, $key, $extra, [...array_keys($amounts), ...array_keys($extra)]);
-        $after = $this->connection->table($this->map->table)->where($legacy->getKeyName(), $moved)->first();
-
-        if ($after !== null) {
-            $this->refuseIncrementMove($legacy, $key, $current, (array) $after);
-        }
-
-        return $incremented;
-    }
-
-    /**
-     * @param  array<string, mixed>  $before
-     * @param  array<string, mixed>  $values
-     */
-    private function choose(Model $legacy, array $before, array $values, null|ResolvedMap $current): ResolvedMap
-    {
-        $probed = $this->map->branchFor(self::probe($legacy, array_replace($before, $values)));
-        $consistent = [];
-
-        foreach ($this->map->branches as $branch) {
-            $served = $this->projected($branch, $values);
-
-            if ($served !== null && $this->map->branchFor(self::probe($legacy, array_replace($before, $values, $served))) === $branch) {
-                $consistent[] = $branch;
-            }
-        }
-
-        foreach ([$current, $probed] as $choice) {
-            if ($choice !== null && in_array($choice, $consistent, true)) {
-                return $choice;
-            }
-        }
-
-        return $consistent[0] ?? $probed;
-    }
-
-    private function refuseStoredBranch(Model $legacy, null|int|string $key, int|string $stored, ResolvedMap $held): void
-    {
-        $row = $this->connection->table($this->map->table)->where($legacy->getKeyName(), $stored)->first();
-        $chosen = $row === null ? $held : $this->map->branchFor(self::stored($legacy, (array) $row));
-
-        if ($chosen !== $held) {
-            $successor = class_basename($chosen->primary->model);
-
-            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that stores '.($key === null ? 'a new record' : 'record '.$key).' in '.class_basename($held->primary->model).' where servedFrom() chooses '.$successor, 'The view serves the record with values that servedFrom() reads as a '.$successor.', so the record would sit in a successor its selector does not choose.');
-        }
-    }
-
-    /**
-     * @param  array<string, mixed>  $after
-     */
-    private function refuseIncrementMove(Model $legacy, int|string $key, ResolvedMap $current, array $after): void
-    {
-        $target = $this->map->branchFor(self::probe($legacy, $after));
-
-        if ($target !== $current) {
-            throw CompatibilityWriteRefused::unsupported($legacy::class, 'an increment that moves record '.$key.' to '.class_basename($target->primary->model), 'An increment adds to the values its record stores, and a move recreates the record through another successor model.');
-        }
-    }
-
-    private function refuseReclassified(Model $legacy, Model $primary, null|int|string $key): void
-    {
-        $membership = $this->map->membership;
-
-        if ($membership === null) {
-            return;
-        }
-
-        $table = $this->map->primary->table;
-        $stored = $this->connection->table($table)->where($table.'.'.$this->map->primary->key, $primary->getKey())->value($table.'.'.$membership->column);
-
-        if ($stored !== $membership->alias) {
-            throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that gives '.($key === null ? 'a new record' : 'record '.$key).' another legacy model', class_basename($membership->successor).' stored '.$membership->column.' '.(is_scalar($stored) ? SqlFragments::literal((string) $stored) : 'null').' where '.class_basename($legacy).' writes '.SqlFragments::literal($membership->alias).', so '.class_basename($legacy).' would no longer serve the record.');
-        }
-    }
-
-    private function deleteBranch(Model $legacy): int
-    {
-        $key = self::keyOf($legacy);
-        [$current] = $this->holding($legacy, $key);
-
-        if ($current === null) {
-            return 0;
-        }
-
-        $deleted = $this->through($current)->delete($legacy);
-
-        if ($this->map->retainedTable !== null) {
-            $this->connection->table($this->map->retainedTable)->where((string) $this->map->retainedKey, $key)->delete();
-        }
-
-        return $deleted;
-    }
-
-    /**
-     * @return array{null|ResolvedMap, null|Model}
-     */
-    private function holding(Model $legacy, int|string $key): array
-    {
-        (new MassWriter($this->map, $this->connection))->lockIdentity($legacy->getKeyName(), $key);
-
-        foreach ($this->map->branches as $branch) {
-            $primary = $this->through($branch)->lock($legacy, $key);
-
-            if ($primary !== null) {
-                (new MassWriter($branch, $this->connection))->lockDependentsOf(self::keyOf($primary));
-
-                return [$branch, $primary];
-            }
-        }
-
-        return [null, null];
     }
 
     /**
@@ -728,73 +523,6 @@ final readonly class RecordWriter
         $row = $this->connection->table($this->map->table)->where($legacy->getKeyName(), $key)->first();
 
         return $row === null ? throw new LogicException("{$this->map->table} serves no row {$key} for the successor row the write locked.") : (array) $row;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @param  list<int|string>  $names
-     */
-    private function settle(Model $legacy, ResolvedMap $branch, Model $primary, int|string $key, array $values, array $names): int|string
-    {
-        $this->confirm($legacy, $branch, $key, $values, $this->identifiersWhere($branch, $branch->primary->key, self::keyOf($primary)));
-        $moved = $this->rekey($legacy, null, $key, $values);
-
-        if ($moved !== $key) {
-            $this->readBack($legacy, $moved, $names);
-        }
-
-        return $moved;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @param  array<string, mixed>  $stored
-     */
-    private function confirm(Model $legacy, ResolvedMap $branch, int|string $key, array $values, array $stored): void
-    {
-        (new MassWriter($this->map, $this->connection))->claim($stored, $branch);
-        $written = $values[$legacy->getKeyName()] ?? $key;
-        $kept = $stored[$legacy->getKeyName()] ?? null;
-
-        if ((is_int($written) || is_string($written)) && (is_int($kept) || is_string($kept)) && $this->sameIdentity($branch, $legacy->getKeyName(), $written, $kept)) {
-            return;
-        }
-
-        throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that changes the id of record '.$key, class_basename($branch->primary->model).' stored id '.(is_scalar($kept) ? (string) $kept : 'none').' where the write gives '.(is_scalar($written) ? (string) $written : '').', and the retained values and the instance follow the id the write gives.');
-    }
-
-    private function sameIdentity(ResolvedMap $branch, string $name, int|string $written, int|string $kept): bool
-    {
-        if ((string) $written === (string) $kept) {
-            return true;
-        }
-
-        $type = (new ColumnCatalog($this->connection, throughSearchPath: true))->type($branch->primary->table, (string) $branch->identifiers[$name]->column()) ?? 'text';
-
-        return $this->connection->scalar("select cast(? as {$type}) = cast(? as {$type})", [(string) $written, (string) $kept]) === true;
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private function allocated(Model $legacy, ResolvedMap $branch, int|string $key): array
-    {
-        return $this->identifiersWhere($branch, (string) $branch->identifiers[$legacy->getKeyName()]->column(), $key);
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private function identifiersWhere(ResolvedMap $branch, string $column, int|string $value): array
-    {
-        $table = $branch->primary->table;
-        $columns = array_map(fn (Identifier $identifier) => (string) $identifier->column(), $branch->identifiers);
-        $row = (array) $this->connection->table($table)
-            ->where($table.'.'.(string) $branch->membership?->column, $branch->membership?->alias)
-            ->where($table.'.'.$column, $value)
-            ->first(array_values($columns));
-
-        return array_map(fn (string $column) => $row[$column] ?? null, $columns);
     }
 
     private function through(ResolvedMap $branch): self
@@ -808,42 +536,6 @@ final readonly class RecordWriter
     private static function probe(Model $legacy, array $attributes): Model
     {
         return (clone $legacy)->setRawAttributes($attributes);
-    }
-
-    /**
-     * @param  array<string, mixed>  $row
-     */
-    private static function stored(Model $legacy, array $row): Model
-    {
-        $stored = $legacy->newInstance([], true)->setRawAttributes($row, true);
-        ExternalAttributes::readFrom($stored, true);
-
-        return $stored;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @return null|array<string, mixed>
-     */
-    private function projected(ResolvedMap $branch, array $values): null|array
-    {
-        $served = (new MassWriter($branch, $this->connection))->served($values, fixed: true);
-
-        if ($served === null) {
-            return null;
-        }
-
-        $named = array_flip(array_map(fn (int|string $name) => Str::afterLast((string) $name, '.'), array_keys($values)));
-
-        foreach ($branch->attributes as $name => $attribute) {
-            $conversion = $attribute->conversions()[0] ?? null;
-
-            if ($conversion instanceof Fixed && ! array_key_exists($name, $named) && ! array_key_exists($name, $served)) {
-                $served[$name] = $conversion->value;
-            }
-        }
-
-        return $served;
     }
 
     /**
@@ -861,11 +553,13 @@ final readonly class RecordWriter
             $name = (string) $name;
             $attribute = $this->map->attributes[$name] ?? null;
 
-            if (array_key_exists($name, $this->map->identifiers)) {
-                MassWriter::refuseRaw($this->map, $name, $value);
-                $stored[$this->map->primary->table][(string) $this->map->identifiers[$name]->column()] = $value;
-
-                continue;
+            if ($attribute === null && $name === $this->map->successorKey && $key !== null) {
+                throw CompatibilityWriteRefused::readOnly(
+                    model: $legacy::class,
+                    attribute: $name,
+                    key: $key,
+                    because: 'The successor key binds the record to its '.class_basename($this->map->primary->model).', and a write that rebinds it would serve another root under the same legacy identity.',
+                );
             }
 
             if ($attribute === null) {
@@ -1041,7 +735,13 @@ final readonly class RecordWriter
             }
         }
 
-        $projected = $target === null ? [] : $this->projected($target, $values) ?? [];
+        $projected = $target === null ? [] : (new MassWriter(
+            map: $target,
+            connection: $this->connection,
+        ))->served(
+            values: $values,
+            fixed: true,
+        ) ?? [];
         $after = clone $before;
         $after->setRawAttributes(array_replace($before->getAttributes(), $projected, $values));
 
@@ -1121,20 +821,16 @@ final readonly class RecordWriter
         $retained = new RetainedRows($this->map, $this->connection);
 
         if ($amounts === [] && array_filter($values, fn (mixed $value) => $value instanceof Expression) === []) {
-            $retained->upsert($this->map->branch ? $key : self::keyOf($primary), $values);
+            $retained->set(
+                key: $key,
+                values: $values,
+            );
 
             return;
         }
 
-        if ($this->map->branch) {
-            $legacyKey = (new $this->map->model)->getKeyName();
-            (new MassWriter($this->map, $this->connection))->retainByIdentity($this->connection->table($this->map->table)->where($legacyKey, $key)->select($legacyKey), $values, $amounts);
-
-            return;
-        }
-
-        $key = $this->map->primary->table.'.'.$this->map->primary->key;
-        $retained->upsertAll($this->connection->table($this->map->primary->table)->where($key, self::keyOf($primary))->select($key), $values, $amounts);
+        $root = $this->map->primary->table.'.'.$this->map->primary->key;
+        $retained->update(roots: $this->connection->table($this->map->primary->table)->where(column: $root, operator: '=', value: self::keyOf($primary))->select($root), values: $values, amounts: $amounts);
     }
 
     /**
@@ -1184,11 +880,14 @@ final readonly class RecordWriter
 
     private function lock(Model $legacy, int|string $key): null|Model
     {
-        $query = $this->successor($this->map->primary->model)->newModelQuery()->where((string) $this->map->identifiers[$legacy->getKeyName()]->column(), $key);
+        $retained = ViewCompiler::retainedTable($this->map);
+        $root = $this->connection->table($retained)->where(column: $retained.'.'.$legacy->getKeyName(), operator: '=', value: $key)->value($retained.'.'.$this->map->successorKey);
 
-        if ($this->map->membership !== null) {
-            $query->where($this->map->membership->column, $this->map->membership->alias);
+        if ($root === null) {
+            return null;
         }
+
+        $query = $this->successor($this->map->primary->model)->newModelQuery()->whereKey($root);
 
         foreach (ViewCompiler::hidden($this->map) as $condition) {
             $query->whereRaw('NOT COALESCE(('.$condition.'), false)');
@@ -1197,22 +896,35 @@ final readonly class RecordWriter
         return $query->lockForUpdate()->first();
     }
 
-    private function identify(Model $legacy, Model $primary): int|string
+    private function refuseNamedRoot(Model $legacy, mixed $root): void
     {
-        $columns = [];
+        $table = $this->map->primary->table;
 
-        foreach ($this->map->identifiers as $name => $identifier) {
-            $columns[$name] = (string) $identifier->column();
+        if ($this->connection->table($table)->where(
+            column: $table.'.'.$this->map->primary->key,
+            operator: '=',
+            value: $root,
+        )->exists()) {
+            throw CompatibilityWriteRefused::unsupported(
+                model: $legacy::class,
+                operation: "a create that names the existing {$this->map->primary->table} row ".(is_scalar($root) ? (string) $root : '')." as its {$this->map->successorKey}",
+                because: 'A legacy create creates its own '.class_basename($this->map->primary->model).', and a successor key that names an existing one would bind a second record to it.',
+            );
         }
+    }
 
-        $identity = (array) $primary->newModelQuery()->whereKey($primary->getKey())->toBase()->first(array_values($columns));
-        $primary->setRawAttributes(array_replace($primary->getAttributes(), $identity), true);
-        $key = $identity[$columns[$legacy->getKeyName()]] ?? null;
-
-        if (! is_int($key) && ! is_string($key)) {
-            throw new LogicException("{$this->map->primary->table}.{$columns[$legacy->getKeyName()]} read back no key for the new ".class_basename($legacy).'.');
-        }
-
+    /**
+     * @param  array<string, mixed>  $retained
+     */
+    private function identify(Model $legacy, Model $primary, array $retained): int|string
+    {
+        $key = (new RetainedRows(
+            map: $this->map,
+            connection: $this->connection,
+        ))->insert(
+            root: self::keyOf($primary),
+            values: $retained,
+        );
         Applying::identified($legacy, $key);
 
         return $key;

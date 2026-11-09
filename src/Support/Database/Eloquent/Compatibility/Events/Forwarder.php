@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Closure;
-use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
@@ -104,18 +103,36 @@ final class Forwarder
      */
     public static function register(DispatcherContract $events, string $model): void
     {
-        foreach (Compatibility::of($model)->successors() as $primary => $successors) {
-            foreach ($successors as $successor) {
-                $forward = self::lazily($model, $primary, $successor);
-                $forwarded = array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT);
+        $successors = Compatibility::of($model)->successors();
+        $primary = $successors[0] ?? null;
 
-                foreach ($forwarded as $event) {
-                    self::prepend($events, "eloquent.{$event}: {$successor}", fn (Model $instance): null|false => $forward($event, $instance, false));
-                }
+        foreach ($successors as $successor) {
+            $forward = self::lazily(
+                model: $model,
+                successor: $successor,
+            );
+            $forwarded = array_keys($successor === $primary ? self::PRIMARY : self::DEPENDENT);
 
-                foreach (self::objects($successor, $forwarded) as $object) {
-                    self::prepend($events, $object, fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin($fired, $successor)) === null ? null : $forward($origin[0], $origin[1], true));
-                }
+            foreach ($forwarded as $event) {
+                self::prepend(
+                    events: $events,
+                    event: "eloquent.{$event}: {$successor}",
+                    listener: fn (Model $instance): null|false => $forward($event, $instance, false),
+                );
+            }
+
+            foreach (self::objects(
+                successor: $successor,
+                events: $forwarded,
+            ) as $object) {
+                self::prepend(
+                    events: $events,
+                    event: $object,
+                    listener: fn (object $fired): null|false => (self::$emitted?->offsetExists($fired) ?? false) || ($origin = self::origin(
+                        fired: $fired,
+                        successor: $successor,
+                    )) === null ? null : $forward($origin[0], $origin[1], true),
+                );
             }
         }
     }
@@ -163,12 +180,15 @@ final class Forwarder
      * @param  class-string<Model>  $model
      * @return Closure(string, Model, bool): (null|false)
      */
-    private static function lazily(string $model, string $primary, string $successor): Closure
+    private static function lazily(string $model, string $successor): Closure
     {
         $forwarder = null;
 
-        return function (string $event, Model $instance, bool $object) use (&$forwarder, $model, $primary, $successor): null|false {
-            $forwarder ??= self::resolve(LegacyBuilder::mapOf($model), $primary, $successor);
+        return function (string $event, Model $instance, bool $object) use (&$forwarder, $model, $successor): null|false {
+            $forwarder ??= self::resolve(
+                map: LegacyBuilder::mapOf($model),
+                successor: $successor,
+            );
 
             return $forwarder->forward($event, $instance, $object);
         };
@@ -320,9 +340,9 @@ final class Forwarder
         return $caller !== null && $caller['function'] === $frame[1] && ($caller['object'] ?? null) === $successor;
     }
 
-    private static function resolve(ResolvedMap $map, string $primary, string $successor): self
+    private static function resolve(ResolvedMap $map, string $successor): self
     {
-        $served = $map->branches[$primary] ?? $map->morphs[$successor] ?? $map;
+        $served = $map->morphs[$successor] ?? $map;
 
         foreach ($served->related as $related) {
             if ($related->model === $successor) {
@@ -352,7 +372,7 @@ final class Forwarder
     {
         $record = $sequence->record;
 
-        if ($record === null || ($this->dependent === null && $ahead && ! $record->removes && ! $this->member($successor, false))) {
+        if ($record === null) {
             return null;
         }
 
@@ -446,7 +466,14 @@ final class Forwarder
     {
         $listened = array_filter($this->dependent === null ? self::FOLLOWING[$event] : ['saving', 'updating', 'updated', 'saved'], $this->listens(...)) !== [];
 
-        return $listened && $this->member($successor, true) ? $this->read($successor, in_array($event, ['deleting', 'forceDeleting'], true)) : null;
+        return $listened ? $this->read(
+            successor: $successor,
+            removes: in_array(
+                needle: $event,
+                haystack: ['deleting', 'forceDeleting'],
+                strict: true,
+            ),
+        ) : null;
     }
 
     private function read(Model $successor, bool $removes): null|LegacyRecord
@@ -480,33 +507,6 @@ final class Forwarder
         return ($removes || $successor->exists) && $record->records() === [] ? null : $record;
     }
 
-    private function member(Model $successor, bool $stored): bool
-    {
-        $membership = $this->served->membership;
-
-        if ($membership === null || $this->dependent !== null || ! array_key_exists($membership->column, $successor->getAttributes())) {
-            return true;
-        }
-
-        $column = $membership->column;
-        $value = $successor->getAttributes()[$column];
-
-        if ($stored || ($value instanceof Expression && $successor->exists && ! $successor->isDirty($column))) {
-            return ! $successor->exists || self::stored($successor, $column) === $membership->alias;
-        }
-
-        return ($value instanceof Expression ? LegacyRecord::evaluate($successor, $column, $value)[0] : $value) === $membership->alias;
-    }
-
-    private static function stored(Model $successor, string $column): mixed
-    {
-        $original = $successor->getRawOriginal();
-
-        return array_key_exists($column, $original) && ! $original[$column] instanceof Expression
-            ? $original[$column]
-            : $successor->newModelQuery()->useWritePdo()->whereKey($original[$successor->getKeyName()] ?? $successor->getKey())->value($column);
-    }
-
     /**
      * @param  array<string, mixed>  $before
      */
@@ -527,7 +527,11 @@ final class Forwarder
             $attribute = $this->served->attributes[$name] ?? null;
             $because = match (true) {
                 $removes => 'The forwarded event belongs to a delete, which writes no value.',
-                array_key_exists($name, $this->served->identifiers) => 'It identifies the record, and a forwarded event cannot move it.',
+                in_array(
+                    needle: $name,
+                    haystack: [$legacy->getKeyName(), $this->served->successorKey],
+                    strict: true,
+                ) => 'It identifies the record, and a forwarded event cannot move it.',
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 ! $serves => 'The written '.class_basename($successor).' no longer serves this '.class_basename($legacy).', so the forwarded write cannot store it there.',

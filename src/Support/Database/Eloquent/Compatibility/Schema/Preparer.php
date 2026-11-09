@@ -4,18 +4,17 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
+use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 
 final readonly class Preparer
 {
-    private const int CHUNK = 1000;
-
     public function __construct(private ColumnCatalog $columnCatalog) {}
 
-    public function statements(ResolvedMap $map): Statements
+    public function statements(ResolvedMap $map, ConnectionInterface $connection): Statements
     {
         $checks = [];
         $indexes = [];
@@ -28,111 +27,79 @@ final readonly class Preparer
             }
         }
 
-        [$transaction, $afterwards] = $this->identifiers($map);
-
-        return new Statements('prepare', [...$checks, ...$transaction], [...$afterwards, ...$indexes]);
+        return new Statements(
+            operation: 'prepare',
+            transaction: [
+                ...$checks,
+                ...$this->successorKey($map),
+                ...Backfiller::storage(
+                    map: $map,
+                    connection: $connection,
+                ),
+            ],
+            afterwards: [
+                ...$this->uniqueIndex(
+                    map: $map->table,
+                    table: $map->table,
+                    index: self::uniqueName($map),
+                    columns: '('.SqlFragments::identifier($map->successorKey).')',
+                    constraint: true,
+                ),
+                ...$indexes,
+                ...$this->updatedAtIndex($map),
+            ],
+        );
     }
 
-    /**
-     * @return array{list<string>, list<string>}
-     */
-    private function identifiers(ResolvedMap $map): array
+    public static function uniqueName(ResolvedMap $map): string
     {
-        $legacy = $this->columnCatalog->of($map->table);
-        $primary = SqlFragments::identifier($map->primary->table);
-        $key = SqlFragments::identifier($map->primary->key);
-        $keyType = $this->columnCatalog->type($map->primary->table, $map->primary->key) ?? throw InvalidCompatibilityMap::because($map->table, "the successor table {$map->primary->table} has no column {$map->primary->key}");
-        $membership = $map->membership;
-        $discriminator = $membership === null ? null : SqlFragments::identifier($membership->column);
-        $columns = $discriminator === null ? [] : ['ADD COLUMN IF NOT EXISTS '.$discriminator.' text'];
-        $shared = [];
-        $defaults = [];
-        $fills = [];
-        $missing = [];
-        $checks = [];
-        $notNull = [];
-        $foreignChecks = [];
-        $indexes = [];
-
-        if ($legacy === []) {
-            throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
-        }
-
-        foreach ($map->identifiers as $name => $identifier) {
-            $column = $legacy[$name] ?? throw InvalidCompatibilityMap::because($map->table, "{$map->table} has no column {$name}, so identifier '{$name}' has no type to take");
-            $existing = $this->columnCatalog->type($map->primary->table, (string) $identifier->column());
-
-            if ($existing !== null && $existing !== $column->type) {
-                throw InvalidCompatibilityMap::because($map->table, $membership === null
-                    ? "{$map->primary->table} already has a column {$identifier->column()} of type {$existing}, and identifier '{$name}' needs {$column->type}, the type of {$map->table}.{$name}; change or drop {$map->primary->table}.{$identifier->column()}, then prepare again"
-                    : "{$map->primary->table}.{$identifier->column()} is {$existing}, and {$map->table}.{$name} is {$column->type}; identifiers that share a successor column take one type");
-            }
-
-            $sharesSequence = $membership !== null && $identifier->isInteger();
-            $default = match (true) {
-                $identifier->isUuid() => 'gen_random_uuid()',
-                $sharesSequence => $this->sharedDefault($map, $name, $column),
-                default => $this->sequenceDefault($map, $name, $column),
-            };
-            $successorColumn = SqlFragments::identifier((string) $identifier->column());
-            $filledName = SqlFragments::objectName($map->table, $map->primary->table.'_'.$identifier->column().'_filled');
-            $filled = SqlFragments::identifier($filledName);
-            $unique = SqlFragments::objectName($map->table, $map->primary->table.'_'.($sharesSequence ? $membership->column.'_' : '').$identifier->column().'_unique');
-            $columns[] = 'ADD COLUMN IF NOT EXISTS '.$successorColumn.' '.$column->type;
-            $defaults[] = 'ALTER COLUMN '.$successorColumn.' SET DEFAULT '.$default;
-            $defaults[] = 'DROP CONSTRAINT IF EXISTS '.$filled;
-            $foreignChecks[] = $this->refuseForeignCheck($map, $filledName, (string) $identifier->column());
-            $foreignChecks[] = $identifier->isUuid() ? '' : $this->refuseUnusableSequence($map, $map->primary->table, (string) $identifier->column(), $default);
-            $foreignChecks[] = $sharesSequence ? $this->refuseUnusableSequence($map, $map->table, $name, $default) : '';
-            $fills[] = $successorColumn.' = COALESCE('.$successorColumn.', '.$default.')';
-            $missing[] = $successorColumn.' IS NULL';
-            $checks[] = ['ADD CONSTRAINT '.$filled.' CHECK ('.$successorColumn.' IS NOT NULL) NOT VALID', 'VALIDATE CONSTRAINT '.$filled];
-            $notNull[] = ['ALTER COLUMN '.$successorColumn.' SET NOT NULL', 'DROP CONSTRAINT '.$filled];
-            $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, $unique, '('.($sharesSequence ? $discriminator.', ' : '').$successorColumn.')', true)];
-
-            if ($membership !== null && ! $sharesSequence) {
-                $indexes = [...$indexes, ...$this->uniqueIndex($map->table, $map->primary->table, SqlFragments::objectName($map->table, $map->primary->table.'_'.$membership->column.'_'.$identifier->column().'_unique'), '('.SqlFragments::identifier($membership->column).', '.$successorColumn.')', true)];
-            }
-
-            if ($sharesSequence) {
-                $shared[] = 'ALTER TABLE '.SqlFragments::identifier($map->table).' ALTER COLUMN '.SqlFragments::identifier($name).' SET DEFAULT '.$default;
-                $shared[] = self::advance($map->table, $name);
-            }
-        }
-
-        $table = "ALTER TABLE {$primary}\n  ";
-
-        return [
-            [
-                ...($shared === [] ? [] : ['CREATE SEQUENCE IF NOT EXISTS '.SqlFragments::identifier(Identifier::SHARED_SEQUENCE), ...$shared]),
-                $table.implode(",\n  ", $columns),
-                "DO \$compatibility\$\nDECLARE\n  found text;\nBEGIN\n".implode('', $foreignChecks)."END\n\$compatibility\$",
-                $table.implode(",\n  ", $defaults),
-            ],
-            [
-                "DO \$compatibility\$\nDECLARE\n  filled_through {$keyType};\n  fill_upto {$keyType};\nBEGIN\n"
-                    ."  LOOP\n"
-                    ."    SELECT chunk.{$key} INTO fill_upto FROM (SELECT {$key} FROM {$primary} WHERE filled_through IS NULL OR {$key} > filled_through ORDER BY {$key} LIMIT ".self::CHUNK.") AS chunk ORDER BY chunk.{$key} DESC LIMIT 1;\n"
-                    ."    EXIT WHEN fill_upto IS NULL;\n"
-                    ."    UPDATE {$primary} SET ".implode(', ', $fills).' WHERE ('.implode(' OR ', $missing).") AND {$key} <= fill_upto AND (filled_through IS NULL OR {$key} > filled_through);\n"
-                    ."    filled_through := fill_upto;\n"
-                    ."    COMMIT;\n"
-                    ."  END LOOP;\n"
-                    ."END\n\$compatibility\$",
-                $table.implode(",\n  ", array_column($checks, 0)),
-                $table.implode(",\n  ", array_column($checks, 1)),
-                // Two statements: ALTER TABLE drops constraints before SET NOT NULL, which would then scan the table.
-                $table.implode(",\n  ", array_column($notNull, 0)),
-                $table.implode(",\n  ", array_column($notNull, 1)),
-                ...$indexes,
-            ],
-        ];
+        return SqlFragments::objectName(
+            map: $map->table,
+            name: $map->table.'_'.$map->successorKey.'_unique',
+        );
     }
 
     /**
      * @return list<string>
      */
-    public function updatedAtIndex(ResolvedMap $map): array
+    private function successorKey(ResolvedMap $map): array
+    {
+        $legacy = $this->columnCatalog->of($map->table);
+
+        if ($legacy === []) {
+            throw InvalidCompatibilityMap::because($map->table, "the legacy table {$map->table} does not exist");
+        }
+
+        $type = $this->columnCatalog->type(
+            table: $map->primary->table,
+            column: $map->primary->key,
+        ) ?? throw InvalidCompatibilityMap::because(
+            map: $map->table,
+            problem: "the successor table {$map->primary->table} has no column {$map->primary->key}",
+        );
+        $existing = $legacy[$map->successorKey] ?? null;
+
+        if ($existing !== null && $existing->type !== $type) {
+            throw InvalidCompatibilityMap::because(
+                map: $map->table,
+                problem: "{$map->table}.{$map->successorKey} is {$existing->type}, and the successor key holds the {$type} key of {$map->primary->table}; change or drop {$map->table}.{$map->successorKey}, then prepare again",
+            );
+        }
+
+        if ($existing !== null && $existing->generated) {
+            throw InvalidCompatibilityMap::because(
+                map: $map->table,
+                problem: "{$map->table}.{$map->successorKey} is a generated or identity column, and the backfill writes the key of each row's ".class_basename($map->primary->model).' into it',
+            );
+        }
+
+        return $existing === null ? ['ALTER TABLE '.SqlFragments::identifier($map->table).' ADD COLUMN IF NOT EXISTS '.SqlFragments::identifier($map->successorKey).' '.$type] : [];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function updatedAtIndex(ResolvedMap $map): array
     {
         $legacy = new $map->model;
         $column = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;
@@ -154,79 +121,6 @@ final readonly class Preparer
                 ."  END IF;\nEND\n\$compatibility\$",
             'CREATE INDEX CONCURRENTLY IF NOT EXISTS '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($map->table).' ('.SqlFragments::identifier($column).')',
         ];
-    }
-
-    public static function advance(string $table, string $column): string
-    {
-        $next = 'CASE WHEN is_called THEN last_value + 1 ELSE last_value END';
-        $shared = SqlFragments::identifier(Identifier::SHARED_SEQUENCE);
-
-        return "DO \$compatibility\$\nDECLARE\n  legacy_sequence text := pg_get_serial_sequence(".SqlFragments::literal(SqlFragments::identifier($table)).', '.SqlFragments::literal($column).");\n  legacy_next bigint := 1;\n  shared_next bigint;\n  target bigint;\nBEGIN\n"
-            ."  EXECUTE format('ALTER SEQUENCE %s INCREMENT BY %s', ".SqlFragments::literal($shared).', (SELECT increment_by FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = '.SqlFragments::literal(Identifier::SHARED_SEQUENCE)."));\n"
-            ."  IF legacy_sequence IS NOT NULL THEN\n"
-            ."    EXECUTE format('SELECT {$next} FROM %s', legacy_sequence) INTO legacy_next;\n"
-            ."  END IF;\n"
-            ."  SELECT {$next} INTO shared_next FROM {$shared};\n"
-            .'  target := greatest(legacy_next, (SELECT coalesce(max('.SqlFragments::identifier($column).'), 0) + 1 FROM '.SqlFragments::identifier($table)."));\n"
-            ."  IF target > shared_next THEN\n"
-            .'    PERFORM setval('.SqlFragments::literal($shared).", target, false);\n"
-            ."  END IF;\n"
-            ."END\n\$compatibility\$";
-    }
-
-    private function sharedDefault(ResolvedMap $map, string $name, Column $column): string
-    {
-        if ($column->generated) {
-            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is an identity column, and integer() on a discriminated successor moves it onto the sequence ".Identifier::SHARED_SEQUENCE);
-        }
-
-        if ($column->default === null || preg_match('/^(pg_catalog\.)?nextval\(/', $column->default) !== 1) {
-            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} draws from no sequence, and integer() on a discriminated successor moves it onto the sequence ".Identifier::SHARED_SEQUENCE);
-        }
-
-        return Identifier::sharedDefault();
-    }
-
-    private function refuseForeignCheck(ResolvedMap $map, string $name, string $column): string
-    {
-        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$name} already exists on {$map->primary->table} and is not the check prepare() adds. Drop or rename it, then prepare again.");
-        $expected = "'CHECK ((' || quote_ident(".SqlFragments::literal($column).") || ' IS NOT NULL))'";
-
-        return '  SELECT pg_get_constraintdef(oid) INTO found FROM pg_constraint WHERE conrelid = to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($map->primary->table)).') AND conname = '.SqlFragments::literal($name).";\n"
-            ."  IF found NOT IN ({$expected}, {$expected} || ' NOT VALID') THEN\n"
-            ."    RAISE EXCEPTION '%', {$refusal};\n"
-            ."  END IF;\n";
-    }
-
-    private function refuseUnusableSequence(ResolvedMap $map, string $table, string $column, string $default): string
-    {
-        $sequence = (string) preg_replace('/^(?:pg_catalog\.)?nextval\((.+)\)$/s', '$1', $default);
-        $relation = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($table)).')';
-        $grantee = "CASE WHEN granted.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(granted.grantee)) END AS inserter, granted.grantee";
-        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot prepare: {$table}.{$column} draws from ")
-            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(', and ').' || found || '.SqlFragments::literal(" can insert into {$table} without USAGE on it. Grant USAGE ON SEQUENCE ")
-            ." || CAST({$sequence} AS text) || ".SqlFragments::literal(' to each of them, then prepare again.');
-
-        return "  SELECT string_agg(inserter, ', ' ORDER BY inserter) INTO found FROM (\n"
-            ."    SELECT {$grantee} FROM pg_class relation CROSS JOIN LATERAL aclexplode(coalesce(relation.relacl, acldefault('r', relation.relowner))) AS granted WHERE relation.oid = {$relation} AND granted.privilege_type = 'INSERT'\n"
-            ."    UNION SELECT {$grantee} FROM pg_attribute attribute CROSS JOIN LATERAL aclexplode(attribute.attacl) AS granted WHERE attribute.attrelid = {$relation} AND attribute.attnum > 0 AND NOT attribute.attisdropped AND granted.privilege_type = 'INSERT'\n"
-            ."  ) AS inserters WHERE NOT has_sequence_privilege(CAST(CASE WHEN grantee = 0 THEN 'public' ELSE pg_get_userbyid(grantee) END AS name), CAST({$sequence} AS oid), 'USAGE, UPDATE');\n"
-            ."  IF found IS NOT NULL THEN\n"
-            ."    RAISE EXCEPTION '%', {$refusal};\n"
-            ."  END IF;\n";
-    }
-
-    private function sequenceDefault(ResolvedMap $map, string $name, Column $column): string
-    {
-        if ($column->generated) {
-            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is an identity column, and integer() shares a sequence that must outlive the legacy column");
-        }
-
-        if ($column->default === null || preg_match('/^(pg_catalog\.)?nextval\(/', $column->default) !== 1) {
-            throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} draws from no sequence, and integer() shares the legacy table's own sequence");
-        }
-
-        return $column->default;
     }
 
     /**
@@ -287,31 +181,19 @@ final readonly class Preparer
      */
     public function unfinished(ResolvedMap $map): array
     {
-        $primary = 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($map->primary->table)).')';
         $refusal = fn (string $what) => SqlFragments::literal("Compatibility map '{$map->table}' cannot install: {$what}, so prepare() has not finished. Run Compatibility::prepare() until it completes, then install again.");
-        $identifiers = '';
-
-        foreach ($map->identifiers as $identifier) {
-            $column = (string) $identifier->column();
-            $discriminator = $map->membership !== null && $identifier->isInteger() ? $map->membership->column : null;
-            $identifiers .= "  IF NOT EXISTS (\n"
-                ."    SELECT FROM pg_attribute attribute\n"
-                .($discriminator === null ? '' : '    JOIN pg_attribute discriminator ON discriminator.attrelid = attribute.attrelid AND discriminator.attname = '.SqlFragments::literal($discriminator)."\n")
-                ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
-                .'      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND '
-                .($discriminator === null ? 'table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum' : 'table_index.indnkeyatts = 2 AND table_index.indkey[0] = discriminator.attnum AND table_index.indkey[1] = attribute.attnum')."\n"
-                ."    WHERE attribute.attrelid = {$primary} AND attribute.attname = ".SqlFragments::literal($column)." AND attribute.attnotnull\n"
-                ."  ) THEN\n"
-                ."    RAISE EXCEPTION '%', ".$refusal("{$map->primary->table}.{$column} is not yet NOT NULL with a unique index ".($discriminator === null ? 'of its own' : "on ({$discriminator}, {$column})")).";\n"
-                ."  END IF;\n";
-        }
-
-        $statements = ["DO \$compatibility\$\nBEGIN\n{$identifiers}END\n\$compatibility\$"];
+        $statements = ["DO \$compatibility\$\nBEGIN\n"
+            .'  IF NOT '.self::uniqueKey($map)." THEN\n"
+            ."    RAISE EXCEPTION '%', ".$refusal("{$map->table}.{$map->successorKey} has no unique index of its own").";\n"
+            ."  END IF;\n"
+            .'  IF '.self::relation(Backfiller::ledger($map->table))." IS NULL THEN\n"
+            ."    RAISE EXCEPTION '%', ".$refusal(Backfiller::ledger($map->table).' does not exist').";\n"
+            ."  END IF;\nEND\n\$compatibility\$"];
 
         foreach ($map->related as $related) {
             if ($related->successor->atMostOneBecause() !== null && ! $related->belongsTo) {
                 [$index, $columns] = $this->atMostOneIndex($map, $related);
-                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".$this->relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
+                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
                     .$this->definitions($related->table, $index, $columns, true)
                     ."  IF found IS DISTINCT FROM expected THEN\n"
                     ."    RAISE EXCEPTION '%', ".$refusal("{$index} is missing, not valid, or not the unique index prepare() builds on {$related->table}").";\n"
@@ -320,6 +202,16 @@ final readonly class Preparer
         }
 
         return $statements;
+    }
+
+    public static function uniqueKey(ResolvedMap $map): string
+    {
+        return "EXISTS (\n"
+            ."    SELECT FROM pg_attribute attribute\n"
+            ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
+            ."      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum\n"
+            .'    WHERE attribute.attrelid = '.self::relation($map->table).' AND attribute.attname = '.SqlFragments::literal($map->successorKey)." AND NOT attribute.attisdropped\n"
+            .'  )';
     }
 
     /**
@@ -335,7 +227,7 @@ final readonly class Preparer
         ];
     }
 
-    private function relation(string $name): string
+    private static function relation(string $name): string
     {
         return 'to_regclass(quote_ident(current_schema()) || '.SqlFragments::literal('.'.SqlFragments::identifier($name)).')';
     }
@@ -347,7 +239,7 @@ final readonly class Preparer
         return "  EXECUTE format('CREATE TEMPORARY TABLE %I (LIKE %I.%I)', ".SqlFragments::literal($table).', current_schema(), '.SqlFragments::literal($table).");\n"
             .'  CREATE UNIQUE INDEX '.SqlFragments::identifier($index).' ON '.SqlFragments::identifier($table).' '.$columns.";\n"
             .'  SELECT '.$definition.' INTO expected FROM pg_index WHERE indrelid = '.SqlFragments::literal('pg_temp.'.SqlFragments::identifier($table))."::regclass;\n"
-            .'  SELECT '.$definition.' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique'.($valid ? ' AND indisvalid' : '').' AND indrelid = '.$this->relation($table).";\n"
+            .'  SELECT '.$definition.' INTO found FROM pg_index WHERE indexrelid = existing AND indisunique'.($valid ? ' AND indisvalid' : '').' AND indrelid = '.self::relation($table).";\n"
             .'  DROP TABLE pg_temp.'.SqlFragments::identifier($table).";\n";
     }
 
@@ -358,7 +250,7 @@ final readonly class Preparer
     {
         $refusal = SqlFragments::literal("Compatibility map '{$map}' cannot prepare: {$index} already exists and is not the unique index prepare() builds. Drop or rename it, then prepare again.");
         $statements = [
-            "DO \$compatibility\$\nDECLARE\n  existing regclass := {$this->relation($index)};\n  expected text;\n  found text;\nBEGIN\n"
+            "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
                 ."  IF existing IS NULL THEN\n    RETURN;\n  END IF;\n"
                 .$this->definitions($table, $index, $columns, false)
                 ."  IF found IS DISTINCT FROM expected THEN\n"

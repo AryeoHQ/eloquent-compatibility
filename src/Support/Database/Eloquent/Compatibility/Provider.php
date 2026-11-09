@@ -13,6 +13,7 @@ use Support\Database\Eloquent\Compatibility\Console\CacheServedModels;
 use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
 use Support\Database\Eloquent\Compatibility\Console\ClearServedModels;
 use Support\Database\Eloquent\Compatibility\Console\CompileSql;
+use Support\Database\Eloquent\Compatibility\Console\Status;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 
@@ -33,7 +34,7 @@ class Provider extends ServiceProvider
 
     public function boot(): void
     {
-        $this->commands([CompileSql::class, Backfill::class, CheckDrift::class, CacheServedModels::class, ClearServedModels::class]);
+        $this->commands([CompileSql::class, Backfill::class, CheckDrift::class, Status::class, CacheServedModels::class, ClearServedModels::class]);
         $this->optimizes(optimize: 'compatibility:cache', clear: 'compatibility:clear', key: 'compatibility');
         $this->forward();
     }

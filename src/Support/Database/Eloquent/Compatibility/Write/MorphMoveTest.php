@@ -12,9 +12,8 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
@@ -70,7 +69,15 @@ final class MorphMoveTest extends TestCase
         Video::query()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'title' => 'Tour embed']);
 
         $this->assertSame([['created', 'link', 'https://youtu.be/tour'], ['saved', 'place asset', 'place_asset_link'], ['deleted', 'file', 'tour.mp4']], $order);
-        $this->assertSame('Tour embed', DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('title'));
+        $this->assertSame('Tour embed', DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 1,
+            )->value('place_asset_id'),
+        )->value('title'));
     }
 
     #[Test]
@@ -111,7 +118,15 @@ final class MorphMoveTest extends TestCase
     #[Test]
     public function it_moves_a_record_whose_place_asset_names_no_target_into_the_one_its_choice_picks(): void
     {
-        $asset = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('id');
+        $asset = DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->value('id');
         DB::table('place_assets')->where('id', $asset)->update(['asset_type' => 'retired_asset']);
 
         Video::query()->findOrFail(3)->update(['original_file_name' => 'drone-v2.mov']);
@@ -122,14 +137,42 @@ final class MorphMoveTest extends TestCase
     #[Test]
     public function it_keeps_the_old_target_of_a_moved_record_while_another_place_asset_still_names_it(): void
     {
-        $file = DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->value('asset_id');
-        DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->update(['asset_id' => $file]);
+        $file = DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 1,
+            )->value('place_asset_id'),
+        )->value('asset_id');
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->update(['asset_id' => $file]);
 
         $updated = Video::query()->findOrFail(1)->update(['youtube_embed_url' => 'https://youtu.be/tour']);
 
         $this->assertTrue($updated);
         $this->assertSame(['https://youtu.be/tour', 'tour.mp4'], [Video::query()->findOrFail(1)->youtube_embed_url, Video::query()->findOrFail(3)->original_file_name]);
-        $this->assertSame([true, $file], [DB::table('asset_files')->where('id', $file)->exists(), DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 3)->value('asset_id')]);
+        $this->assertSame([true, $file], [DB::table('asset_files')->where(
+            column: 'id',
+            operator: '=',
+            value: $file,
+        )->exists(), DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 3,
+            )->value('place_asset_id'),
+        )->value('asset_id')]);
     }
 
     #[Test]
@@ -200,7 +243,15 @@ final class MorphMoveTest extends TestCase
     {
         $before = $this->rows();
         AssetFile::deleted(function (): void {
-            DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 1)->update(['asset_type' => 'unknown_asset']);
+            DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_videos')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: 1,
+                )->value('place_asset_id'),
+            )->update(['asset_type' => 'unknown_asset']);
         });
 
         try {
@@ -233,20 +284,55 @@ final class MorphMoveTest extends TestCase
 
         $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'size_kb' => 300]);
 
-        $this->assertSame(['place_asset_file', 'oak.mp4', null], [DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', 2)->value('asset_type'), $video->newQuery()->findOrFail(2)->getAttribute('original_file_name'), $video->newQuery()->findOrFail(2)->getAttribute('youtube_embed_url')]);
+        $this->assertSame(['place_asset_file', 'oak.mp4', null], [DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: 2,
+            )->value('place_asset_id'),
+        )->value('asset_type'), $video->newQuery()->findOrFail(2)->getAttribute('original_file_name'), $video->newQuery()->findOrFail(2)->getAttribute('youtube_embed_url')]);
     }
 
     #[Test]
     public function it_hands_the_external_write_of_an_updated_or_moved_record_the_place_asset_fields_the_same_write_changes(): void
     {
         $video = $this->guardedVideo();
-        $caption = fn (int $id) => FakeMediaLibrary::bound()->stored('caption-'.DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('id'))?->mimeType;
+        $caption = fn (int $id) => FakeMediaLibrary::bound()->stored('caption-'.DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: DB::table('place_videos')->where(
+                column: 'id',
+                operator: '=',
+                value: $id,
+            )->value('place_asset_id'),
+        )->value('id'))?->mimeType;
 
         $video->newQuery()->findOrFail(1)->update(['title' => 'Tour v2', 'caption' => 'Tour caption']);
         $video->newQuery()->findOrFail(2)->update(['youtube_embed_url' => null, 'original_file_name' => 'oak.mp4', 'title' => 'Oak upload', 'caption' => 'Oak caption']);
 
         $this->assertSame(['Tour v2: Tour caption', 'Oak upload: Oak caption'], [$caption(1), $caption(2)]);
-        $this->assertSame([['Tour v2', 'place_asset_file'], ['Oak upload', 'place_asset_file']], array_map(fn (int $id) => [DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('title'), DB::table('place_assets')->where('legacy_type', 'place_video')->where('legacy_id', $id)->value('asset_type')], [1, 2]));
+        $this->assertSame([['Tour v2', 'place_asset_file'], ['Oak upload', 'place_asset_file']], array_map(
+            callback: fn (int $id) => [DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_videos')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: $id,
+                )->value('place_asset_id'),
+            )->value('title'), DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_videos')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: $id,
+                )->value('place_asset_id'),
+            )->value('asset_type')],
+            array: [1, 2],
+        ));
     }
 
     #[Test]
@@ -293,30 +379,58 @@ final class MorphMoveTest extends TestCase
             public static function compatibility(Compatibility $video): Compatibility
             {
                 return $video
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('place_videos_retained')
-                    ->timestamps()
                     ->guard('sized', fn (Model $after, Model $before) => $before->getAttribute('size_kb') !== null && $after->getAttribute('size_kb') === null, because: 'A sized upload keeps its size.', instead: 'Keep the upload.')
-                    ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                        ->attribute('caption', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => FakeMediaLibrary::bound()->stored('caption-'.$asset->getKey())?->mimeType])->all(),
-                            write: fn (PlaceAsset $asset, null|string $caption) => FakeMediaLibrary::bound()->put('caption-'.$asset->getKey(), new FileMetadata($asset->title.': '.$caption))))
-                        ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->attribute(
+                            name: 'caption',
+                            definition: fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => FakeMediaLibrary::bound()->stored('caption-'.$asset->getKey())?->mimeType])->all(),
+                                write: fn (PlaceAsset $asset, null|string $caption) => FakeMediaLibrary::bound()->put('caption-'.$asset->getKey(), new FileMetadata($asset->title.': '.$caption))),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? AssetLink::class : AssetFile::class,
-                            successors: fn (Successors $successors) => $successors
-                                ->as(AssetFile::class, fn (Successor $file) => $file
-                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute
-                                        ->from('size_bytes')
-                                        ->dividedBy(1000))
-                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null)))
-                                ->as(AssetLink::class, fn (Successor $link) => $link
-                                    ->attribute('original_file_name', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('size_kb', fn (Attribute $attribute) => $attribute->fixed(null))
-                                    ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))));
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: AssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'original_file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'size_kb',
+                                        definition: fn (Attribute $attribute) => $attribute
+                                            ->from('size_bytes')
+                                            ->dividedBy(1000),
+                                    )
+                                    ->attribute(
+                                        name: 'youtube_embed_url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'original_file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'size_kb',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                    )
+                                    ->attribute(
+                                        name: 'youtube_embed_url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
             }
         };
     }

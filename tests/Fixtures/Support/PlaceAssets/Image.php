@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\PlaceAssets;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
@@ -12,9 +13,8 @@ use Illuminate\Support\Collection as Values;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Files\FileMetadata;
 
@@ -43,24 +43,35 @@ final class Image extends Model implements Compatible
     public static function compatibility(Compatibility $image): Compatibility
     {
         return $image
-            ->discriminatedBy('legacy_type')
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier
-                ->integer()
-                ->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier
-                ->uuid()
-                ->from('legacy_uuid'))
             ->retainedIn('place_images_retained')
-            ->timestamps()
-            ->servedFrom(PlaceAsset::class, fn (Successor $asset) => $asset
-                ->attribute('title', fn (Attribute $attribute) => $attribute->from('title'))
-                ->relatedMorph(fn (PlaceAsset $asset) => $asset->asset(),
-                    successors: fn (Successors $successors) => $successors
-                        ->as(AssetFile::class, fn (Successor $file) => $file
-                            ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                            ->attribute('mime_type', fn (Attribute $attribute) => $attribute
-                                ->external(
-                                    read: fn (Collection $files): Values => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                                    write: fn (AssetFile $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType)))));
+            ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_image'))
+                ->attribute(
+                    name: 'created_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                )
+                ->attribute(
+                    name: 'updated_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                )
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('title'),
+                )
+                ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                    choose: fn (Image $image): string => AssetFile::class,
+                    targets: fn (Targets $targets) => $targets
+                        ->as(target: AssetFile::class, successor: fn (Successor $file) => $file
+                            ->attribute(
+                                name: 'file_name',
+                                definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                            )
+                            ->attribute(
+                                name: 'mime_type',
+                                definition: fn (Attribute $attribute) => $attribute
+                                    ->external(
+                                        read: fn (Collection $files): Values => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
+                                        write: fn (AssetFile $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                            ))));
     }
 }

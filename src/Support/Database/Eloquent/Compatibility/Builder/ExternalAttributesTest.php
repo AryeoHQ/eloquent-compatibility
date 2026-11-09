@@ -21,17 +21,13 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
-use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
-use Tests\Fixtures\Support\Files\Link;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\TestCase;
@@ -90,10 +86,47 @@ final class ExternalAttributesTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_the_successor_keys_of_a_loaded_collection_from_the_retained_table_and_its_column_types_once(): void
+    {
+        $photos = Photo::query()->orderBy('id')->get();
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        $read = $photos[1]->mime_type;
+
+        $this->assertSame(['image/jpeg', 1, 1, 0], [
+            $read,
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_contains(
+                    haystack: $sql,
+                    needle: 'from pg_attribute table_column',
+                ),
+            )),
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_starts_with(
+                    haystack: $sql,
+                    needle: 'select "file_id", "id" from "photos_retained"',
+                ),
+            )),
+            count(array_filter(
+                array: $statements,
+                callback: fn (string $sql) => str_contains(
+                    haystack: $sql,
+                    needle: 'from "photos" ',
+                ),
+            )),
+        ]);
+    }
+
+    #[Test]
     public function it_reads_one_record_through_a_collection_of_one(): void
     {
         $library = FakeMediaLibrary::bound();
-        $asset = DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 3)->value('zml_asset_id');
+        $asset = DB::table('files')->where(column: 'id', operator: '=', value: FileTables::fileOf(table: 'photos', id: 3))->value('zml_asset_id');
 
         $this->assertSame('image/png', Photo::query()->findOrFail(3)->mime_type);
         $this->assertSame([['fetch', [$asset]]], $library->calls);
@@ -152,30 +185,6 @@ final class ExternalAttributesTest extends TestCase
 
         $this->assertSame([['video/mp4', 'tour.mp4', false], [null, null, false], ['video/quicktime', 'drone.mov', false]], $videos->map(fn (Video $video) => [$video->mime_type, $video->original_file_name, $video->isDirty()])->all());
         $this->assertSame([0, 1], [$linkQueries, count(FakeMediaLibrary::bound()->calls)]);
-    }
-
-    #[Test]
-    public function it_serves_the_value_an_earlier_branch_fixes_and_refuses_a_filter_its_later_branch_keeps_externally(): void
-    {
-        $embeds = $this->embeds();
-
-        $this->assertSame(['video/mp4', 'text/html', 'video/quicktime'], $embeds::query()->orderBy('id')->get()->map(fn (Model $video) => $video->getAttribute('mime_type'))->all());
-        $this->assertCount(1, FakeMediaLibrary::bound()->calls);
-
-        $this->expectException(CompatibilityQueryRefused::class);
-
-        $embeds::query()->where('mime_type', 'text/html')->get();
-    }
-
-    #[Test]
-    public function it_serves_the_value_the_holding_branch_fixes_whatever_columns_the_record_loaded_or_changed(): void
-    {
-        $embeds = $this->embeds();
-        $partial = $embeds::query()->orderBy('id')->get(['id'])->map(fn (Model $video) => $video->getAttribute('mime_type'))->all();
-        $changed = $embeds::query()->findOrFail(2);
-        $changed->setAttribute('youtube_embed_url', null);
-
-        $this->assertSame([['video/mp4', 'text/html', 'video/quicktime'], 'text/html'], [$partial, $changed->getAttribute('mime_type')]);
     }
 
     #[Test]
@@ -392,12 +401,45 @@ final class ExternalAttributesTest extends TestCase
         foreach ([
             fn () => Photo::query()->toBase()->join('files', 'photos.mime_type', '=', 'files.mime_type')->get(['photos.id']),
             fn () => Photo::query()->join('files', 'files.mime_type', '=', 'photos.mime_type')->get(['photos.id']), // @phpstan-ignore staticMethod.dynamicCall
-            fn () => Photo::query()->toBase()->leftJoin('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where(fn (QueryBuilder $nested) => $nested->where('photos.mime_type', 'image/png')))->get(['photos.id']),
+            fn () => Photo::query()->toBase()->leftJoin(
+                table: 'files',
+                first: fn (JoinClause $join) => $join->on(
+                    first: 'files.id',
+                    operator: '=',
+                    second: 'photos.file_id',
+                )->where(fn (QueryBuilder $nested) => $nested->where(
+                    column: 'photos.mime_type',
+                    operator: '=',
+                    value: 'image/png',
+                )),
+            )->get(['photos.id']),
             fn () => Photo::query()->toBase()->joinWhere('files', 'photos.mime_type', '=', 'image/png')->get(['photos.id']),
             fn () => Photo::query()->toBase()->from('photos as p')->join('files', 'p.mime_type', '=', 'files.mime_type')->get(['p.id']),
             fn () => Video::query()->toBase()->join('files', 'videos.mime_type', '=', 'files.mime_type')->get(['videos.id']),
-            fn () => Photo::query()->toBase()->join('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where('files.legacy_type', 'photo')->where('mime_type', 'image/png'))->get(['photos.id']),
-            fn () => Photo::query()->toBase()->join('files', fn (JoinClause $join) => $join->on('files.legacy_id', '=', 'photos.id')->where('files.legacy_type', 'photo'))->where('files.mime_type', 'like', 'image/%')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join(
+                table: 'files',
+                first: fn (JoinClause $join) => $join->on(
+                    first: 'files.id',
+                    operator: '=',
+                    second: 'photos.file_id',
+                )->where(
+                    column: 'mime_type',
+                    operator: '=',
+                    value: 'image/png',
+                ),
+            )->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join(
+                table: 'files',
+                first: fn (JoinClause $join) => $join->on(
+                    first: 'files.id',
+                    operator: '=',
+                    second: 'photos.file_id',
+                ),
+            )->where(
+                column: 'files.mime_type',
+                operator: 'like',
+                value: 'image/%',
+            )->get(['photos.id']),
         ] as $query) {
             try {
                 $result = $query();
@@ -481,7 +523,15 @@ final class ExternalAttributesTest extends TestCase
             fn () => Photo::query()->toBase()->where('file_name', '=', fn (QueryBuilder $files) => $files->from('files')->select('filename')->whereColumn('files.mime_type', 'photos.mime_type')->limit(1))->get(),
             fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereExists(fn (QueryBuilder $links) => $links->from('links')->whereColumn('links.url', 'photos.mime_type')))->get(),
             fn () => Video::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.mime_type', 'videos.mime_type'))->get(),
-            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn('files.legacy_id', 'photos.id')->where('files.legacy_type', 'photo')->where('mime_type', 'image/png'))->get(),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $files) => $files->from('files')->whereColumn(
+                first: 'files.id',
+                operator: '=',
+                second: 'photos.file_id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            ))->get(),
             fn () => Photo::query()->toBase()->from('photos as p')->whereExists(fn (QueryBuilder $files) => $files->from('files as p')->where('p.mime_type', 'image/png'))->get(['id']),
             fn () => Photo::query()->whereExists(Photo::query()->where('file_name', 'elm.png'))->get(), // @phpstan-ignore staticMethod.dynamicCall
         ] as $query) {
@@ -520,15 +570,77 @@ final class ExternalAttributesTest extends TestCase
         $results = [];
 
         foreach ([
-            fn () => Photo::query()->toBase()->join('files', 'files.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('photos.id')->pluck('photos.id')->all(),
-            fn () => Photo::query()->toBase()->join('files as f', 'f.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('mime_type')->orderBy('photos.id')->pluck('photos.id')->all(),
-            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join('files', 'files.legacy_id', '=', 'q.id')->whereColumn('q.id', 'photos.id')->where('mime_type', 'image/png'))->orderBy('id')->pluck('id')->all(),
-            fn () => Photo::query()->join('files', 'files.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->orderBy('photos.id')->pluck('photos.id')->all(), // @phpstan-ignore staticMethod.dynamicCall
-            fn () => Photo::query()->toBase()->join('files', 'files.legacy_id', '=', 'photos.id')->where('photos.mime_type', 'image/png')->get(['photos.id']),
-            fn () => Photo::query()->toBase()->join('links', 'links.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join(
+                table: 'files',
+                first: 'files.id',
+                operator: '=',
+                second: 'photos.file_id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            )->orderBy('photos.id')->pluck('photos.id')->all(),
+            fn () => Photo::query()->toBase()->join(
+                table: 'files as f',
+                first: 'f.id',
+                operator: '=',
+                second: 'photos.file_id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            )->orderBy('mime_type')->orderBy('photos.id')->pluck('photos.id')->all(),
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join(
+                table: 'files',
+                first: 'files.id',
+                operator: '=',
+                second: 'q.file_id',
+            )->whereColumn(
+                first: 'q.id',
+                operator: '=',
+                second: 'photos.id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            ))->orderBy('id')->pluck('id')->all(),
+            fn () => Photo::query()->join('files', 'files.id', '=', 'photos.file_id')->where('mime_type', 'image/png')->orderBy('photos.id')->pluck('photos.id')->all(), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->join(
+                table: 'files',
+                first: 'files.id',
+                operator: '=',
+                second: 'photos.file_id',
+            )->where(
+                column: 'photos.mime_type',
+                operator: '=',
+                value: 'image/png',
+            )->get(['photos.id']),
+            fn () => Photo::query()->toBase()->join(
+                table: 'links',
+                first: 'links.id',
+                operator: '=',
+                second: 'photos.file_id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            )->get(['photos.id']),
             fn () => Photo::query()->toBase()->join('photos as p', 'p.id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']),
-            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join('links', 'links.legacy_id', '=', 'q.id')->whereColumn('q.id', 'photos.id')->where('mime_type', 'image/png'))->get(),
-            fn () => Photo::query()->join('links', 'links.legacy_id', '=', 'photos.id')->where('mime_type', 'image/png')->get(['photos.id']), // @phpstan-ignore staticMethod.dynamicCall
+            fn () => Photo::query()->toBase()->whereExists(fn (QueryBuilder $photos) => $photos->from('photos as q')->join(
+                table: 'links',
+                first: 'links.id',
+                operator: '=',
+                second: 'q.file_id',
+            )->whereColumn(
+                first: 'q.id',
+                operator: '=',
+                second: 'photos.id',
+            )->where(
+                column: 'mime_type',
+                operator: '=',
+                value: 'image/png',
+            ))->get(),
+            fn () => Photo::query()->join('links', 'links.id', '=', 'photos.file_id')->where('mime_type', 'image/png')->get(['photos.id']), // @phpstan-ignore staticMethod.dynamicCall
         ] as $query) {
             try {
                 $results[] = $query();
@@ -542,10 +654,10 @@ final class ExternalAttributesTest extends TestCase
         $refusal = fn (string $operation) => Photo::class.'::$mime_type cannot take '.$operation.'. Why: it is stored outside the database, so no SQL reads it. Instead: filter or sort on the stored column through the successor model.';
 
         $this->assertSame([
-            [2, 3],
-            [2, 3],
-            [2, 3],
-            [2, 3],
+            [3],
+            [3],
+            [3],
+            [3],
             $refusal('where'),
             $refusal('where'),
             $refusal('where'),
@@ -572,7 +684,7 @@ final class ExternalAttributesTest extends TestCase
     public function it_hands_the_read_the_successors_of_the_loaded_records_only(): void
     {
         $photos = Photo::query()->whereIn('id', [1, 3])->orderBy('id')->get();
-        $assets = DB::table('files')->where('legacy_type', 'photo')->whereIn('legacy_id', [1, 3])->orderBy('legacy_id')->pluck('zml_asset_id')->all();
+        $assets = DB::table('files')->join(table: 'photos_retained', first: 'photos_retained.file_id', operator: '=', second: 'files.id')->whereIn(column: 'photos_retained.id', values: [1, 3])->orderBy('photos_retained.id')->pluck('files.zml_asset_id')->all();
 
         $this->assertSame('image/png', $photos[1]->mime_type);
         $calls = FakeMediaLibrary::bound()->calls;
@@ -658,23 +770,33 @@ final class ExternalAttributesTest extends TestCase
             public static function compatibility(Compatibility $photo): Compatibility
             {
                 return $photo
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
                     ->retainedIn('photos_retained')
-                    ->servedFrom(File::class, fn (Successor $file) => $file
-                        ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                        ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                            read: fn (Collection $files): array => (self::$read ?? throw new LogicException('The test sets no read.'))($files),
-                            write: fn (File $file, null|string $mimeType) => null)));
+                    ->servedFrom(root: File::class, key: 'file_id', successor: fn (Successor $file) => $file
+                        ->attribute(
+                            name: 'file_name',
+                            definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                        )
+                        ->attribute(
+                            name: 'mime_type',
+                            definition: fn (Attribute $attribute) => $attribute->external(
+                                read: fn (Collection $files): array => (self::$read ?? throw new LogicException('The test sets no read.'))($files),
+                                write: fn (File $file, null|string $mimeType) => null),
+                        ));
             }
         };
-        $third = (string) DB::table('files')->where('legacy_type', 'photo')->where('legacy_id', 3)->value('id');
+        $third = (string) FileTables::fileOf(table: 'photos', id: 3);
         $mimeTypes = fn (): array => $photos::query()->orderBy('id')->get()->map(fn (Model $photo) => $photo->getAttribute('mime_type'))->all();
         $failures = [];
 
         foreach ([
-            fn (Collection $files): array => array_fill_keys($files->where('legacy_id', '!=', 3)->modelKeys(), 'image/jpeg'),
+            fn (Collection $files): array => array_fill_keys(
+                keys: $files->where(
+                    key: 'id',
+                    operator: '!=',
+                    value: $third,
+                )->modelKeys(),
+                value: 'image/jpeg',
+            ),
             fn (Collection $files): array => [...array_fill_keys($files->modelKeys(), 'image/jpeg'), 'zml-unknown' => 'image/png'],
         ] as $read) {
             $photos::$read = $read;
@@ -687,7 +809,17 @@ final class ExternalAttributesTest extends TestCase
             }
         }
 
-        $photos::$read = fn (Collection $files): array => [...array_fill_keys($files->modelKeys(), 'image/jpeg'), ...array_fill_keys($files->where('legacy_id', 3)->modelKeys(), null)];
+        $photos::$read = fn (Collection $files): array => [...array_fill_keys(
+            keys: $files->modelKeys(),
+            value: 'image/jpeg',
+        ), ...array_fill_keys(
+            keys: $files->where(
+                key: 'id',
+                operator: '=',
+                value: $third,
+            )->modelKeys(),
+            value: null,
+        )];
 
         $this->assertSame([
             "The external() read closure of attribute 'mime_type' on photos returns no value for successor key {$third}; it returns one value, or null, for each successor it receives.",
@@ -775,7 +907,8 @@ final class ExternalAttributesTest extends TestCase
     #[Test]
     public function it_resolves_a_collection_larger_than_the_bind_parameter_limit_with_one_successor_query(): void
     {
-        DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type) select 'photo', nextval('compatibility_legacy_id_seq'), gen_random_uuid(), 'bulk-' || n || '.jpg', 'image/jpeg' from generate_series(1, 65536) as n");
+        DB::statement("insert into files (id, filename, mime_type) select gen_random_uuid(), 'bulk-' || n || '.jpg', 'image/jpeg' from generate_series(1, 65536) as n");
+        DB::statement("insert into photos_retained (uuid, file_id) select gen_random_uuid(), id from files where filename like 'bulk-%'");
         $photos = Photo::query()->get(['id']);
 
         $successorQueries = $this->successorQueries(fn () => $photos[0]->mime_type);
@@ -854,41 +987,6 @@ final class ExternalAttributesTest extends TestCase
             DB::purge('compatibility_replicated');
             DB::statement('drop schema compatibility_replica cascade');
         }
-    }
-
-    private function embeds(): Model
-    {
-        return new class extends Model implements Compatible
-        {
-            use ServesCompatibility;
-
-            protected $table = 'videos';
-
-            public function getMorphClass()
-            {
-                return 'video';
-            }
-
-            public static function compatibility(Compatibility $video): Compatibility
-            {
-                return $video
-                    ->discriminatedBy('legacy_type')
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('videos_retained')
-                    ->servedFrom(
-                        choose: fn (Model $video): string => $video->getAttribute('youtube_embed_url') !== null ? Link::class : File::class,
-                        successors: fn (Successors $successors) => $successors
-                            ->as(Link::class, fn (Successor $link) => $link
-                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->fixed('text/html'))
-                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->from('url')))
-                            ->as(File::class, fn (Successor $file) => $file
-                                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType))
-                                ->attribute('youtube_embed_url', fn (Attribute $attribute) => $attribute->fixed(null))));
-            }
-        };
     }
 
     private function successorQueries(Closure $read, string $table = 'files'): int

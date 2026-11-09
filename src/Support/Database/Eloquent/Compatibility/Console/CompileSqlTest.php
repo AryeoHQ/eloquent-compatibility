@@ -4,20 +4,22 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Schema\InstallerTest;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
@@ -26,6 +28,7 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\ListingTitles;
 use Tests\TestCase;
 
 #[CoversClass(CompileSql::class)]
@@ -63,61 +66,204 @@ final class CompileSqlTest extends TestCase
         $map = Compatibility::of(Listing::class)->resolve();
         $statements = Statements::install($map, DB::connection());
 
-        $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class]));
-        $printed = explode("\n", Artisan::output(), 4);
+        $this->assertSame(0, Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'install', 'model' => Listing::class],
+        ));
+        [$header, $body] = explode(
+            separator: "\n\nBEGIN;\n\n",
+            string: Artisan::output(),
+            limit: 2,
+        );
+        $printed = explode(
+            separator: "\n",
+            string: $header,
+        );
 
-        $this->assertSame('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=install: the statements Compatibility::install() runs for listings', $printed[0]);
+        $this->assertSame('-- compatibility:sql install Tests\Fixtures\Support\Listings\Listing: the statements Compatibility::install() runs for listings', $printed[0]);
         $this->assertMatchesRegularExpression('/^-- Read from database testing\w*, schema public \(search path .+\), on PostgreSQL \d+\.\d+/', $printed[1]);
         $this->assertMatchesRegularExpression('/^-- Compiled at \d{4}-\d{2}-\d{2}T/', $printed[2]);
-        $this->assertSame(
-            "\nBEGIN;\n\n".implode("\n;\n\n", [...Statements::guard($map, DB::connection(), 'install'), ...$statements->transaction])."\n;\n\nCOMMIT;\n\n-- After the transaction commits, outside any transaction\n\n".implode("\n;\n\n", $statements->afterwards)."\n;\n",
-            $printed[3],
-        );
-        $this->assertStringContainsString("ALTER TABLE \"listing_photos\"\n  DROP CONSTRAINT \"listing_photos_listing_id_foreign\",\n  ADD CONSTRAINT \"listing_photos_listing_id_foreign\" FOREIGN KEY (\"listing_id\") REFERENCES \"jobs\" (\"legacy_id\") ON DELETE CASCADE NOT VALID\n;", $printed[3]);
+        $this->assertSame(array_map(
+            callback: fn (array $lock) => "-- Locks {$lock[0]} in {$lock[1]}",
+            array: $statements->locks,
+        ), array_values(array_filter(
+            array: $printed,
+            callback: fn (string $line) => str_starts_with(
+                haystack: $line,
+                needle: '-- Locks ',
+            ),
+        )));
+        $this->assertSame(implode(
+            separator: "\n;\n\n",
+            array: [...Statements::guard(
+                map: $map,
+                connection: DB::connection(),
+                operation: 'install',
+            ), ...$statements->transaction],
+        )."\n;\n\nCOMMIT;\n", $body);
+        $this->assertStringEndsWith("ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY (\"job_id\") REFERENCES \"jobs\" (\"id\") ON DELETE CASCADE NOT VALID\n;\n\nCOMMIT;\n", $body);
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
     }
 
     #[Test]
-    public function it_prints_the_retained_primary_key_install_adds_after_commit_in_a_transaction_of_its_own(): void
+    public function it_prints_each_dependent_and_where_each_hook_of_dependents_runs_in_the_install(): void
     {
-        DB::statement('alter table listings add column job_id uuid');
-        DB::statement("comment on column listings.job_id is 'compatibility retained key'");
-        DB::statement('update listings set job_id = jobs.id from jobs where jobs.legacy_id = listings.id');
-        DB::statement('create unique index listings_retained_pkey on listings (job_id)');
+        DB::statement(ListingTitles::VIEW);
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
 
-        Artisan::call('compatibility:sql', ['model' => Listing::class]);
-        $printed = Artisan::output();
+            protected $table = 'listings';
 
-        $this->assertStringEndsWith(
-            "\n-- Then in one transaction of their own\n\nBEGIN;\n\n"
-            ."ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_pkey\" PRIMARY KEY USING INDEX \"listings_retained_pkey\"\n;\n\n"
-            ."ALTER TABLE \"listings_retained\" DROP CONSTRAINT \"listings_retained_job_id_not_null\"\n;\n\nCOMMIT;\n",
-            $printed,
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return Listing::compatibility($listing)->dependents(ListingTitles::class);
+            }
+        };
+
+        try {
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => $model::class],
+            );
+            [$header, $body] = explode(
+                separator: "\n\nBEGIN;\n\n",
+                string: Artisan::output(),
+                limit: 2,
+            );
+        } finally {
+            DB::statement('drop view listing_titles');
+        }
+
+        $printed = explode(
+            separator: "\n\n",
+            string: $body,
         );
-        $this->assertStringContainsString("ALTER TABLE \"listings_retained\" VALIDATE CONSTRAINT \"listings_retained_job_id_not_null\"\n;", $printed);
-        $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"));
+        $before = array_search(
+            needle: '-- ListingTitles::beforeInstall() runs here, inside the transaction',
+            haystack: $printed,
+            strict: true,
+        );
+        $after = array_search(
+            needle: '-- ListingTitles::afterInstall() runs here, inside the transaction',
+            haystack: $printed,
+            strict: true,
+        );
+
+        $this->assertContains('-- view listing_titles depends on listings', explode(
+            separator: "\n",
+            string: $header,
+        ));
+        $this->assertIsInt($before);
+        $this->assertIsInt($after);
+        $this->assertStringStartsWith("SELECT set_config('compatibility.grants'", $printed[$before - 1]);
+        $this->assertStringContainsString('EXECUTE granted;', $printed[$after - 1]);
+        $this->assertStringStartsWith('ALTER TABLE "listings" RENAME TO "listings_retained"', $printed[$before + 1]);
+    }
+
+    #[Test]
+    public function it_prints_the_legacy_only_data_retire_discards(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        DB::statement('drop table listing_photos, listing_shares');
+
+        $this->assertSame(0, Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'retire', 'model' => Listing::class],
+        ));
+
+        $this->assertSame([
+            '-- retire() discards listings_retained: 3 rows, with the legacy-only columns uuid, mls_number, featured',
+            '-- retire() discards listings_backfill, the backfill ledger of listings',
+            '-- retire() discards the compatibility_backfills row of listings',
+        ], array_slice(
+            array: explode(
+                separator: "\n",
+                string: explode(
+                    separator: "\n\nBEGIN;\n\n",
+                    string: Artisan::output(),
+                    limit: 2,
+                )[0],
+            ),
+            offset: 3,
+        ));
+    }
+
+    #[DataProviderExternal(InstallerTest::class, 'dependents')]
+    #[Test]
+    public function it_prints_each_object_that_depends_on_the_legacy_table_in_the_prepare_header(string $create, string $drop, string $dependent): void
+    {
+        DB::statement($create);
+
+        try {
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'prepare', 'model' => Listing::class],
+            );
+            $printed = Artisan::output();
+        } finally {
+            DB::statement($drop);
+        }
+
+        $this->assertContains("-- {$dependent} depends on listings", explode(
+            separator: "\n",
+            string: explode(
+                separator: "\n\nBEGIN;\n\n",
+                string: $printed,
+                limit: 2,
+            )[0],
+        ));
     }
 
     #[Test]
     public function it_prints_a_statement_list_without_an_afterwards_section_when_nothing_runs_after_the_transaction(): void
     {
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        Artisan::call('compatibility:sql', ['model' => Listing::class, '--for' => 'recompile']);
-        $printed = explode("\n", Artisan::output(), 4);
+        Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'update', 'model' => Listing::class],
+        );
+        [$header, $body] = explode(
+            separator: "\n\nBEGIN;\n\n",
+            string: Artisan::output(),
+            limit: 2,
+        );
 
-        $this->assertSame('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=recompile: the statements Compatibility::recompile() runs for listings', $printed[0]);
+        $this->assertSame('-- compatibility:sql update Tests\Fixtures\Support\Listings\Listing: the statements Compatibility::update() runs for listings', explode(
+            separator: "\n",
+            string: $header,
+        )[0]);
         $map = Compatibility::of(Listing::class)->resolve();
-        $this->assertSame("\nBEGIN;\n\n".implode("\n;\n\n", [...Statements::guard($map, DB::connection(), 'recompile'), Statements::recompile($map, DB::connection())->transaction[0]])."\n;\n\nCOMMIT;\n", $printed[3]);
+        $this->assertSame(implode(
+            separator: "\n;\n\n",
+            array: [...Statements::guard(
+                map: $map,
+                connection: DB::connection(),
+                operation: 'update',
+            ), Statements::update(
+                map: $map,
+                connection: DB::connection(),
+            )->transaction[0]],
+        )."\n;\n\nCOMMIT;\n", $body);
     }
 
     #[Test]
     public function it_prints_the_query_that_counts_the_legacy_rows_a_hide_rule_hides_at_install(): void
     {
-        Artisan::call('compatibility:sql', ['model' => Listing::class]);
+        Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'install', 'model' => Listing::class],
+        );
 
         $this->assertStringContainsString(
-            '  SELECT count(*) INTO hidden_rows FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."legacy_id" = "listings"."id" AND (COALESCE(("merged_into_job_id" is not null), false)));',
+            '  SELECT count(*) INTO hidden_rows FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."id" = "listings"."job_id" AND (COALESCE(("merged_into_job_id" is not null), false)));',
             Artisan::output(),
         );
     }
@@ -143,7 +289,10 @@ final class CompileSqlTest extends TestCase
         $refusal = null;
 
         try {
-            Artisan::call('compatibility:sql', ['model' => Listing::class, '--output' => $file]);
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => Listing::class, '--output' => $file],
+            );
 
             if ($change !== null) {
                 DB::statement($change);
@@ -166,7 +315,7 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
-    public function it_runs_a_printed_recompile_of_a_map_over_two_successors_only_while_neither_successor_changed(): void
+    public function it_runs_a_printed_update_only_while_the_root_it_read_is_unchanged(): void
     {
         FileTables::create();
         FileTables::seedMedia();
@@ -175,8 +324,11 @@ final class CompileSqlTest extends TestCase
         $refusal = null;
 
         try {
-            Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile', '--output' => $file]);
-            DB::statement('alter table links add column notes text');
+            Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'update', 'model' => Video::class, '--output' => $file],
+            );
+            DB::statement('alter table files add column notes text');
 
             try {
                 DB::unprepared((string) file_get_contents($file));
@@ -188,7 +340,7 @@ final class CompileSqlTest extends TestCase
             unlink($file);
         }
 
-        $this->assertStringContainsString("Compatibility map 'videos' cannot recompile: videos, videos_retained, files or links changed after compatibility:sql read them. Print the statements again.", (string) $refusal);
+        $this->assertStringContainsString("Compatibility map 'videos' cannot update: videos, videos_retained or files changed after compatibility:sql read them. Print the statements again.", (string) $refusal);
     }
 
     #[Test]
@@ -197,30 +349,38 @@ final class CompileSqlTest extends TestCase
         $file = tempnam(sys_get_temp_dir(), 'compatibility');
 
         try {
-            $this->assertSame(0, Artisan::call('compatibility:sql', ['model' => Listing::class, '--for' => 'prepare', '--output' => $file]));
-            $this->assertStringContainsString("Wrote 19 statements to {$file}.", Artisan::output());
-            $this->assertStringStartsWith('-- compatibility:sql Tests\Fixtures\Support\Listings\Listing --for=prepare:', (string) file_get_contents((string) $file));
+            $this->assertSame(0, Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'prepare', 'model' => Listing::class, '--output' => $file],
+            ));
+            $this->assertStringContainsString("Wrote 12 statements to {$file}.", Artisan::output());
+            $this->assertStringStartsWith('-- compatibility:sql prepare Tests\Fixtures\Support\Listings\Listing:', (string) file_get_contents((string) $file));
         } finally {
             unlink((string) $file);
         }
     }
 
     #[Test]
-    public function it_prints_the_union_view_a_map_over_two_successors_recompiles_to(): void
+    public function it_prints_the_view_update_replaces_from_the_retained_table_and_its_root(): void
     {
         FileTables::create();
         FileTables::seedMedia();
         FileTables::installMedia();
 
-        $exit = Artisan::call('compatibility:sql', ['model' => Video::class, '--for' => 'recompile']);
+        $exit = Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'update', 'model' => Video::class],
+        );
         $printed = Artisan::output();
 
         $this->assertSame(0, $exit);
         $this->assertStringContainsString("COMMIT;\n", $printed);
         $this->assertStringContainsString('CREATE OR REPLACE VIEW "videos" AS', $printed);
-        $this->assertSame(1, substr_count($printed, "\nUNION ALL\n"));
-        $this->assertStringContainsString("FROM (SELECT * FROM \"files\" WHERE \"files\".\"legacy_type\" = 'video') AS \"files\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"files\".\"legacy_id\"", $printed);
-        $this->assertStringContainsString("FROM (SELECT * FROM \"links\" WHERE \"links\".\"legacy_type\" = 'video') AS \"links\"\nLEFT JOIN \"videos_retained\" ON \"videos_retained\".\"id\" = \"links\".\"legacy_id\"", $printed);
+        $this->assertStringContainsString('FROM "videos_retained"'."\n".'JOIN "files" ON "files"."id" = "videos_retained"."file_id"', $printed);
+        $this->assertStringNotContainsString('UNION ALL', (string) strstr(
+            haystack: $printed,
+            needle: 'CREATE OR REPLACE VIEW',
+        ));
     }
 
     #[Test]
@@ -235,46 +395,61 @@ final class CompileSqlTest extends TestCase
 
         FileTables::backfill();
 
-        $this->artisan('compatibility:sql', ['model' => Photo::class])
+        $this->artisan(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'install', 'model' => Photo::class],
+        )
             ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
 
         $file = sys_get_temp_dir().'/compatibility-photos-'.getmypid().'.sql';
 
-        $this->artisan('compatibility:sql', ['model' => Photo::class, '--output' => $file])
+        $this->artisan(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'install', 'model' => Photo::class, '--output' => $file],
+        )
             ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
             ->assertFailed();
         $this->assertFileDoesNotExist($file);
 
-        Compatibility::install(Photo::class);
+        Compatibility::install(
+            model: Photo::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->artisan('compatibility:sql', ['model' => Photo::class, '--for' => 'uninstall'])
-            ->expectsOutputToContain('Compatibility::uninstall() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::uninstall() instead.')
+        $this->artisan(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'rollback', 'model' => Photo::class],
+        )
+            ->expectsOutputToContain('Compatibility::rollback() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::rollback() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
     }
 
     #[Test]
-    public function it_refuses_to_print_an_install_that_catches_up_a_backfill_and_deletes_the_successor_rows_of_hard_deleted_legacy_rows(): void
+    public function it_prints_an_install_after_a_pass_with_a_warning_that_the_printed_sql_omits_the_backfill_passes(): void
     {
-        $refusal = "Compatibility map 'listings' cannot install: the last compatibility:backfill of listings left a watermark, and Compatibility::install() catches up the legacy writes since it and deletes the successor rows of hard-deleted legacy rows before it takes the lock, and no printed SQL runs that catch-up. Run Compatibility::install() instead.";
-        (new Backfiller(Compatibility::of(Listing::class)->resolve(), DB::connection()))->run();
-        DB::delete('delete from listings where id = 3');
+        (new Backfiller(
+            map: Compatibility::of(Listing::class)->resolve(),
+            connection: DB::connection(),
+        ))->run();
+        DB::update("update listings set title = 'Oak Manor' where id = 1");
 
-        $this->artisan('compatibility:sql', ['model' => Listing::class])
-            ->expectsOutputToContain($refusal)
-            ->doesntExpectOutputToContain('BEGIN;')
-            ->assertFailed();
+        $exitCode = Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'install', 'model' => Listing::class],
+        );
+        $output = Artisan::output();
 
-        Compatibility::install(Listing::class);
-        Compatibility::uninstall(Listing::class);
-
-        $this->artisan('compatibility:sql', ['model' => Listing::class])
-            ->expectsOutputToContain($refusal)
-            ->doesntExpectOutputToContain('BEGIN;')
-            ->assertFailed();
-        $this->assertSame([1, 2], array_map(intval(...), array_column(DB::select('select legacy_id from jobs order by legacy_id'), 'legacy_id')));
+        $this->assertSame(0, $exitCode);
+        $this->assertStringContainsString("\n-- Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.\n-- Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of listings. Run Compatibility::install() instead.\n", $output);
+        $this->assertStringContainsString("\n\nALTER TABLE \"listings\" RENAME TO \"listings_retained\"\n;\n\n", $output);
+        $this->assertStringEndsWith("\n;\n\nCOMMIT;\n", $output);
+        $this->assertSame(['r', 'Oak Manor'], [
+            DB::scalar("select relkind::text from pg_class where oid = 'listings'::regclass"),
+            DB::table('listings')->where(column: 'id', operator: '=', value: 1)->value('title'),
+        ]);
     }
 
     #[Test]
@@ -297,7 +472,13 @@ final class CompileSqlTest extends TestCase
         };
 
         try {
-            $exits = [Artisan::call('compatibility:sql', ['model' => $model::class]), Artisan::call('compatibility:sql', ['model' => $model::class, '--for' => 'uninstall'])];
+            $exits = [Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => $model::class],
+            ), Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'update', 'model' => $model::class],
+            )];
             $schema = DB::connection('compatibility_replicated')->scalar('select current_schema()');
         } finally {
             DB::purge('compatibility_replicated');
@@ -337,17 +518,24 @@ final class CompileSqlTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(CompileSqlTest::$successor, fn (Successor $job) => $job->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: CompileSqlTest::$successor, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    )->attribute(
+                        name: 'company_id',
+                        definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                    ));
             }
         };
         $exits = [];
 
         foreach ($successors as $successor) {
             self::$successor = $successor::class;
-            $exits[] = Artisan::call('compatibility:sql', ['model' => $legacy::class]);
+            $exits[] = Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => $legacy::class],
+            );
         }
 
         $this->assertSame([0, 1], $exits);
@@ -373,18 +561,28 @@ final class CompileSqlTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier->uuid()->from('legacy_uuid'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'))
-                        ->attribute('listed_wall', fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.')));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                        )
+                        ->attribute(
+                            name: 'listed_wall',
+                            definition: fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.'),
+                        ));
             }
         };
 
         try {
-            $exit = Artisan::call('compatibility:sql', ['model' => $model::class]);
+            $exit = Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'install', 'model' => $model::class],
+            );
             $sequence = (array) DB::selectOne('select last_value, is_called from compatibility_probe');
         } finally {
             DB::statement('drop sequence compatibility_probe');
@@ -398,10 +596,10 @@ final class CompileSqlTest extends TestCase
      * @param  array<string, string>  $arguments
      */
     #[Test]
-    #[TestWith([['model' => Listing::class, '--for' => 'drop'], '--for must be prepare, install, recompile or uninstall, not drop.'])]
-    #[TestWith([['model' => 'Listing'], 'Listing is not a class. Name the legacy model by its full class name.'])]
-    #[TestWith([['model' => Job::class], "Compatibility map 'jobs' is declared wrongly: Job does not implement Support\\Database\\Eloquent\\Compatibility\\Contracts\\Compatible, so it declares no map."])]
-    #[TestWith([['model' => Listing::class, '--for' => 'uninstall'], "Compatibility map 'listings' is declared wrongly: listings is not a view, so uninstall() has nothing to reverse."])]
+    #[TestWith([['operation' => 'drop', 'model' => Listing::class], 'The operation must be prepare, install, update, rollback or retire, not drop.'])]
+    #[TestWith([['operation' => 'install', 'model' => 'Listing'], 'Listing is not a class. Name the legacy model by its full class name.'])]
+    #[TestWith([['operation' => 'install', 'model' => Job::class], "Compatibility map 'jobs' is declared wrongly: Job does not implement Support\\Database\\Eloquent\\Compatibility\\Contracts\\Compatible, so it declares no map."])]
+    #[TestWith([['operation' => 'update', 'model' => Listing::class], "Compatibility map 'listings' is declared wrongly: listings is not a view, so update() has nothing to replace; install() creates it."])]
     public function it_exits_non_zero_with_the_reason_it_cannot_print_the_statements(array $arguments, string $refusal): void
     {
         $this->artisan('compatibility:sql', $arguments)

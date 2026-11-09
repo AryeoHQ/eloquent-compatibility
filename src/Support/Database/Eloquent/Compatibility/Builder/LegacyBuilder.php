@@ -663,7 +663,7 @@ final class LegacyBuilder extends Builder
             }
         }
 
-        if ($map->branches !== [] || $map->isMorphed($attribute)) {
+        if ($map->isMorphed($attribute)) {
             $onView();
 
             return $this;
@@ -680,7 +680,6 @@ final class LegacyBuilder extends Builder
         }
 
         $owner = $map->owners[$attribute]->table;
-        $key = $this->model->getKeyName();
         $negated = $this->negations % 2 === 1;
         $negate = $not !== $negated;
         [$type, $served] = $this->served($attribute, $owner);
@@ -694,7 +693,7 @@ final class LegacyBuilder extends Builder
 
         [$filters, $combine, $negate] = $stored;
         $column = $served === null ? $owner.'.'.$definition->column() : new RawExpression($served);
-        $successors = $this->query->newQuery()->select($map->primary->table.'.'.$map->identifiers[$key]->column());
+        $successors = $this->query->newQuery()->select($map->primary->table.'.'.$map->primary->key);
 
         if ($owner === $map->primary->table) {
             $successors->from($owner);
@@ -702,12 +701,17 @@ final class LegacyBuilder extends Builder
             $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
         }
 
-        if ($map->membership !== null) {
-            $successors->whereRaw($map->membership->of($map->primary->table));
-        }
-
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
-        $this->query->whereIn($this->model->qualifyColumn($key), $successors, str_replace(' not', '', $boolean), $negated);
+        $this->query->whereIn(
+            column: $this->model->qualifyColumn($map->successorKey),
+            values: $successors,
+            boolean: str_replace(
+                search: ' not',
+                replace: '',
+                subject: $boolean,
+            ),
+            not: $negated,
+        );
         $view = $this->relation()['oid'];
 
         if ($view !== 0 && $this->query instanceof LegacyQueryBuilder) {

@@ -69,15 +69,21 @@ final class Successor
     }
 
     /**
-     * @param  Closure(Successors): mixed  $successors
+     * @param  Closure(Targets): mixed  $targets
      */
-    public function relatedMorph(Closure $relation, Closure $successors, null|Closure $choose = null): self
+    public function relatedMorph(Closure $relation, Closure $choose, Closure $targets): self
     {
         if ($this->morph !== null) {
             throw InvalidCompatibilityMap::because($this->map, 'relatedMorph() on '.class_basename($this->model).' is declared twice; one legacy record reads one MorphTo of its successor');
         }
 
-        $this->morph = RelatedMorph::compile($this->map, $this->model, $relation, $successors, $choose);
+        $this->morph = RelatedMorph::compile(
+            map: $this->map,
+            parent: $this->model,
+            relation: $relation,
+            choose: $choose,
+            targets: $targets,
+        );
 
         return $this;
     }

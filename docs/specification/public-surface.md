@@ -121,7 +121,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 | :-- | :-- |
 | `compatibility:backfill {model} {--chunk=1000} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
 | `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, served records whose root no longer matches the map's `when()`, and trashed rows separately |
-| `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table |
+| `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table, for review; it refuses no install because of a watermark |
 | `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names; a backfilling model also shows its pass count, its watermark, and its refused and failed counts |
 | `compatibility:cache` | discovers the served models and caches the list |
 | `compatibility:clear` | removes the cached list |
@@ -132,7 +132,7 @@ The package has no configuration of its own. Each tuning value is a named argume
 
 `compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed.
 
-`compatibility:sql install` also prints each lock install takes, with its mode and table. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
 
 The commands are public by name. Their classes are internal.
 
@@ -149,7 +149,7 @@ The commands are public by name. Their classes are internal.
 
 `$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row and runs one `compatibility:backfill` pass catches an initializer that leaves the discriminator unset.
 
-`Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A test that uses `RefreshDatabase` can therefore install a served model.
+`Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install, which no pass preceded, runs its full pass inside that transaction. A test that uses `RefreshDatabase` can therefore install a served model.
 
 ## Interfaces and their arguments
 

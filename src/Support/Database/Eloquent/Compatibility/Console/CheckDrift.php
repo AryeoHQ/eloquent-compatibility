@@ -16,7 +16,7 @@ final class CheckDrift extends Command
         {--model=* : Check only these legacy models, each by its class or by the class name of one served model}
         {--limit=100 : Report at most this many records per check and model}';
 
-    protected $description = 'Name each record where a served model and its successors drifted apart, reading only, and exit non-zero on any finding that is not informational.';
+    protected $description = 'Name each record where a served model and its successors drifted apart, reading only, and exit non-zero on any finding.';
 
     public function handle(ServedModels $served): int
     {
@@ -49,34 +49,47 @@ final class CheckDrift extends Command
         $findings = [];
         $refusals = [];
 
+        $siblings = [];
+
+        foreach ($served->all() as $sibling) {
+            try {
+                $siblings[] = Compatibility::of($sibling)->resolve();
+            } catch (Throwable $exception) {
+                if (! in_array(
+                    needle: $sibling,
+                    haystack: $models,
+                    strict: true,
+                )) {
+                    $refusals[] = "{$sibling}: {$exception->getMessage()} The check of every map that shares its successors is incomplete.";
+                }
+            }
+        }
+
         foreach ($models as $model) {
             try {
                 $map = Compatibility::of($model)->resolve();
-                $findings = [...$findings, ...(new DriftQueries(Compatibility::connection($map)))->find($map, (int) $limit)];
+                $findings = [...$findings, ...(new DriftQueries(Compatibility::connection($map)))->find(
+                    map: $map,
+                    limit: (int) $limit,
+                    siblings: $siblings,
+                )];
             } catch (Throwable $exception) {
                 $refusals[] = "{$model}: {$exception->getMessage()}";
             }
         }
 
-        $failing = array_values(array_filter($findings, fn (DriftFinding $finding) => ! $finding->check->informational()));
-        $informational = array_values(array_filter($findings, fn (DriftFinding $finding) => $finding->check->informational()));
         $checked = ' in '.count($models).' served '.str('model')->plural(count($models));
 
-        if ($failing !== []) {
-            $this->findings($failing);
-            $this->components->error(count($failing).' drift '.str('finding')->plural(count($failing)).$checked.'.');
-        }
-
-        if ($informational !== []) {
-            $this->findings($informational);
-            $this->components->info(count($informational).' informational '.str('finding')->plural(count($informational)).$checked.', which '.(count($informational) === 1 ? 'does' : 'do').' not fail the check.');
+        if ($findings !== []) {
+            $this->findings($findings);
+            $this->components->error(count($findings).' drift '.str('finding')->plural(count($findings)).$checked.'.');
         }
 
         foreach ($refusals as $refusal) {
             $this->output->getErrorStyle()->writeln($refusal, OutputStyle::OUTPUT_RAW);
         }
 
-        if ($failing !== [] || $refusals !== []) {
+        if ($findings !== [] || $refusals !== []) {
             return self::FAILURE;
         }
 

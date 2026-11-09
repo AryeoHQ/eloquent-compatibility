@@ -11,15 +11,20 @@ use Illuminate\Support\Carbon;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\PlaceAssets\AssetFile;
+use Tests\Fixtures\Support\PlaceAssets\AssetLink;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 
 /**
  * @property int $id
  * @property string $uuid
- * @property string $file_name
- * @property string $mime_type
+ * @property null|string $place_asset_id
+ * @property null|string $file_name
+ * @property null|string $mime_type
+ * @property null|string $url
  * @property null|int $level
  * @property null|Carbon $created_at
  * @property null|Carbon $updated_at
@@ -40,18 +45,45 @@ final class FloorPlan extends Model implements Compatible
     public static function compatibility(Compatibility $floorPlan): Compatibility
     {
         return $floorPlan
-            ->discriminatedBy('legacy_type')
-            ->identifiedBy('id', fn (Identifier $identifier) => $identifier
-                ->integer()
-                ->from('legacy_id'))
-            ->identifiedBy('uuid', fn (Identifier $identifier) => $identifier
-                ->uuid()
-                ->from('legacy_uuid'))
             ->retainedIn('floorplans_retained')
-            ->timestamps()
-            ->servedFrom(File::class, fn (Successor $file) => $file
-                ->when(fn (Builder $files) => $files->whereIn('mime_type', ['image/png', 'application/pdf']))
-                ->attribute('file_name', fn (Attribute $attribute) => $attribute->from('filename'))
-                ->attribute('mime_type', fn (Attribute $attribute) => $attribute->from('mime_type')));
+            ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'floorplan'))
+                ->attribute(
+                    name: 'created_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                )
+                ->attribute(
+                    name: 'updated_at',
+                    definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                )
+                ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                    choose: fn (FloorPlan $plan): string => $plan->url !== null ? AssetLink::class : AssetFile::class,
+                    targets: fn (Targets $targets) => $targets
+                        ->as(target: AssetFile::class, successor: fn (Successor $file) => $file
+                            ->attribute(
+                                name: 'file_name',
+                                definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                            )
+                            ->attribute(
+                                name: 'mime_type',
+                                definition: fn (Attribute $attribute) => $attribute->from('mime_type'),
+                            )
+                            ->attribute(
+                                name: 'url',
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                            ))
+                        ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                            ->attribute(
+                                name: 'file_name',
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                            )
+                            ->attribute(
+                                name: 'mime_type',
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                            )
+                            ->attribute(
+                                name: 'url',
+                                definition: fn (Attribute $attribute) => $attribute->from('url'),
+                            ))));
     }
 }

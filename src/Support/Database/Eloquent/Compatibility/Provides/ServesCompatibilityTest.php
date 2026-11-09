@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Provides;
 
+use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
@@ -89,11 +90,14 @@ final class ServesCompatibilityTest extends TestCase
     {
         $eloquent = fn () => Listing::withTrashed()->orderBy('id')->get()->map(fn (Listing $listing) => $listing->getAttributes())->all();
         $raw = fn () => array_map(fn (object $row) => (array) $row, DB::select('select * from listings order by id'));
-        $before = [$eloquent(), $raw()];
-
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        $before = [$eloquent(), $raw()];
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $listing = Listing::query()->findOrFail(1);
 
         $this->assertSame($before, [$eloquent(), $raw()]);
@@ -119,11 +123,33 @@ final class ServesCompatibilityTest extends TestCase
         $nativeJobs = DB::table('jobs')->count();
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $translated = $writes('Cedar', 'Fir');
 
         $this->assertSame([4, [[4, 'Birch Hall', false], [5, 'Ash', true]], 0], [$native, $tableRows, $nativeJobs]);
-        $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('jobs', 'legacy_id', 'name')]);
+        $this->assertSame([6, [[4, 'Birch Hall', false], [5, 'Ash', true], [6, 'Cedar Hall', false], [7, 'Fir', true]]], [$translated, $rows('listings', 'id', 'title')]);
+    }
+
+    #[Test]
+    public function it_replicates_a_served_record_onto_a_root_of_its_own_once_installed(): void
+    {
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $jobs = DB::table('jobs')->count();
+
+        $replica = Listing::query()->findOrFail(1)->replicate(['uuid']);
+        $replica->status = ListingStatus::Draft;
+        $replica->save();
+
+        $this->assertSame(['Oak House', $jobs + 1], [Listing::query()->findOrFail($replica->id)->title, DB::table('jobs')->count()]);
+        $this->assertNotSame(DB::table('listings')->where('id', 1)->value('job_id'), DB::table('listings')->where('id', $replica->id)->value('job_id'));
     }
 }
 

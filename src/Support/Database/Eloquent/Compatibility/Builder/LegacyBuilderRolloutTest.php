@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Builder;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -22,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityQueryRefused
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
+use Tests\Fixtures\Support\Backfills\CompletedPass;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
@@ -70,12 +72,32 @@ final class LegacyBuilderRolloutTest extends TestCase
         yield 'a record update' => [fn () => Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']), 'update listings', $title(1), 'Oak Manor'];
         yield 'a record create' => [fn () => Listing::query()->create(['title' => 'Oak Manor', 'company_id' => ListingTables::COMPANY]), 'insert listings', $title(4), 'Oak Manor'];
         yield 'a record delete' => [fn () => Listing::query()->findOrFail(1)->delete(), 'update listings', fn () => DB::table('listings')->where('id', 1)->whereNotNull('deleted_at')->count(), 1];
-        yield 'a record increment' => [fn () => Listing::query()->findOrFail(1)->increment('price'), 'update listings', fn () => DB::table('jobs')->where('legacy_id', 1)->value('price_cents'), 125150];
+        yield 'a record increment' => [fn () => Listing::query()->findOrFail(1)->increment('price'), 'update listings', fn () => DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->value('price_cents'), 125150];
         yield 'a mass update' => [fn () => Listing::query()->whereKey(1)->update(['title' => 'Oak Manor']), 'update listings', $title(1), 'Oak Manor'];
         yield 'a query builder insert' => [fn () => Listing::query()->toBase()->insert(['title' => 'Oak Manor', 'company_id' => ListingTables::COMPANY]), 'insert listings', $title(4), 'Oak Manor'];
         yield 'a query builder delete' => [fn () => Listing::query()->toBase()->where('id', 3)->delete(), 'delete listings', fn () => DB::table('listings')->where('id', 3)->count(), 0];
-        yield 'a query builder increment' => [fn () => Listing::query()->toBase()->where('id', 1)->increment('price'), 'update listings', fn () => DB::table('jobs')->where('legacy_id', 1)->value('price_cents'), 125150];
-        yield 'a query builder decrement' => [fn () => Listing::query()->toBase()->where('id', 1)->decrement('price'), 'update listings', fn () => DB::table('jobs')->where('legacy_id', 1)->value('price_cents'), 124950];
+        yield 'a query builder increment' => [fn () => Listing::query()->toBase()->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->increment('price'), 'update listings', fn () => DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->value('price_cents'), 125150];
+        yield 'a query builder decrement' => [fn () => Listing::query()->toBase()->where(
+            column: 'id',
+            operator: '=',
+            value: 1,
+        )->decrement('price'), 'update listings', fn () => DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(1),
+        )->value('price_cents'), 124950];
     }
 
     /**
@@ -88,7 +110,7 @@ final class LegacyBuilderRolloutTest extends TestCase
     {
         $this->prepare();
         Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $this->statements = [];
 
         $write();
@@ -112,7 +134,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         Listing::query()->findOrFail(1)->update(['title' => 'Pine Lodge']);
         Listing::query()->findOrFail(1)->update(['title' => 'Birch Lodge']);
         $native = $this->statements();
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $this->statements = [];
 
         Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
@@ -159,9 +181,10 @@ final class LegacyBuilderRolloutTest extends TestCase
 
         try {
             Compatibility::prepare(Photo::class);
-            DB::statement("insert into files (legacy_type, legacy_id, legacy_uuid, filename, mime_type, size_bytes, created_at, updated_at) select 'photo', id, uuid, file_name, mime_type, round(size_kb * 1000), created_at, updated_at from photos");
+            DB::statement('update photos set file_id = gen_random_uuid() where file_id is null');
+            DB::statement('insert into files (id, filename, mime_type, size_bytes, created_at, updated_at) select file_id, file_name, mime_type, round(size_kb * 1000), created_at, updated_at from photos');
             Photo::query()->findOrFail(1)->update(['caption' => 'Front door']);
-            $this->inAnotherProcess("Tests\\Fixtures\\Support\\Files\\FileTables::catalog('photo'); Support\\Database\\Eloquent\\Compatibility\\Compatibility::install(Tests\\Fixtures\\Support\\Files\\Photo::class)");
+            $this->inAnotherProcess("Tests\\Fixtures\\Support\\Files\\FileTables::catalog('photos'); Support\\Database\\Eloquent\\Compatibility\\Compatibility::install(Tests\\Fixtures\\Support\\Files\\Photo::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))");
             $this->statements = [];
 
             $outcome = $write();
@@ -182,7 +205,7 @@ final class LegacyBuilderRolloutTest extends TestCase
     {
         $this->prepare();
         Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $listing = Listing::query()->findOrFail(1);
         $this->statements = [];
 
@@ -201,7 +224,10 @@ final class LegacyBuilderRolloutTest extends TestCase
     {
         $this->prepare();
         Listing::query()->findOrFail(1)->update(['title' => 'Pine Lodge']);
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $this->statements = [];
 
         Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
@@ -245,11 +271,11 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_natively_again_after_another_process_uninstalls_the_view(): void
+    public function it_writes_natively_again_after_another_process_rolls_back_the_view(): void
     {
         $this->install();
         Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
 
         Listing::query()->findOrFail(1)->update(['title' => 'Oak Lodge']);
         Listing::query()->whereKey(3)->update(['price' => '150.00']);
@@ -259,20 +285,20 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     #[Test]
-    public function it_translates_a_filter_once_another_process_installs_the_view_and_stops_once_another_uninstalls_it(): void
+    public function it_translates_a_filter_once_another_process_installs_the_view_and_stops_once_another_rolls_back_it(): void
     {
         $this->prepare();
         $before = Listing::query()->where('price', '>', 100)->toBase()->toSql();
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $installed = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
-        $uninstalled = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
+        $rolledBack = DB::transaction(fn () => [Listing::query()->where('price', '>', 100)->toBase()->toSql(), array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())]);
 
         $this->assertStringNotContainsString('"jobs"', $before);
         $this->assertStringContainsString('"jobs"."price_cents" > ?', $installed[0]);
-        $this->assertStringNotContainsString('"jobs"', $uninstalled[0]);
-        $this->assertSame([[1], [1, 3]], [$installed[1], $uninstalled[1]]);
+        $this->assertStringNotContainsString('"jobs"', $rolledBack[0]);
+        $this->assertSame([[1], [1, 3]], [$installed[1], $rolledBack[1]]);
     }
 
     /**
@@ -324,15 +350,22 @@ final class LegacyBuilderRolloutTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return LegacyBuilderReadTest::identified($listing)
-                    ->servedFrom(Job::class, fn (Successor $job) => LegacyBuilderReadTest::required($job)
-                        ->attribute('price', fn (Attribute $attribute) => $attribute->from('price_mills')->dividedBy(1000)));
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->attribute(
+                            name: 'price',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_mills')->dividedBy(1000),
+                        ));
             }
         };
         Compatibility::prepare($model::class);
         ListingTables::backfill();
-        DB::update('update jobs set price_mills = 1005 where legacy_id = 1');
-        DB::update('update jobs set price_mills = 1010 where legacy_id = 3');
-        Compatibility::install($model::class);
+        CompletedPass::recordHandBackfill(model: $model::class);
+        DB::update('update jobs set price_mills = 1005 where id = (select job_id from listings where id = 1)');
+        DB::update('update jobs set price_mills = 1010 where id = (select job_id from listings where id = 3)');
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         DB::statement('create schema compatibility_empty');
         $searchPath = DB::scalar("select current_setting('search_path')");
         $read = fn () => array_map(intval(...), $model->newQuery()->where('price', 1.01)->orderBy('id')->pluck('id')->all());
@@ -354,7 +387,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->install();
         DB::statement('create schema compatibility_tenant');
         DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
-        DB::update('update compatibility_tenant.jobs set price_cents = case legacy_id when 1 then 100 when 3 then 15000 else price_cents end');
+        DB::update('update compatibility_tenant.jobs set price_cents = case id when (select job_id from public.listings_retained where id = 1) then 100 when (select job_id from public.listings_retained where id = 3) then 15000 else price_cents end');
         $searchPath = DB::scalar("select current_setting('search_path')");
         $read = fn () => array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all());
 
@@ -525,7 +558,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->prepare();
         $listing = Listing::query()->findOrFail(1);
         $install = $this->startInAnotherProcess('Illuminate\Support\Facades\DB::listen(function ($query) { if ($query->sql === \'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE\') { usleep(1500000); } });'
-            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $this->awaitLock('ShareRowExclusiveLock');
 
         DB::transaction(fn () => $listing->update(['title' => 'Oak Manor']));
@@ -535,11 +568,11 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     #[Test]
-    public function it_asks_the_catalog_again_for_a_filter_a_builder_adds_after_another_process_uninstalls_the_view(): void
+    public function it_asks_the_catalog_again_for_a_filter_a_builder_adds_after_another_process_rolls_back_the_view(): void
     {
         $this->install();
         $query = Listing::query()->where('price', '>', 100);
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
 
         $query->where('price', '<', 5000);
 
@@ -547,11 +580,11 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_run_a_filter_it_translated_once_another_process_uninstalls_the_view_and_a_new_query_reads_the_native_rows(): void
+    public function it_refuses_to_run_a_filter_it_translated_once_another_process_rolls_back_the_view_and_a_new_query_reads_the_native_rows(): void
     {
         $this->install();
         $query = Listing::query()->where('price', '>', 100)->orderBy('id');
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
         try {
@@ -560,7 +593,7 @@ final class LegacyBuilderRolloutTest extends TestCase
             $stale = $refusal->getMessage();
         }
 
-        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process rolled back or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
         $this->assertSame([1, 3], array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all()));
     }
 
@@ -569,10 +602,10 @@ final class LegacyBuilderRolloutTest extends TestCase
     {
         $this->install();
         $warmed = array_map(intval(...), Listing::query()->where('price', 1)->pluck('id')->all());
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class);'
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class);'
             .' Illuminate\Support\Facades\DB::statement(\'alter table listings alter column price type numeric(10,0)\');'
-            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
-        DB::update('update jobs set price_cents = 149 where legacy_id = 3');
+            .' Support\Database\Eloquent\Compatibility\Compatibility::prepare(Tests\Fixtures\Support\Listings\Listing::class); Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
+        DB::update('update jobs set price_cents = 149 where id = (select job_id from listings_retained where id = 3)');
 
         $this->assertSame([[], [3], 1], [$warmed, array_map(intval(...), Listing::query()->where('price', 1)->pluck('id')->all()), DB::scalar('select count(*) from listings where price = 1')]);
     }
@@ -622,7 +655,7 @@ final class LegacyBuilderRolloutTest extends TestCase
                 $refusal = $exception->getMessage();
             }
 
-            $tenant = DB::scalar('select name from compatibility_tenant.jobs where legacy_id = 1');
+            $tenant = DB::scalar('select name from compatibility_tenant.jobs where id = (select job_id from public.listings_retained where id = 1)');
         } finally {
             DB::select("select set_config('search_path', ?, false)", [$searchPath]);
             DB::statement('drop schema compatibility_tenant cascade');
@@ -636,10 +669,10 @@ final class LegacyBuilderRolloutTest extends TestCase
     {
         $this->install();
         $query = Listing::query()->where('price', 1)->orderBy('id');
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class);'
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class);'
             .' Illuminate\Support\Facades\DB::statement(\'alter table listings alter column price type numeric(10,0)\');'
-            .' Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
-        DB::update('update jobs set price_cents = 149 where legacy_id = 3');
+            .' Support\Database\Eloquent\Compatibility\Compatibility::prepare(Tests\Fixtures\Support\Listings\Listing::class); Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
+        DB::update('update jobs set price_cents = 149 where id = (select job_id from listings_retained where id = 3)');
         $query->where('price', '>=', 0);
 
         try {
@@ -648,7 +681,7 @@ final class LegacyBuilderRolloutTest extends TestCase
             $mixed = $refusal->getMessage();
         }
 
-        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $mixed);
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process rolled back or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $mixed);
         $this->assertSame([3], array_map(intval(...), Listing::query()->where('price', 1)->where('price', '>=', 0)->orderBy('id')->pluck('id')->all()));
     }
 
@@ -658,7 +691,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         $this->install();
         DB::statement('create schema compatibility_tenant');
         DB::statement('create table compatibility_tenant.jobs as select * from public.jobs');
-        DB::update('update compatibility_tenant.jobs set price_cents = case legacy_id when 1 then 100 when 3 then 15000 else price_cents end');
+        DB::update('update compatibility_tenant.jobs set price_cents = case id when (select job_id from public.listings_retained where id = 1) then 100 when (select job_id from public.listings_retained where id = 3) then 15000 else price_cents end');
         $searchPath = DB::scalar("select current_setting('search_path')");
         $query = Listing::query()->where('price', '>', 100)->orderBy('id');
 
@@ -711,11 +744,11 @@ final class LegacyBuilderRolloutTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_iterate_a_cursor_whose_filter_it_translated_once_another_process_uninstalls_the_view_after_the_cursor_was_created(): void
+    public function it_refuses_to_iterate_a_cursor_whose_filter_it_translated_once_another_process_rolls_back_the_view_after_the_cursor_was_created(): void
     {
         $this->install();
         $cursor = Listing::query()->where('price', '>', 100)->orderBy('id')->cursor();
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
         try {
@@ -724,12 +757,12 @@ final class LegacyBuilderRolloutTest extends TestCase
             $stale = $refusal->getMessage();
         }
 
-        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
+        $this->assertSame(Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process rolled back or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', $stale);
         $this->assertSame([1, 3], array_map(fn (Listing $listing) => (int) $listing->id, Listing::query()->where('price', '>', 100)->orderBy('id')->cursor()->all()));
     }
 
     #[Test]
-    public function it_refuses_to_run_a_union_whose_operand_filter_it_translated_once_another_process_uninstalls_the_view(): void
+    public function it_refuses_to_run_a_union_whose_operand_filter_it_translated_once_another_process_rolls_back_the_view(): void
     {
         $this->install();
         $union = fn () => Listing::query()->toBase()->where('id', 0)->union(Listing::query()->where('price', '>', 100));
@@ -740,7 +773,7 @@ final class LegacyBuilderRolloutTest extends TestCase
             return $ids;
         };
         $query = $union();
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
         try {
@@ -749,17 +782,17 @@ final class LegacyBuilderRolloutTest extends TestCase
             $stale = $refusal->getMessage();
         }
 
-        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], [$stale, $ids($union())]);
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process rolled back or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], [$stale, $ids($union())]);
     }
 
     #[Test]
-    public function it_refuses_to_run_a_filter_it_translated_inside_a_transaction_once_another_process_uninstalls_the_view_before_the_query_runs(): void
+    public function it_refuses_to_run_a_filter_it_translated_inside_a_transaction_once_another_process_rolls_back_the_view_before_the_query_runs(): void
     {
         $this->install();
 
         $answers = DB::transaction(function (): array {
             $query = Listing::query()->where('price', '>', 100)->orderBy('id');
-            $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+            $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
             DB::table('listings')->where('id', 3)->update(['price' => '150.00']);
 
             try {
@@ -771,7 +804,7 @@ final class LegacyBuilderRolloutTest extends TestCase
             return [$stale, array_map(intval(...), Listing::query()->where('price', '>', 100)->orderBy('id')->pluck('id')->all())];
         });
 
-        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process uninstalled or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], $answers);
+        $this->assertSame([Listing::class.' cannot run a query whose filters it translated for the view listings. Why: Another process rolled back or replaced that view after the filters were translated, so they read successor rows that listings no longer serves. Instead: build the query again.', [1, 3]], $answers);
     }
 
     /**
@@ -821,7 +854,10 @@ final class LegacyBuilderRolloutTest extends TestCase
     private function install(): void
     {
         $this->prepare();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     private function inAnotherProcess(string $statement): void
@@ -888,7 +924,7 @@ final class LegacyBuilderRolloutTest extends TestCase
 
     private function job(int $legacyId): Job
     {
-        return Job::withTrashed()->where('legacy_id', $legacyId)->firstOrFail();
+        return Job::withTrashed()->whereKey(ListingTables::jobOf($legacyId))->firstOrFail();
     }
 
     private static function statement(string $sql): string

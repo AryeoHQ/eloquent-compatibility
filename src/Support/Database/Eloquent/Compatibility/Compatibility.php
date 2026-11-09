@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
@@ -11,15 +12,14 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\ConfigurationUrlParser;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
-use Support\Database\Eloquent\Compatibility\Definition\Branch;
+use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
-use Support\Database\Eloquent\Compatibility\Definition\Successors;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
@@ -31,23 +31,14 @@ final class Compatibility
 
     private readonly string $map;
 
-    /** @var array<string, Identifier> */
-    private array $identifiers = [];
-
     private null|string $retainedTable = null;
 
-    private null|string $retainedKey = null;
+    private null|string $successorKey = null;
 
-    private bool $timestamps = false;
+    private null|Successor $root = null;
 
-    private null|string $discriminator = null;
-
-    private null|Successor $primary = null;
-
-    private null|Closure $selector = null;
-
-    /** @var array<class-string<Model>, Branch> */
-    private array $branches = [];
+    /** @var null|class-string<ManagesDependents> */
+    private null|string $dependents = null;
 
     /** @var list<Hide> */
     private array $hides = [];
@@ -84,114 +75,137 @@ final class Compatibility
         self::run($model, Statements::prepare(...));
     }
 
-    public static function install(string $model): void
+    public static function install(string $model, CarbonInterval $statementTimeout): void
     {
         $map = self::of($model)->resolve();
         $connection = self::connection($map);
 
         try {
-            (new Installer($connection))->install($map, fn () => Statements::install($map, $connection, catchingUp: true));
+            (new Installer($connection))->install(
+                map: $map,
+                statementTimeout: $statementTimeout,
+                compile: fn () => self::logged(
+                    map: $map,
+                    statements: Statements::install(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                ),
+            );
         } finally {
             LegacyBuilder::forgetViews();
         }
     }
 
-    public static function recompile(string $model): void
+    public static function update(string $model): void
     {
-        self::run($model, Statements::recompile(...));
+        self::run(
+            model: $model,
+            statements: Statements::update(...),
+        );
     }
 
-    public static function uninstall(string $model): void
+    public static function rollback(string $model): void
     {
-        self::run($model, Statements::uninstall(...));
-    }
+        $map = self::of($model)->resolve();
+        $connection = self::connection($map);
 
-    /**
-     * @param  Closure(Identifier): mixed  $identifier
-     */
-    public function identifiedBy(string $attribute, Closure $identifier): self
-    {
-        if (array_key_exists($attribute, $this->identifiers)) {
-            throw $this->invalid("identifier '{$attribute}' is declared twice");
+        try {
+            (new Installer($connection))->rollback(
+                map: $map,
+                compile: fn () => self::logged(
+                    map: $map,
+                    statements: Statements::rollback(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                ),
+            );
+        } finally {
+            LegacyBuilder::forgetViews();
         }
-
-        ResolvedMap::refuseCaptures($this->map, "the closure of identifier '{$attribute}'", $identifier);
-
-        $declared = new Identifier($this->map, $attribute);
-        $identifier($declared);
-        $this->identifiers[$attribute] = $declared;
-
-        return $this;
     }
 
-    public function retainedIn(string $table, null|string $key = null): self
+    public static function retire(string $model): void
+    {
+        self::run(
+            model: $model,
+            statements: Statements::retire(...),
+        );
+    }
+
+    public function retainedIn(string $table): self
     {
         if ($this->retainedTable !== null) {
             throw $this->invalid('retainedIn() is declared twice');
         }
 
-        if ($table === '' || $key === '') {
-            throw $this->invalid('retainedIn() names an empty table or key');
+        if ($table === '') {
+            throw $this->invalid('retainedIn() names an empty table');
         }
 
         $this->retainedTable = $table;
-        $this->retainedKey = $key;
-
-        return $this;
-    }
-
-    public function timestamps(): self
-    {
-        $this->timestamps = true;
-
-        return $this;
-    }
-
-    public function discriminatedBy(string $column): self
-    {
-        if ($this->discriminator !== null) {
-            throw $this->invalid('discriminatedBy() is declared twice');
-        }
-
-        if ($column === '' || str_contains($column, '.')) {
-            throw $this->invalid("discriminatedBy() names '{$column}', which names no column of the primary successor's own table");
-        }
-
-        $this->discriminator = $column;
 
         return $this;
     }
 
     /**
-     * @param  null|Closure(Successor): mixed  $definition
-     * @param  null|Closure(Successors): mixed  $successors
+     * @param  class-string<Model>  $root
+     * @param  Closure(Successor): mixed  $successor
      */
-    public function servedFrom(null|string $successor = null, null|Closure $definition = null, null|Closure $choose = null, null|Closure $successors = null): self
+    public function servedFrom(string $root, string $key, Closure $successor): self
     {
-        if ($this->primary !== null || $this->selector !== null) {
+        if ($this->root !== null) {
             throw $this->invalid('servedFrom() is declared twice');
         }
 
-        if ($successor === null) {
-            return $this->servedFromSeveral($definition, $choose, $successors);
+        if (! is_subclass_of(
+            object_or_class: $root,
+            class: Model::class,
+        )) {
+            throw $this->invalid("servedFrom() names {$root}, which is not an Eloquent model");
         }
 
-        if ($choose !== null || $successors !== null) {
-            throw $this->invalid("servedFrom() names {$successor} and also takes choose: or successors:; declare one successor with servedFrom(".class_basename($successor).'::class, fn (Successor $successor) => ...), or several with choose: and successors: alone');
+        if ($key === '' || str_contains(
+            haystack: $key,
+            needle: '.',
+        )) {
+            throw $this->invalid("servedFrom() names the successor key '{$key}', which names no column of {$this->map}");
         }
 
-        if ($definition === null) {
-            throw $this->invalid("servedFrom() names {$successor} without a closure over it");
+        ResolvedMap::refuseCaptures(
+            map: $this->map,
+            role: 'the servedFrom() closure',
+            closure: $successor,
+        );
+
+        $this->root = new Successor(
+            map: $this->map,
+            model: $root,
+        );
+        $this->successorKey = $key;
+        $successor($this->root);
+
+        return $this;
+    }
+
+    /**
+     * @param  class-string<ManagesDependents>  $dependents
+     */
+    public function dependents(string $dependents): self
+    {
+        if ($this->dependents !== null) {
+            throw $this->invalid('dependents() is declared twice');
         }
 
-        if (! is_subclass_of($successor, Model::class)) {
-            throw $this->invalid("servedFrom() names {$successor}, which is not an Eloquent model");
+        if (! is_subclass_of(
+            object_or_class: $dependents,
+            class: ManagesDependents::class,
+        )) {
+            throw $this->invalid("dependents() names {$dependents}, which does not implement ".ManagesDependents::class);
         }
 
-        ResolvedMap::refuseCaptures($this->map, 'the servedFrom() closure', $definition);
-
-        $this->primary = new Successor($this->map, $successor);
-        $definition($this->primary);
+        $this->dependents = $dependents;
 
         return $this;
     }
@@ -246,55 +260,26 @@ final class Compatibility
     }
 
     /**
-     * @param  null|Closure(Successors): mixed  $successors
-     */
-    private function servedFromSeveral(null|Closure $definition, null|Closure $choose, null|Closure $successors): self
-    {
-        if ($definition !== null) {
-            throw $this->invalid('servedFrom() takes a closure without a successor class; name the class before it, or declare several successors with choose: and successors:');
-        }
-
-        if ($successors === null) {
-            throw $this->invalid('servedFrom() names no successor; declare one with servedFrom(Successor::class, fn (Successor $successor) => ...), or several with choose: and successors:');
-        }
-
-        $branches = Successors::declare($this->map, 'servedFrom()', $choose, $successors, 'declare servedFrom(%s::class, fn (Successor $successor) => ...) instead');
-
-        if (count($branches) === 1) {
-            $this->primary = reset($branches)->successor;
-
-            return $this;
-        }
-
-        $this->selector = $choose;
-        $this->branches = $branches;
-
-        return $this;
-    }
-
-    /**
-     * @return array<class-string<Model>, list<class-string<Model>>>
+     * @return list<class-string<Model>>
      */
     public function successors(): array
     {
-        $served = [];
-
-        foreach ($this->branches === [] ? array_filter([$this->primary]) : array_map(fn (Branch $branch) => $branch->successor, $this->branches) as $primary) {
-            $models = [];
-
-            for ($pending = [$primary]; $pending !== [];) {
-                $successor = array_shift($pending);
-                $models[] = $successor->model;
-
-                foreach ([...$successor->relations(), ...array_values($successor->morph()->targets ?? [])] as $relation) {
-                    $pending[] = $relation->successor;
-                }
-            }
-
-            $served[$primary->model] = $models;
+        if ($this->root === null) {
+            return [];
         }
 
-        return $served;
+        $models = [];
+
+        for ($pending = [$this->root]; $pending !== [];) {
+            $successor = array_shift($pending);
+            $models[] = $successor->model;
+
+            foreach ([...$successor->relations(), ...array_values($successor->morph()->targets ?? [])] as $relation) {
+                $pending[] = $relation->successor;
+            }
+        }
+
+        return $models;
     }
 
     public function resolve(): ResolvedMap
@@ -302,17 +287,13 @@ final class Compatibility
         return new ResolvedMap(
             $this->model,
             $this->map,
-            $this->identifiers,
             $this->retainedTable,
-            $this->retainedKey,
-            $this->timestamps,
-            $this->primary,
+            $this->successorKey,
+            $this->root,
             $this->hides,
             $this->guards,
             $this->withoutForwarding,
-            $this->discriminator,
-            $this->selector,
-            $this->branches,
+            $this->dependents,
         );
     }
 
@@ -322,12 +303,10 @@ final class Compatibility
         $connection = $legacy->getConnection();
         $successors = [];
 
-        foreach ($map->branches === [] ? [$map] : $map->branches as $branch) {
-            $successors[$branch->primary->model] = [(new $branch->primary->model)->getConnectionName(), 'the successor '.class_basename($branch->primary->model)];
+        $successors[$map->primary->model] = [(new $map->primary->model)->getConnectionName(), 'the successor '.class_basename($map->primary->model)];
 
-            foreach ($branch->related as $related) {
-                $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
-            }
+        foreach ($map->related as $related) {
+            $successors[$related->model] = [(new $related->model)->getConnectionName() ?? $successors[$related->parent][0] ?? null, 'the relation from '.class_basename($related->parent).' to '.class_basename($related->model)];
         }
 
         self::refusePrefix($map, $connection, class_basename($legacy));
@@ -395,10 +374,25 @@ final class Compatibility
         $connection = self::connection($map);
 
         try {
-            (new Installer($connection))->compileAndRun($map->tables(), fn () => $statements($map, $connection));
+            (new Installer($connection))->compileAndRun(
+                tables: $map->tables(),
+                compile: fn () => self::logged(
+                    map: $map,
+                    statements: $statements($map, $connection),
+                ),
+            );
         } finally {
             LegacyBuilder::forgetViews();
         }
+    }
+
+    private static function logged(ResolvedMap $map, Statements $statements): Statements
+    {
+        foreach ($statements->notes as $note) {
+            Log::info("Compatibility map '{$map->table}' {$statements->operation}: {$note}");
+        }
+
+        return $statements;
     }
 
     /**

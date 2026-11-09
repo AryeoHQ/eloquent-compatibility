@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Expression;
@@ -18,7 +19,6 @@ use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
-use Support\Database\Eloquent\Compatibility\Definition\Identifier;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -56,7 +56,10 @@ final class MassWriterTest extends TestCase
         });
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
     }
 
     protected function tearDown(): void
@@ -82,11 +85,36 @@ final class MassWriterTest extends TestCase
         $updated = Listing::query()->where('price', '>', 50)->update(['title' => 'Renamed', 'price' => '10.25', 'city' => 'Tacoma', 'latitude' => 1.5, 'mls_number' => 'MLS-X']);
 
         $this->assertSame(2, $updated);
-        $this->assertSame([['Renamed', 1025], ['Renamed', 1025]], DB::table('jobs')->whereIn('legacy_id', [1, 3])->orderBy('legacy_id')->get(['name', 'price_cents'])->map(fn (object $job) => array_values((array) $job))->all());
-        $this->assertSame(['Pine Flat', null], array_values((array) DB::table('jobs')->where('legacy_id', 2)->first(['name', 'price_cents'])));
-        $this->assertSame(['Tacoma', 'Tacoma'], DB::table('places')->join('jobs', 'jobs.id', '=', 'places.job_id')->orderBy('jobs.legacy_id')->pluck('places.city')->all());
-        $this->assertSame([1.5, 1.5], DB::table('job_sites')->join('jobs', 'jobs.id', '=', 'job_sites.job_id')->orderBy('jobs.legacy_id')->pluck('job_sites.latitude')->all());
-        $this->assertSame(['MLS-X', 'MLS-X'], DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->whereIn('jobs.legacy_id', [1, 3])->orderBy('jobs.legacy_id')->pluck('mls_number')->all());
+        $this->assertSame([['Renamed', 1025], ['Renamed', 1025]], DB::table('jobs')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'jobs.id',
+        )->whereIn(
+            column: 'listings_retained.id',
+            values: [1, 3],
+        )->orderBy('listings_retained.id')->get(['jobs.name', 'jobs.price_cents'])->map(fn (object $job) => array_values((array) $job))->all());
+        $this->assertSame(['Pine Flat', null], array_values((array) DB::table('jobs')->where(
+            column: 'id',
+            operator: '=',
+            value: ListingTables::jobOf(2),
+        )->first(['name', 'price_cents'])));
+        $this->assertSame(['Tacoma', 'Tacoma'], DB::table('places')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'places.job_id',
+        )->orderBy('listings_retained.id')->pluck('places.city')->all());
+        $this->assertSame([1.5, 1.5], DB::table('job_sites')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'job_sites.job_id',
+        )->orderBy('listings_retained.id')->pluck('job_sites.latitude')->all());
+        $this->assertSame(['MLS-X', 'MLS-X'], DB::table('listings_retained')->whereIn(
+            column: 'listings_retained.id',
+            values: [1, 3],
+        )->orderBy('listings_retained.id')->pluck('mls_number')->all());
         $this->assertSame([], array_values(array_filter(array_keys(Event::dispatchedEvents()), fn (string $event) => str_starts_with($event, 'eloquent.'))));
     }
 
@@ -94,7 +122,9 @@ final class MassWriterTest extends TestCase
     public function it_runs_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
     {
         DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
+        self::serveNativeJobs();
         DB::table('jobs')->insert(['name' => 'Single', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]);
+        self::serveNativeJobs();
         $write = ['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B'];
 
         $one = $this->statements(fn () => Listing::query()->where('title', 'Single')->update($write));
@@ -112,7 +142,7 @@ final class MassWriterTest extends TestCase
     public function it_keeps_reaching_every_table_when_the_write_changes_the_attribute_it_filters_on(): void
     {
         $updated = Listing::query()->where('title', 'Oak House')->where('price', '>', 1000)->update(['title' => 'Oak Manor', 'price' => '1.00', 'street' => '2 Oak St', 'mls_number' => 'MLS-1B']);
-        $job = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $job = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $this->assertSame(1, $updated);
         $this->assertSame(['Oak Manor', 100], [$job->name, $job->price_cents]);
@@ -124,7 +154,7 @@ final class MassWriterTest extends TestCase
     public function it_creates_the_related_rows_a_matching_record_lacks(): void
     {
         Listing::withTrashed()->whereKey([1, 2])->update(['street' => '7 Ash St', 'latitude' => 3.5]);
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $this->assertSame([['7 Ash St', null, null]], DB::table('places')->where('job_id', $pine->id)->get(['street', 'city', 'parent_id'])->map(fn (object $place) => array_values((array) $place))->all());
         $this->assertNotNull(DB::table('places')->where('job_id', $pine->id)->value('created_at'));
@@ -149,11 +179,14 @@ final class MassWriterTest extends TestCase
             DB::statement('drop schema compatibility_tenant cascade');
         }
 
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $this->assertSame(['compatibility_tenant', 2], [$schema, $updated]);
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
-        $this->assertSame([false, false], DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('featured')->all());
+        $this->assertSame([false, false], DB::table('listings_retained')->whereIn(
+            column: 'listings_retained.id',
+            values: [1, 2],
+        )->pluck('featured')->all());
         $this->assertSame([[3.5, false], [3.5, false]], Listing::withTrashed()->whereKey([1, 2])->orderBy('id')->get()->map(fn (Listing $listing) => [$listing->latitude, $listing->featured])->all());
     }
 
@@ -173,18 +206,41 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->related(fn (Job $job) => $job->hasOne(DefaultedPlace::class), fn (Successor $place) => $place
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->hasOne(DefaultedPlace::class),
+                            definition: fn (Successor $place) => $place
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                        ));
             }
         };
         DB::table('jobs')->insert([['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Lodge', 'company_id' => ListingTables::COMPANY]]);
-        $legacyId = fn (string $name): int => (int) Job::query()->where('name', $name)->value('legacy_id');
-        $places = fn (int $legacyId): array => DB::table('places')->join('jobs', 'jobs.id', '=', 'places.job_id')->where('jobs.legacy_id', $legacyId)->get(['places.street', 'places.city', 'places.created_at'])->map(fn (object $place) => [$place->street, $place->city, $place->created_at !== null])->all();
+        self::serveNativeJobs();
+        $legacyId = fn (string $name): int => (int) DB::table('listings_retained')->where(
+            column: 'job_id',
+            operator: '=',
+            value: Job::query()->where(
+                column: 'name',
+                operator: '=',
+                value: $name,
+            )->value('id'),
+        )->value('id');
+        $places = fn (int $legacyId): array => DB::table('places')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'places.job_id',
+        )->where(
+            column: 'listings_retained.id',
+            operator: '=',
+            value: $legacyId,
+        )->get(['places.street', 'places.city', 'places.created_at'])->map(fn (object $place) => [$place->street, $place->city, $place->created_at !== null])->all();
 
         $defaulted->newQuery()->whereKey(2)->update(['city' => 'Tacoma']);
         $defaulted->newQuery()->whereKey($legacyId('Birch Lodge'))->update(['street' => '9 Birch St']);
@@ -209,18 +265,23 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->related(fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'), fn (Successor $place) => $place
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->attribute('city', fn (Attribute $attribute) => $attribute->from('city'))));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'),
+                            definition: fn (Successor $place) => $place
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
+                        ));
             }
         };
 
         $updated = $seattle->newQuery()->whereKey(1)->update(['street' => '2 Oak St', 'city' => 'Tacoma']);
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
 
         $this->assertSame(1, $updated);
         $this->assertSame([['2 Oak St', 'Tacoma']], DB::table('places')->where('job_id', $oak->id)->get(['street', 'city'])->map(fn (object $place) => array_values((array) $place))->all());
@@ -242,13 +303,18 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->related(fn (Job $job) => $job->belongsTo(Company::class, 'company_id'), fn (Successor $company) => $company
-                            ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
-                                ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline')))));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
+                            definition: fn (Successor $company) => $company
+                                ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
+                                    ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
+                        ));
             }
         };
 
@@ -288,21 +354,29 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('company_id', fn (Attribute $attribute) => $attribute->from('company_id'))
-                        ->related(fn (Job $job) => $job->belongsTo(Company::class, 'company_id'), fn (Successor $company) => $company
-                            ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
-                                ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline')))));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
+                            definition: fn (Successor $company) => $company
+                                ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
+                                    ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
+                        ));
             }
         };
 
         $updated = $profiled->newQuery()->whereKey(1)->update(['company_id' => self::OTHER_COMPANY, 'tagline' => 'Homes by the water']);
 
         $this->assertSame(1, $updated);
-        $this->assertSame(self::OTHER_COMPANY, Job::query()->where('legacy_id', 1)->value('company_id'));
+        $this->assertSame(self::OTHER_COMPANY, Job::query()->whereKey(ListingTables::jobOf(1))->value('company_id'));
         $this->assertSame([[ListingTables::COMPANY, 'Homes by the water'], [self::OTHER_COMPANY, 'Other tagline']], DB::table('company_profiles')->orderBy('company_id')->get(['company_id', 'tagline'])->map(fn (object $profile) => array_values((array) $profile))->all());
     }
 
@@ -310,22 +384,30 @@ final class MassWriterTest extends TestCase
     public function it_creates_a_dependent_under_a_parent_the_same_write_creates(): void
     {
         $sited = $this->sited();
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $updated = $sited->newQuery()->whereKey([1, 2])->update(['street' => '7 Ash St', 'latitude' => 3.5]);
 
         $this->assertSame(2, $updated);
         $this->assertSame(['7 Ash St'], DB::table('places')->where('job_id', $pine->id)->pluck('street')->all());
         $this->assertSame([3.5], DB::table('job_sites')->where('job_id', $pine->id)->pluck('latitude')->all());
-        $this->assertSame([3.5, 3.5], DB::table('job_sites')->join('jobs', 'jobs.id', '=', 'job_sites.job_id')->whereIn('jobs.legacy_id', [1, 2])->pluck('latitude')->all());
+        $this->assertSame([3.5, 3.5], DB::table('job_sites')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'job_sites.job_id',
+        )->whereIn(
+            column: 'listings_retained.id',
+            values: [1, 2],
+        )->pluck('latitude')->all());
     }
 
     #[Test]
     public function it_writes_the_existing_dependent_that_a_parent_the_same_write_creates_reaches_rather_than_create_a_second(): void
     {
         $sited = $this->sited();
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
-        $elm = Job::query()->where('legacy_id', 3)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail();
         DB::table('places')->whereIn('job_id', [$oak->id, $elm->id])->delete();
 
         $updated = [
@@ -342,7 +424,7 @@ final class MassWriterTest extends TestCase
     public function it_creates_no_related_row_for_a_null_value(): void
     {
         Listing::withTrashed()->whereKey(2)->update(['street' => null, 'latitude' => null]);
-        $pine = Job::withTrashed()->where('legacy_id', 2)->firstOrFail();
+        $pine = Job::withTrashed()->whereKey(ListingTables::jobOf(2))->firstOrFail();
 
         $this->assertSame([0, 0], [DB::table('places')->where('job_id', $pine->id)->count(), DB::table('job_sites')->where('job_id', $pine->id)->count()]);
     }
@@ -350,17 +432,26 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_adds_an_amount_through_a_linear_conversion_and_to_a_legacy_only_column(): void
     {
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         DB::table('listings_retained')->where('job_id', $oak->id)->update(['views' => 40]);
-        $elm = Job::query()->where('legacy_id', 3)->firstOrFail();
-        DB::table('listings_retained')->where('job_id', $elm->id)->delete();
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->firstOrFail();
+        DB::table('listings_retained')->where(
+            column: 'job_id',
+            operator: '=',
+            value: $elm->id,
+        )->update(['views' => 5]);
 
         Listing::withTrashed()->increment('price', 1.5);
         Listing::withTrashed()->incrementEach(['views' => 2], ['mls_number' => 'MLS-Z']);
         Listing::withTrashed()->decrement('latitude', 0.5);
         Listing::query()->findOrFail(3)->increment('views', 3);
 
-        $this->assertSame([1, 125200, 2, null, 3, 10149], DB::table('jobs')->orderBy('legacy_id')->get(['legacy_id', 'price_cents'])->flatMap(fn (object $job) => array_values((array) $job))->all());
+        $this->assertSame([1, 125200, 2, null, 3, 10149], DB::table('jobs')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'jobs.id',
+        )->orderBy('listings_retained.id')->get(['listings_retained.id as legacy_id', 'jobs.price_cents'])->flatMap(fn (object $job) => array_values((array) $job))->all());
         $this->assertSame([42, 7, 10], Listing::withTrashed()->orderBy('id')->pluck('views')->all());
         $this->assertSame(['MLS-Z', 'MLS-Z', 'MLS-Z'], Listing::withTrashed()->orderBy('id')->pluck('mls_number')->all());
         $this->assertSame([47.1062, null, -122.8321], Listing::withTrashed()->orderBy('id')->pluck('latitude')->all());
@@ -374,7 +465,11 @@ final class MassWriterTest extends TestCase
         $aliased->getQuery()->from('listings AS legacy');
         $eloquent = $aliased->where('legacy.id', 2)->update(['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
         $incremented = Listing::query()->withoutGlobalScopes()->getQuery()->from('listings as legacy')->where('legacy.id', 3)->incrementEach(['views' => 2], ['mls_number' => DB::raw("legacy.title || '-' || legacy.views")]);
-        $retained = fn (int $legacyId): array => array_values((array) DB::table('listings_retained')->join('jobs', 'jobs.id', '=', 'listings_retained.job_id')->where('jobs.legacy_id', $legacyId)->first(['mls_number', 'views']));
+        $retained = fn (int $legacyId): array => array_values((array) DB::table('listings_retained')->where(
+            column: 'listings_retained.id',
+            operator: '=',
+            value: $legacyId,
+        )->first(['mls_number', 'views']));
 
         $this->assertSame([1, 1, 1], [$updated, $eloquent, $incremented]);
         $this->assertSame([['Oak House', 5], ['Pine Flat-5', 5], ['Elm Cottage-5', 7]], [$retained(1), $retained(2), $retained(3)]);
@@ -383,7 +478,7 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_writes_a_json_path_into_the_column_that_owns_it_for_a_mapped_a_related_and_a_legacy_only_column(): void
     {
-        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb)');
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
         DB::table('settings_holders')->insert([
@@ -395,9 +490,13 @@ final class MassWriterTest extends TestCase
 
         try {
             Compatibility::prepare($holder::class);
-            DB::statement('insert into configured_jobs (legacy_id, name, settings) select id, name, settings from settings_holders');
-            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.legacy_id = settings_holders.id where settings_holders.options is not null');
-            Compatibility::install($holder::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, settings) select job_id, name, settings from settings_holders');
+            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.id = settings_holders.job_id where settings_holders.options is not null');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
 
             $updated = [
                 $holder->newQuery()->whereKey([1, 3])->update(['settings->enabled' => true, 'preferences->theme' => 'dark', 'options->b' => 2]),
@@ -407,7 +506,8 @@ final class MassWriterTest extends TestCase
             $sites = DB::table('configured_sites')->count();
         } finally {
             DB::statement('drop view if exists settings_holders');
-            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_sites, configured_jobs cascade');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, configured_sites, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
@@ -423,7 +523,7 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_evaluates_the_json_paths_and_expressions_of_one_mass_write_against_the_values_before_the_write_as_a_native_update_does(): void
     {
-        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, label text)');
+        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, label text, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
         DB::table('settings_holders')->insert([
             ['name' => 'Oak', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
@@ -443,15 +543,20 @@ final class MassWriterTest extends TestCase
             }
 
             Compatibility::prepare($holder::class);
-            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
-            Compatibility::install($holder::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name) select job_id, name from settings_holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
 
             $updated = array_map(fn (int $id) => $holder->newQuery()->whereKey($id)->update($writes[$id]), array_keys($writes));
             $served = $rows('settings_holders');
             $native = $rows('settings_natives');
         } finally {
             DB::statement('drop view if exists settings_holders');
-            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_jobs cascade');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, settings_natives, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
@@ -461,9 +566,9 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_a_json_path_into_the_served_default_of_a_legacy_only_column_for_a_record_without_a_retained_row(): void
+    public function it_writes_a_json_path_into_a_legacy_only_column_and_serves_no_successor_row_without_a_retained_row(): void
     {
-        DB::statement("create table settings_holders (id serial primary key, name text not null, preferences jsonb not null default '{}'::jsonb, notes jsonb)");
+        DB::statement("create table settings_holders (id serial primary key, name text not null, preferences jsonb not null default '{}'::jsonb, notes jsonb, created_at timestamptz, updated_at timestamptz)");
         DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
         DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
         $holder = $this->jsonHolder();
@@ -471,28 +576,33 @@ final class MassWriterTest extends TestCase
 
         try {
             Compatibility::prepare($holder::class);
-            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
-            Compatibility::install($holder::class);
-            DB::table('configured_jobs')->insert(['legacy_id' => 10, 'name' => 'Ash']);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name) select job_id, name from settings_holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            DB::table('configured_jobs')->insert(['name' => 'Ash']);
 
             $before = $rows();
             $updated = $holder->newQuery()->whereKey([1, 10])->update(['preferences->theme' => 'dark', 'notes->seen' => true]);
             $after = $rows();
         } finally {
             DB::statement('drop view if exists settings_holders');
-            DB::statement('drop table if exists settings_holders, settings_holders_retained, configured_jobs cascade');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
-        $this->assertSame([[1, ['theme' => 'light'], null], [10, [], null]], $before);
-        $this->assertSame(2, $updated);
-        $this->assertSame([[1, ['theme' => 'dark'], null], [10, ['theme' => 'dark'], null]], $after);
+        $this->assertSame([[1, ['theme' => 'light'], null]], $before);
+        $this->assertSame(1, $updated);
+        $this->assertSame([[1, ['theme' => 'dark'], null]], $after);
     }
 
     #[Test]
     public function it_writes_a_whole_json_value_into_a_mapped_and_a_related_column_for_records_with_and_without_the_related_row_as_a_native_update_does(): void
     {
-        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb)');
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
         DB::table('settings_holders')->insert([
@@ -507,9 +617,13 @@ final class MassWriterTest extends TestCase
         try {
             DB::table('settings_natives')->whereIn('id', [1, 2])->update($values);
             Compatibility::prepare($holder::class);
-            DB::statement('insert into configured_jobs (legacy_id, name, settings) select id, name, settings from settings_holders');
-            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.legacy_id = settings_holders.id where settings_holders.options is not null');
-            Compatibility::install($holder::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, settings) select job_id, name, settings from settings_holders');
+            DB::statement('insert into configured_sites (configured_job_id, options) select configured_jobs.id, settings_holders.options from settings_holders join configured_jobs on configured_jobs.id = settings_holders.job_id where settings_holders.options is not null');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
 
             $updated = $holder->newQuery()->whereKey([1, 2])->update($values);
             $served = $rows('settings_holders');
@@ -517,7 +631,8 @@ final class MassWriterTest extends TestCase
             $sites = DB::table('configured_sites')->count();
         } finally {
             DB::statement('drop view if exists settings_holders');
-            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_sites, configured_jobs cascade');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, settings_natives, configured_sites, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
@@ -528,13 +643,12 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_a_whole_json_value_into_a_legacy_only_column_for_records_with_and_without_a_retained_row_as_a_native_update_does(): void
+    public function it_writes_a_whole_json_value_into_a_legacy_only_column_as_a_native_update_does(): void
     {
-        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, notes json)');
+        DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, notes json, created_at timestamptz, updated_at timestamptz)');
         DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
         DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
         DB::statement('create table settings_natives as select * from settings_holders');
-        DB::table('settings_natives')->insert(['id' => 10, 'name' => 'Ash']);
         $values = ['preferences' => ['theme' => 'dark'], 'notes' => ['seen', 'pinned']];
         $rows = fn (string $table): array => DB::table($table)->orderBy('id')->get(['id', 'preferences', 'notes'])->map(fn (object $row) => [$row->id, json_decode((string) $row->preferences, true), json_decode((string) $row->notes, true)])->all();
         $holder = $this->jsonHolder();
@@ -542,33 +656,38 @@ final class MassWriterTest extends TestCase
         try {
             DB::table('settings_natives')->whereIn('id', [1, 10])->update($values);
             Compatibility::prepare($holder::class);
-            DB::statement('insert into configured_jobs (legacy_id, name) select id, name from settings_holders');
-            Compatibility::install($holder::class);
-            DB::table('configured_jobs')->insert(['legacy_id' => 10, 'name' => 'Ash']);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name) select job_id, name from settings_holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            DB::table('configured_jobs')->insert(['name' => 'Ash']);
 
             $updated = $holder->newQuery()->whereKey([1, 10])->update($values);
             $served = $rows('settings_holders');
             $native = $rows('settings_natives');
         } finally {
             DB::statement('drop view if exists settings_holders');
-            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_natives, configured_jobs cascade');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, settings_natives, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
             LegacyBuilder::forgetViews();
         }
 
-        $this->assertSame(2, $updated);
-        $this->assertSame([[1, ['theme' => 'dark'], ['seen', 'pinned']], [10, ['theme' => 'dark'], ['seen', 'pinned']]], $native);
+        $this->assertSame(1, $updated);
+        $this->assertSame([[1, ['theme' => 'dark'], ['seen', 'pinned']]], $native);
         $this->assertSame($native, $served);
     }
 
     #[Test]
     public function it_refuses_a_json_path_write_into_an_attribute_whose_conversions_read_the_whole_value(): void
     {
-        $before = DB::table('jobs')->orderBy('legacy_id')->get()->all();
+        $before = DB::table('jobs')->orderBy('id')->get()->all();
 
         $refusal = $this->refusal(fn () => Listing::query()->whereKey(1)->update(['price->amount' => 5]));
 
         $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its conversions read the whole stored value, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
-        $this->assertEquals($before, DB::table('jobs')->orderBy('legacy_id')->get()->all());
+        $this->assertEquals($before, DB::table('jobs')->orderBy('id')->get()->all());
     }
 
     #[Test]
@@ -596,16 +715,23 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job->attribute('status', fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 'Draft', 'live' => 'Active', 'closed' => 'Sold'])));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job->attribute(
+                        name: 'status',
+                        definition: fn (Attribute $attribute) => $attribute->from('lifecycle_status')->mapping(['drafting' => 'Draft', 'live' => 'Active', 'closed' => 'Sold']),
+                    ));
             }
         };
 
         $refused = $this->refusal(fn () => $mapped->newQuery()->increment('status'));
 
         $this->assertSame($mapped::class.' cannot run an increment of $status through its compatibility map. Why: Its conversions are not linear, so an amount added to it has no one stored amount. Instead: Write each record through '.class_basename($mapped::class).', or write the successor models directly.', $refused->getMessage());
-        $this->assertSame(['live', 'drafting', 'closed'], DB::table('jobs')->orderBy('legacy_id')->pluck('lifecycle_status')->all());
+        $this->assertSame(['live', 'drafting', 'closed'], DB::table('jobs')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'jobs.id',
+        )->orderBy('listings_retained.id')->pluck('jobs.lifecycle_status')->all());
     }
 
     #[Test]
@@ -616,7 +742,44 @@ final class MassWriterTest extends TestCase
 
         $this->assertSame(Listing::class.'::$price cannot take a raw expression. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write the computed value, or write the stored column through the successor model.', $raw->getMessage());
         $this->assertSame(Listing::class.' records cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
-        $this->assertSame([125050, 9999], DB::table('jobs')->whereNotNull('price_cents')->orderBy('legacy_id')->pluck('price_cents')->all());
+        $this->assertSame([125050, 9999], DB::table('jobs')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'jobs.id',
+        )->whereNotNull('jobs.price_cents')->orderBy('listings_retained.id')->pluck('jobs.price_cents')->all());
+    }
+
+    #[DataProvider('successorKeyWrites')]
+    #[Test]
+    public function it_refuses_a_write_of_the_successor_key_as_a_write_of_an_attribute_the_legacy_model_cannot_change(Closure $write, string $refused, string $because): void
+    {
+        $before = DB::table('listings_retained')->orderBy('id')->pluck('job_id')->all();
+
+        $refusal = $this->refusal(fn () => $write(DB::table('jobs')->where(
+            column: 'name',
+            operator: '=',
+            value: 'Elm Cottage',
+        )->value('id')));
+
+        $this->assertSame("{$refused} cannot change \$job_id. Why: {$because} Instead: Leave job_id unchanged in writes through Listing.", $refusal->getMessage());
+        $this->assertSame($before, DB::table('listings_retained')->orderBy('id')->pluck('job_id')->all());
+    }
+
+    /**
+     * @return array<string, array{Closure(mixed): mixed, string, string}>
+     */
+    public static function successorKeyWrites(): array
+    {
+        return [
+            'a record write' => [function (mixed $job): void {
+                $listing = Listing::query()->findOrFail(1);
+                $listing->job_id = $job;
+                $listing->save();
+            }, Listing::class.' record 1', 'The successor key binds the record to its Job, and a write that rebinds it would serve another root under the same legacy identity.'],
+            'a mass write' => [fn (mixed $job) => Listing::query()->whereKey(1)->update(['job_id' => $job]), Listing::class.' records', 'The successor key binds each record to its Job, and a write that changes it would serve another root under the same legacy identity.'],
+            'an increment' => [fn () => Listing::query()->whereKey(1)->increment('job_id'), Listing::class.' records', 'The successor key binds each record to its Job, and a write that changes it would serve another root under the same legacy identity.'],
+        ];
     }
 
     #[Test]
@@ -625,7 +788,12 @@ final class MassWriterTest extends TestCase
         $refused = $this->refusal(fn () => Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]));
 
         $this->assertSame(Listing::class.'::$status cannot take a mass write. Why: It is declared transitions(), so each record\'s change runs its successor\'s state-machine trigger, and a set-based statement cannot run a trigger per row. Instead: Write the records one at a time through Listing.', $refused->getMessage());
-        $this->assertSame([['Oak House', 'live'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->orderBy('legacy_id')->get(['name', 'lifecycle_status'])->map(fn (object $job) => array_values((array) $job))->all());
+        $this->assertSame([['Oak House', 'live'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->join(
+            table: 'listings_retained',
+            first: 'listings_retained.job_id',
+            operator: '=',
+            second: 'jobs.id',
+        )->orderBy('listings_retained.id')->get(['jobs.name', 'jobs.lifecycle_status'])->map(fn (object $job) => array_values((array) $job))->all());
     }
 
     #[Test]
@@ -635,14 +803,14 @@ final class MassWriterTest extends TestCase
         $updated = Listing::query()->whereKey(1)->update(['title' => 'Oak Manor', 'mls_number' => DB::raw("title || ' ' || id")]);
 
         $this->assertSame(Listing::class.'::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.', $refused->getMessage());
-        $this->assertSame('Elm Cottage', Job::query()->where('legacy_id', 3)->value('name'));
+        $this->assertSame('Elm Cottage', Job::query()->whereKey(ListingTables::jobOf(3))->value('name'));
         $this->assertSame([1, 'Oak Manor', 'Oak House 1'], [$updated, Listing::query()->findOrFail(1)->title, Listing::query()->findOrFail(1)->mls_number]);
     }
 
     #[Test]
     public function it_skips_a_record_a_concurrent_write_moved_out_of_the_filter_while_the_write_waited_for_its_lock(): void
     {
-        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where legacy_id = 1");
+        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where id = (select job_id from listings_retained where id = 1)");
 
         $updated = Listing::query()->where('title', 'Oak House')->update(['title' => 'Mass']);
 
@@ -653,7 +821,7 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_skips_deleting_a_record_a_concurrent_write_moved_out_of_the_filter_while_the_delete_waited_for_its_lock(): void
     {
-        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where legacy_id = 1");
+        $locked = $this->lockConcurrently("update jobs set name = 'Changed' where id = (select job_id from listings_retained where id = 1)");
 
         $deleted = Listing::query()->where('title', 'Oak House')->forceDelete();
 
@@ -700,7 +868,13 @@ final class MassWriterTest extends TestCase
         Listing::query()->whereKey(1)->update(['street' => '2 Oak St']);
 
         $this->assertSame(Listing::class.' cannot write $street in one statement to records that have no places row. Why: A set-based write creates the missing places rows in SQL, and places.id has no database default to key them. Instead: Write the records one at a time through Listing, or give places.id a database default.', $refused->getMessage());
-        $this->assertSame(['Oak House', 'Pine Flat'], Job::withTrashed()->whereIn('legacy_id', [1, 2])->orderBy('legacy_id')->pluck('name')->all());
+        $this->assertSame(['Oak House', 'Pine Flat'], Job::withTrashed()->whereIn(
+            column: 'id',
+            values: DB::table('listings_retained')->whereIn(
+                column: 'id',
+                values: [1, 2],
+            )->select('job_id'),
+        )->orderBy('name')->pluck('name')->all());
         $this->assertSame(['2 Oak St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
     }
 
@@ -708,6 +882,7 @@ final class MassWriterTest extends TestCase
     public function it_binds_no_matched_key_into_a_statement(): void
     {
         DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
+        self::serveNativeJobs();
         $keys = DB::table('jobs')->where('name', 'Bulk')->pluck('id')->all();
 
         [$updated] = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update(['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B']));
@@ -720,8 +895,9 @@ final class MassWriterTest extends TestCase
     #[Test]
     public function it_deletes_the_primary_rows_hard_in_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
     {
-        $oak = Job::query()->where('legacy_id', 1)->firstOrFail();
+        $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
         DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
+        self::serveNativeJobs();
         Listing::query()->where('price', '>', 1000)->get();
 
         $one = $this->statements(fn () => Listing::query()->where('price', '>', 1000)->forceDelete());
@@ -810,8 +986,6 @@ final class MassWriterTest extends TestCase
         {
             use ServesCompatibility;
 
-            public $timestamps = false;
-
             protected $table = 'settings_holders';
 
             protected $guarded = [];
@@ -819,10 +993,12 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $holder): Compatibility
             {
                 return $holder
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
-                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
-                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name')));
+                    ->retainedIn('settings_holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'name',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        ));
             }
         };
     }
@@ -833,8 +1009,6 @@ final class MassWriterTest extends TestCase
         {
             use ServesCompatibility;
 
-            public $timestamps = false;
-
             protected $table = 'settings_holders';
 
             protected $guarded = [];
@@ -842,13 +1016,21 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $holder): Compatibility
             {
                 return $holder
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('settings_holders_retained', key: 'configured_job_id')
-                    ->servedFrom(ConfiguredJob::class, fn (Successor $job) => $job
-                        ->attribute('name', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->attribute('settings', fn (Attribute $attribute) => $attribute->from('settings'))
-                        ->related(fn (ConfiguredJob $job) => $job->site(), fn (Successor $site) => $site
-                            ->attribute('options', fn (Attribute $attribute) => $attribute->from('options'))));
+                    ->retainedIn('settings_holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'name',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'settings',
+                            definition: fn (Attribute $attribute) => $attribute->from('settings'),
+                        )
+                        ->related(
+                            relation: fn (ConfiguredJob $job) => $job->site(),
+                            definition: fn (Successor $site) => $site
+                                ->attribute('options', fn (Attribute $attribute) => $attribute->from('options')),
+                        ));
             }
         };
     }
@@ -866,15 +1048,25 @@ final class MassWriterTest extends TestCase
             public static function compatibility(Compatibility $listing): Compatibility
             {
                 return $listing
-                    ->identifiedBy('id', fn (Identifier $identifier) => $identifier->integer()->from('legacy_id'))
-                    ->retainedIn('listings_retained', key: 'job_id')
-                    ->servedFrom(Job::class, fn (Successor $job) => $job
-                        ->attribute('title', fn (Attribute $attribute) => $attribute->from('name'))
-                        ->related(fn (Job $job) => $job->rootPlace(), fn (Successor $place) => $place
-                            ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
-                            ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
-                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')))));
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            definition: fn (Successor $place) => $place
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
+                                ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
+                                    ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))),
+                        ));
             }
         };
+    }
+
+    private static function serveNativeJobs(): void
+    {
+        DB::statement('insert into listings_retained (job_id) select jobs.id from jobs where not exists (select from listings_retained where listings_retained.job_id = jobs.id)');
     }
 }

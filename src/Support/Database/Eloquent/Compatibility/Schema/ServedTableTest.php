@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -41,7 +42,10 @@ final class ServedTableTest extends TestCase
     #[Test]
     public function it_relies_on_postgresql_to_refuse_every_native_write_to_the_installed_view(): void
     {
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $jobs = DB::table('jobs')->orderBy('id')->get()->all();
 
         $states = array_map(fn (Closure $write) => $this->stateOf($write), [
@@ -50,7 +54,16 @@ final class ServedTableTest extends TestCase
             fn () => DB::table('listings')->insertOrIgnore(['id' => 9, 'title' => 'Birch House']),
             fn () => DB::table('listings')->upsert(['id' => 1, 'title' => 'Oak Manor'], ['id']),
             fn () => DB::table('listings')->where('id', 1)->update(['title' => 'Oak Manor']),
-            fn () => DB::table('listings')->join('jobs', 'jobs.legacy_id', '=', 'listings.id')->where('listings.id', 1)->updateFrom(['title' => 'Oak Manor']),
+            fn () => DB::table('listings')->join(
+                table: 'jobs',
+                first: 'jobs.id',
+                operator: '=',
+                second: 'listings.job_id',
+            )->where(
+                column: 'listings.id',
+                operator: '=',
+                value: 1,
+            )->updateFrom(['title' => 'Oak Manor']),
             fn () => DB::table('listings')->where('id', 1)->delete(),
             fn () => DB::table('listings')->truncate(),
         ]);
@@ -67,7 +80,10 @@ final class ServedTableTest extends TestCase
 
         $answers = [ServedTable::serves($listing), ServedTable::serves($listing)];
         $before = $asked();
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $installed = $asked();
         $answers[] = ServedTable::serves($listing);
 
@@ -77,7 +93,10 @@ final class ServedTableTest extends TestCase
     #[Test]
     public function it_asks_the_catalog_once_per_transaction_and_again_in_the_next_one(): void
     {
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $listing = new Listing;
         $asked = $this->catalogQueries();
 
@@ -95,15 +114,15 @@ final class ServedTableTest extends TestCase
     }
 
     #[Test]
-    public function it_answers_an_install_or_an_uninstall_another_process_commits_in_the_next_transaction(): void
+    public function it_answers_an_install_or_an_rollback_another_process_commits_in_the_next_transaction(): void
     {
         $listing = new Listing;
         $read = fn () => DB::transaction(fn () => [ServedTable::serves($listing), ServedTable::reading($listing, ['jobs'])['view']]);
 
         $answers = [$read()];
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::install(Tests\Fixtures\Support\Listings\Listing::class, statementTimeout: \\Carbon\\CarbonInterval::seconds(30))');
         $answers[] = $read();
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         $answers[] = $read();
 
         $this->assertSame([[false, false], [true, true], [false, false]], $answers);
@@ -112,11 +131,14 @@ final class ServedTableTest extends TestCase
     #[Test]
     public function it_asks_the_catalog_again_once_the_transaction_that_holds_an_answer_ends(): void
     {
-        Compatibility::install(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
         $listing = new Listing;
 
         $answers = [DB::transaction(fn () => ServedTable::serves($listing))];
-        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::uninstall(Tests\Fixtures\Support\Listings\Listing::class)');
+        $this->inAnotherProcess('Support\Database\Eloquent\Compatibility\Compatibility::rollback(Tests\Fixtures\Support\Listings\Listing::class)');
         $answers[] = ServedTable::serves($listing);
         $answers[] = ServedTable::view(DB::connection(), 'listings');
 
