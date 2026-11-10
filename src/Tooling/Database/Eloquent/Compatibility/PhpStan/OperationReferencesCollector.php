@@ -9,8 +9,6 @@ use PhpParser\Node\Expr\MethodCall;
 use PhpParser\Node\Identifier;
 use PHPStan\Analyser\Scope;
 use PHPStan\Collectors\Collector;
-use PHPStan\Type\Constant\ConstantStringType;
-use PHPStan\Type\ObjectType;
 use Support\Database\Eloquent\Compatibility\Contracts\InitializesLegacy;
 use Support\Database\Eloquent\Compatibility\Contracts\InitializesSuccessors;
 use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
@@ -23,6 +21,8 @@ use Support\Database\Eloquent\Compatibility\Write\Successors;
  */
 final class OperationReferencesCollector implements Collector
 {
+    use ReadsCallArguments;
+
     private const array OPERATIONS = [
         WritesAttribute::class,
         InitializesSuccessors::class,
@@ -56,7 +56,10 @@ final class OperationReferencesCollector implements Collector
                 haystack: self::METHODS,
                 strict: true,
             )
-            || ! new ObjectType(Successors::class)->isSuperTypeOf($scope->getType($node->var))->yes()
+            || ! $this->is(
+                class: Successors::class,
+                type: $scope->getType($node->var),
+            )
             || array_filter(
                 array: self::OPERATIONS,
                 callback: $operation->implementsInterface(...),
@@ -64,16 +67,13 @@ final class OperationReferencesCollector implements Collector
             return null;
         }
 
-        $classes = [];
-
-        foreach ($node->getArgs() as $index => $argument) {
-            if ($argument->name?->toString() === 'class' || ($argument->name === null && ! $argument->unpack && $index === 0)) {
-                $classes = array_map(
-                    callback: fn (ConstantStringType $class) => $class->getValue(),
-                    array: $scope->getType($argument->value)->getConstantStrings(),
-                );
-            }
-        }
+        $classes = $this->strings(
+            argument: $this->argument(
+                call: $node,
+                name: 'class',
+            ),
+            scope: $scope,
+        );
 
         if ($classes === []) {
             return null;

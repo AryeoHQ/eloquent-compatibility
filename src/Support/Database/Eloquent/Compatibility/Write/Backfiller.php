@@ -8,7 +8,6 @@ use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
 use Exception;
-use Illuminate\Container\Container;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -687,7 +686,7 @@ final readonly class Backfiller
                 }
 
                 if ($model === null && $wants) {
-                    throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} row {$this->key} {$key} holds external() values for {$related->table}, and the related() relation from {$related->parentTable} reads no {$related->table} row the backfill can create for it; its parent row is missing, or it is a BelongsTo");
+                    throw InvalidCompatibilityMap::cannot($this->map->table, 'backfill', "{$this->map->table} row {$this->key} {$key} holds computedAs() values for {$related->table}, and the related() relation from {$related->parentTable} reads no {$related->table} row the backfill can create for it; its parent row is missing, or it is a BelongsTo");
                 }
 
                 if ($model instanceof Model) {
@@ -769,12 +768,11 @@ final readonly class Backfiller
             return false;
         }
 
-        $instance = Container::getInstance()->make($operation);
-
-        if (! $instance instanceof WritesAttribute) {
-            throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
-        }
-
+        $instance = UnitOfWork::resolve(
+            class: $operation,
+            interface: WritesAttribute::class,
+            role: 'operation',
+        );
         $record = (new $this->map->model)->setConnection($this->connectionName)->newInstance([], true)->setRawAttributes([$this->key => $key, $name => $value], true);
         $owner = $branch->owners[$name];
         $instance->write((new Staging(

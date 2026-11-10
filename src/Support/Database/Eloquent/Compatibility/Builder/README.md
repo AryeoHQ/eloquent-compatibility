@@ -6,7 +6,7 @@
 
 After install, the legacy table name is a read-only view over the successors. The view serves a converted attribute as an expression over a stored column. The Listing fixture serves `price` as `jobs.price_cents / 100`.
 
-A filter on that expression returns the right rows. But PostgreSQL cannot use an index on `jobs.price_cents` for it, so a large table needs a sequential scan. An attribute with no conversion needs no help. PostgreSQL inlines the view, so a filter on a renamed column already uses the stored column's index.
+A filter on that expression returns the right rows. But PostgreSQL cannot use an index on `jobs.price_cents` for it, so a large table needs a sequential scan. An attribute that only renames a column needs no help. PostgreSQL inlines the view, so a filter on a renamed column already uses the stored column's index.
 
 `LegacyBuilder` therefore rewrites a filter on a converted attribute onto the stored column, before Laravel compiles the query. `LegacyBuilderReadTest::it_filters_a_converted_attribute_on_its_stored_column_once_installed()` pins the result:
 
@@ -96,6 +96,7 @@ A filter stays on the view, which is correct but slow, in these cases:
 - **No inverse exists.** Examples are `like` on a mapping, a value no mapping declares, and any `readAs()` attribute.
 - **A range has a NULL bound,** as in `whereBetween('price', [null, 100])`. SQL returns unknown for that comparison, and the view keeps that result.
 - **A negated filter's complement has no inverse.** Negating the stored filter instead would drop rows whose stored value is NULL, while the view can serve them as a value, for example through `orDefault()`.
+- **An `orFrom()` attribute.** It reads `COALESCE()` over two tables, so its filter runs on the view with no index.
 - **The role cannot read the successors.** It lacks `SELECT` on a successor, or row-level security is active there. The subquery would then fail, or filter different rows than the view.
 
 ## Exactness

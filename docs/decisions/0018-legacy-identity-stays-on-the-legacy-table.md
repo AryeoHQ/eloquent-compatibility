@@ -33,7 +33,7 @@ Declined: a successor key that stays nullable after install, and `SET NOT NULL`,
 - A root hard-deleted after the existence proof and before install adds the foreign key leaves a successor key with no row. The `NOT VALID` foreign key does not catch it, and the view's inner join hides that record. Declined: an anti-join probe under the lock, which is a whole-table scan under the lock.
 - A related key such as `listings.place_id` becomes an ordinary mapped attribute, read from the related row. A stored related key would go stale when v2 moves a Job to another Place.
 - A successor whose native creates legacy readers must see carries the successor trait.
-- A native create outside a transaction, of a root class that a discovered map serves, runs in a short transaction of its own, which holds the `ACCESS SHARE` lock until it commits. A successor that overrides `performInsert()` or `performInsertOrIgnore()` itself conflicts with the trait.
+- A native create outside a transaction, of a root class that a discovered map serves, runs in a short transaction of its own, which holds the `ACCESS SHARE` lock until it commits. A successor that overrides `performInsert()`, `performInsertOrIgnore()` or `fireModelEvent()` itself conflicts with the trait.
 - Legacy readers do not see a v2-created listing until install.
 - The database does not enforce exclusivity across legacy models on a shared successor. Revisit that only when a real need appears.
 - [Storage](../specification/storage.md) states the columns and constraints.

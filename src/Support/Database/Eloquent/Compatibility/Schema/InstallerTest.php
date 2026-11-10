@@ -702,7 +702,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -724,7 +724,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -786,7 +786,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -806,7 +806,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is computedAs(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
         }
 
         $this->assertSame(['r', 's'], [$this->kind('photos'), DB::scalar("select attgenerated::text from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'")]);
@@ -829,7 +829,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is computedAs(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
         }
 
         $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);

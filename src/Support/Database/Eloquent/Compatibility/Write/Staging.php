@@ -163,14 +163,6 @@ final class Staging
         $this->actions[] = $action;
     }
 
-    /**
-     * @return array<string, null|Model>
-     */
-    public function models(): array
-    {
-        return $this->models;
-    }
-
     public function model(string $table): null|Model
     {
         return $table === $this->map->primary->table ? $this->root : $this->models[$table] ?? null;
@@ -270,10 +262,10 @@ final class Staging
             }
         }
 
-        throw CompatibilityWriteRefused::unsupported(
+        throw CompatibilityWriteRefused::unrelated(
             model: $this->map->model,
-            operation: 'an operation that names '.class_basename($class),
-            because: 'The map relates no '.class_basename($class).' under its root '.class_basename($this->map->primary->model).', so the unit of work holds no such successor.',
+            successor: $class,
+            root: $this->map->primary->model,
         );
     }
 
@@ -300,10 +292,11 @@ final class Staging
      */
     private function forwardedOnly(string $method, string $class): CompatibilityWriteRefused
     {
-        return CompatibilityWriteRefused::unsupported(
+        return CompatibilityWriteRefused::forwardedOnly(
             model: $this->map->model,
-            operation: "an operation that calls {$method} for ".class_basename($class).' from a forwarded legacy event',
-            because: 'A forwarded event belongs to the save of '.($this->forwarding === null ? 'a successor' : class_basename($this->forwarding)).', so the operation reaches that successor alone and the package saves nothing else.',
+            method: $method,
+            successor: $class,
+            forwarding: $this->forwarding,
         );
     }
 }

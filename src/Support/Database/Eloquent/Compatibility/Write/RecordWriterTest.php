@@ -26,12 +26,14 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\AliasedPlace;
 use Tests\Fixtures\Support\Listings\ConfiguredJob;
+use Tests\Fixtures\Support\Listings\ConfiguredSite;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\WriteConfiguredCity;
 use Tests\TestCase;
 
 #[CoversClass(RecordWriter::class)]
@@ -545,7 +547,7 @@ final class RecordWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_write_of_a_read_only_computed_attribute_and_a_value_its_conversions_cannot_store(): void
+    public function it_refuses_a_write_of_a_read_only_computed_attribute_and_a_change_of_a_read_only_fixed_attribute(): void
     {
         $before = $this->snapshot();
         $listing = new class extends Model implements Compatible
@@ -890,6 +892,142 @@ final class RecordWriterTest extends TestCase
         $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
     }
 
+    #[Test]
+    public function it_increments_the_identifier_of_a_record_and_writes_its_extra_values_under_the_new_identifier(): void
+    {
+        $incremented = Listing::query()->create(['title' => 'Elm House', 'company_id' => ListingTables::COMPANY]);
+        $id = (int) $incremented->id;
+
+        $incremented->increment('id', 95, ['title' => 'Elm Lodge']);
+
+        $this->assertSame([$id + 95, 'Elm Lodge'], [$incremented->id, $incremented->title]);
+        $this->assertSame([$id + 95 => 'Elm Lodge'], Listing::query()->whereKey([$id, $id + 95])->pluck('title', 'id')->all());
+    }
+
+    #[Test]
+    public function it_refuses_an_identifier_increment_whose_successor_listener_changes_its_extra_value_and_keeps_the_old_identifier(): void
+    {
+        $incremented = Listing::query()->create(['title' => 'Elm House', 'company_id' => ListingTables::COMPANY]);
+        $id = (int) $incremented->id;
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+
+        $refusal = $this->refusal(fn () => $incremented->increment('id', 95, ['title' => 'Elm Lodge']));
+
+        $this->assertStringContainsString(' record '.($id + 95)." cannot take this write of \$title. Why: The write stores 'Elm Lodge', and the view now serves title as 'ELM LODGE'", $refusal->getMessage());
+        $this->assertSame([$id => 'Elm House'], Listing::query()->whereKey([$id, $id + 95])->pluck('title', 'id')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_live_create_that_supplies_a_stored_less_read_only_attribute_and_creates_one_that_supplies_null(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->attribute(name: 'mls_number', definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $jobs) => $jobs->mapWithKeys(fn (Job $job) => [$job->getKey() => null]))->readOnly(because: 'The MLS assigns its own numbers.', ignoreWrites: false)));
+            }
+        };
+        $retained = DB::table('listings_retained')->count();
+
+        $refusal = $this->refusal(fn () => $listing->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'mls_number' => 'MLS-9']));
+        $created = $listing->newQuery()->create(['title' => 'Cedar House', 'company_id' => ListingTables::COMPANY, 'mls_number' => null]);
+
+        $this->assertSame(['The MLS assigns its own numbers.', true], [$refusal->because, str_ends_with($refusal->refused, ' records cannot change $mls_number')]);
+        $this->assertSame([false, $retained + 1], [DB::table('jobs')->where('name', 'Birch House')->exists(), DB::table('listings_retained')->count()]);
+        $this->assertSame('Cedar House', DB::table('jobs')->where('id', ListingTables::jobOf($created->getKey()))->value('name'));
+    }
+
+    #[Test]
+    public function it_assigns_a_read_only_attribute_that_ignores_writes_into_the_root_a_create_creates_and_dispatches_no_write_ignored(): void
+    {
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = $event->change->attribute;
+        });
+
+        $created = $this->companyIgnoringListing()::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([[], ListingTables::COMPANY], [$ignored, DB::table('jobs')->where('id', ListingTables::jobOf($created->getKey()))->value('company_id')]);
+    }
+
+    #[Test]
+    public function it_keeps_the_updated_at_a_caller_writes_beside_a_legacy_only_column(): void
+    {
+        $listing = Listing::query()->findOrFail(1);
+
+        $listing->update(['mls_number' => 'MLS-1D', 'updated_at' => '2026-04-01 00:00:00']);
+
+        $read = Listing::query()->findOrFail(1);
+        $this->assertSame(['MLS-1D', '2026-04-01 00:00:00'], [$read->mls_number, $read->updated_at?->format('Y-m-d H:i:s')]);
+    }
+
+    #[Test]
+    public function it_reads_filters_and_writes_an_attribute_that_falls_back_to_a_companion_column_once_installed(): void
+    {
+        DB::statement('create table holders (id serial primary key, name text not null, city text, created_at timestamp(0), updated_at timestamp(0))');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, city text)');
+        DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb, city text)');
+        DB::table('holders')->insert([['name' => 'Oak', 'city' => 'Seattle'], ['name' => 'Pine', 'city' => 'Tacoma']]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city')->orFrom(successor: ConfiguredSite::class, column: 'city')->writtenBy(WriteConfiguredCity::class))
+                        ->related(fn (ConfiguredJob $job) => $job->site()));
+            }
+        };
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('update holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, city) select job_id, name, city from holders');
+            DB::statement("insert into configured_sites (configured_job_id, city) select job_id, 'Seattle' from holders where name = 'Oak'");
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            DB::table('configured_jobs')->where('name', 'Oak')->update(['city' => null]);
+            $read = $holder->newQuery()->orderBy('id')->pluck('city', 'id')->all();
+            $found = $holder->newQuery()->where('city', 'Seattle')->pluck('id')->all();
+            $holder->newQuery()->findOrFail(1)->update(['city' => 'Everett']);
+            $written = [$holder->newQuery()->findOrFail(1)->getAttribute('city'), DB::table('configured_jobs')->where('name', 'Oak')->value('city'), DB::table('configured_sites')->value('city')];
+        } finally {
+            DB::statement('drop view if exists holders');
+            DB::statement('drop table if exists holders, holders_retained, holders_backfill, configured_sites, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([1 => 'Seattle', 2 => 'Tacoma'], $read);
+        $this->assertSame([1], $found);
+        $this->assertSame(['Everett', 'Everett', 'Seattle'], $written);
+    }
+
     private function companyIgnoringListing(): Model
     {
         return new class extends Model implements Compatible
@@ -906,6 +1044,7 @@ final class RecordWriterTest extends TestCase
                     ->retainedIn('listings_retained')
                     ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                         ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
                         ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
                         ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: true)));
             }

@@ -20,6 +20,7 @@ use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
+use Tests\Fixtures\Support\PlaceAssets\ClassifyPlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
@@ -40,6 +41,7 @@ final class MorphMoveTest extends TestCase
         PlaceAssetTables::create();
         PlaceAssetTables::seed();
         PlaceAssetTables::install();
+        ClassifyPlaceAsset::$origins = [];
     }
 
     protected function tearDown(): void
@@ -190,6 +192,15 @@ final class MorphMoveTest extends TestCase
                 value: 3,
             )->value('place_asset_id'),
         )->value('asset_id')]);
+    }
+
+    #[Test]
+    public function it_hands_the_successors_initializer_of_a_legacy_create_the_live_origin(): void
+    {
+        $image = Image::query()->create(['title' => 'Side', 'file_name' => 'side.jpg']);
+
+        $this->assertSame([Origin::Live], ClassifyPlaceAsset::$origins);
+        $this->assertSame(['Side', 'place_image'], [Image::query()->findOrFail($image->getKey())->getAttribute('title'), PlaceAsset::query()->where('title', 'Side')->value('legacy_type')]);
     }
 
     #[Test]

@@ -59,7 +59,7 @@ final class Applying
 
     public static function legacyOf(Model $successor): null|Model
     {
-        return self::holds($successor) ? self::$writes[$successor] ?? null : null;
+        return self::$writes[$successor] ?? null;
     }
 
     public static function identified(Model $legacy, int|string $key): void

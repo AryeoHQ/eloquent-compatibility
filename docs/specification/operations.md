@@ -100,7 +100,7 @@ One legacy write runs these steps, in this order:
 2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root, its retained row and the touched related rows `FOR UPDATE`, parents first. The touched related rows are every related successor the map declares under the root, because an operation names the successors it writes only when it runs. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
-5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor.
+5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor's class.
 6. **Verify.** The package reads the record back through the view and runs the round-trip check.
 7. **Forward.** The package forwards one legacy event.
 
@@ -138,7 +138,7 @@ The check compares values the way the legacy model's casts do. A JSON object com
 
 A `hide()` rule can hide the record after the write, whether the write itself, a successor listener or a trigger trips it. The check then reads the record through the map's column expressions without its `hide()` conditions, filtered to the record's key. A hide that keeps every written value passes, and a hide that loses one refuses the write. When that read also finds no row, a listener or a trigger removed the record, and the check refuses the write.
 
-Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
+Before install, no view exists, and a legacy write goes to the legacy table without reaching the check. Only a backfill row reaches it then, and the check reads that record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
 
 ### What the comparisons skip
 
@@ -309,7 +309,7 @@ The reverse direction. An application creates a successor natively, and the succ
 
 `Provides\CarriesLegacy` takes an `ACCESS SHARE` lock on each legacy table whose `when()` the new root matches, before it checks whether that legacy model is installed. It locks no other legacy table. A native create therefore waits for the `ACCESS EXCLUSIVE` lock of an install it would join, and afterward it sees the installed state. A native floor plan create waits for FloorPlan's install, and not for Photo's.
 
-`Provides\CarriesLegacy` opens a transaction around the insert when the caller has none, for a root class that a discovered map serves, or a subclass of one. It does so whether or not that map is installed, and decides inside the transaction, under the `ACCESS SHARE` lock, whether to insert the legacy row. The `creating` event, the root insert, the retained-row insert and the `created` event then commit or roll back together, through `save()` and through `saveOrIgnore()`. A create through those two paths therefore leaves no successor without its legacy row. Inside a caller's transaction, the trait opens nothing. A successor that overrides `performInsert()` or `performInsertOrIgnore()` itself conflicts with the trait.
+`Provides\CarriesLegacy` opens a transaction around the insert when the caller has none, for a root class that a discovered map serves, or a subclass of one. It does so whether or not that map is installed, and decides inside the transaction, under the `ACCESS SHARE` lock, whether to insert the legacy row. The `creating` event, the root insert, the retained-row insert and the `created` event then commit or roll back together, through `save()` and through `saveOrIgnore()`. A create through those two paths therefore leaves no successor without its legacy row. Inside a caller's transaction, the trait opens nothing. A successor that overrides `performInsert()`, `performInsertOrIgnore()` or `fireModelEvent()` itself conflicts with the trait.
 
 The trait sees only a model insert. A query-builder insert into the root table (`Job::query()->insert()`, `upsert()`, `insertUsing()`, `DB::table('jobs')`) and an insert through another class over the root table that is not a subclass of the map's root insert no legacy row, so the view does not serve that root. [Lifecycle: the writer boundary](lifecycle.md#the-writer-boundary) lists these writers.
 

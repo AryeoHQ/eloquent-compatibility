@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -20,6 +21,11 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\ClearListingAddress;
+use Tests\Fixtures\Support\Listings\ClearListingSite;
+use Tests\Fixtures\Support\Listings\HookedJobInitializer;
+use Tests\Fixtures\Support\Listings\HookedTitleWrite;
+use Tests\Fixtures\Support\Listings\HookedWriteScope;
+use Tests\Fixtures\Support\Listings\HookLog;
 use Tests\Fixtures\Support\Listings\InterleavingWriteScope;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
@@ -28,7 +34,9 @@ use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\MovingWriteScope;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\QueueNestedListingActions;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\RecordsHooks;
 use Tests\Fixtures\Support\Listings\SkippingWriteScope;
 use Tests\Fixtures\Support\Listings\SwallowingWriteScope;
 use Tests\TestCase;
@@ -58,6 +66,7 @@ final class UnitOfWorkTest extends TestCase
 
     protected function tearDown(): void
     {
+        Date::setTestNow();
         ListingTables::drop();
 
         parent::tearDown();
@@ -165,10 +174,11 @@ final class UnitOfWorkTest extends TestCase
     }
 
     #[Test]
-    public function it_keeps_the_legacy_updated_at_of_a_create_whose_job_created_listener_saves_the_job_a_second_later(): void
+    public function it_keeps_the_legacy_updated_at_of_a_create_whose_job_created_listener_saves_the_job(): void
     {
+        Date::setTestNow('2026-06-07 10:00:00');
         Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
-            usleep(1_100_000);
+            Date::setTestNow('2026-06-07 10:00:01');
             Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
         });
 
@@ -275,6 +285,131 @@ final class UnitOfWorkTest extends TestCase
 
         $this->assertSame($skipping::class.' cannot take this write, because its write scope SkippingWriteScope returned without running it. Why: The package runs the write inside SkippingWriteScope::run(), and run() returned without calling $write, so the write would report success and store nothing. Instead: Make SkippingWriteScope::run() call $write and return its result.', $refusal);
         $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_deletes_the_related_successor_an_operation_names_after_the_saves_and_inserts_none_that_the_same_write_created(): void
+    {
+        $siting = $this->siting();
+        $fired = [];
+        Event::listen('eloquent.saved: '.Job::class, function () use (&$fired): void {
+            $fired[] = 'Job saved';
+        });
+
+        foreach (['created', 'deleting', 'deleted'] as $event) {
+            Event::listen("eloquent.{$event}: ".JobSite::class, function () use (&$fired, $event): void {
+                $fired[] = "JobSite {$event}";
+            });
+        }
+
+        $siting->newQuery()->findOrFail(1)->update(['title' => 'Oak Manor', 'latitude' => null]);
+        $updated = $fired;
+        $created = $siting->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'latitude' => null]);
+        $read = $siting->newQuery()->findOrFail(1);
+
+        $this->assertSame(['Job saved', 'JobSite deleting', 'JobSite deleted'], $updated);
+        $this->assertSame([...$updated, 'Job saved'], $fired);
+        $this->assertSame([false, 'Oak Manor', null], [JobSite::query()->where('job_id', ListingTables::jobOf(1))->exists(), $read->getAttribute('title'), $read->getAttribute('latitude')]);
+        $this->assertSame([true, false], [Job::query()->whereKey(ListingTables::jobOf($created->getKey()))->exists(), JobSite::query()->where('job_id', ListingTables::jobOf($created->getKey()))->exists()]);
+    }
+
+    #[Test]
+    public function it_runs_an_action_that_an_earlier_action_queues_after_that_action(): void
+    {
+        QueueNestedListingActions::$ran = [];
+
+        $this->nesting()->newQuery()->findOrFail(1)->update(['title' => 'Oak Manor']);
+
+        $this->assertSame(['queued by the operation', 'queued by that action'], QueueNestedListingActions::$ran);
+        $this->assertSame('Oak Manor', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_resolves_the_write_scope_the_operation_and_the_successors_initializer_from_the_container_with_their_bound_dependency(): void
+    {
+        $log = new HookLog;
+        $this->app->instance(RecordsHooks::class, $log);
+        $hooked = $this->hooked();
+
+        $hooked->newQuery()->findOrFail(1)->update(['title' => 'Oak Manor']);
+        $updated = $log->hooks;
+        $log->hooks = [];
+        $created = $hooked->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([HookedWriteScope::class, HookedTitleWrite::class], $updated);
+        $this->assertSame([HookedWriteScope::class, HookedTitleWrite::class, HookedJobInitializer::class], $log->hooks);
+        $this->assertSame(['Oak Manor', 'Birch House'], [DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'), DB::table('jobs')->where('id', ListingTables::jobOf($created->getKey()))->value('name')]);
+    }
+
+    private function siting(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->related(relation: fn (Job $job) => $job->site(), successor: fn (Successor $site) => $site
+                            ->attribute(name: 'latitude', definition: fn (Attribute $attribute) => $attribute->from('latitude')->writtenBy(ClearListingSite::class))));
+            }
+        };
+    }
+
+    private function nesting(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(QueueNestedListingActions::class)));
+            }
+        };
+    }
+
+    private function hooked(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(HookedTitleWrite::class))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false)))
+                    ->successorsInitializedBy(HookedJobInitializer::class)
+                    ->writesWithin(HookedWriteScope::class);
+            }
+        };
     }
 
     private function swallowing(): Model

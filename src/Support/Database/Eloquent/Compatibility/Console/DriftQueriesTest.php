@@ -240,7 +240,7 @@ final class DriftQueriesTest extends TestCase
         DB::update("update place_images set mime_type = 'image/gif' where id = 1");
 
         $this->assertSame([
-            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
         ], $this->find(Image::class));
     }
 
@@ -256,7 +256,7 @@ final class DriftQueriesTest extends TestCase
         ], $this->find(Image::class, 1));
         $this->assertSame([
             [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
-            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
+            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
         ], $this->find(Image::class, 2));
     }
 
@@ -399,8 +399,8 @@ final class DriftQueriesTest extends TestCase
             ...($install ? [] : [
                 [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
                 [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for file_name than the view would serve from place_assets'],
-                [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its external() read returns'],
-                [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for mime_type than its external() read returns'],
+                [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
+                [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for mime_type than its computedAs() read returns'],
             ]),
             [Image::class, 'no morph target', 'place_images#1', "its asset_type 'place_brochure' names no target relatedMorph() declares"],
             [Image::class, 'no morph target', 'place_images#2', 'its asset_files row does not exist'],

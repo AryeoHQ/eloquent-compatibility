@@ -178,7 +178,7 @@ final class AssertsServedCompatibilityTest extends TestCase
         DB::statement('alter table floorplans_retained alter column drawn_by drop default');
 
         $this->assertStringStartsWith(
-            'The legacy-only column floorplans.drawn_by is NOT NULL with no default, and the map of FloorPlan declares no legacyInitializedBy(), so a native create cannot fill it.',
+            'The legacy-only column floorplans_retained.drawn_by is NOT NULL with no default, and the map of FloorPlan declares no legacyInitializedBy(), so a native create cannot fill it.',
             $this->failureOf(
                 model: FloorPlan::class,
                 nativeCreate: fn () => PlaceAsset::query()->create(['legacy_type' => 'floorplan', 'asset_type' => 'place_asset_file', 'asset_id' => AssetFile::query()->create(['filename' => 'pine-plan.pdf'])->getKey()]),

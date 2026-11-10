@@ -190,6 +190,17 @@ final readonly class ResolvedMap
         ], is_string(...))));
     }
 
+    public function relatedAt(string $table): Related
+    {
+        foreach ($this->related as $related) {
+            if ($related->table === $table) {
+                return $related;
+            }
+        }
+
+        throw new LogicException("Compatibility map '{$this->table}' reaches no table {$table} through related().");
+    }
+
     /**
      * @param  list<string>  $columns
      * @return list<string>
@@ -339,13 +350,6 @@ final readonly class ResolvedMap
         $tables = [];
 
         foreach ($related as $relation) {
-            if (array_key_exists(
-                key: $relation->model,
-                array: $tables,
-            )) {
-                throw $this->invalid('it relates '.class_basename($relation->model).' twice under the root '.class_basename($successors[0]->model).', and an operation names each related successor by its class');
-            }
-
             $tables[$relation->model] = $relation->table;
         }
 
@@ -388,7 +392,7 @@ final readonly class ResolvedMap
         }
 
         foreach ($attributes as $name => $attribute) {
-            if (! $attribute->invertible() || $attribute->operation() !== null || $attribute->readOnlyBecause() !== null) {
+            if (! $attribute->isWritable()) {
                 continue;
             }
 

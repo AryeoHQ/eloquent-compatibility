@@ -57,17 +57,6 @@ final readonly class MassWriter
     }
 
     /**
-     * @template TResult
-     *
-     * @param  Closure(): TResult  $write
-     * @return TResult
-     */
-    public function transaction(Closure $write): mixed
-    {
-        return $this->unit->transaction($write);
-    }
-
-    /**
      * @param  array<array-key, mixed>  $values
      * @param  array<array-key, float|int|numeric-string>  $amounts
      */

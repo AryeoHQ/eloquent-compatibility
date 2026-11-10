@@ -288,7 +288,7 @@ final readonly class DriftQueries
 
             foreach (array_keys($rows) as $key) {
                 if (array_key_exists($key, $differs) && count($findings) < $limit) {
-                    $findings[] = new DriftFinding($map->model, DriftCheck::ValuesDiffer, self::record($map->table, $key), "{$map->table} holds other values for ".implode(', ', $differs[$key]).' than '.(count($differs[$key]) === 1 ? 'its external() read returns' : 'their external() reads return'));
+                    $findings[] = new DriftFinding($map->model, DriftCheck::ValuesDiffer, self::record($map->table, $key), "{$map->table} holds other values for ".implode(', ', $differs[$key]).' than '.(count($differs[$key]) === 1 ? 'its computedAs() read returns' : 'their computedAs() reads return'));
                 }
             }
 

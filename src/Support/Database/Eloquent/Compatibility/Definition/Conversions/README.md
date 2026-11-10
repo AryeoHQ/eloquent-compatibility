@@ -41,8 +41,8 @@ An attribute may chain several conversions. `Attribute::read()` applies them in 
 | `OrDefault` | `orDefault(0)` | `COALESCE(s, 0)` | The value unchanged | `=` and `!=`, except against the default |
 | `AsType` | `asType('date')` | `CAST(s AS date)` | The value unchanged | None, and never exact |
 | `InTimeZone` | `inTimeZone('America/Chicago')` | `s AT TIME ZONE 'America/Chicago'`, an instant as that zone's wall clock | The wall clock in that zone, as an instant in the application zone | `=`, `!=`, `<`, `>`, `<=`, `>=` against a date or a wall-clock string |
-| `ReadAs` | `readAs('sql')` | The SQL as written | Never; the attribute's `writtenBy()` operation writes it, or `readOnly()` refuses the write | None |
-| `Fixed` | `fixed('listing')` | The literal | Only the same value; it refuses any other | None |
+| `ReadAs` | `readAs('sql')` | The SQL as written | Never; its `writtenBy()` operation writes it, or its `readOnly()` declaration refuses or discards the write | None |
+| `Fixed` | `fixed('listing')` | The literal | Never; its `readOnly()` declaration decides: `ignoreWrites: false` refuses the write, and `true` discards it | None |
 
 `Fixed` also renders the literals the other classes embed, such as the divisor of `DividedBy`.
 

@@ -197,6 +197,7 @@ final class AttributeTest extends TestCase
         yield 'fixed that says no write' => [fn (Attribute $attribute) => $attribute->fixed(null)->resolve(), 'has no inverse, so its read says no write; declare writtenBy() or readOnly()'];
         yield 'fixed and written by' => [fn (Attribute $attribute) => $attribute->fixed(null)->writtenBy(LeaveTitleUnchanged::class)->resolve(), 'is fixed(), so it reads one value and no operation writes it'];
         yield 'a fallback without a column' => [fn (Attribute $attribute) => $attribute->readAs('1')->orFrom(successor: Place::class, column: 'street')->writtenBy(LeaveTitleUnchanged::class)->resolve(), 'reads as raw SQL with readAs(), so it takes no other conversion'];
+        yield 'a fallback without its own column' => [fn (Attribute $attribute) => $attribute->orFrom(successor: Place::class, column: 'street')->writtenBy(LeaveTitleUnchanged::class)->resolve(), 'reads orFrom() without from(), so it has no column to read first'];
     }
 
     /**

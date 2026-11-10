@@ -15,7 +15,6 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Console\DriftFinding;
 use Support\Database\Eloquent\Compatibility\Console\DriftQueries;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
-use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityException;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -23,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
 
 trait AssertsServedCompatibility
 {
@@ -80,13 +80,15 @@ trait AssertsServedCompatibility
             $legacy = new $model;
             $allocated = [$legacy->getKeyName(), $map->successorKey, ...($legacy->usesUniqueIds() ? $legacy->uniqueIds() : [])];
 
-            foreach ((new ColumnCatalog($connection, throughSearchPath: true))->of($views === null ? $map->table : ViewCompiler::retainedTable($map)) as $name => $column) {
+            $read = $views === null ? $map->table : ViewCompiler::retainedTable($map);
+
+            foreach ((new ColumnCatalog($connection, throughSearchPath: true))->of($read) as $name => $column) {
                 if ($column->needsAValue() && ! in_array($name, $allocated, true) && $map->legacyOnly([$name]) !== []) {
                     $uninitialized[] = $name;
                 }
             }
 
-            Assert::assertSame([], $uninitialized, "The legacy-only column {$map->table}.".implode(', ', $uninitialized).' is NOT NULL with no default, and the map of '.class_basename($model).' declares no legacyInitializedBy(), so a native create cannot fill it.');
+            Assert::assertSame([], $uninitialized, "The legacy-only column {$read}.".implode(', ', $uninitialized).' is NOT NULL with no default, and the map of '.class_basename($model).' declares no legacyInitializedBy(), so a native create cannot fill it.');
         }
 
         $connection->beginTransaction();
@@ -104,7 +106,7 @@ trait AssertsServedCompatibility
 
             Assert::assertInstanceOf($map->primary->model, $root, "nativeCreate creates no {$map->primary->model} to serve as the root of a new {$model}; return the root it creates.");
             Assert::assertTrue($root->exists, "nativeCreate returns a {$map->primary->model} it never saved.");
-            Assert::assertTrue(self::isMember($map, $root), 'nativeCreate creates a '.class_basename($map->primary->model).' outside the when() of '.class_basename($model).", so a native create inserts no {$map->table} row. Set its membership column at birth, through a Creating listener.");
+            Assert::assertTrue(RetainedRows::member(root: $root, map: $map), 'nativeCreate creates a '.class_basename($map->primary->model).' outside the when() of '.class_basename($model).", so a native create inserts no {$map->table} row. Set its membership column at birth, through a Creating listener.");
 
             Assert::assertTrue(
                 $connection->table(ViewCompiler::retainedTable($map))->where(
@@ -117,7 +119,7 @@ trait AssertsServedCompatibility
 
             foreach ($siblings as $sibling) {
                 Assert::assertFalse(
-                    $sibling->primary->model === $map->primary->model && self::isMember($sibling, $root),
+                    $sibling->primary->model === $map->primary->model && RetainedRows::member(root: $root, map: $sibling),
                     'nativeCreate creates a '.class_basename($map->primary->model).' that the when() of '.class_basename($model).' and of '.class_basename($sibling->model).' both match, so one root would gain a legacy row in each. Make membership exclusive across the maps that share it.',
                 );
             }
@@ -136,19 +138,5 @@ trait AssertsServedCompatibility
             $connection->rollBack();
             LegacyBuilder::forgetViews();
         }
-    }
-
-    private static function isMember(ResolvedMap $map, Model $root): bool
-    {
-        $when = $map->primary->membershipScope();
-
-        if ($when === null) {
-            return true;
-        }
-
-        $query = $root->newModelQuery()->whereKey($root->getKey());
-        $when($query);
-
-        return $query->exists();
     }
 }

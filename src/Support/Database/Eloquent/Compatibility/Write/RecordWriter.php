@@ -221,7 +221,7 @@ final readonly class RecordWriter
     public function delete(Model $legacy): int
     {
         return $this->unit->transaction(function () use ($legacy): int {
-            return $this->written($legacy, UnitOfWork::keyOf($legacy), [], [], function (Staging $graph, Model $original, ResolvedMap $chosen) use ($legacy): int {
+            return $this->written($legacy, UnitOfWork::keyOf($legacy), [], [], function (Staging $graph) use ($legacy): int {
                 ExternalAttributes::resolveAll($legacy);
                 $root = $graph->root();
                 $this->unit->run($legacy, $root, fn () => $root->forceDelete());
@@ -412,13 +412,13 @@ final readonly class RecordWriter
         $before = $original->getAttributes();
 
         foreach ($chosen->attributes as $name => $attribute) {
-            if ($chosen->owners[$name] === $target->successor && ! array_key_exists($name, $mapped) && $attribute->invertible() && $attribute->operation() === null && $attribute->readOnlyBecause() === null) {
+            if ($chosen->owners[$name] === $target->successor && ! array_key_exists($name, $mapped) && $attribute->isWritable()) {
                 $mapped[$name] = $before[$name] ?? null;
             }
         }
 
         if ($holding !== null && $current !== $chosen) {
-            $this->refuseUnfilled($graph->root(), $current, $chosen, $mapped, $original);
+            $this->refuseUnfilled($current, $chosen, $mapped, $original);
         }
 
         if ($old !== null) {
@@ -471,7 +471,7 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $values
      */
-    private function refuseUnfilled(Model $root, ResolvedMap $from, ResolvedMap $to, array $values, Model $original): void
+    private function refuseUnfilled(ResolvedMap $from, ResolvedMap $to, array $values, Model $original): void
     {
         $related = $to->target ?? throw new LogicException("Compatibility map '{$this->map->table}' moves a record into no relatedMorph() target.");
         [$unfilled, $required] = $this->unsupplied(
@@ -540,15 +540,15 @@ final readonly class RecordWriter
         }
 
         $target = $graph->model($related->table);
-        $root = $graph->root();
-        $expected = [$related->morphAlias, $target?->getKey()];
-        $pointer = array_values($this->pointer($root) + [$morph->typeColumn => null, $morph->idColumn => null]);
-        $record = $key === null ? 'a new record' : 'record '.$key;
-        $successor = class_basename($this->map->primary->model);
 
         if ($target === null) {
             return;
         }
+
+        $expected = [$related->morphAlias, $target->getKey()];
+        $pointer = array_values($this->pointer($graph->root()) + [$morph->typeColumn => null, $morph->idColumn => null]);
+        $record = $key === null ? 'a new record' : 'record '.$key;
+        $successor = class_basename($this->map->primary->model);
 
         if (array_map(self::quoted(...), $pointer) !== array_map(self::quoted(...), $expected)) {
             throw CompatibilityWriteRefused::unsupported($legacy::class, 'a successor listener that repoints '.$record, $successor.' stored '.$morph->typeColumn.' '.self::quoted($pointer[0]).' and '.$morph->idColumn.' '.self::quoted($pointer[1]).' where the write gives '.self::quoted($expected[0]).' and '.self::quoted($expected[1]).', so the record would point at a target the write did not store.');

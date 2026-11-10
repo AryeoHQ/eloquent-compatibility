@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
+use BackedEnum;
 use Illuminate\Database\Eloquent\Model;
+use Stringable;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Throwable;
 
@@ -116,6 +118,35 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
+    /**
+     * @param  class-string<Model>  $successor
+     * @param  class-string<Model>  $root
+     */
+    public static function unrelated(string $model, string $successor, string $root): self
+    {
+        $name = class_basename($successor);
+
+        return new self(
+            "{$model} cannot run an operation that names {$name} through its compatibility map",
+            "The map relates no {$name} under its root ".class_basename($root).', so the unit of work holds no such successor.',
+            "Relate {$name} under ".class_basename($root).' in the map of '.class_basename($model).', or make the operation name a successor the map relates.',
+        );
+    }
+
+    /**
+     * @param  class-string<Model>  $successor
+     */
+    public static function forwardedOnly(string $model, string $method, string $successor, null|Model $forwarding): self
+    {
+        $saved = $forwarding === null ? 'a successor' : class_basename($forwarding);
+
+        return new self(
+            "{$model} cannot run an operation that calls {$method} for ".class_basename($successor).' from a forwarded legacy event through its compatibility map',
+            "A forwarded event belongs to the save of {$saved}, so the operation reaches that successor alone and the package saves nothing else.",
+            "Make the operation reach only {$saved} when a forwarded event runs it, or write the attribute through ".class_basename($model).', whose write runs the whole unit of work.',
+        );
+    }
+
     public static function rawExpression(string $model, string $attribute, string $because): self
     {
         return new self(
@@ -136,8 +167,8 @@ final class CompatibilityWriteRefused extends CompatibilityException
             $value === null => 'null',
             is_bool($value) => $value ? 'true' : 'false',
             is_scalar($value) => "'".$value."'",
-            $value instanceof \BackedEnum => "'".$value->value."'",
-            $value instanceof \Stringable => "'".$value."'",
+            $value instanceof BackedEnum => "'".$value->value."'",
+            $value instanceof Stringable => "'".$value."'",
             default => get_debug_type($value),
         };
     }

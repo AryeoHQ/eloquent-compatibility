@@ -18,9 +18,6 @@ use PHPStan\Collectors\Collector;
 use PHPStan\Reflection\ExtendedMethodReflection;
 use PHPStan\Reflection\MethodReflection;
 use PHPStan\Reflection\ParameterReflection;
-use PHPStan\Type\Constant\ConstantStringType;
-use PHPStan\Type\ObjectType;
-use PHPStan\Type\Type;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -34,6 +31,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Targets;
  */
 final class MapRelationsCollector implements Collector
 {
+    use ReadsCallArguments;
+
     private const array DEFINITIONS = [
         Compatibility::class,
         Successor::class,
@@ -99,7 +98,6 @@ final class MapRelationsCollector implements Collector
             ) => ['operations', $this->strings(
                 argument: $this->argument(
                     call: $call,
-                    position: 0,
                     name: 'operation',
                 ),
                 scope: $scope,
@@ -114,7 +112,6 @@ final class MapRelationsCollector implements Collector
             ) => ['operations', $this->strings(
                 argument: $this->argument(
                     call: $call,
-                    position: 0,
                     name: 'initializer',
                 ),
                 scope: $scope,
@@ -125,7 +122,6 @@ final class MapRelationsCollector implements Collector
             ) => ['relates', $this->relatedModels(
                 relation: $this->argument(
                     call: $call,
-                    position: 0,
                     name: 'relation',
                 ),
                 scope: $scope,
@@ -136,7 +132,6 @@ final class MapRelationsCollector implements Collector
             ) => ['relates', $this->strings(
                 argument: $this->argument(
                     call: $call,
-                    position: 0,
                     name: 'target',
                 ),
                 scope: $scope,
@@ -211,39 +206,5 @@ final class MapRelationsCollector implements Collector
         }
 
         return array_values(array_unique($models));
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function strings(null|Expr $argument, Scope $scope): array
-    {
-        if ($argument === null) {
-            return [];
-        }
-
-        return array_map(
-            callback: fn (ConstantStringType $string) => $string->getValue(),
-            array: $scope->getType($argument)->getConstantStrings(),
-        );
-    }
-
-    private function argument(MethodCall $call, int $position, string $name): null|Expr
-    {
-        foreach ($call->getArgs() as $index => $argument) {
-            if ($argument->name?->toString() === $name || ($argument->name === null && ! $argument->unpack && $index === $position)) {
-                return $argument->value;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * @param  class-string  $class
-     */
-    private function is(string $class, Type $type): bool
-    {
-        return new ObjectType($class)->isSuperTypeOf($type)->yes();
     }
 }

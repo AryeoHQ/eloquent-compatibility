@@ -75,12 +75,11 @@ final readonly class UnitOfWork
             return $write();
         }
 
-        $instance = Container::getInstance()->make($scope);
-
-        if (! $instance instanceof ScopesWrites) {
-            throw new LogicException("The write scope {$scope} does not implement ".ScopesWrites::class.'.');
-        }
-
+        $instance = self::resolve(
+            class: $scope,
+            interface: ScopesWrites::class,
+            role: 'write scope',
+        );
         $scoped = new ScopedWrite($write);
         $result = $instance->run($touched, $scoped(...));
 
@@ -184,7 +183,7 @@ final readonly class UnitOfWork
             $owner = $map->owners[$name];
             $value = $values[$name] ?? null;
 
-            if ($owner !== $map->primary && $value !== null && $attribute->readOnlyBecause() !== null && $attribute->storesColumn() && $attribute->invertible() && $attribute->column() === $owner->key) {
+            if ($owner !== $map->primary && $value !== null && $attribute->readOnlyBecause() !== null && $attribute->invertible() && $attribute->column() === $owner->key) {
                 $named[$owner->table] = $this->stored($map, $attribute, $name, $value);
                 $names[$owner->table] = $name;
             }
@@ -514,16 +513,18 @@ final readonly class UnitOfWork
                 }
 
                 if ($attribute->readOnlyBecause() !== null) {
-                    $this->readOnlyPath(
+                    $this->readOnly(
                         graph: $graph,
                         attribute: $attribute,
+                        name: $name,
+                        value: $value,
                         change: new Change(
                             record: $record,
                             original: $original,
                             attribute: $name,
                             origin: $origin,
                         ),
-                        value: $value,
+                        creating: false,
                     );
 
                     continue;
@@ -560,7 +561,11 @@ final readonly class UnitOfWork
 
             if ($operation !== null) {
                 self::hook(
-                    run: fn () => $this->operation($operation)->write($graph->successors(), $value, $change),
+                    run: fn () => self::resolve(
+                        class: $operation,
+                        interface: WritesAttribute::class,
+                        role: 'operation',
+                    )->write($graph->successors(), $value, $change),
                     origin: $origin,
                     model: $map->model,
                     key: $creating ? null : self::keyOrNull($original),
@@ -630,11 +635,11 @@ final readonly class UnitOfWork
             return;
         }
 
-        $instance = Container::getInstance()->make($initializer);
-
-        if (! $instance instanceof InitializesSuccessors) {
-            throw new LogicException("The initializer {$initializer} does not implement ".InitializesSuccessors::class.'.');
-        }
+        $instance = self::resolve(
+            class: $initializer,
+            interface: InitializesSuccessors::class,
+            role: 'initializer',
+        );
 
         self::hook(
             run: fn () => $instance->initialize($graph->successors(), new Creation(
@@ -697,20 +702,8 @@ final readonly class UnitOfWork
         );
 
         foreach ($graph->deletions() as $model) {
-            $this->run($legacy, $model, fn () => self::untimestamped($classes, fn () => $model->delete()));
+            $this->run($legacy, $model, fn () => Model::withoutTimestampsOn($classes, fn () => $model->delete()));
         }
-    }
-
-    /**
-     * @template TResult
-     *
-     * @param  list<class-string<Model>>  $classes
-     * @param  Closure(): TResult  $write
-     * @return TResult
-     */
-    private static function untimestamped(array $classes, Closure $write): mixed
-    {
-        return $classes === [] ? $write() : Model::withoutTimestampsOn($classes, $write);
     }
 
     /**
@@ -737,7 +730,7 @@ final readonly class UnitOfWork
                 $this->holding(
                     legacy: $legacy,
                     models: $graph->held(),
-                    write: fn () => self::untimestamped($classes, $action),
+                    write: fn () => Model::withoutTimestampsOn($classes, $action),
                 );
             }
         }
@@ -780,7 +773,7 @@ final readonly class UnitOfWork
      */
     private function readOnly(Staging $graph, Attribute $attribute, string $name, mixed $value, Change $change, bool $creating): void
     {
-        $stored = $attribute->storesColumn() && $attribute->invertible();
+        $stored = $attribute->invertible();
 
         if ($attribute->ignoresWrites()) {
             if ($creating && $stored && $this->assignsCreated($graph, $attribute, $name, $value)) {
@@ -810,28 +803,6 @@ final readonly class UnitOfWork
         }
 
         $this->assignsCreated($graph, $attribute, $name, $value);
-    }
-
-    /**
-     * @param  Staging<Model>  $graph
-     */
-    private function readOnlyPath(Staging $graph, Attribute $attribute, Change $change, mixed $value): void
-    {
-        if (! $attribute->ignoresWrites()) {
-            throw CompatibilityWriteRefused::readOnly(
-                model: $graph->map->model,
-                attribute: $change->attribute,
-                key: self::keyOf($change->original),
-                because: (string) $attribute->readOnlyBecause(),
-            );
-        }
-
-        if ($value !== null) {
-            Event::dispatch(new WriteIgnored(
-                change: $change,
-                value: $value,
-            ));
-        }
     }
 
     /**
@@ -868,10 +839,7 @@ final readonly class UnitOfWork
         }
 
         self::assignRaw(
-            model: $graph->relatedOrNew($this->relatedOf(
-                map: $graph->map,
-                table: $owner->table,
-            )->model),
+            model: $graph->relatedOrNew($graph->map->relatedAt($owner->table)->model),
             values: [$column => $stored],
         );
 
@@ -900,10 +868,7 @@ final readonly class UnitOfWork
             return;
         }
 
-        $related = $this->relatedOf(
-            map: $map,
-            table: $owner->table,
-        )->model;
+        $related = $map->relatedAt($owner->table)->model;
         $model = $graph->related($related);
 
         if ($model === null && $stored === null) {
@@ -968,7 +933,7 @@ final readonly class UnitOfWork
         $names = [];
 
         foreach ($map->attributes as $name => $attribute) {
-            if ($map->owners[$name] === $map->primary && $attribute->invertible() && $attribute->operation() === null && $attribute->readOnlyBecause() === null && array_key_exists($name, $values)) {
+            if ($map->owners[$name] === $map->primary && $attribute->isWritable() && array_key_exists($name, $values)) {
                 $names[(string) $attribute->column()] = $name;
             }
         }
@@ -1135,7 +1100,7 @@ final readonly class UnitOfWork
         }
 
         if ((! $model->exists || $model->isDirty()) && ! $graph->deferred($model)) {
-            $this->run($legacy, $model, fn () => self::untimestamped($classes, fn () => $model->save()));
+            $this->run($legacy, $model, fn () => Model::withoutTimestampsOn($classes, fn () => $model->save()));
         }
 
         foreach ($graph->map->related as $related) {
@@ -1226,25 +1191,17 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  class-string<WritesAttribute<covariant Model>>  $operation
-     * @return WritesAttribute<Model>
+     * @template THook of object
+     *
+     * @param  class-string  $class
+     * @param  class-string<THook>  $interface
+     * @return THook
      */
-    private function operation(string $operation): WritesAttribute
+    public static function resolve(string $class, string $interface, string $role): object
     {
-        $instance = Container::getInstance()->make($operation);
+        $instance = Container::getInstance()->make($class);
 
-        return $instance instanceof WritesAttribute ? $instance : throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
-    }
-
-    private function relatedOf(ResolvedMap $map, string $table): Related
-    {
-        foreach ($map->related as $related) {
-            if ($related->table === $table) {
-                return $related;
-            }
-        }
-
-        throw new LogicException("Compatibility map '{$map->table}' reaches no table {$table} through related().");
+        return $instance instanceof $interface ? $instance : throw new LogicException("The {$role} {$class} does not implement {$interface}.");
     }
 
     /**

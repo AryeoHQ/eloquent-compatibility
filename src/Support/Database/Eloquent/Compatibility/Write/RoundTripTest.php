@@ -412,6 +412,89 @@ final class RoundTripTest extends TestCase
         $this->assertSame([null, 3], [$city(3), $withheld::query()->find(3)?->getKey()]);
     }
 
+    #[Test]
+    public function it_refuses_and_rolls_back_a_record_and_a_mass_increment_whose_successor_listener_stores_another_sum(): void
+    {
+        $this->installListings();
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            if ($job->isDirty('price_cents')) {
+                $job->price_cents = min($job->price_cents, 125100);
+            }
+        });
+        $job = ListingTables::jobOf(1);
+
+        $record = $this->refused(fn () => Listing::query()->findOrFail(1)->increment('price', 5));
+        $mass = $this->refused(fn () => Listing::query()->whereKey(1)->increment('price', 5));
+
+        foreach ([$record, $mass] as $refusal) {
+            $this->assertStringStartsWith(Listing::class." record 1 cannot take this write of \$price. Why: The write stores '1255.50', and the view now serves price as '1251.00'", $refusal);
+        }
+
+        $this->assertSame(125050, DB::table('jobs')->where('id', $job)->value('price_cents'));
+    }
+
+    #[Test]
+    public function it_compares_a_successor_boolean_with_the_value_an_uncast_legacy_attribute_writes(): void
+    {
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'lit', definition: fn (Attribute $attribute) => $attribute->from('lit')));
+            }
+        };
+        Event::listen('eloquent.saving: '.ConfiguredJob::class, function (ConfiguredJob $job): void {
+            if ($job->getAttribute('name') === 'Negated') {
+                $job->setAttribute('lit', ! $job->getAttribute('lit'));
+            }
+        });
+
+        $read = $this->holding(
+            holder: $holder,
+            columns: 'lit boolean',
+            row: ['name' => 'Oak', 'lit' => false],
+            copied: ['lit'],
+            write: function () use ($holder): array {
+                $holder->newQuery()->findOrFail(1)->update(['lit' => '1']);
+                $read = [$holder->newQuery()->findOrFail(1)->getAttribute('lit')];
+                $holder->newQuery()->findOrFail(1)->update(['lit' => 0]);
+                $read[] = $holder->newQuery()->findOrFail(1)->getAttribute('lit');
+                $read[] = $this->refused(fn () => $holder->newQuery()->findOrFail(1)->update(['name' => 'Negated', 'lit' => '1']));
+                $read[] = DB::table('configured_jobs')->value('lit');
+
+                return $read;
+            },
+        );
+
+        $this->assertSame([true, false], [$read[0], $read[1]]);
+        $this->assertStringContainsString("record 1 cannot take this write of \$lit. Why: The write stores '1', and the view now serves lit as false", (string) $read[2]);
+        $this->assertFalse($read[3]);
+    }
+
+    /**
+     * @param  Closure(): mixed  $write
+     */
+    private function refused(Closure $write): string
+    {
+        try {
+            $write();
+        } catch (CompatibilityWriteRefused $refusal) {
+            return $refusal->getMessage();
+        }
+
+        $this->fail('The write was not refused.');
+    }
+
     /**
      * @param  array<string, mixed>  $row
      * @param  list<string>  $copied
@@ -420,7 +503,7 @@ final class RoundTripTest extends TestCase
     private function holding(Model $holder, string $columns, array $row, array $copied, Closure $write): mixed
     {
         DB::statement('create table holders (id serial primary key, name text not null, '.$columns.', created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, stamped_at timestamp(0) without time zone)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, stamped_at timestamp(0) without time zone, lit boolean)');
         DB::table('holders')->insert($row);
         $copy = implode('', array_map(fn (string $column) => ', '.$column, $copied));
 

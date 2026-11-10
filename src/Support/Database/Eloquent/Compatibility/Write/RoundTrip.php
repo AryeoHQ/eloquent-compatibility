@@ -176,7 +176,7 @@ final class RoundTrip
     {
         return match (true) {
             $attribute->ignoresWrites() => true,
-            $attribute->readOnlyBecause() !== null && ! ($attribute->storesColumn() && $attribute->invertible()) => true,
+            $attribute->readOnlyBecause() !== null && ! $attribute->invertible() => true,
             $attribute->isExternal() => $origin !== Origin::Live || $attribute->operation() === null,
             default => false,
         };

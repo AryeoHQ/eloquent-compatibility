@@ -243,7 +243,7 @@ final class ExternalAttributes
         }, $key);
 
         if ($refused > 0) {
-            throw InvalidCompatibilityMap::cannot($map->table, 'install', "{$refused} {$map->table} rows hold a {$name} that the external() read of attribute '{$name}' does not return; the first are {$key} ".implode(', ', $first).". Write each value through the attribute's external() write before install(), because install() drops {$map->table}.{$name}");
+            throw InvalidCompatibilityMap::cannot($map->table, 'install', "{$refused} {$map->table} rows hold a {$name} that the computedAs() read of attribute '{$name}' does not return; the first are {$key} ".implode(', ', $first).". Write each value through the attribute's writtenBy() operation before install(), because install() drops {$map->table}.{$name}");
         }
     }
 
@@ -538,7 +538,7 @@ final class ExternalAttributes
         return match (true) {
             is_scalar($value) => $value,
             $value instanceof Stringable => (string) $value,
-            default => throw new LogicException("The external() read of attribute '{$name}' on {$map->table} returns ".get_debug_type($value).', which rollback() cannot store in a column.'),
+            default => throw new LogicException("The computedAs() read of attribute '{$name}' on {$map->table} returns ".get_debug_type($value).', which rollback() cannot store in a column.'),
         };
     }
 }

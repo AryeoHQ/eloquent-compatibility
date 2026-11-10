@@ -8,7 +8,6 @@ use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Expression as QueryExpression;
-use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\Column;
@@ -615,7 +614,7 @@ final class LegacyRecord
             .($related->morphType === null ? '' : ' AND '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->morphType).' = '.SqlFragments::literal((string) $related->morphAlias));
 
         while ($related->parentTable !== $primary->table) {
-            $parent = $this->relatedTo($related->parentTable);
+            $parent = $this->served->relatedAt($related->parentTable);
             $condition = SqlFragments::identifier($parent->parentTable).'.'.SqlFragments::identifier($parent->parentKey).' IN (SELECT '.SqlFragments::identifier($parent->table).'.'.SqlFragments::identifier($parent->relatedKey).' FROM '.SqlFragments::identifier($parent->table).' WHERE '.$condition.')';
             $related = $parent;
         }
@@ -673,17 +672,6 @@ final class LegacyRecord
         }
 
         return $this->keys[$column];
-    }
-
-    private function relatedTo(string $table): Related
-    {
-        foreach ($this->served->related as $related) {
-            if ($related->table === $table) {
-                return $related;
-            }
-        }
-
-        throw new LogicException("Compatibility map '{$this->map->table}' reaches no table {$table} through related().");
     }
 
     /**

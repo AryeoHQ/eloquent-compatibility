@@ -246,7 +246,7 @@ final class Attribute
 
     public function ignoresWrites(): bool
     {
-        return $this->readOnly !== null && $this->ignoreWrites;
+        return $this->ignoreWrites;
     }
 
     /**
@@ -262,9 +262,9 @@ final class Attribute
         return $this->column !== null && $this->fixed === null && $this->readAs === null && $this->computed === null && $this->orFrom === null;
     }
 
-    public function storesColumn(): bool
+    public function isWritable(): bool
     {
-        return $this->column !== null && $this->computed === null;
+        return $this->invertible() && $this->operation === null && $this->readOnly === null;
     }
 
     /**

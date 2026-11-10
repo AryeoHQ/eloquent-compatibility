@@ -169,7 +169,7 @@ When `choose:` picks another class for a record, the package moves the target in
 
 `when()` on the root decides which roots gain a legacy row when they are created natively. A native `PlaceAsset` create gains a FloorPlan row only when its `legacy_type` is FloorPlan's morph alias.
 
-The package evaluates `when()` only when it creates a legacy row: at a native successor create after install, and at install's insert of retained rows for natively created roots. From then on, the successor key binds the legacy row to its root, and the package never evaluates `when()` to decide what that row serves ([Storage: the view](storage.md#the-view)).
+The package evaluates `when()` on every native create of a root class that a discovered map serves, before and after install. It does so to choose which legacy tables to lock, which legacy model receives a shared root's pre-insert events, and, after install, which legacy rows to insert. It evaluates it again at install's insert of retained rows for natively created roots. From then on, the successor key binds the legacy row to its root, and the package never evaluates `when()` to decide what that row serves ([Storage: the view](storage.md#the-view)).
 
 Membership must therefore be exclusive across the maps that share a root, and stable from creation. A root that two maps' `when()` both match gets a legacy row in each. A root that leaves its map's scope stays served by the legacy row it already has.
 

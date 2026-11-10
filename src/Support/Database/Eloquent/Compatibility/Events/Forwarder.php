@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Closure;
-use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
@@ -280,11 +279,7 @@ final class Forwarder
         $chosen = self::$chosen ??= new WeakMap;
         $pending = $deferred[$successor] ?? [];
 
-        foreach ([$deferred, $chosen] as $entries) {
-            if ($entries->offsetExists($successor)) {
-                $entries->offsetUnset($successor);
-            }
-        }
+        unset($deferred[$successor], $chosen[$successor]);
 
         if (! $proceeds) {
             return null;
@@ -325,9 +320,7 @@ final class Forwarder
         $chosen = self::$chosen ??= new WeakMap;
         $choices = $chosen[$successor] ?? [];
 
-        if ($chosen->offsetExists($successor)) {
-            $chosen->offsetUnset($successor);
-        }
+        unset($chosen[$successor]);
 
         return $choices;
     }
@@ -663,9 +656,13 @@ final class Forwarder
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 ! $serves => 'The written '.class_basename($successor).' no longer serves this '.class_basename($legacy).', so the forwarded write cannot store it there.',
                 $attribute->ignoresWrites() => null,
-                $attribute->isExternal() && $attribute->operation() !== null => in_array($event, self::STORED_BEFORE, true) && ! $deferred ? null : 'It is declared computedAs(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so its operation reaches no save.",
+                $attribute->isExternal() && $attribute->operation() !== null => match (true) {
+                    $deferred => "It is declared computedAs(), and the package raised the legacy {$event} event after the saving and creating listeners of ".class_basename($successor).' ran, because several legacy models share '.class_basename($successor).', so its operation reaches no save.',
+                    in_array($event, self::STORED_BEFORE, true) => null,
+                    default => 'It is declared computedAs(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so its operation reaches no save.",
+                },
                 $attribute->operation() !== null => 'It is writtenBy() '.class_basename($attribute->operation()).', and only a write through '.class_basename($legacy).' runs its operation, which may stage other successors.',
-                $attribute->readOnlyBecause() !== null => $inserts && $attribute->storesColumn() && $attribute->invertible() ? null : $attribute->readOnlyBecause(),
+                $attribute->readOnlyBecause() !== null => $inserts && $attribute->invertible() ? null : $attribute->readOnlyBecause(),
                 ! $attribute->invertible() => 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
@@ -695,11 +692,11 @@ final class Forwarder
             $operation = $attribute->operation();
 
             if ($operation !== null) {
-                $instance = Container::getInstance()->make($operation);
-
-                if (! $instance instanceof WritesAttribute) {
-                    throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
-                }
+                $instance = UnitOfWork::resolve(
+                    class: $operation,
+                    interface: WritesAttribute::class,
+                    role: 'operation',
+                );
 
                 UnitOfWork::hook(
                     run: fn () => $instance->write((new Staging(

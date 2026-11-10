@@ -15,7 +15,7 @@ use Tests\Fixtures\Tooling\Concerns\GetsFixtures;
 
 /** @extends RuleTestCase<CallMethodsRule> */
 #[CoversNothing]
-class WrittenByMustNameAnOperationTest extends RuleTestCase
+class WrittenByArgumentTypeTest extends RuleTestCase
 {
     use GetsFixtures;
 

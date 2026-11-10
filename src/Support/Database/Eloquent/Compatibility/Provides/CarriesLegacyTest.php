@@ -23,16 +23,19 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\CarriedJob;
+use Tests\Fixtures\Support\Listings\HookLog;
 use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\PromotedJob;
+use Tests\Fixtures\Support\Listings\RecordsHooks;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\Brochure;
 use Tests\Fixtures\Support\PlaceAssets\Image;
@@ -58,6 +61,19 @@ final class CarriesLegacyTest extends TestCase
     }
 
     #[Test]
+    public function it_resolves_the_legacy_initializer_of_a_native_create_from_the_container_with_its_bound_dependency(): void
+    {
+        $this->installListings();
+        $log = new HookLog;
+        $this->app->instance(RecordsHooks::class, $log);
+
+        $job = DB::transaction(fn () => Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]));
+
+        $this->assertSame([InitializeLegacyListing::class], $log->hooks);
+        $this->assertSame('JOB-Birch House', DB::table('listings_retained')->where('job_id', $job->id)->value('mls_number'));
+    }
+
+    #[Test]
     public function it_inserts_the_retained_row_with_its_identity_and_the_initializer_values_inside_the_create_transaction(): void
     {
         $this->installListings();
@@ -77,7 +93,7 @@ final class CarriesLegacyTest extends TestCase
         $this->assertSame('JOB-Birch House', $row['mls_number']);
         $this->assertSame(['Birch House', 'JOB-Birch House'], [Listing::query()->findOrFail($next)->title, Listing::query()->findOrFail($next)->mls_number]);
         $this->assertSame($job, ListingTables::jobOf($next));
-        $this->assertSame([[$next, $job]], InitializeLegacyListing::$seen);
+        $this->assertSame([[$next, $job, Origin::Live]], InitializeLegacyListing::$seen);
 
         DB::beginTransaction();
         $rolledBack = Job::query()->create(['name' => 'Cedar House', 'company_id' => ListingTables::COMPANY]);

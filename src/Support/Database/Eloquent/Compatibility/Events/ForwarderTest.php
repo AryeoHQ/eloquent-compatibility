@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -31,6 +32,7 @@ use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provider;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
 use Tests\Fixtures\Support\Backfills\CompletedPass;
 use Tests\Fixtures\Support\Files\ArchiveLegacyFile;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
@@ -43,6 +45,8 @@ use Tests\Fixtures\Support\Files\LegacyFileSaving;
 use Tests\Fixtures\Support\Files\LegacyFileUpdated;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\HookedComputedWrite;
+use Tests\Fixtures\Support\Listings\HookLog;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\JobUpdated;
@@ -52,6 +56,8 @@ use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\NumberedJob;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\ReachBeyondForwardedJob;
+use Tests\Fixtures\Support\Listings\RecordsHooks;
 use Tests\Fixtures\Support\Listings\RecordUpdated;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
 use Tests\Fixtures\Support\Listings\TransitionListingStatus;
@@ -245,7 +251,7 @@ final class ForwarderTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertSame('A listener of a '.Photo::class.' event that File forwarded cannot change $mime_type. Why: It is declared computedAs(), and File raised its saving event after its own saving listeners ran, so its operation reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.', $refusal);
+        $this->assertSame('A listener of a '.Photo::class.' event that File forwarded cannot change $mime_type. Why: It is declared computedAs(), and the package raised the legacy saving event after the saving and creating listeners of File ran, because several legacy models share File, so its operation reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.', $refusal);
         $this->assertFalse(DB::table('files')->where('filename', 'birch.png')->exists());
     }
 
@@ -2203,6 +2209,120 @@ final class ForwarderTest extends TestCase
             ['saving', 1, 'Oak Lodge', 'MLS-1'], ['updating', 1, 'Oak Lodge', 'MLS-1'], ['updated', 1, 'Oak Lodge', 'MLS-1'], ['saved', 1, 'Oak Lodge', 'MLS-1'],
         ], $this->seen);
         $this->assertSame('Oak Lodge', Job::query()->whereKey(ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_discards_a_change_a_legacy_listener_makes_to_an_attribute_that_ignores_writes_and_dispatches_write_ignored(): void
+    {
+        $ignoring = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: true)));
+            }
+        };
+        Forwarder::register($this->app->make('events'), $ignoring::class);
+        $other = '9f1e2d3c-4b5a-4678-9e0f-1a2b3c4d5e6f';
+        Event::listen('eloquent.saving: '.$ignoring::class, function (Model $listing) use ($other): void {
+            $listing->setAttribute('company_id', $other);
+        });
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = [$event->change->origin, $event->change->attribute, $event->value];
+        });
+
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([[Origin::Live, 'company_id', $other]], $ignored);
+        $this->assertSame([ListingTables::COMPANY, 'Oak Lodge'], array_values((array) DB::table('jobs')->where('id', ListingTables::jobOf(1))->first(['company_id', 'name'])));
+    }
+
+    #[Test]
+    public function it_refuses_an_operation_a_forwarded_legacy_listener_reaches_that_queues_an_action_or_reads_another_successor(): void
+    {
+        $reaching = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'mls_number', definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $jobs) => $jobs->mapWithKeys(fn (Job $job) => [$job->getKey() => null]))->writtenBy(ReachBeyondForwardedJob::class))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'street', definition: fn (Attribute $attribute) => $attribute->from('street'))));
+            }
+        };
+        Forwarder::register($this->app->make('events'), $reaching::class);
+        $reach = 'act';
+        Event::listen('eloquent.saving: '.$reaching::class, function (Model $listing) use (&$reach): void {
+            $listing->setAttribute('mls_number', $reach);
+        });
+        $refusals = [];
+
+        foreach (['act', 'place'] as $value) {
+            $reach = $value;
+
+            try {
+                Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
+                $refusals[] = 'no refusal';
+            } catch (CompatibilityWriteRefused $refusal) {
+                $refusals[] = str_replace($reaching::class, 'Listing', $refusal->getMessage());
+            }
+        }
+
+        $this->assertStringStartsWith('Listing cannot run an operation that calls afterSave() for Job from a forwarded legacy event through its compatibility map. Why: A forwarded event belongs to the save of Job, so the operation reaches that successor alone and the package saves nothing else. Instead: Make the operation reach only Job when a forwarded event runs it, or write the attribute through ', $refusals[0]);
+        $this->assertStringStartsWith('Listing cannot run an operation that calls related() for Place from a forwarded legacy event through its compatibility map. Why: A forwarded event belongs to the save of Job,', $refusals[1]);
+        $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_resolves_the_operation_a_forwarded_legacy_listener_reaches_from_the_container_with_its_bound_dependency(): void
+    {
+        $log = new HookLog;
+        $this->app->instance(RecordsHooks::class, $log);
+        $computed = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'mls_number', definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $jobs) => $jobs->mapWithKeys(fn (Job $job) => [$job->getKey() => null]))->writtenBy(HookedComputedWrite::class)));
+            }
+        };
+        Forwarder::register($this->app->make('events'), $computed::class);
+        Event::listen('eloquent.saving: '.$computed::class, function (Model $listing): void {
+            $listing->setAttribute('mls_number', 'MLS-9');
+        });
+
+        Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail()->update(['name' => 'Oak Lodge']);
+
+        $this->assertSame([HookedComputedWrite::class], $log->hooks);
+        $this->assertSame('Oak Lodge', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
     }
 
     /**

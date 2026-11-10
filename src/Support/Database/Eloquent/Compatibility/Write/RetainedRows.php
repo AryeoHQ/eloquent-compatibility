@@ -21,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use WeakMap;
 
@@ -56,9 +57,7 @@ final class RetainedRows
         );
 
         foreach ($members as $map) {
-            if ($connection->transactionLevel() > 0) {
-                $connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN ACCESS SHARE MODE');
-            }
+            $connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN ACCESS SHARE MODE');
 
             if (! self::installed($connection, $map)) {
                 continue;
@@ -76,9 +75,13 @@ final class RetainedRows
             $legacy->setUniqueIds();
         }
 
-        $sequence = $legacy->getKey() === null ? $this->connection->scalar('select pg_get_serial_sequence(?, ?)', [SqlFragments::identifier(ViewCompiler::retainedTable($this->map)), $legacy->getKeyName()]) : null;
+        $sequence = $legacy->getKey() === null ? Statements::sequence(
+            connection: $this->connection,
+            table: ViewCompiler::retainedTable($this->map),
+            column: $legacy->getKeyName(),
+        ) : null;
 
-        if (is_string($sequence)) {
+        if ($sequence !== null) {
             $legacy->setAttribute(
                 key: $legacy->getKeyName(),
                 value: $this->connection->scalar('select nextval(cast(? as regclass))', [$sequence]),
@@ -93,12 +96,11 @@ final class RetainedRows
         $initializer = $this->map->legacyInitializer;
 
         if ($initializer !== null) {
-            $instance = Container::getInstance()->make($initializer);
-
-            if (! $instance instanceof InitializesLegacy) {
-                throw new LogicException("The initializer {$initializer} does not implement ".InitializesLegacy::class.'.');
-            }
-
+            $instance = UnitOfWork::resolve(
+                class: $initializer,
+                interface: InitializesLegacy::class,
+                role: 'initializer',
+            );
             $graphs = (new UnitOfWork(
                 map: $this->map,
                 connection: $root->getConnection(),
@@ -189,7 +191,7 @@ final class RetainedRows
         }
     }
 
-    private static function member(Model $root, ResolvedMap $map): bool
+    public static function member(Model $root, ResolvedMap $map): bool
     {
         $when = $map->primary->membershipScope();
 
