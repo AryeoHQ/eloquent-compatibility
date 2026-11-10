@@ -12,11 +12,23 @@ use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
+use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Throwable;
+use WeakMap;
 
-final readonly class RoundTrip
+final class RoundTrip
 {
-    public function __construct(private ResolvedMap $map, private Connection $connection) {}
+    /** @var null|WeakMap<Connection, array<class-string<Model>, string>> */
+    private static null|WeakMap $unhidden = null;
+
+    public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection) {}
+
+    public static function forget(): void
+    {
+        self::$unhidden = null;
+    }
 
     /**
      * @param  Staging<Model>  $graph
@@ -27,12 +39,14 @@ final readonly class RoundTrip
     public function check(Staging $graph, Model $legacy, Model $original, int|string $key, array $written, array $added, Origin $origin): null|array
     {
         $row = $this->connection->table($this->map->table)->useWritePdo()->where($legacy->getKeyName(), $key)->first();
+        $served = $row === null ? $this->hidden(
+            keyName: $legacy->getKeyName(),
+            key: $key,
+        ) : (array) $row;
 
-        if ($row === null) {
+        if ($served === null) {
             return null;
         }
-
-        $served = (array) $row;
 
         foreach ($written as $name => $value) {
             $attribute = $graph->map->attributes[$name] ?? null;
@@ -84,7 +98,32 @@ final readonly class RoundTrip
             }
         }
 
-        return $served;
+        return $row === null ? null : $served;
+    }
+
+    /**
+     * @return null|array<string, mixed>
+     */
+    private function hidden(string $keyName, int|string $key): null|array
+    {
+        $compiled = self::$unhidden ??= new WeakMap;
+        $selects = $compiled[$this->connection] ?? [];
+        $selects[$this->map->model] ??= (new ViewCompiler(
+            columnCatalog: new ColumnCatalog(
+                connection: $this->connection,
+                throughSearchPath: true,
+            ),
+            connection: $this->connection,
+        ))->unhidden($this->map);
+        $compiled[$this->connection] = $selects;
+        $record = SqlFragments::identifier($this->map->table);
+        $row = $this->connection->selectOne(
+            query: 'SELECT * FROM ('.$selects[$this->map->model].') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($keyName).' = ?',
+            bindings: [$key],
+            useReadPdo: false,
+        );
+
+        return $row === null ? null : (array) $row;
     }
 
     public function skips(Attribute $attribute, Origin $origin): bool

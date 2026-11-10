@@ -11,6 +11,7 @@ use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
@@ -25,6 +26,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provider;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
@@ -191,6 +193,7 @@ final class ForwarderTest extends TestCase
         FileTables::create();
         FileTables::seed();
         FileTables::install();
+        $this->app->instance(ServedModels::class, $this->servedOnly([Listing::class, Photo::class]));
         Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
             $photo->mime_type = 'image/webp';
         });
@@ -208,6 +211,7 @@ final class ForwarderTest extends TestCase
         FileTables::create();
         FileTables::seed();
         FileTables::install();
+        $this->app->instance(ServedModels::class, $this->servedOnly([Listing::class, Photo::class]));
         Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
             $photo->mime_type = 'image/webp';
         });
@@ -220,6 +224,27 @@ final class ForwarderTest extends TestCase
 
         $this->assertSame([['creating', 'image/webp'], ['created', 'image/avif'], ['saved', 'image/avif']], $this->seen);
         $this->assertSame('image/avif', Photo::query()->where('file_name', 'birch.png')->firstOrFail()->mime_type);
+    }
+
+    #[Test]
+    public function it_refuses_a_computed_fact_a_legacy_saving_listener_assigns_for_a_successor_create_on_a_shared_root_after_the_successor_listeners_ran(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        Event::listen('eloquent.saving: '.Photo::class, function (Photo $photo): void {
+            $photo->mime_type = 'image/webp';
+        });
+
+        try {
+            File::query()->create(['filename' => 'birch.png', 'mime_type' => 'image/png']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame('A listener of a '.Photo::class.' event that File forwarded cannot change $mime_type. Why: It is declared computedAs(), and File raised its saving event after its own saving listeners ran, so its operation reaches no save. Instead: Write mime_type through Photo, or change File or the model that stores mime_type directly.', $refusal);
+        $this->assertFalse(DB::table('files')->where('filename', 'birch.png')->exists());
     }
 
     #[Test]
@@ -656,12 +681,56 @@ final class ForwarderTest extends TestCase
             ['saving', 'Photo', 1, 'oak-porch.jpg'], ['updating', 'Photo', 1, 'oak-porch.jpg'], ['updated', 'Photo', 1, 'oak-porch.jpg'], ['saved', 'Photo', 1, 'oak-porch.jpg'],
         ], $updated);
         $this->assertSame([
-            ['created', 'LegacyFile', 3, 'birch-lease.pdf'], ['saved', 'LegacyFile', 3, 'birch-lease.pdf'],
-        ], array_values(array_filter($this->seen, fn (array $seen) => in_array($seen[0], ['created', 'saved'], true))));
+            ['saving', 'LegacyFile', null, 'birch-lease.pdf'], ['creating', 'LegacyFile', null, 'birch-lease.pdf'], ['created', 'LegacyFile', 3, 'birch-lease.pdf'], ['saved', 'LegacyFile', 3, 'birch-lease.pdf'],
+        ], $this->seen);
         $this->assertSame([[true, false], [false, false]], array_map(fn (File $file) => [
             DB::table('legacy_files_retained')->where('file_id', $file->id)->exists(),
             DB::table('photos_retained')->where('file_id', $file->id)->exists(),
         ], [$lease, $tour]));
+    }
+
+    #[Test]
+    public function it_forwards_a_native_create_of_a_shared_root_to_no_legacy_model_whose_when_leaves_the_new_row_out_and_reads_each_legacy_record_once(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $standIns = [];
+        DB::listen(function (QueryExecuted $query) use (&$standIns): void {
+            if (preg_match('/, "(\w+)" AS \(SELECT \* FROM "\1" UNION ALL SELECT \* FROM jsonb_populate_record/', $query->sql, $match) === 1) {
+                $standIns[] = $match[1];
+            }
+        });
+        $this->listen(Photo::class, self::EVENTS, fn (Photo $photo) => ['Photo', $photo->getAttribute('file_name')]);
+        $this->listen(LegacyFile::class, self::EVENTS, fn (LegacyFile $file) => ['LegacyFile', $file->getAttribute('file_name')]);
+        $creates = [];
+
+        foreach (['birch-lease.pdf' => 'application/pdf', 'birch.jpg' => 'image/jpeg'] as $filename => $mimeType) {
+            $this->seen = [];
+            $standIns = [];
+            File::query()->create(['filename' => $filename, 'mime_type' => $mimeType]);
+            $read = array_count_values($standIns);
+            ksort($read);
+            $creates[$filename] = [array_map(fn (array $seen) => "{$seen[1]} {$seen[0]}", $this->seen), $read];
+        }
+
+        $this->assertSame([
+            'birch-lease.pdf' => [['LegacyFile saving', 'LegacyFile creating', 'LegacyFile created', 'LegacyFile saved'], ['legacy_files_retained' => 1, 'photos_retained' => 1]],
+            'birch.jpg' => [['Photo saving', 'Photo creating', 'Photo created', 'Photo saved'], ['legacy_files_retained' => 1, 'photos_retained' => 1]],
+        ], $creates);
+    }
+
+    #[Test]
+    public function it_forwards_the_saving_and_creating_of_a_native_create_on_a_root_one_map_serves_ahead_of_the_successor_creating_listeners(): void
+    {
+        Event::listen('eloquent.creating: '.Job::class, function (Job $job): void {
+            $this->seen[] = ['Job creating', $job->name];
+        });
+        $this->listen(Listing::class, ['saving', 'creating', 'created', 'saved'], fn (Listing $listing) => [$listing->title]);
+
+        Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([['saving', 'Birch House'], ['creating', 'Birch House'], ['Job creating', 'Birch House'], ['created', 'Birch House'], ['saved', 'Birch House']], $this->seen);
     }
 
     #[Test]
@@ -2117,6 +2186,35 @@ final class ForwarderTest extends TestCase
                 $this->seen[] = $legacy instanceof $model ? [$event, ...$describe($legacy)] : [$event, $legacy::class];
             });
         }
+    }
+
+    /**
+     * @param  list<class-string<Model>>  $models
+     */
+    private function servedOnly(array $models): ServedModels
+    {
+        $files = new Filesystem;
+        $cache = (string) tempnam(
+            directory: sys_get_temp_dir(),
+            prefix: 'compatibility-served-',
+        );
+        $files->put(
+            path: $cache,
+            contents: '<?php return '.var_export(
+                value: $models,
+                return: true,
+            ).';',
+        );
+        $served = new ServedModels(
+            cache: $cache,
+            scans: false,
+            withoutCache: false,
+            files: $files,
+        );
+        $served->all();
+        $files->delete($cache);
+
+        return $served;
     }
 
     private function withheldListing(): Model

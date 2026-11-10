@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Provides;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
 
 /**
@@ -58,6 +59,8 @@ trait CarriesLegacy
             RetainedRows::carry($this);
         }
 
-        return parent::fireModelEvent($event, $halt);
+        $result = parent::fireModelEvent($event, $halt);
+
+        return $event === 'creating' && Forwarder::creating(successor: $this, proceeds: $result !== false) === false ? false : $result;
     }
 }

@@ -132,6 +132,8 @@ After a write, every written attribute must read back its new value through the 
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
+A `hide()` rule can hide the record after the write, whether the write itself, a successor listener or a trigger trips it. The check then reads the record through the map's column expressions without its `hide()` conditions, filtered to the record's key. A hide that keeps every written value passes, and a hide that loses one refuses the write.
+
 Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
 
 ### What the comparisons skip
@@ -308,6 +310,12 @@ The reverse direction. An application creates a successor natively, and the succ
 `assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Map compilation reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
+
+A native create on a root that several discovered maps share forwards its legacy events only to the legacy model whose `when()` admits the new row. The package raises that model's `saving` and `creating` after the successor's own `creating` event returns, and before the insert. `when()` therefore reads the values that every successor `saving` and `creating` listener set, including the `Creating` listener that sets a discriminator ([The map: membership](the-map.md#membership)). A legacy veto from either event stops the insert. `created` and `saved` follow the insert. A root that one map serves keeps the earlier order, in which the legacy `saving` and `creating` run ahead of the successor's own listeners.
+
+On a shared root, a legacy `saving` listener therefore runs after the successor's `saving` and `creating` listeners, and no successor listener sees a change it makes. The package refuses that listener's change of a `computedAs()` attribute, because the attribute's operation reaches no successor `saving` listener.
+
+When the inserted row joins another legacy model than the one the `creating` event chose, the package refuses the create inside its transaction with `CompatibilityWriteRefused::membershipMoved()`. A database default, a trigger, or a legacy `creating` listener that changes a column `when()` reads causes it.
 
 ### Native successors before install
 

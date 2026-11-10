@@ -47,6 +47,23 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
+    /**
+     * @param  class-string<Model>  $root
+     * @param  list<class-string<Model>>  $raised
+     * @param  list<class-string<Model>>  $joined
+     */
+    public static function membershipMoved(string $root, array $raised, array $joined): self
+    {
+        $named = fn (array $models): string => $models === [] ? 'no legacy model' : implode(' and ', array_map(class_basename(...), $models));
+        $name = class_basename($root);
+
+        return new self(
+            "{$root} cannot take this create, because its legacy model changed between its creating event and its insert",
+            'The package raised the legacy saving and creating events to '.$named($raised).", and the inserted {$name} row joins ".$named($joined).', so a column that when() reads changed after the creating event.',
+            "Set every column that when() reads before the insert, in the create's attributes or in a listener of {$name}, rather than in a database default or trigger.",
+        );
+    }
+
     public static function unstorable(string $model, string $attribute, string $because): self
     {
         return new self(

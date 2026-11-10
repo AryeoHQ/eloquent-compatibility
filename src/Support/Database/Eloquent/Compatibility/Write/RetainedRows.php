@@ -17,6 +17,8 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\InitializesLegacy;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
+use Support\Database\Eloquent\Compatibility\Events\Forwarder;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -34,16 +36,26 @@ final class RetainedRows
         return self::carriers($root) !== [];
     }
 
+    public static function shares(Model $root): bool
+    {
+        return count(self::carriers($root)) > 1;
+    }
+
     public static function carry(Model $root): void
     {
         $connection = $root->getConnection();
         $writing = Applying::legacyOf($root);
+        $members = array_values(array_filter(
+            array: self::carriers($root),
+            callback: fn (ResolvedMap $map) => $writing?->getTable() !== $map->table && self::member($root, $map),
+        ));
+        self::refuseMoved(
+            root: $root,
+            chosen: Forwarder::chosen($root),
+            members: $members,
+        );
 
-        foreach (self::carriers($root) as $map) {
-            if ($writing?->getTable() === $map->table || ! self::member($root, $map)) {
-                continue;
-            }
-
+        foreach ($members as $map) {
             if ($connection->transactionLevel() > 0) {
                 $connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN ACCESS SHARE MODE');
             }
@@ -138,6 +150,29 @@ final class RetainedRows
         }
 
         return $maps;
+    }
+
+    /**
+     * @param  array<class-string<Model>, bool>  $chosen
+     * @param  list<ResolvedMap>  $members
+     */
+    private static function refuseMoved(Model $root, array $chosen, array $members): void
+    {
+        $joined = array_map(fn (ResolvedMap $map) => $map->model, $members);
+
+        foreach ($chosen as $model => $admitted) {
+            if ($admitted !== in_array(
+                needle: $model,
+                haystack: $joined,
+                strict: true,
+            )) {
+                throw CompatibilityWriteRefused::membershipMoved(
+                    root: $root::class,
+                    raised: array_keys(array_filter($chosen)),
+                    joined: $joined,
+                );
+            }
+        }
     }
 
     private static function member(Model $root, ResolvedMap $map): bool

@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Exceptions;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\LegacyFile;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\Place;
@@ -28,6 +31,11 @@ final class CompatibilityWriteRefusedTest extends TestCase
             CompatibilityWriteRefused::rawExpression(Listing::class, 'title', 'It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead.'),
             CompatibilityWriteRefused::roundTrip(Listing::class, 'title', 7, 'Oak Manor', 'OAK MANOR'),
             CompatibilityWriteRefused::successorsMoved(Listing::class, JobSite::class, ['a1'], []),
+            CompatibilityWriteRefused::membershipMoved(
+                root: File::class,
+                raised: [],
+                joined: [Photo::class, LegacyFile::class],
+            ),
         ];
 
         $this->assertSame([
@@ -40,6 +48,7 @@ final class CompatibilityWriteRefusedTest extends TestCase
             'Tests\Fixtures\Support\Listings\Listing::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.',
             'Tests\Fixtures\Support\Listings\Listing record 7 cannot take this write of $title. Why: The write stores \'Oak Manor\', and the view now serves title as \'OAK MANOR\', so the record would not read back what was written. Instead: Make the operation of title store a value its read serves back.',
             'Tests\Fixtures\Support\Listings\Listing cannot take this write now, because its JobSite rows moved after the write scope ran. Why: The write scope received the keys [a1], and the package then locked [], so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
+            'Tests\Fixtures\Support\Files\File cannot take this create, because its legacy model changed between its creating event and its insert. Why: The package raised the legacy saving and creating events to no legacy model, and the inserted File row joins Photo and LegacyFile, so a column that when() reads changed after the creating event. Instead: Set every column that when() reads before the insert, in the create\'s attributes or in a listener of File, rather than in a database default or trigger.',
         ], array_map(fn (CompatibilityWriteRefused $refusal) => $refusal->getMessage(), $refusals));
         $this->assertContainsOnlyInstancesOf(CompatibilityException::class, $refusals);
     }

@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Carbon\CarbonInterval;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -28,6 +30,7 @@ use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\Place;
 use Tests\TestCase;
 
 #[CoversClass(RoundTrip::class)]
@@ -157,6 +160,123 @@ final class RoundTripTest extends TestCase
         }
 
         $this->assertSame($before, DB::table('files')->where('id', FileTables::fileOf(table: 'photos', id: 1))->value('mime_type'));
+    }
+
+    #[Test]
+    public function it_refuses_and_rolls_back_a_write_whose_successor_listener_hides_the_record_and_loses_the_written_value(): void
+    {
+        $this->installListings();
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->value('id');
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job) use ($elm): void {
+            $job->merged_into_job_id = $elm;
+            $job->name = 'Tampered';
+        });
+
+        try {
+            Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringStartsWith(Listing::class." record 1 cannot take this write of \$title. Why: The write stores 'Oak Manor', and the view now serves title as 'Tampered'", $refusal);
+        $this->assertSame(['Oak House', null, 'Oak House'], [DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'), DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('merged_into_job_id'), Listing::query()->find(1)?->title]);
+    }
+
+    #[Test]
+    public function it_passes_a_write_whose_successor_listener_hides_the_record_and_keeps_every_written_value_reading_it_in_one_query(): void
+    {
+        $this->installListings();
+        $elm = Job::query()->whereKey(ListingTables::jobOf(3))->value('id');
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job) use ($elm): void {
+            $job->merged_into_job_id = $elm;
+        });
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            $statements[] = $query->sql;
+        });
+
+        $written = [Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor'])];
+        $statements = [];
+        $written[] = Listing::query()->findOrFail(3)->update(['title' => 'Elm Lodge']);
+        $reads = array_map(fn (string $pattern) => count(array_filter($statements, fn (string $sql) => preg_match($pattern, $sql) === 1)), ['/^SELECT \* FROM \(SELECT/', '/pg_attribute|domain_chain/']);
+
+        $this->assertSame([[true, true], [1, 0]], [$written, $reads]);
+        $this->assertSame([['Oak Manor', 'Elm Lodge'], null, null], [[DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'), DB::table('jobs')->where('id', ListingTables::jobOf(3))->value('name')], Listing::query()->find(1), Listing::query()->find(3)]);
+    }
+
+    #[Test]
+    public function it_passes_a_write_that_moves_its_own_record_into_a_hide_rule_and_refuses_one_whose_listener_rewrites_the_written_value_into_it(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        $withheld = $this->withheld();
+        Compatibility::prepare($withheld::class);
+        ListingTables::backfill();
+        Compatibility::install(
+            model: $withheld::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        Event::listen('eloquent.saving: '.Place::class, function (Place $place): void {
+            if ($place->city === 'Tacoma') {
+                $place->city = 'Withheld';
+            }
+        });
+        $city = fn (int $listing): mixed => DB::table('places')->where('job_id', ListingTables::jobOf($listing))->value('city');
+
+        $written = $withheld::query()->findOrFail(1)->update(['city' => 'Withheld']);
+
+        try {
+            $withheld::query()->findOrFail(3)->update(['city' => 'Tacoma']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame([true, 'Withheld', null], [$written, $city(1), $withheld::query()->find(1)]);
+        $this->assertStringContainsString("record 3 cannot take this write of \$city. Why: The write stores 'Tacoma', and the view now serves city as 'Withheld'", $refusal);
+        $this->assertSame([null, 3], [$city(3), $withheld::query()->find(3)?->getKey()]);
+    }
+
+    private function installListings(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+    }
+
+    private function withheld(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            successor: fn (Successor $place) => $place
+                                ->atMostOne(because: 'A listing has one address.')
+                                ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city')),
+                        ))
+                    ->hide(fn (Builder $jobs) => $jobs->whereHas('rootPlace', fn (Builder $places) => $places->where('city', 'Withheld')), because: 'A withheld address keeps its listing off the site.');
+            }
+        };
     }
 
     private function untitled(): Model

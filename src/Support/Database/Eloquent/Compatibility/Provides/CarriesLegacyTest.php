@@ -14,13 +14,19 @@ use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Tests\Fixtures\Support\Files\FloorPlan;
 use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
+use Tests\Fixtures\Support\PlaceAssets\Brochure;
+use Tests\Fixtures\Support\PlaceAssets\Image;
+use Tests\Fixtures\Support\PlaceAssets\InteractiveContent;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video;
 use Tests\TestCase;
 
 #[CoversTrait(CarriesLegacy::class)]
@@ -223,6 +229,97 @@ final class CarriesLegacyTest extends TestCase
 
         $this->assertTrue(DB::table('jobs')->where('id', $created->getKey())->exists());
         $this->assertFalse(DB::table('listings_retained')->where('job_id', $created->getKey())->exists());
+    }
+
+    #[Test]
+    public function it_raises_the_legacy_events_of_a_native_create_on_a_shared_root_only_to_the_member_a_successor_creating_listener_makes_it(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::install();
+        $seen = [];
+        $pending = null;
+        Event::listen('eloquent.creating: '.PlaceAsset::class, function (PlaceAsset $asset) use (&$seen, &$pending): void {
+            $seen[] = ['PlaceAsset creating', $asset->legacy_type];
+            $asset->legacy_type ??= 'place_image';
+            $pending = $asset;
+        });
+
+        foreach ([Image::class, Video::class, InteractiveContent::class, Brochure::class, FloorPlan::class] as $model) {
+            foreach (['saving', 'creating', 'created', 'saved'] as $event) {
+                Event::listen("eloquent.{$event}: {$model}", function (Model $legacy) use (&$seen, &$pending, $event): void {
+                    $seen[] = [class_basename($legacy)." {$event}", $pending?->legacy_type, $legacy->getAttribute('title')];
+                });
+            }
+        }
+
+        $file = AssetFile::query()->create(['filename' => 'side.jpg', 'mime_type' => 'image/jpeg']);
+        $asset = PlaceAsset::query()->create(['asset_type' => $file->getMorphClass(), 'asset_id' => $file->id, 'title' => 'Side']);
+
+        $this->assertSame([
+            ['PlaceAsset creating', null],
+            ['Image saving', 'place_image', 'Side'],
+            ['Image creating', 'place_image', 'Side'],
+            ['Image created', 'place_image', 'Side'],
+            ['Image saved', 'place_image', 'Side'],
+        ], $seen);
+        $this->assertSame(['place_image', true], [DB::table('place_assets')->where('id', $asset->id)->value('legacy_type'), DB::table('place_images_retained')->where('place_asset_id', $asset->id)->exists()]);
+    }
+
+    #[Test]
+    public function it_inserts_nothing_for_a_native_create_on_a_shared_root_that_a_legacy_saving_or_creating_listener_refuses(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::install();
+        foreach (['saving', 'creating'] as $event) {
+            Event::listen("eloquent.{$event}: ".Image::class, fn (Image $image): null|false => $image->getAttribute('title') === "Side {$event}" ? false : null);
+        }
+
+        $file = AssetFile::query()->create(['filename' => 'side.jpg', 'mime_type' => 'image/jpeg']);
+        $retained = DB::table('place_images_retained')->count();
+        $outcomes = [];
+
+        foreach (['saving', 'creating'] as $event) {
+            $asset = PlaceAsset::query()->create(['legacy_type' => 'place_image', 'asset_type' => $file->getMorphClass(), 'asset_id' => $file->id, 'title' => "Side {$event}"]);
+            $outcomes[$event] = [$asset->exists, DB::table('place_assets')->where('title', "Side {$event}")->exists()];
+        }
+
+        $this->assertSame(['saving' => [false, false], 'creating' => [false, false]], $outcomes);
+        $this->assertSame($retained, DB::table('place_images_retained')->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_native_create_on_a_shared_root_whose_insert_joins_another_legacy_model_than_its_creating_event_chose(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        PlaceAssetTables::install();
+        DB::unprepared("create or replace function compatibility_reclassify() returns trigger language plpgsql as \$\$ begin if new.title = 'Garden' then new.legacy_type := 'place_video'; end if; return new; end \$\$");
+        DB::statement('create trigger compatibility_reclassify before insert on place_assets for each row execute function compatibility_reclassify()');
+        $seen = [];
+
+        foreach (['saving', 'creating', 'created', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Image::class, function () use (&$seen, $event): void {
+                $seen[] = $event;
+            });
+        }
+
+        $file = AssetFile::query()->create(['filename' => 'garden.jpg', 'mime_type' => 'image/jpeg']);
+        $retained = [DB::table('place_images_retained')->count(), DB::table('place_videos_retained')->count()];
+
+        try {
+            PlaceAsset::query()->create(['legacy_type' => 'place_image', 'asset_type' => $file->getMorphClass(), 'asset_id' => $file->id, 'title' => 'Garden']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        } finally {
+            DB::statement('drop function if exists compatibility_reclassify() cascade');
+        }
+
+        $this->assertSame(PlaceAsset::class.' cannot take this create, because its legacy model changed between its creating event and its insert. Why: The package raised the legacy saving and creating events to Image, and the inserted PlaceAsset row joins Video, so a column that when() reads changed after the creating event. Instead: Set every column that when() reads before the insert, in the create\'s attributes or in a listener of PlaceAsset, rather than in a database default or trigger.', $refusal);
+        $this->assertSame(['saving', 'creating'], $seen);
+        $this->assertSame([false, $retained], [DB::table('place_assets')->where('title', 'Garden')->exists(), [DB::table('place_images_retained')->count(), DB::table('place_videos_retained')->count()]]);
     }
 
     private function installListings(): void

@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
+use Support\Database\Eloquent\Compatibility\Write\RoundTrip;
 use WeakMap;
 
 /**
@@ -70,6 +71,7 @@ final class LegacyBuilder extends Builder
     {
         self::$catalogs = [];
         ServedTable::forget();
+        RoundTrip::forget();
         self::$collations = [];
     }
 

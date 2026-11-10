@@ -42,6 +42,19 @@ final readonly class ViewCompiler
         );
     }
 
+    public function unhidden(ResolvedMap $map): string
+    {
+        $retainedTable = self::retainedTable($map);
+
+        return $this->select(
+            map: $map,
+            shape: $this->columnCatalog->of($map->table),
+            defaultsOn: $retainedTable,
+            retained: $this->columnCatalog->of($retainedTable),
+            hides: false,
+        );
+    }
+
     /**
      * @param  array<string, Column>  $shape
      * @param  list<string>  $external
@@ -205,9 +218,9 @@ final readonly class ViewCompiler
         return $conditions;
     }
 
-    public static function root(ResolvedMap $map, string $retained): string
+    public static function root(ResolvedMap $map, string $retained, bool $hides = true): string
     {
-        return 'JOIN '.self::primary($map).' ON '.SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier($map->primary->key).' = '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($map->successorKey);
+        return 'JOIN '.($hides ? self::primary($map) : SqlFragments::identifier($map->primary->table)).' ON '.SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier($map->primary->key).' = '.SqlFragments::identifier($retained).'.'.SqlFragments::identifier($map->successorKey);
     }
 
     /**
@@ -248,7 +261,7 @@ final readonly class ViewCompiler
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
      */
-    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained): string
+    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, bool $hides = true): string
     {
         $retainedTable = self::retainedTable($map);
 
@@ -282,6 +295,7 @@ final readonly class ViewCompiler
             ."\n".self::root(
                 map: $map,
                 retained: $retainedTable,
+                hides: $hides,
             )
             .implode('', array_map(fn (string $lateral) => "\n".$lateral, self::laterals($map)));
     }
