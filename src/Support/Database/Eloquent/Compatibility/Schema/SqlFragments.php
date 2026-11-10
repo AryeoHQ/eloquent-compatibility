@@ -30,6 +30,16 @@ final class SqlFragments
         return in_array($type, self::FLOATS, true);
     }
 
+    public static function isDecimal(null|string $type): bool
+    {
+        return $type !== null && preg_match('/^(numeric|decimal)(\(\d+(, ?\d+)?\))?$/i', $type) === 1;
+    }
+
+    public static function isNumeric(null|string $type): bool
+    {
+        return self::isInteger($type) || self::isFloat($type) || self::isDecimal($type);
+    }
+
     public static function isZoned(null|string $type): bool
     {
         return $type !== null && preg_match('/^(timestamp(\(\d\))? with time zone|timestamptz(\(\d\))?)$/i', $type) === 1;

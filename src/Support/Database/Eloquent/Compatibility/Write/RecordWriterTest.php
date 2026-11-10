@@ -16,6 +16,7 @@ use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -24,6 +25,7 @@ use Support\Database\Eloquent\Compatibility\Events\WriteIgnored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\AliasedPlace;
+use Tests\Fixtures\Support\Listings\ConfiguredJob;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -79,8 +81,9 @@ final class RecordWriterTest extends TestCase
         $update = $this->refusal(fn () => $listing->save());
         $insert = $this->refusal(fn () => Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'street' => '9 Birch St', 'mls_number' => 'MLS-9']));
 
-        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Place refused its save. Why: The write stores its values through Place, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Place.', $update->getMessage());
-        $this->assertSame($update->getMessage(), $insert->getMessage());
+        $place = Place::query()->where('job_id', ListingTables::jobOf(1))->value('id');
+        $this->assertSame("Tests\\Fixtures\\Support\\Listings\\Listing record 1 cannot take this write, because a listener of Place {$place} refused its save. Why: The write stores its values through Place, and that model's own listeners refused them. Instead: Make the write satisfy the rules of Place.", $update->getMessage());
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Place refused its save. Why: The write stores its values through Place, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Place.', $insert->getMessage());
         $this->assertSame($before, $this->snapshot());
     }
 
@@ -186,7 +189,7 @@ final class RecordWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => $write($listing));
 
-        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 1 cannot take this write, because a listener of Job '.ListingTables::jobOf(1).' refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
         $this->assertSame([], $fired);
         $this->assertSame($before, $this->snapshot());
         $this->assertNotInstanceOf(NullDispatcher::class, Model::getEventDispatcher());
@@ -219,7 +222,7 @@ final class RecordWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => $write($listing));
 
-        $this->assertStringEndsWith(' cannot take this write, because a listener of JobSite refused its save. Why: The write stores its values through JobSite, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of JobSite.', $refusal->getMessage());
+        $this->assertMatchesRegularExpression('/ cannot take this write, because a listener of JobSite( [0-9a-f-]{36})? refused its save\. Why: The write stores its values through JobSite, and that model\'s own listeners refused them\. Instead: Make the write satisfy the rules of JobSite\.$/', $refusal->getMessage());
         $this->assertSame($before, $this->snapshot());
     }
 
@@ -259,7 +262,7 @@ final class RecordWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => $listing->delete());
 
-        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame("Tests\\Fixtures\\Support\\Listings\\Listing record {$listing->id} cannot take this write, because a listener of Job ".ListingTables::jobOf($listing->id)." refused its save. Why: The write stores its values through Job, and that model's own listeners refused them. Instead: Make the write satisfy the rules of Job.", $refusal->getMessage());
         $this->assertSame(['retrieved', 'vetoed'], $fired->all());
         $this->assertSame($before, $this->snapshot());
 
@@ -294,7 +297,7 @@ final class RecordWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => $listing->restore()); // @phpstan-ignore staticMethod.dynamicCall
 
-        $this->assertSame('Tests\Fixtures\Support\Listings\Listing cannot take this write, because a listener of Job refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
+        $this->assertSame('Tests\Fixtures\Support\Listings\Listing record 2 cannot take this write, because a listener of Job '.ListingTables::jobOf(2).' refused its save. Why: The write stores its values through Job, and that model\'s own listeners refused them. Instead: Make the write satisfy the rules of Job.', $refusal->getMessage());
         $this->assertSame(['retrieved', 'vetoed'], $fired->all());
         $this->assertSame($before, $this->snapshot());
 
@@ -825,6 +828,52 @@ final class RecordWriterTest extends TestCase
         $this->assertSame([['Listing saving', 'Listing updating', 'Listing updated', 'Listing saved'], []], [$loud, $fired]);
         $this->assertSame(['MLS-1C', $updatedAt, $updatedAt], [Listing::query()->findOrFail(1)->mls_number, Listing::query()->findOrFail(1)->updated_at?->toDateTimeString(), $listing->updated_at?->toDateTimeString()]);
         $this->assertSame($jobUpdatedAt, DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('updated_at'));
+    }
+
+    #[Test]
+    public function it_keeps_the_updated_at_touch_of_a_legacy_only_write_when_updated_at_is_itself_legacy_only(): void
+    {
+        DB::statement('create table holders (id serial primary key, name text not null, note text, created_at timestamp(0), updated_at timestamp(0))');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::table('holders')->insert([['name' => 'Oak', 'note' => 'a', 'created_at' => '2026-01-01 00:00:00', 'updated_at' => '2026-01-01 00:00:00']]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('update holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name) select job_id, name from holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            Date::setTestNow('2026-03-03 03:03:03');
+            $record = $holder->newQuery()->findOrFail(1);
+            $record->update(['note' => 'b']);
+            $stamps = [DB::table('holders_retained')->value('updated_at'), (string) $record->getAttribute('updated_at')];
+        } finally {
+            Date::setTestNow();
+            DB::statement('drop view if exists holders');
+            DB::statement('drop table if exists holders, holders_retained, holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame(['2026-03-03 03:03:03', '2026-03-03 03:03:03'], $stamps);
     }
 
     #[Test]

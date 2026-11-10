@@ -103,10 +103,17 @@ final class RetainedRows
                 map: $this->map,
                 connection: $root->getConnection(),
             ))->graphs([[$this->map, $root]], lock: true);
-            $instance->initialize($graphs[0]->successors(), new Creation(
-                record: $legacy,
+            UnitOfWork::hook(
+                run: fn () => $instance->initialize($graphs[0]->successors(), new Creation(
+                    record: $legacy,
+                    origin: Origin::Live,
+                )),
                 origin: Origin::Live,
-            ));
+                model: $this->map->model,
+                key: null,
+                attribute: null,
+                class: $initializer,
+            );
         }
 
         $values = array_intersect_key($legacy->getAttributes(), array_flip($this->map->legacyOnly(array_keys($legacy->getAttributes()))));
@@ -134,7 +141,14 @@ final class RetainedRows
         if (! array_key_exists($root::class, $known)) {
             $known[$root::class] = array_values(array_filter(
                 array: $served->all(),
-                callback: fn (string $model) => (Compatibility::of($model)->successors()[0] ?? null) === $root::class,
+                callback: function (string $model) use ($root): bool {
+                    $successor = Compatibility::of($model)->successors()[0] ?? null;
+
+                    return $successor !== null && is_a(
+                        object_or_class: $root,
+                        class: $successor,
+                    );
+                },
             ));
             $carriers[$served] = $known;
         }

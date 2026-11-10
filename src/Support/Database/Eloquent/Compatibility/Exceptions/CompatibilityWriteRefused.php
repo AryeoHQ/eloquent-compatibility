@@ -24,12 +24,22 @@ final class CompatibilityWriteRefused extends CompatibilityException
         );
     }
 
-    public static function roundTrip(string $model, string $attribute, int|string $key, mixed $written, mixed $served): self
+    public static function roundTrip(string $model, string $attribute, int|string $key, mixed $written, mixed $served, bool $hidden = false, null|Throwable $previous = null): self
     {
         return new self(
-            "{$model} record {$key} cannot take this write of \${$attribute}",
-            'The write stores '.self::shown($written).", and the view now serves {$attribute} as ".self::shown($served).', so the record would not read back what was written.',
-            "Make the operation of {$attribute} store a value its read serves back.",
+            refused: "{$model} record {$key} cannot take this write of \${$attribute}",
+            because: 'The write stores '.self::shown($written).', and '.($hidden ? "the record, which a hide() rule now hides, reads {$attribute} as " : "the view now serves {$attribute} as ").self::shown($served).', so the record would not read back what was written.',
+            instead: "Make the operation of {$attribute} store a value its read serves back.",
+            previous: $previous,
+        );
+    }
+
+    public static function roundTripLost(string $model, int|string $key): self
+    {
+        return new self(
+            refused: "{$model} record {$key} cannot take this write, because no row holds the record after it",
+            because: "Read without its hide() rules, no row serves record {$key} once the write has saved, so a listener or a trigger removed the record the write stored.",
+            instead: 'Keep the successors of the record in place while a write through '.class_basename($model).' runs.',
         );
     }
 
@@ -40,10 +50,34 @@ final class CompatibilityWriteRefused extends CompatibilityException
      */
     public static function successorsMoved(string $model, string $successor, array $scoped, array $locked): self
     {
+        $keys = fn (array $keys): string => '['.implode(
+            separator: ', ',
+            array: array_slice(
+                array: $keys,
+                offset: 0,
+                length: 10,
+            ),
+        ).(count($keys) > 10 ? ', and '.(count($keys) - 10).' more' : '').']';
+        $counted = fn (array $keys): string => count($keys).(count($keys) === 1 ? ' key' : ' keys');
+
         return new self(
-            "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran',
-            'The write scope received the keys ['.implode(', ', $scoped).'], and the package then locked ['.implode(', ', $locked).'], so it would write a row the scope never ordered.',
-            'Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
+            refused: "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran',
+            because: 'The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered.',
+            instead: 'Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
+        );
+    }
+
+    /**
+     * @param  class-string  $scope
+     */
+    public static function unscoped(string $model, string $scope): self
+    {
+        $name = class_basename($scope);
+
+        return new self(
+            refused: "{$model} cannot take this write, because its write scope {$name} returned without running it",
+            because: "The package runs the write inside {$name}::run(), and run() returned without calling \$write, so the write would report success and store nothing.",
+            instead: "Make {$name}::run() call \$write and return its result.",
         );
     }
 
@@ -108,14 +142,15 @@ final class CompatibilityWriteRefused extends CompatibilityException
         };
     }
 
-    public static function bySuccessorListener(string $model, Model $successor): self
+    public static function bySuccessorListener(string $model, Model $successor, null|int|string $key = null): self
     {
         $name = class_basename($successor);
+        $successorKey = $successor->getKey();
 
         return new self(
-            "{$model} cannot take this write, because a listener of {$name} refused its save",
-            "The write stores its values through {$name}, and that model's own listeners refused them.",
-            "Make the write satisfy the rules of {$name}.",
+            refused: ($key === null ? $model : "{$model} record {$key}").' cannot take this write, because a listener of '.$name.(is_int($successorKey) || is_string($successorKey) ? " {$successorKey}" : '').' refused its save',
+            because: "The write stores its values through {$name}, and that model's own listeners refused them.",
+            instead: "Make the write satisfy the rules of {$name}.",
         );
     }
 

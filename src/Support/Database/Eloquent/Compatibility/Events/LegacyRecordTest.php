@@ -88,7 +88,7 @@ final class LegacyRecordTest extends TestCase
         $job->update(['name' => 'Oak Manor']);
 
         $this->assertSame(
-            ["select array_to_string(current_schemas(true), ',') as", 'SELECT * FROM "listings"', 'WITH "jobs" AS (SELECT', 'update "jobs" set "name"', 'SELECT * FROM "listings"'],
+            ["select array_to_string(current_schemas(true), ',') as", 'SELECT * FROM "listings"', 'WITH "jobs" AS NOT', 'update "jobs" set "name"', 'SELECT * FROM "listings"'],
             array_map(fn (array $query) => implode(' ', array_slice(explode(' ', (string) $query['query']), 0, 4)), DB::getQueryLog()),
         );
     }

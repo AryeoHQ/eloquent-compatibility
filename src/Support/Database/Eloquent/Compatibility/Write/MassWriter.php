@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Brick\Math\BigDecimal;
 use Closure;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
@@ -14,9 +15,7 @@ use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use LogicException;
-use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
-use Support\Database\Eloquent\Compatibility\Definition\Conversions\MultipliedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -76,6 +75,7 @@ final readonly class MassWriter
     {
         [$mapped, $retained] = $this->split($values);
         [$added, $retainedAmounts] = $this->amounts($amounts);
+        $added = array_diff_key($added, $mapped);
 
         return $this->each($keys, function (array $records, array $roots) use ($mapped, $retained, $added, $retainedAmounts, $alias): int {
             $primary = $this->map->primary;
@@ -109,6 +109,17 @@ final readonly class MassWriter
                     callback: fn (int|string $name) => ! str_contains((string) $name, '->'),
                     mode: ARRAY_FILTER_USE_KEY,
                 )));
+
+                foreach ($added as $name => $amount) {
+                    $before = $original->getAttributes()[$name] ?? null;
+
+                    if (is_numeric($before) && ! $this->map->attributes[$name]->ignoresWrites()) {
+                        $after->setAttribute(
+                            key: $name,
+                            value: (string) BigDecimal::of(self::number($before))->plus(self::number($amount)),
+                        );
+                    }
+                }
 
                 if ($added !== []) {
                     $this->unit->assign(
@@ -187,38 +198,105 @@ final readonly class MassWriter
                 map: $this->map,
                 connection: $this->connection,
             );
-            $touched = $this->unit->scopes() ? $this->unit->touched($this->unit->graphs(array_map(
-                callback: fn (Model $root) => [$writer->variantOf($root), $root],
-                array: $this->unit->roots(array_values(array_unique($rootKeys, SORT_REGULAR)), lock: false),
-            ), lock: false)) : [];
+            $chunks = array_chunk(
+                array: $legacyKeys,
+                length: UnitOfWork::CHUNK,
+            );
+            $scoped = [];
 
-            return $this->unit->scoped($touched, function () use ($keys, $rootKeys, $touched, $writer, $write): int {
-                $roots = $this->unit->roots(array_values(array_unique($rootKeys, SORT_REGULAR)), lock: true);
-                $locked = $this->unit->graphs(array_map(
-                    callback: fn (Model $root) => [$writer->variantOf($root), $root],
-                    array: $roots,
-                ), lock: true);
-                $this->unit->refuseMoved($touched, $locked);
-                $legacyKeys = $this->legacyKeys($keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']), array_keys($rootKeys));
-                $originals = $this->originals($legacyKeys);
-                $records = [];
-                $held = [];
+            if ($this->unit->scopes()) {
+                foreach ($chunks as $index => $chunk) {
+                    $scoped[$index] = $this->unit->touched($this->graphsOf(
+                        writer: $writer,
+                        roots: $this->unit->roots(
+                            keys: self::rootsOf(
+                                rootKeys: $rootKeys,
+                                chunk: $chunk,
+                            ),
+                            lock: false,
+                        ),
+                        lock: false,
+                    ));
+                }
+            }
 
-                foreach ($legacyKeys as $key) {
-                    $root = $rootKeys[$key] ?? null;
-                    $original = $originals[$key] ?? null;
+            return $this->unit->scoped(touched: UnitOfWork::merged($scoped), write: function () use ($keys, $rootKeys, $chunks, $scoped, $writer, $write): int {
+                $this->unit->lock(array_values(array_unique(
+                    array: $rootKeys,
+                    flags: SORT_REGULAR,
+                )));
+                $written = 0;
 
-                    if ($root === null || $original === null || ! array_key_exists($root, $locked)) {
-                        continue;
+                foreach ($chunks as $index => $chunk) {
+                    $locked = $this->graphsOf(
+                        writer: $writer,
+                        roots: $this->unit->roots(
+                            keys: self::rootsOf(
+                                rootKeys: $rootKeys,
+                                chunk: $chunk,
+                            ),
+                            lock: false,
+                        ),
+                        lock: true,
+                    );
+                    $this->unit->refuseMoved(
+                        scoped: $scoped[$index] ?? [],
+                        graphs: $locked,
+                    );
+                    $legacyKeys = $this->legacyKeys(
+                        keys: $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']),
+                        within: $chunk,
+                    );
+                    $originals = $this->originals($legacyKeys);
+                    $records = [];
+                    $held = [];
+
+                    foreach ($legacyKeys as $key) {
+                        $root = $rootKeys[$key] ?? null;
+                        $original = $originals[$key] ?? null;
+
+                        if ($root === null || $original === null || ! array_key_exists($root, $locked)) {
+                            continue;
+                        }
+
+                        $records[$key] = [$original, $locked[$root]];
+                        $held[$key] = $root;
                     }
 
-                    $records[$key] = [$original, $locked[$root]];
-                    $held[$key] = $root;
+                    $written += $records === [] ? 0 : $write($records, array_flip(array_map(strval(...), $held)));
                 }
 
-                return $records === [] ? 0 : $write($records, array_flip(array_map(strval(...), $held)));
+                return $written;
             });
         });
+    }
+
+    /**
+     * @param  array<int|string, Model>  $roots
+     * @return array<int|string, Staging<Model>>
+     */
+    private function graphsOf(RecordWriter $writer, array $roots, bool $lock): array
+    {
+        return $this->unit->graphs(array_map(
+            callback: fn (Model $root) => [$writer->variantOf($root), $root],
+            array: $roots,
+        ), lock: $lock);
+    }
+
+    /**
+     * @param  array<int|string, int|string>  $rootKeys
+     * @param  list<int|string>  $chunk
+     * @return list<int|string>
+     */
+    private static function rootsOf(array $rootKeys, array $chunk): array
+    {
+        $roots = array_values(array_unique(
+            array: array_intersect_key($rootKeys, array_flip($chunk)),
+            flags: SORT_REGULAR,
+        ));
+        sort($roots);
+
+        return $roots;
     }
 
     /**
@@ -240,7 +318,7 @@ final readonly class MassWriter
         $retained = ViewCompiler::retainedTable($this->map);
         $values = [];
 
-        foreach (array_chunk($roots, 1000) as $chunk) {
+        foreach (array_chunk(array: $roots, length: UnitOfWork::CHUNK) as $chunk) {
             foreach ($this->connection->table($retained)->useWritePdo()->whereIn($retained.'.'.$this->map->successorKey, $chunk)->get([$this->map->successorKey, ...$columns]) as $row) {
                 $row = (array) $row;
                 $root = $row[$this->map->successorKey] ?? null;
@@ -283,7 +361,7 @@ final readonly class MassWriter
         $key = (new $this->map->model)->getKeyName();
         $roots = [];
 
-        foreach (array_chunk($legacyKeys, 1000) as $chunk) {
+        foreach (array_chunk($legacyKeys, UnitOfWork::CHUNK) as $chunk) {
             foreach ($this->connection->table($retained)->useWritePdo()->whereIn($retained.'.'.$key, $chunk)->whereNotNull($retained.'.'.$this->map->successorKey)->pluck($retained.'.'.$this->map->successorKey, $retained.'.'.$key) as $legacy => $root) {
                 if (is_int($root) || is_string($root)) {
                     $roots[$legacy] = $root;
@@ -303,7 +381,7 @@ final readonly class MassWriter
         $legacy = (new $this->map->model)->setConnection($this->connection->getName());
         $originals = [];
 
-        foreach (array_chunk($legacyKeys, 1000) as $chunk) {
+        foreach (array_chunk($legacyKeys, UnitOfWork::CHUNK) as $chunk) {
             foreach ($this->connection->table($this->map->table)->useWritePdo()->whereIn($legacy->getKeyName(), $chunk)->get() as $row) {
                 $original = $legacy->newInstance([], true)->setRawAttributes((array) $row, true);
                 $originals[UnitOfWork::keyOf($original)] = $original;
@@ -382,12 +460,12 @@ final readonly class MassWriter
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute !== null) {
-                $linear = array_filter($attribute->conversions(), fn (object $conversion) => ! $conversion instanceof DividedBy && ! $conversion instanceof MultipliedBy) === [];
-
-                if (! $attribute->invertible() || ! $linear || $attribute->operation() !== null || $attribute->readOnlyBecause() !== null) {
-                    throw CompatibilityWriteRefused::unsupported($this->map->model, "an increment of \${$name}", 'Its conversions are not linear, so an amount added to it has no one stored amount.');
-                }
-
+                UnitOfWork::refuseIncrement(
+                    map: $this->map,
+                    attribute: $attribute,
+                    name: $name,
+                    key: null,
+                );
                 $added[$name] = $amount;
             } else {
                 $retained[$name] = $amount;
@@ -509,6 +587,11 @@ final readonly class MassWriter
         }
 
         return (array) $row;
+    }
+
+    private static function number(int|float|string $value): string
+    {
+        return is_float($value) ? json_encode(value: $value, flags: JSON_THROW_ON_ERROR) : (string) $value;
     }
 
     /**

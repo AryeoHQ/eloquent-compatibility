@@ -9,17 +9,30 @@ use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
+use RuntimeException;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
+use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Listings\CarriedJob;
 use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\PromotedJob;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\Brochure;
 use Tests\Fixtures\Support\PlaceAssets\Image;
@@ -39,6 +52,7 @@ final class CarriesLegacyTest extends TestCase
     {
         ListingTables::drop();
         PlaceAssetTables::drop();
+        FileTables::drop();
 
         parent::tearDown();
     }
@@ -232,6 +246,69 @@ final class CarriesLegacyTest extends TestCase
     }
 
     #[Test]
+    public function it_inserts_the_retained_row_of_a_native_create_through_a_subclass_of_the_root_its_map_serves_from(): void
+    {
+        DB::statement('create table holders (id serial primary key, name text not null, created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::table('holders')->insert([['name' => 'Oak']]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: CarriedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+        $files = new Filesystem;
+        $cache = (string) tempnam(
+            directory: sys_get_temp_dir(),
+            prefix: 'compatibility-served-',
+        );
+        $files->put(
+            path: $cache,
+            contents: '<?php return '.var_export(
+                value: [$holder::class],
+                return: true,
+            ).';',
+        );
+        $this->app->instance(ServedModels::class, new ServedModels(
+            cache: $cache,
+            scans: false,
+            withoutCache: false,
+            files: $files,
+        ));
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('update holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name) select job_id, name from holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $created = PromotedJob::query()->create(['name' => 'Birch']);
+            $carried = [DB::table('holders_retained')->where('job_id', $created->getKey())->exists(), DB::table('holders')->where('name', 'Birch')->exists()];
+        } finally {
+            $files->delete($cache);
+            DB::statement('drop view if exists holders');
+            DB::statement('drop table if exists holders, holders_retained, holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([true, true], $carried);
+    }
+
+    #[Test]
     public function it_raises_the_legacy_events_of_a_native_create_on_a_shared_root_only_to_the_member_a_successor_creating_listener_makes_it(): void
     {
         PlaceAssetTables::create();
@@ -264,6 +341,41 @@ final class CarriesLegacyTest extends TestCase
             ['Image saved', 'place_image', 'Side'],
         ], $seen);
         $this->assertSame(['place_image', true], [DB::table('place_assets')->where('id', $asset->id)->value('legacy_type'), DB::table('place_images_retained')->where('place_asset_id', $asset->id)->exists()]);
+    }
+
+    #[Test]
+    public function it_raises_the_deferred_legacy_events_of_a_native_create_on_a_shared_root_once_when_a_retry_follows_a_successor_creating_listener_that_threw(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $seen = new Collection;
+
+        foreach (['saving', 'creating', 'created', 'saved'] as $event) {
+            Event::listen("eloquent.{$event}: ".Photo::class, function () use ($seen, $event): void {
+                $seen->push($event);
+            });
+        }
+
+        $throws = true;
+        Event::listen('eloquent.creating: '.File::class, function () use (&$throws): void {
+            if ($throws) {
+                $throws = false;
+
+                throw new RuntimeException('The first create fails.');
+            }
+        });
+        $file = new File(['filename' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+
+        try {
+            $file->save();
+        } catch (RuntimeException) {
+        }
+
+        $failed = $seen->all();
+        $file->save();
+
+        $this->assertSame([[], ['saving', 'creating', 'created', 'saved']], [$failed, $seen->slice(count($failed))->values()->all()]);
     }
 
     #[Test]

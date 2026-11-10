@@ -9,6 +9,7 @@ use Closure;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\Config;
@@ -29,6 +30,8 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final readonly class UnitOfWork
 {
+    public const int CHUNK = 1000;
+
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     /**
@@ -78,7 +81,21 @@ final readonly class UnitOfWork
             throw new LogicException("The write scope {$scope} does not implement ".ScopesWrites::class.'.');
         }
 
-        return $instance->run($touched, $write);
+        $scoped = new ScopedWrite($write);
+        $result = $instance->run($touched, $scoped(...));
+
+        if ($scoped->failure !== null) {
+            throw $scoped->failure;
+        }
+
+        if (! $scoped->ran) {
+            throw CompatibilityWriteRefused::unscoped(
+                model: $this->map->model,
+                scope: $scope,
+            );
+        }
+
+        return $result;
     }
 
     /**
@@ -125,6 +142,34 @@ final readonly class UnitOfWork
     }
 
     /**
+     * @param  array<array-key, array<class-string<Model>, list<int|string>>>  $touched
+     * @return array<class-string<Model>, list<int|string>>
+     */
+    public static function merged(array $touched): array
+    {
+        $merged = [];
+
+        foreach ($touched as $classes) {
+            foreach ($classes as $class => $keys) {
+                $merged[$class] = [...$merged[$class] ?? [], ...$keys];
+            }
+        }
+
+        foreach ($merged as $class => $keys) {
+            $keys = array_values(array_unique(
+                array: $keys,
+                flags: SORT_REGULAR,
+            ));
+            sort($keys);
+            $merged[$class] = $keys;
+        }
+
+        ksort($merged);
+
+        return $merged;
+    }
+
+    /**
      * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $values
      * @return Staging<Model>
@@ -133,6 +178,7 @@ final readonly class UnitOfWork
     {
         $map = $graph->map;
         $named = [];
+        $names = [];
 
         foreach ($map->attributes as $name => $attribute) {
             $owner = $map->owners[$name];
@@ -140,26 +186,74 @@ final readonly class UnitOfWork
 
             if ($owner !== $map->primary && $value !== null && $attribute->readOnlyBecause() !== null && $attribute->storesColumn() && $attribute->invertible() && $attribute->column() === $owner->key) {
                 $named[$owner->table] = $this->stored($map, $attribute, $name, $value);
+                $names[$owner->table] = $name;
             }
         }
 
         $models = [];
+        $linked = [];
 
         foreach ($map->related as $related) {
             $parent = $models[$related->parentTable] ?? null;
 
             if (array_key_exists($related->table, $named)) {
                 $query = $this->successor($related->model)->newQueryWithoutScopes()->whereKey($named[$related->table]);
-                $models[$related->table] = ($lock ? $query->lockForUpdate() : $query)->first();
-            } elseif ($parent !== null && ! $related->belongsTo) {
+                $existing = ($lock ? $query->lockForUpdate() : $query)->first();
+
+                if ($existing !== null) {
+                    $this->refuseHeld(
+                        map: $map,
+                        related: $related,
+                        existing: $existing,
+                        name: $names[$related->table],
+                    );
+                    $linked[$related->table] = $existing;
+                }
+
+                $models[$related->table] = $existing;
+            } elseif ($parent !== null) {
                 $models[$related->table] = $this->find($related, $parent, $lock);
             }
         }
 
-        return new Staging(
+        $linking = new Staging(
             map: $map,
             root: $graph->root(),
-            models: $models,
+            models: array_diff_key($models, $linked),
+        );
+
+        foreach ($linked as $table => $existing) {
+            $linking->link(
+                table: $table,
+                model: $existing,
+            );
+        }
+
+        return $linking;
+    }
+
+    private function refuseHeld(ResolvedMap $map, Related $related, Model $existing, string $name): void
+    {
+        if ($related->belongsTo || $related->morphType !== null) {
+            return;
+        }
+
+        $holder = $existing->getAttributes()[$related->relatedKey] ?? null;
+
+        if ($holder === null || ! $this->successor($related->parent)->newQueryWithoutScopes()->where(
+            column: $related->parentKey,
+            operator: '=',
+            value: $holder,
+        )->exists()) {
+            return;
+        }
+
+        $parent = class_basename($related->parent);
+
+        throw CompatibilityWriteRefused::unsupported(
+            model: $map->model,
+            operation: "a create that names the {$related->table} row ".self::keyOf($existing)." as its \${$name}",
+            because: 'That '.class_basename($related->model)." belongs to {$parent} ".(is_scalar($holder) ? (string) $holder : '').", which still exists. A create links only a row whose {$parent} is gone, because the package never re-keys a related row.",
         );
     }
 
@@ -200,12 +294,7 @@ final readonly class UnitOfWork
             return [];
         }
 
-        $primary = $this->map->primary;
-        $query = $this->successor($primary->model)->newModelQuery()->whereKey($keys)->orderBy($primary->table.'.'.$primary->key);
-
-        foreach (ViewCompiler::hidden($this->map) as $condition) {
-            $query->whereRaw('NOT COALESCE(('.$condition.'), false)');
-        }
+        $query = $this->rootQuery($keys);
 
         if ($lock) {
             $query->lockForUpdate();
@@ -217,14 +306,65 @@ final readonly class UnitOfWork
             $roots[self::keyOf($root)] = $root;
         }
 
-        $retained = $this->map->retainedTable;
-
-        if ($lock && $retained !== null && $roots !== []) {
-            $successorKey = $retained.'.'.$this->map->successorKey;
-            $this->connection->query()->fromSub($this->connection->table($retained)->select($successorKey)->whereIn($successorKey, array_keys($roots))->orderBy($successorKey)->lockForUpdate(), 'locked')->count();
+        if ($lock) {
+            $this->lockRetained(array_keys($roots));
         }
 
         return $roots;
+    }
+
+    /**
+     * @param  list<int|string>  $keys
+     */
+    public function lock(array $keys): void
+    {
+        sort($keys);
+        $primary = $this->map->primary;
+
+        foreach (array_chunk(array: $keys, length: self::CHUNK) as $chunk) {
+            $locked = $this->rootQuery($chunk)->lockForUpdate()->toBase()->pluck($primary->table.'.'.$primary->key)->all();
+            $this->lockRetained(array_values(array_filter(
+                array: $locked,
+                callback: fn (mixed $key) => is_int($key) || is_string($key),
+            )));
+        }
+    }
+
+    /**
+     * @param  list<int|string>  $keys
+     * @return Builder<Model>
+     */
+    private function rootQuery(array $keys): Builder
+    {
+        $primary = $this->map->primary;
+        $query = $this->successor($primary->model)->newModelQuery()->whereKey($keys)->orderBy($primary->table.'.'.$primary->key);
+
+        foreach (ViewCompiler::hidden($this->map) as $condition) {
+            $query->whereRaw('NOT COALESCE(('.$condition.'), false)');
+        }
+
+        return $query;
+    }
+
+    /**
+     * @param  list<int|string>  $roots
+     */
+    private function lockRetained(array $roots): void
+    {
+        $retained = $this->map->retainedTable;
+
+        if ($retained === null || $roots === []) {
+            return;
+        }
+
+        $successorKey = $retained.'.'.$this->map->successorKey;
+        $this->connection->query()->fromSub(
+            query: $this->connection->table($retained)->select($successorKey)->whereIn(
+                column: $successorKey,
+                values: $roots,
+            )->orderBy($successorKey)->lockForUpdate(),
+            as: 'locked',
+        )->count();
     }
 
     /**
@@ -244,6 +384,8 @@ final readonly class UnitOfWork
         }
 
         for ($level = 0; $level < $depth; $level++) {
+            $levels = [];
+
             foreach ($roots as $index => [$variant]) {
                 $related = $variant->related[$level] ?? null;
 
@@ -252,9 +394,25 @@ final readonly class UnitOfWork
                 }
 
                 $parent = $tables[$index][$related->parentTable] ?? null;
-                $model = $parent === null || ! $parent->exists ? null : $this->find($related, $parent, $lock);
-                $tables[$index][$related->table] = $model;
-                $models[$index][$related->table] = $model;
+                $levels[spl_object_id($related)] ??= [$related, []];
+
+                if ($parent !== null && $parent->exists) {
+                    $levels[spl_object_id($related)][1][$index] = $parent;
+                }
+
+                $tables[$index][$related->table] = null;
+                $models[$index][$related->table] = null;
+            }
+
+            foreach ($levels as [$related, $parents]) {
+                foreach ($this->findEach(
+                    related: $related,
+                    parents: $parents,
+                    lock: $lock,
+                ) as $index => $model) {
+                    $tables[$index][$related->table] = $model;
+                    $models[$index][$related->table] = $model;
+                }
             }
         }
 
@@ -269,6 +427,72 @@ final readonly class UnitOfWork
         }
 
         return $graphs;
+    }
+
+    /**
+     * @param  array<array-key, Model>  $parents
+     * @return array<array-key, Model>
+     */
+    private function findEach(Related $related, array $parents, bool $lock): array
+    {
+        $values = [];
+
+        foreach ($parents as $index => $parent) {
+            $attributes = $parent->getAttributes();
+            $value = $attributes[$related->parentKey] ?? null;
+
+            if ($value !== null && ($related->morphType === null || ($attributes[$related->morphType] ?? null) === $related->morphAlias)) {
+                $values[$index] = $value;
+            }
+        }
+
+        if ($values === []) {
+            return [];
+        }
+
+        if ($related->morphType !== null) {
+            $query = $this->successor($related->model)->newQuery()->whereKey(array_values(array_unique(
+                array: $values,
+                flags: SORT_REGULAR,
+            )));
+        } else {
+            $relation = Relation::noConstraints(fn () => $this->relation(
+                related: $related,
+                parent: $parents[array_key_first($values)],
+            ));
+            $relation->addEagerConstraints(array_values(array_intersect_key($parents, $values)));
+            $query = $relation->getQuery();
+        }
+
+        $query->orderBy($query->getModel()->getQualifiedKeyName());
+        $rows = [];
+
+        foreach (($lock ? $query->lockForUpdate() : $query)->get() as $row) {
+            $value = $row->getAttributes()[$related->relatedKey] ?? null;
+
+            if (is_int($value) || is_string($value)) {
+                $rows[(string) $value] ??= $row;
+            }
+        }
+
+        $found = [];
+        $held = [];
+
+        foreach ($values as $index => $value) {
+            $row = is_int($value) || is_string($value) ? $rows[(string) $value] ?? null : null;
+
+            if ($row === null) {
+                continue;
+            }
+
+            $found[$index] = array_key_exists(
+                key: spl_object_id($row),
+                array: $held,
+            ) ? clone $row : $row;
+            $held[spl_object_id($row)] = true;
+        }
+
+        return $found;
     }
 
     /**
@@ -335,7 +559,14 @@ final readonly class UnitOfWork
             $operation = $attribute->operation();
 
             if ($operation !== null) {
-                $this->operation($operation)->write($graph->successors(), $value, $change);
+                self::hook(
+                    run: fn () => $this->operation($operation)->write($graph->successors(), $value, $change),
+                    origin: $origin,
+                    model: $map->model,
+                    key: $creating ? null : self::keyOrNull($original),
+                    attribute: $name,
+                    class: $operation,
+                );
 
                 continue;
             }
@@ -348,7 +579,44 @@ final readonly class UnitOfWork
             );
         }
 
-        $this->add($graph, $amounts);
+        $this->add(
+            graph: $graph,
+            amounts: $amounts,
+            record: $record,
+            original: $original,
+            origin: $origin,
+        );
+    }
+
+    public static function refuseIncrement(ResolvedMap $map, Attribute $attribute, string $name, null|int|string $key): void
+    {
+        $operation = $attribute->operation();
+        $because = $attribute->readOnlyBecause();
+
+        if ($because !== null && ! $attribute->ignoresWrites()) {
+            throw CompatibilityWriteRefused::readOnly(
+                model: $map->model,
+                attribute: $name,
+                key: $key,
+                because: $because,
+            );
+        }
+
+        $reason = match (true) {
+            $because !== null => null,
+            $operation !== null => 'It is writtenBy() '.class_basename($operation).', and an increment runs no operation, so the amount reaches no write.',
+            ! $attribute->invertible() => 'It reads no plain stored column, so an amount added to it has no one stored column.',
+            array_filter($attribute->conversions(), fn (object $conversion) => ! $conversion instanceof DividedBy && ! $conversion instanceof MultipliedBy) !== [] => 'Its conversions are not linear, so an amount added to it has no one stored amount.',
+            default => null,
+        };
+
+        if ($reason !== null) {
+            throw CompatibilityWriteRefused::unsupported(
+                model: $map->model,
+                operation: "an increment of \${$name}",
+                because: $reason,
+            );
+        }
     }
 
     /**
@@ -368,10 +636,44 @@ final readonly class UnitOfWork
             throw new LogicException("The initializer {$initializer} does not implement ".InitializesSuccessors::class.'.');
         }
 
-        $instance->initialize($graph->successors(), new Creation(
-            record: $record,
+        self::hook(
+            run: fn () => $instance->initialize($graph->successors(), new Creation(
+                record: $record,
+                origin: $origin,
+            )),
             origin: $origin,
-        ));
+            model: $this->map->model,
+            key: null,
+            attribute: null,
+            class: $initializer,
+        );
+    }
+
+    /**
+     * @param  Closure(): mixed  $run
+     * @param  class-string  $class
+     */
+    public static function hook(Closure $run, Origin $origin, string $model, null|int|string $key, null|string $attribute, string $class): void
+    {
+        try {
+            $run();
+        } catch (Refusal $refusal) {
+            if ($origin !== Origin::Live) {
+                throw $refusal;
+            }
+
+            throw new Refusal(
+                message: ($key === null ? "A new {$model} record" : "{$model} record {$key}").' cannot take '.($attribute === null ? 'this write' : "this write of \${$attribute}").', because '.class_basename($class).' refused it: '.$refusal->getMessage(),
+                previous: $refusal,
+            );
+        }
+    }
+
+    public static function keyOrNull(Model $model): null|int|string
+    {
+        $key = $model->getRawOriginal($model->getKeyName()) ?? $model->getKey();
+
+        return is_int($key) || is_string($key) ? $key : null;
     }
 
     /**
@@ -465,7 +767,11 @@ final readonly class UnitOfWork
     public function run(Model $legacy, Model $successor, Closure $write): void
     {
         if (Applying::run($legacy, $successor, $write) === false) {
-            throw CompatibilityWriteRefused::bySuccessorListener($legacy::class, $successor);
+            throw CompatibilityWriteRefused::bySuccessorListener(
+                model: $legacy::class,
+                successor: $successor,
+                key: self::keyOrNull($legacy),
+            );
         }
     }
 
@@ -549,6 +855,10 @@ final readonly class UnitOfWork
 
         $model = $graph->model($owner->table);
 
+        if ($model !== null && $graph->linked($owner->table)) {
+            return $column === $owner->key;
+        }
+
         if ($model !== null && ! $graph->created($owner->table)) {
             return false;
         }
@@ -557,19 +867,13 @@ final readonly class UnitOfWork
             return $model !== null;
         }
 
-        $related = $this->relatedOf($graph->map, $owner->table);
-
-        if ($column === $owner->key) {
-            $existing = $this->successor($related->model)->newQueryWithoutScopes()->whereKey($stored)->lockForUpdate()->first();
-
-            if ($existing !== null) {
-                $graph->link($owner->table, $existing);
-
-                return true;
-            }
-        }
-
-        self::assignRaw($graph->relatedOrNew($related->model), [$column => $stored]);
+        self::assignRaw(
+            model: $graph->relatedOrNew($this->relatedOf(
+                map: $graph->map,
+                table: $owner->table,
+            )->model),
+            values: [$column => $stored],
+        );
 
         return true;
     }
@@ -596,13 +900,17 @@ final readonly class UnitOfWork
             return;
         }
 
-        $model = $graph->model($owner->table);
+        $related = $this->relatedOf(
+            map: $map,
+            table: $owner->table,
+        )->model;
+        $model = $graph->related($related);
 
         if ($model === null && $stored === null) {
             return;
         }
 
-        $model ??= $graph->relatedOrNew($this->relatedOf($map, $owner->table)->model);
+        $model ??= $graph->relatedOrNew($related);
         $this->assignColumn($graph, $model, $column, $path, $stored);
     }
 
@@ -681,9 +989,13 @@ final readonly class UnitOfWork
 
         if ($stored === null) {
             $graph->defer($root);
-            $graph->afterSave(function () use ($root, $map): void {
+            $graph->afterSave(function () use ($root, $map, $record): void {
                 if ($root->restore() === false) {
-                    throw CompatibilityWriteRefused::bySuccessorListener($map->model, $root);
+                    throw CompatibilityWriteRefused::bySuccessorListener(
+                        model: $map->model,
+                        successor: $root,
+                        key: self::keyOrNull($record),
+                    );
                 }
             });
 
@@ -700,9 +1012,13 @@ final readonly class UnitOfWork
             $skipped[$updated] = true;
         }
 
-        $graph->afterSave(function () use ($root, $stamp, $map): void {
+        $graph->afterSave(function () use ($root, $stamp, $map, $record): void {
             if ($root->delete() === false) {
-                throw CompatibilityWriteRefused::bySuccessorListener($map->model, $root);
+                throw CompatibilityWriteRefused::bySuccessorListener(
+                    model: $map->model,
+                    successor: $root,
+                    key: self::keyOrNull($record),
+                );
             }
 
             $stamped = array_filter(
@@ -725,7 +1041,7 @@ final readonly class UnitOfWork
      * @param  Staging<Model>  $graph
      * @param  array<string, float|int>  $amounts
      */
-    private function add(Staging $graph, array $amounts): void
+    private function add(Staging $graph, array $amounts, Model $record, Model $original, Origin $origin): void
     {
         $map = $graph->map;
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
@@ -737,13 +1053,28 @@ final readonly class UnitOfWork
                 continue;
             }
 
-            $column = $attribute->column();
-            $linear = array_filter($attribute->conversions(), fn (object $conversion) => ! $conversion instanceof DividedBy && ! $conversion instanceof MultipliedBy) === [];
+            self::refuseIncrement(
+                map: $map,
+                attribute: $attribute,
+                name: $name,
+                key: $original->getAttributes() === [] ? null : self::keyOf($original),
+            );
 
-            if ($column === null || ! $attribute->invertible() || ! $linear || $attribute->operation() !== null || $attribute->readOnlyBecause() !== null) {
-                throw CompatibilityWriteRefused::unsupported($map->model, "an increment of \${$name}", 'Its conversions are not linear, so an amount added to it has no one stored amount.');
+            if ($attribute->ignoresWrites()) {
+                Event::dispatch(new WriteIgnored(
+                    change: new Change(
+                        record: $record,
+                        original: $original,
+                        attribute: $name,
+                        origin: $origin,
+                    ),
+                    value: $amount,
+                ));
+
+                continue;
             }
 
+            $column = (string) $attribute->column();
             $owner = $map->owners[$name];
             $model = $graph->model($owner->table);
             $current = $model?->getAttributes()[$column] ?? null;

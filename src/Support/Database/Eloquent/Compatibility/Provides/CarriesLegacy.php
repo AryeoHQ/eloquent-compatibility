@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
+use Throwable;
 
 /**
  * @phpstan-require-extends Model
@@ -59,8 +60,24 @@ trait CarriesLegacy
             RetainedRows::carry($this);
         }
 
-        $result = parent::fireModelEvent($event, $halt);
+        if ($event !== 'creating') {
+            return parent::fireModelEvent(
+                event: $event,
+                halt: $halt,
+            );
+        }
 
-        return $event === 'creating' && Forwarder::creating(successor: $this, proceeds: $result !== false) === false ? false : $result;
+        try {
+            $result = parent::fireModelEvent(
+                event: $event,
+                halt: $halt,
+            );
+        } catch (Throwable $exception) {
+            Forwarder::creating(successor: $this, proceeds: false);
+
+            throw $exception;
+        }
+
+        return Forwarder::creating(successor: $this, proceeds: $result !== false) === false ? false : $result;
     }
 }

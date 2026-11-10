@@ -5,10 +5,14 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Carbon\CarbonInterval;
+use Closure;
+use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -71,7 +75,7 @@ final class RoundTripTest extends TestCase
             }
         };
         Event::listen('eloquent.saving: '.ConfiguredJob::class, function (ConfiguredJob $job): void {
-            if ($job->getAttribute('total') === '12345678901234567890') {
+            if (in_array($job->getAttribute('total'), ['12345678901234567890', '12345678901234567890e0'], true)) {
                 $job->setAttribute('total', '12345678901234567891');
             }
         });
@@ -92,6 +96,13 @@ final class RoundTripTest extends TestCase
                 $refusal = $exception->getMessage();
             }
 
+            try {
+                $tally->newQuery()->findOrFail(1)->update(['total' => '12345678901234567890e0']);
+                $exponent = 'no refusal';
+            } catch (CompatibilityWriteRefused $exception) {
+                $exponent = $exception->getMessage();
+            }
+
             $total = DB::table('configured_jobs')->value('total');
             $rounded = $tally->newQuery()->findOrFail(1)->update(['total' => '7']);
         } finally {
@@ -102,7 +113,170 @@ final class RoundTripTest extends TestCase
         }
 
         $this->assertStringContainsString("cannot take this write of \$total. Why: The write stores '12345678901234567890', and the view now serves total as '12345678901234567891.00'", $refusal);
+        $this->assertStringContainsString("cannot take this write of \$total. Why: The write stores '12345678901234567890e0', and the view now serves total as '12345678901234567891.00'", $exponent);
         $this->assertSame(['1.00', true], [$total, $rounded]);
+    }
+
+    #[Test]
+    public function it_refuses_a_text_write_whose_successor_listener_drops_its_leading_zeros(): void
+    {
+        $this->installListings();
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = ltrim($job->name, '0');
+        });
+
+        try {
+            Listing::query()->findOrFail(1)->update(['title' => '00123']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringStartsWith(Listing::class." record 1 cannot take this write of \$title. Why: The write stores '00123', and the view now serves title as '123'", $refusal);
+        $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_passes_a_json_write_whose_object_keys_the_jsonb_column_reorders(): void
+    {
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            protected $casts = ['settings' => 'array'];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'settings', definition: fn (Attribute $attribute) => $attribute->from('settings')));
+            }
+        };
+
+        $stored = $this->holding(
+            holder: $holder,
+            columns: 'settings jsonb',
+            row: ['name' => 'Oak', 'settings' => '{"a": 1}'],
+            copied: ['settings'],
+            write: function () use ($holder): mixed {
+                $holder->newQuery()->findOrFail(1)->update(['settings' => ['zeta' => 1, 'a' => 2]]);
+
+                return DB::table('configured_jobs')->value('settings');
+            },
+        );
+
+        $this->assertSame('{"a": 2, "zeta": 1}', $stored);
+    }
+
+    #[Test]
+    public function it_passes_a_date_time_value_written_to_an_attribute_the_legacy_model_does_not_cast_as_a_date(): void
+    {
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'stamped_at', definition: fn (Attribute $attribute) => $attribute->from('stamped_at')));
+            }
+        };
+
+        $stored = $this->holding(
+            holder: $holder,
+            columns: 'stamped_at timestamp(0) without time zone',
+            row: ['name' => 'Oak', 'stamped_at' => '2026-01-01 00:00:00'],
+            copied: ['stamped_at'],
+            write: function () use ($holder): array {
+                $stored = [$holder->newQuery()->whereKey(1)->update(['stamped_at' => Date::parse('2026-05-07 12:00:00')])];
+                $stored[] = DB::table('configured_jobs')->value('stamped_at');
+                $record = $holder->newQuery()->findOrFail(1);
+                $record->setAttribute('stamped_at', Date::parse('2026-05-08 12:00:00'));
+                $stored[] = $record->save();
+                $stored[] = DB::table('configured_jobs')->value('stamped_at');
+
+                return $stored;
+            },
+        );
+
+        $this->assertSame([1, '2026-05-07 12:00:00', true, '2026-05-08 12:00:00'], $stored);
+    }
+
+    #[Test]
+    public function it_refuses_a_write_whose_successor_listener_removes_the_record_it_wrote(): void
+    {
+        $this->installListings();
+        Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
+            $job->forceDelete();
+        });
+
+        try {
+            Listing::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame(Listing::class.' record 1 cannot take this write, because no row holds the record after it. Why: Read without its hide() rules, no row serves record 1 once the write has saved, so a listener or a trigger removed the record the write stored. Instead: Keep the successors of the record in place while a write through Listing runs.', $refusal);
+        $this->assertSame('Oak House', Listing::query()->find(1)?->title);
+    }
+
+    #[Test]
+    public function it_refuses_a_write_whose_cast_cannot_read_the_served_value_and_keeps_the_cast_failure_as_the_cause(): void
+    {
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            protected $casts = ['name' => 'encrypted'];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+        Event::listen('eloquent.saving: '.ConfiguredJob::class, function (ConfiguredJob $job): void {
+            $job->setRawAttributes(array_replace($job->getAttributes(), ['name' => 'tampered']));
+        });
+
+        $refusal = $this->holding(
+            holder: $holder,
+            columns: 'note text',
+            row: ['name' => Crypt::encryptString('Oak')],
+            copied: [],
+            write: function () use ($holder): null|CompatibilityWriteRefused {
+                try {
+                    $holder->newQuery()->findOrFail(1)->update(['name' => 'Oak Lodge']);
+                } catch (CompatibilityWriteRefused $exception) {
+                    return $exception;
+                }
+
+                return null;
+            },
+        );
+
+        $this->assertStringContainsString("cannot take this write of \$name. Why: The write stores '", $refusal?->getMessage() ?? 'no refusal');
+        $this->assertInstanceOf(DecryptException::class, $refusal?->getPrevious());
     }
 
     #[Test]
@@ -179,7 +353,7 @@ final class RoundTripTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringStartsWith(Listing::class." record 1 cannot take this write of \$title. Why: The write stores 'Oak Manor', and the view now serves title as 'Tampered'", $refusal);
+        $this->assertStringStartsWith(Listing::class." record 1 cannot take this write of \$title. Why: The write stores 'Oak Manor', and the record, which a hide() rule now hides, reads title as 'Tampered'", $refusal);
         $this->assertSame(['Oak House', null, 'Oak House'], [DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'), DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('merged_into_job_id'), Listing::query()->find(1)?->title]);
     }
 
@@ -234,8 +408,38 @@ final class RoundTripTest extends TestCase
         }
 
         $this->assertSame([true, 'Withheld', null], [$written, $city(1), $withheld::query()->find(1)]);
-        $this->assertStringContainsString("record 3 cannot take this write of \$city. Why: The write stores 'Tacoma', and the view now serves city as 'Withheld'", $refusal);
+        $this->assertStringContainsString("record 3 cannot take this write of \$city. Why: The write stores 'Tacoma', and the record, which a hide() rule now hides, reads city as 'Withheld'", $refusal);
         $this->assertSame([null, 3], [$city(3), $withheld::query()->find(3)?->getKey()]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @param  list<string>  $copied
+     * @param  Closure(): mixed  $write
+     */
+    private function holding(Model $holder, string $columns, array $row, array $copied, Closure $write): mixed
+    {
+        DB::statement('create table holders (id serial primary key, name text not null, '.$columns.', created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, stamped_at timestamp(0) without time zone)');
+        DB::table('holders')->insert($row);
+        $copy = implode('', array_map(fn (string $column) => ', '.$column, $copied));
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('update holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name'.$copy.') select job_id, name'.$copy.' from holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            return $write();
+        } finally {
+            DB::statement('drop view if exists holders');
+            DB::statement('drop table if exists holders, holders_retained, holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
     }
 
     private function installListings(): void

@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\ClearListingAddress;
 use Tests\Fixtures\Support\Listings\InterleavingWriteScope;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
@@ -28,6 +29,8 @@ use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\MovingWriteScope;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\SkippingWriteScope;
+use Tests\Fixtures\Support\Listings\SwallowingWriteScope;
 use Tests\TestCase;
 
 #[CoversClass(UnitOfWork::class)]
@@ -176,9 +179,9 @@ final class UnitOfWorkTest extends TestCase
     }
 
     #[Test]
-    public function it_hands_the_write_scope_the_key_of_an_existing_place_a_create_links(): void
+    public function it_hands_the_write_scope_the_key_of_an_orphaned_place_a_create_links(): void
     {
-        $place = (string) Place::query()->where('job_id', ListingTables::jobOf(1))->value('id');
+        $place = $this->orphanedPlace();
 
         $created = $this->linking()->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place]);
 
@@ -188,9 +191,42 @@ final class UnitOfWorkTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_create_that_names_the_place_of_another_live_record_and_leaves_that_record_its_place(): void
+    {
+        $job = (string) ListingTables::jobOf(1);
+        $place = (string) Place::query()->where('job_id', $job)->value('id');
+        $linking = $this->linking();
+
+        try {
+            $linking->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place]);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = str_replace($linking::class, 'Listing', $exception->getMessage());
+        }
+
+        $this->assertStringStartsWith("Listing cannot run a create that names the places row {$place} as its \$place_id through its compatibility map. Why: That Place belongs to Job {$job}, which still exists. A create links only a row whose Job is gone, because the package never re-keys a related row. Instead: ", $refusal);
+        $this->assertSame([$job, '1 Oak St', 'Seattle'], [Place::query()->whereKey($place)->value('job_id'), Listing::query()->findOrFail(1)->street, Listing::query()->findOrFail(1)->city]);
+    }
+
+    #[Test]
+    public function it_links_an_orphaned_place_before_any_operation_runs_whatever_order_the_map_declares_its_attributes_in(): void
+    {
+        $cities = [];
+
+        foreach ([$this->placeAfterAddress(), $this->placeBeforeAddress()] as $listing) {
+            $place = $this->orphanedPlace();
+            $places = DB::table('places')->count();
+            $listing->newQuery()->create(['title' => 'Ash House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place, 'street' => '9 Ash St', 'city' => 'Tacoma']);
+            $cities[] = [DB::table('places')->where('id', $place)->value('city'), DB::table('places')->count() - $places];
+        }
+
+        $this->assertSame([['Tacoma', 0], ['Tacoma', 0]], $cities);
+    }
+
+    #[Test]
     public function it_refuses_with_a_retryable_error_when_the_place_a_create_links_moves_after_the_write_scope_ran(): void
     {
-        $place = (string) Place::query()->where('job_id', ListingTables::jobOf(1))->value('id');
+        $place = $this->orphanedPlace();
         $listings = DB::table('listings_retained')->count();
         InterleavingWriteScope::$interleave = function () use ($place): void {
             DB::table('places')->where('id', $place)->delete();
@@ -204,7 +240,180 @@ final class UnitOfWorkTest extends TestCase
         }
 
         $this->assertSame($listings, DB::table('listings_retained')->count());
-        $this->assertSame((string) ListingTables::jobOf(1), Place::query()->whereKey($place)->value('job_id'));
+        $this->assertSame([true, null], [Place::query()->whereKey($place)->exists(), Place::query()->whereKey($place)->value('job_id')]);
+    }
+
+    #[Test]
+    public function it_rethrows_the_refusal_a_write_scope_catches_and_commits_nothing(): void
+    {
+        Event::listen('eloquent.saving: '.Job::class, function (Job $job): void {
+            $job->name = strtoupper($job->name);
+        });
+
+        try {
+            $this->swallowing()::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString("record 1 cannot take this write of \$title. Why: The write stores 'Oak Manor', and the view now serves title as 'OAK MANOR'", $refusal);
+        $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_refuses_a_write_whose_scope_returns_without_running_it(): void
+    {
+        $skipping = $this->skipping();
+
+        try {
+            $skipping::query()->findOrFail(1)->update(['title' => 'Oak Manor']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame($skipping::class.' cannot take this write, because its write scope SkippingWriteScope returned without running it. Why: The package runs the write inside SkippingWriteScope::run(), and run() returned without calling $write, so the write would report success and store nothing. Instead: Make SkippingWriteScope::run() call $write and return its result.', $refusal);
+        $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    private function swallowing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return UnitOfWorkTest::scopedMap($listing)->writesWithin(SwallowingWriteScope::class);
+            }
+        };
+    }
+
+    private function skipping(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return UnitOfWorkTest::scopedMap($listing)->writesWithin(SkippingWriteScope::class);
+            }
+        };
+    }
+
+    #[Test]
+    public function it_refuses_a_write_that_reaches_a_related_successor_an_earlier_operation_of_it_deleted(): void
+    {
+        $clearing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'street', definition: fn (Attribute $attribute) => $attribute->from('street')->writtenBy(ClearListingAddress::class))
+                            ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city'))));
+            }
+        };
+
+        try {
+            $clearing->newQuery()->findOrFail(1)->update(['street' => null, 'city' => 'Tacoma']);
+            $refusal = 'no refusal';
+        } catch (CompatibilityWriteRefused $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringContainsString(' cannot run an operation that calls related() for Place after deleteRelated() through its compatibility map. Why: The unit of work deletes that Place after the saves, so a change to it would be saved and then deleted.', $refusal);
+        $this->assertSame([1, 'Seattle'], [Place::query()->where('job_id', ListingTables::jobOf(1))->count(), Place::query()->where('job_id', ListingTables::jobOf(1))->value('city')]);
+    }
+
+    private function orphanedPlace(): string
+    {
+        DB::statement('alter table places alter column job_id drop not null');
+        DB::statement('alter table places drop constraint places_job_id_foreign, add constraint places_job_id_foreign foreign key (job_id) references jobs (id) on delete set null');
+        $job = (string) DB::table('jobs')->insertGetId(['name' => 'Old', 'company_id' => ListingTables::COMPANY], 'id');
+        $place = (string) DB::table('places')->insertGetId(['job_id' => $job, 'street' => '9 Ash St', 'city' => 'Seattle'], 'id');
+        DB::table('jobs')->where('id', $job)->delete();
+
+        return $place;
+    }
+
+    private function placeAfterAddress(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'street', definition: fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city'))
+                            ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A listing keeps its place.', ignoreWrites: false))));
+            }
+        };
+    }
+
+    private function placeBeforeAddress(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A listing keeps its place.', ignoreWrites: false))
+                            ->attribute(name: 'street', definition: fn (Attribute $attribute) => $attribute->from('street'))
+                            ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city'))));
+            }
+        };
     }
 
     private function linking(): Model

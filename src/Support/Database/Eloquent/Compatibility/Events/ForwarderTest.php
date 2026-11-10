@@ -22,6 +22,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -49,6 +50,7 @@ use Tests\Fixtures\Support\Listings\LifecycleStatus;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\NumberedJob;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\RecordUpdated;
 use Tests\Fixtures\Support\Listings\SyncListingToMls;
@@ -697,7 +699,7 @@ final class ForwarderTest extends TestCase
         FileTables::install();
         $standIns = [];
         DB::listen(function (QueryExecuted $query) use (&$standIns): void {
-            if (preg_match('/, "(\w+)" AS \(SELECT \* FROM "\1" UNION ALL SELECT \* FROM jsonb_populate_record/', $query->sql, $match) === 1) {
+            if (preg_match('/, "(\w+)" AS \(SELECT \* FROM jsonb_populate_record\(NULL::"\1"/', $query->sql, $match) === 1) {
                 $standIns[] = $match[1];
             }
         });
@@ -718,6 +720,86 @@ final class ForwarderTest extends TestCase
             'birch-lease.pdf' => [['LegacyFile saving', 'LegacyFile creating', 'LegacyFile created', 'LegacyFile saved'], ['legacy_files_retained' => 1, 'photos_retained' => 1]],
             'birch.jpg' => [['Photo saving', 'Photo creating', 'Photo created', 'Photo saved'], ['legacy_files_retained' => 1, 'photos_retained' => 1]],
         ], $creates);
+    }
+
+    #[Test]
+    public function it_reads_no_stored_root_or_retained_row_in_the_stand_in_query_of_a_native_create(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        $standIns = [];
+        DB::listen(function (QueryExecuted $query) use (&$standIns): void {
+            if (str_starts_with($query->sql, 'WITH ') && str_contains($query->sql, 'jsonb_populate_record')) {
+                $standIns[] = [$query->sql, $query->bindings];
+            }
+        });
+        $this->listen(Photo::class, ['saving'], fn (Photo $photo) => [$photo->getAttribute('file_name')]);
+        $this->listen(LegacyFile::class, ['saving'], fn (LegacyFile $file) => [$file->getAttribute('file_name')]);
+        $this->listen(Listing::class, ['saving'], fn (Listing $listing) => [$listing->title]);
+
+        File::query()->create(['filename' => 'birch.jpg', 'mime_type' => 'image/jpeg']);
+        Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+        $scans = [];
+
+        foreach ($standIns as [$sql, $bindings]) {
+            foreach (DB::select('EXPLAIN (COSTS OFF) '.$sql, $bindings) as $line) {
+                $plan = (string) (((array) $line)['QUERY PLAN'] ?? '');
+
+                if (preg_match('/CTE Scan|Scan(?: using \S+)? on (?:files|photos_retained|legacy_files_retained|jobs|listings_retained)\b/', $plan) === 1) {
+                    $scans[] = trim($plan);
+                }
+            }
+        }
+
+        $this->assertSame([3, []], [count($standIns), $scans]);
+    }
+
+    #[Test]
+    public function it_reads_the_stand_in_row_of_a_native_create_whose_root_key_is_a_scaled_numeric(): void
+    {
+        DB::statement('create sequence numbered_jobs_id_seq');
+        DB::statement("create table numbered_jobs (id numeric(20, 0) primary key default nextval('numbered_jobs_id_seq'), name text not null)");
+        DB::statement('create table holders (id serial primary key, name text not null, job_id numeric(20, 0), created_at timestamptz, updated_at timestamptz)');
+        DB::table('holders')->insert([['name' => 'Oak']]);
+        $holder = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return $holder
+                    ->retainedIn('holders_retained')
+                    ->servedFrom(root: NumberedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name')));
+            }
+        };
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement("update holders set job_id = nextval('numbered_jobs_id_seq')");
+            DB::statement('insert into numbered_jobs (id, name) select job_id, name from holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            Forwarder::register($this->app->make('events'), $holder::class);
+            $this->listen($holder::class, ['saving'], fn (Model $legacy) => [$legacy->getAttribute('name')]);
+
+            NumberedJob::query()->create(['name' => 'Birch']);
+        } finally {
+            DB::statement('drop view if exists holders');
+            DB::statement('drop table if exists holders, holders_retained, holders_backfill, numbered_jobs cascade');
+            DB::statement('drop sequence if exists numbered_jobs_id_seq');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([['saving', 'Birch']], $this->seen);
     }
 
     #[Test]

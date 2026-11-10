@@ -99,7 +99,13 @@ final class LegacyQueryBuilder extends QueryBuilder
         return $this->route(fn (): bool => parent::insert($values), function (Model $legacy) use ($values): bool {
             $legacy->getConnection()->transaction(function () use ($legacy, $values): void {
                 foreach (self::rows($values) as $row) {
-                    $this->writer($legacy)->insert($legacy->newInstance(), $row);
+                    $this->writer($legacy)->insert(
+                        legacy: self::holding(
+                            legacy: $legacy,
+                            row: $row,
+                        ),
+                        values: $row,
+                    );
                 }
             });
 
@@ -117,7 +123,13 @@ final class LegacyQueryBuilder extends QueryBuilder
             $returning = $sequence === null || $sequence === '' ? $legacy->getKeyName() : $sequence;
 
             return $legacy->getConnection()->transaction(function () use ($legacy, $values, $returning): int|string {
-                $key = $this->writer($legacy)->insert($legacy->newInstance(), $values);
+                $key = $this->writer($legacy)->insert(
+                    legacy: self::holding(
+                        legacy: $legacy,
+                        row: $values,
+                    ),
+                    values: $values,
+                );
                 $id = $returning === $legacy->getKeyName() ? $key : $this->newQuery()->from($legacy->getTable())->where($legacy->getKeyName(), $key)->value($returning);
 
                 return is_numeric($id) ? (int) $id : (is_string($id) ? $id : throw new LogicException("{$legacy->getTable()}.{$returning} read back no value for the new ".class_basename($legacy).'.'));
@@ -138,7 +150,14 @@ final class LegacyQueryBuilder extends QueryBuilder
             $inserted = 0;
 
             foreach (self::rows($values) as $row) {
-                $inserted += $this->insertUnlessTaken($legacy, $legacy->newInstance(), $row) === null ? 0 : 1;
+                $inserted += $this->insertUnlessTaken(
+                    legacy: $legacy,
+                    inserting: self::holding(
+                        legacy: $legacy,
+                        row: $row,
+                    ),
+                    row: $row,
+                ) === null ? 0 : 1;
             }
 
             return $inserted;
@@ -168,7 +187,14 @@ final class LegacyQueryBuilder extends QueryBuilder
                 $keys = [];
 
                 foreach (self::rows($values) as $row) {
-                    $key = $this->insertUnlessTaken($legacy, $own ? $legacy : $legacy->newInstance(), $row);
+                    $key = $this->insertUnlessTaken(
+                        legacy: $legacy,
+                        inserting: $own ? $legacy : self::holding(
+                            legacy: $legacy,
+                            row: $row,
+                        ),
+                        row: $row,
+                    );
 
                     if ($key !== null) {
                         $keys[] = $key;
@@ -272,6 +298,14 @@ final class LegacyQueryBuilder extends QueryBuilder
         $this->refuseStale();
 
         return parent::runSelect();
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $row
+     */
+    private static function holding(Model $legacy, array $row): Model
+    {
+        return $legacy->newInstance()->setRawAttributes($row);
     }
 
     /**

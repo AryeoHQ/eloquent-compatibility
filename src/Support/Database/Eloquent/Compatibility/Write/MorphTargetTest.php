@@ -754,6 +754,42 @@ final class MorphTargetTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_move_into_a_target_whose_required_column_a_written_by_attribute_owns_when_the_write_does_not_supply_it(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id');
+            $table->string('body')->nullable();
+        });
+
+        try {
+            $brochure = $this->installed($this->linkWrittenBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
+            $refusals = [];
+
+            foreach ([fn () => $brochure->newQuery()->whereKey(1)->update(['title' => 'Embed']), fn () => $brochure->newQuery()->findOrFail(1)->update(['title' => 'Embed'])] as $write) {
+                try {
+                    $write();
+                    $refusals[] = 'no refusal';
+                } catch (CompatibilityWriteRefused $exception) {
+                    $refusals[] = $exception->getMessage();
+                }
+            }
+
+            $refused = [$this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        foreach ($refusals as $refusal) {
+            $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url through its compatibility map. Why: The move keeps the values the view serves for the attributes of AssetLink, and asset_links.url needs a value the write does not supply.', $refusal);
+        }
+
+        $this->assertSame(['Guide', TrashableAssetFile::class], $refused);
+    }
+
+    #[Test]
     public function it_writes_a_record_whose_choose_closure_already_picks_another_target_from_an_external_attribute_when_the_write_keeps_that_pick(): void
     {
         Schema::create('asset_notes', function (Blueprint $table): void {
@@ -1335,6 +1371,68 @@ final class MorphTargetTest extends TestCase
                                     ->attribute(
                                         name: 'url',
                                         definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
+            }
+        };
+    }
+
+    private function linkWrittenBrochure(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_brochures';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_brochure';
+            }
+
+            public static function compatibility(Compatibility $brochure): Compatibility
+            {
+                return $brochure
+                    ->retainedIn('place_brochures_retained')
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
+                            successor: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all())->writtenBy(WriteNoteBody::class)),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'Embed' && $brochure->getAttribute('note') !== null || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url')->writtenBy(WriteAssetTitle::class),
                                     ))));
             }
         };

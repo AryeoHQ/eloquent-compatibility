@@ -10,6 +10,7 @@ use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Expression as RawExpression;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -66,15 +67,19 @@ final readonly class RecordWriter
             )]) : [];
 
             return $this->unit->scoped($touched, function () use ($legacy, $values, $mapped, $retained, $variant, $root, $graph, $touched): int|string {
-                if ($this->unit->scopes()) {
-                    $this->unit->refuseMoved($touched, [$this->unit->links(
-                        graph: $graph,
-                        values: $mapped,
-                        lock: true,
-                    )]);
-                }
-
-                $original = $legacy->newInstance();
+                $graph = $this->unit->links(
+                    graph: $graph,
+                    values: $mapped,
+                    lock: true,
+                );
+                $this->unit->refuseMoved(
+                    scoped: $touched,
+                    graphs: [$graph],
+                );
+                $original = $legacy->newInstance()->setRawAttributes(
+                    attributes: [],
+                    sync: true,
+                );
 
                 if ($variant->target !== null) {
                     $graph->relatedOrNew($variant->target->model);
@@ -182,6 +187,7 @@ final readonly class RecordWriter
             $key = UnitOfWork::keyOf($legacy);
             [$mapped, $retained] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = $this->amounts($amounts);
+            $added = array_diff_key($added, $mapped);
 
             return $this->written($legacy, $key, $mapped, $added, function (Staging $graph, Model $original) use ($legacy, $key, $amounts, $extra, $mapped, $retained, $added, $retainedAmounts): int {
                 $retained = $this->guard($legacy, $key, $extra, $amounts, $retained);
@@ -468,18 +474,11 @@ final readonly class RecordWriter
     private function refuseUnfilled(Model $root, ResolvedMap $from, ResolvedMap $to, array $values, Model $original): void
     {
         $related = $to->target ?? throw new LogicException("Compatibility map '{$this->map->table}' moves a record into no relatedMorph() target.");
-        $columns = (new ColumnCatalog($this->connection, throughSearchPath: true))->of($related->table);
-        $unfilled = [];
-        $required = [];
-
-        foreach ($to->attributes as $name => $attribute) {
-            $column = $attribute->column();
-
-            if ($to->owners[$name] === $related->successor && $attribute->invertible() && $attribute->operation() === null && $attribute->readOnlyBecause() === null && $column !== null && ($columns[$column] ?? null)?->needsAValue() === true && ($values[$name] ?? null) === null) {
-                $unfilled[] = $name;
-                $required[] = $related->table.'.'.$column;
-            }
-        }
+        [$unfilled, $required] = $this->unsupplied(
+            variant: $to,
+            related: $related,
+            values: $values,
+        );
 
         if ($unfilled !== []) {
             throw CompatibilityWriteRefused::unsupported($this->map->model, 'a write that moves record '.UnitOfWork::keyOf($original).' from '.class_basename((string) $from->target?->model).' to '.class_basename($related->model).' without $'.implode(', $', $unfilled), 'The move keeps the values the view serves for the attributes of '.class_basename($related->model).', and '.implode(' and ', $required).' needs a value the write does not supply.');
@@ -492,18 +491,11 @@ final readonly class RecordWriter
     private function refuseUnsupplied(Model $legacy, int|string $key, mixed $type, ResolvedMap $variant, array $values): void
     {
         $related = $variant->target ?? throw new LogicException("Compatibility map '{$this->map->table}' moves a record into no relatedMorph() target.");
-        $columns = (new ColumnCatalog($this->connection, throughSearchPath: true))->of($related->table);
-        $unsupplied = [];
-        $required = [];
-
-        foreach ($variant->attributes as $name => $attribute) {
-            $column = $attribute->column();
-
-            if ($variant->owners[$name] === $related->successor && $attribute->invertible() && $attribute->readOnlyBecause() === null && $column !== null && ($columns[$column] ?? null)?->needsAValue() === true && ($values[$name] ?? null) === null) {
-                $unsupplied[] = $name;
-                $required[] = $related->table.'.'.$column;
-            }
-        }
+        [$unsupplied, $required] = $this->unsupplied(
+            variant: $variant,
+            related: $related,
+            values: $values,
+        );
 
         if ($unsupplied !== []) {
             $column = (string) $this->map->morph?->typeColumn;
@@ -511,6 +503,28 @@ final readonly class RecordWriter
 
             throw CompatibilityWriteRefused::unsupported($legacy::class, 'a write that moves record '.$key.', whose '.class_basename($this->map->primary->model).' stores '.$stores.', into '.class_basename($related->model).' without $'.implode(', $', $unsupplied), 'targets: declares no target for that '.$column.', so the view serves no value for the move to keep, and '.implode(' and ', $required).' needs a value.');
         }
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @return array{list<string>, list<string>}
+     */
+    private function unsupplied(ResolvedMap $variant, Related $related, array $values): array
+    {
+        $columns = (new ColumnCatalog($this->connection, throughSearchPath: true))->of($related->table);
+        $names = [];
+        $required = [];
+
+        foreach ($variant->attributes as $name => $attribute) {
+            $column = $attribute->column();
+
+            if ($variant->owners[$name] === $related->successor && $attribute->invertible() && $attribute->readOnlyBecause() === null && $column !== null && ($columns[$column] ?? null)?->needsAValue() === true && ($values[$name] ?? null) === null) {
+                $names[] = $name;
+                $required[] = $related->table.'.'.$column;
+            }
+        }
+
+        return [$names, $required];
     }
 
     /**
@@ -587,7 +601,7 @@ final readonly class RecordWriter
     {
         $updatedAt = $legacy->usesTimestamps() ? $legacy->getUpdatedAtColumn() : null;
 
-        if (! $touched || $updatedAt === null || ! array_key_exists($updatedAt, $values)) {
+        if (! $touched || $updatedAt === null || ! array_key_exists($updatedAt, $values) || $this->map->legacyOnly([$updatedAt]) !== []) {
             return $values;
         }
 

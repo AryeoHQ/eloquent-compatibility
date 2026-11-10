@@ -47,10 +47,48 @@ final class CompatibilityWriteRefusedTest extends TestCase
             'Tests\Fixtures\Support\Listings\Listing cannot write $street. Why: They live on a places row the record does not have, and jobs reaches that row through a belongs-to relation, which creates no row. Instead: Create the places row through its own model and associate it with the jobs row first.',
             'Tests\Fixtures\Support\Listings\Listing::$title cannot take a raw expression. Why: It is stored in jobs, and SQL written for the legacy table would read the columns of jobs instead. Instead: Write the computed value, or write the stored column through the successor model.',
             'Tests\Fixtures\Support\Listings\Listing record 7 cannot take this write of $title. Why: The write stores \'Oak Manor\', and the view now serves title as \'OAK MANOR\', so the record would not read back what was written. Instead: Make the operation of title store a value its read serves back.',
-            'Tests\Fixtures\Support\Listings\Listing cannot take this write now, because its JobSite rows moved after the write scope ran. Why: The write scope received the keys [a1], and the package then locked [], so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
+            'Tests\Fixtures\Support\Listings\Listing cannot take this write now, because its JobSite rows moved after the write scope ran. Why: The write scope received 1 key, and the package then locked 0 keys. It locked [], which the scope never received, and no longer found [a1], so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
             'Tests\Fixtures\Support\Files\File cannot take this create, because its legacy model changed between its creating event and its insert. Why: The package raised the legacy saving and creating events to no legacy model, and the inserted File row joins Photo and LegacyFile, so a column that when() reads changed after the creating event. Instead: Set every column that when() reads before the insert, in the create\'s attributes or in a listener of File, rather than in a database default or trigger.',
         ], array_map(fn (CompatibilityWriteRefused $refusal) => $refusal->getMessage(), $refusals));
         $this->assertContainsOnlyInstancesOf(CompatibilityException::class, $refusals);
+    }
+
+    #[Test]
+    public function it_names_only_the_keys_that_moved_up_to_ten_and_counts_both_lists(): void
+    {
+        $scoped = array_map(
+            callback: fn (int $key) => 'k'.$key,
+            array: range(1, 203),
+        );
+        $locked = array_values(array_diff($scoped, ['k7']));
+        $locked = [...$locked, ...array_map(
+            callback: fn (int $key) => 'n'.$key,
+            array: range(1, 12),
+        )];
+
+        $because = CompatibilityWriteRefused::successorsMoved(
+            model: Listing::class,
+            successor: JobSite::class,
+            scoped: $scoped,
+            locked: $locked,
+        )->because;
+
+        $this->assertSame('The write scope received 203 keys, and the package then locked 214 keys. It locked [n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, and 2 more], which the scope never received, and no longer found [k7], so it would write a row the scope never ordered.', $because);
+    }
+
+    #[Test]
+    public function it_names_the_record_and_the_successor_a_listener_refused(): void
+    {
+        $place = (new Place)->forceFill(['id' => 'a1b2c3d4-0000-4000-8000-000000000001']);
+
+        $this->assertSame(
+            'Tests\Fixtures\Support\Listings\Listing record 3 cannot take this write, because a listener of Place a1b2c3d4-0000-4000-8000-000000000001 refused its save',
+            CompatibilityWriteRefused::bySuccessorListener(
+                model: Listing::class,
+                successor: $place,
+                key: 3,
+            )->refused,
+        );
     }
 
     #[Test]

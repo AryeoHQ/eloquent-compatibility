@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Write;
 
 use BackedEnum;
+use Brick\Math\BigDecimal;
+use Brick\Math\Exception\MathException;
+use Closure;
 use DateTimeInterface;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Collection;
@@ -12,6 +15,7 @@ use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Schema\Column;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -20,14 +24,20 @@ use WeakMap;
 
 final class RoundTrip
 {
+    private const array NUMERIC_CASTS = ['int', 'integer', 'real', 'float', 'double', 'decimal'];
+
     /** @var null|WeakMap<Connection, array<class-string<Model>, string>> */
     private static null|WeakMap $unhidden = null;
+
+    /** @var null|WeakMap<Connection, array<class-string<Model>, list<string>>> */
+    private static null|WeakMap $numeric = null;
 
     public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection) {}
 
     public static function forget(): void
     {
         self::$unhidden = null;
+        self::$numeric = null;
     }
 
     /**
@@ -45,13 +55,43 @@ final class RoundTrip
         ) : (array) $row;
 
         if ($served === null) {
-            return null;
+            throw CompatibilityWriteRefused::roundTripLost(
+                model: $this->map->model,
+                key: $key,
+            );
         }
 
-        foreach ($written as $name => $value) {
-            $attribute = $graph->map->attributes[$name] ?? null;
+        $hidden = $row === null;
 
-            if ($attribute === null || $this->skips($attribute, $origin) || str_contains($name, '->')) {
+        foreach ($written as $name => $value) {
+            [$base, $path] = array_pad(
+                array: explode(
+                    separator: '->',
+                    string: $name,
+                    limit: 2,
+                ),
+                length: 2,
+                value: null,
+            );
+            $attribute = $graph->map->attributes[$base] ?? null;
+
+            if ($attribute === null || $this->skips(
+                attribute: $attribute,
+                origin: $origin,
+            )) {
+                continue;
+            }
+
+            if ($path !== null) {
+                $this->checkPath(
+                    key: $key,
+                    name: $name,
+                    path: $path,
+                    value: $value,
+                    column: $served[$base] ?? null,
+                    hidden: $hidden,
+                );
+
                 continue;
             }
 
@@ -65,40 +105,46 @@ final class RoundTrip
                 continue;
             }
 
-            if (! self::same($legacy, $name, $value, $served[$name])) {
-                throw CompatibilityWriteRefused::roundTrip(
-                    model: $this->map->model,
-                    attribute: $name,
-                    key: $key,
-                    written: $value,
-                    served: $served[$name],
-                );
-            }
+            $this->compare(
+                legacy: $legacy,
+                name: $name,
+                key: $key,
+                written: $value,
+                served: $served[$name],
+                hidden: $hidden,
+            );
         }
 
         foreach ($added as $name => $amount) {
             $attribute = $graph->map->attributes[$name] ?? null;
             $before = $original->getAttributes()[$name] ?? null;
 
-            if ($attribute === null || $before === null || ! array_key_exists($name, $served)) {
+            if ($attribute === null || $before === null || $this->skips(
+                attribute: $attribute,
+                origin: $origin,
+            ) || ! array_key_exists($name, $served)) {
                 continue;
             }
 
             $sum = $this->connection->scalar('select cast(? as numeric) + cast(? as numeric)', [$before, $amount]);
-            $expected = $legacy->newInstance([], true)->setAttribute($name, $sum)->getAttributes()[$name] ?? null;
 
-            if (! self::same($legacy, $name, $expected, $served[$name])) {
-                throw CompatibilityWriteRefused::roundTrip(
-                    model: $this->map->model,
-                    attribute: $name,
-                    key: $key,
-                    written: $expected,
-                    served: $served[$name],
-                );
-            }
+            $this->compare(
+                legacy: $legacy,
+                name: $name,
+                key: $key,
+                written: $legacy->newInstance(
+                    attributes: [],
+                    exists: true,
+                )->setAttribute(
+                    key: $name,
+                    value: $sum,
+                )->getAttributes()[$name] ?? null,
+                served: $served[$name],
+                hidden: $hidden,
+            );
         }
 
-        return $row === null ? null : $served;
+        return $hidden ? null : $served;
     }
 
     /**
@@ -136,53 +182,170 @@ final class RoundTrip
         };
     }
 
-    public static function same(Model $legacy, string $name, mixed $written, mixed $served): bool
+    private function compare(Model $legacy, string $name, int|string $key, mixed $written, mixed $served, bool $hidden): void
     {
-        $written = $written instanceof BackedEnum ? $written->value : $written;
+        [$same, $cause] = self::same(
+            legacy: $legacy,
+            name: $name,
+            written: $written,
+            served: $served,
+            numeric: fn (): bool => $this->numeric($legacy, $name),
+        );
+
+        if ($same) {
+            return;
+        }
+
+        throw CompatibilityWriteRefused::roundTrip(
+            model: $this->map->model,
+            attribute: $name,
+            key: $key,
+            written: $written,
+            served: $served,
+            hidden: $hidden,
+            previous: $cause,
+        );
+    }
+
+    private function checkPath(int|string $key, string $name, string $path, mixed $value, mixed $column, bool $hidden): void
+    {
+        if (! is_string($column)) {
+            return;
+        }
+
+        $read = json_decode(
+            json: $column,
+            associative: true,
+        );
+        $segments = preg_split(
+            pattern: '/->|\[|\]/',
+            subject: $path,
+            limit: -1,
+            flags: PREG_SPLIT_NO_EMPTY,
+        );
+
+        foreach (is_array($segments) ? $segments : [] as $segment) {
+            $read = is_array($read) && array_key_exists(
+                key: $segment,
+                array: $read,
+            ) ? $read[$segment] : null;
+        }
+
+        $written = json_decode(
+            json: json_encode(
+                value: $value,
+                flags: JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION,
+            ),
+            associative: true,
+        );
+
+        if (self::canonical($read) === self::canonical($written)) {
+            return;
+        }
+
+        throw CompatibilityWriteRefused::roundTrip(
+            model: $this->map->model,
+            attribute: $name,
+            key: $key,
+            written: is_array($written) ? json_encode($written, JSON_THROW_ON_ERROR) : $written,
+            served: is_array($read) ? json_encode($read, JSON_THROW_ON_ERROR) : $read,
+            hidden: $hidden,
+        );
+    }
+
+    private function numeric(Model $legacy, string $name): bool
+    {
+        if ($legacy->hasCast(
+            key: $name,
+            types: self::NUMERIC_CASTS,
+        )) {
+            return true;
+        }
+
+        $known = self::$numeric ??= new WeakMap;
+        $models = $known[$this->connection] ?? [];
+        $models[$this->map->model] ??= array_keys(array_filter(
+            array: (new ColumnCatalog(
+                connection: $this->connection,
+                throughSearchPath: true,
+            ))->of($this->map->table),
+            callback: fn (Column $column) => SqlFragments::isNumeric($column->baseType ?? $column->type),
+        ));
+        $known[$this->connection] = $models;
+
+        return in_array(
+            needle: $name,
+            haystack: $models[$this->map->model],
+            strict: true,
+        );
+    }
+
+    /**
+     * @param  Closure(): bool  $numeric
+     * @return array{bool, null|Throwable}
+     */
+    private static function same(Model $legacy, string $name, mixed $written, mixed $served, Closure $numeric): array
+    {
+        $written = match (true) {
+            $written instanceof BackedEnum => $written->value,
+            $written instanceof DateTimeInterface => $legacy->fromDateTime($written),
+            default => $written,
+        };
 
         if (is_array($written)) {
-            return is_string($served) && self::canonical(json_decode($served, true)) === self::canonical($written);
+            return [is_string($served) && self::canonical(json_decode(json: $served, associative: true)) === self::canonical($written), null];
         }
 
         $probe = $legacy->newInstance([], true);
         $probe->setRawAttributes([$name => $served], true);
         $probe->setRawAttributes([$name => $written]);
+        $cause = null;
 
         try {
             if ($probe->originalIsEquivalent($name)) {
-                return true;
+                return [true, null];
             }
-        } catch (Throwable) {
+        } catch (Throwable $exception) {
+            $cause = $exception;
         }
 
-        return match (true) {
+        return [match (true) {
             $written === null || $served === null => $written === $served,
-            $written instanceof DateTimeInterface || $served instanceof DateTimeInterface => false,
             is_bool($written) || is_bool($served) => filter_var($written, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) === filter_var($served, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE),
-            is_numeric($written) && is_numeric($served) => self::numericallySame(written: $written, served: $served),
+            is_numeric($written) && is_numeric($served) && $numeric() => self::numericallySame(written: $written, served: $served),
+            self::decoded($written) !== null && self::decoded($served) !== null => self::canonical(self::decoded($written)) === self::canonical(self::decoded($served)),
             default => ExternalAttributes::same($served, $written),
-        };
+        }, $cause];
     }
 
     private static function numericallySame(int|float|string $written, int|float|string $served): bool
     {
-        if (is_float($written) || is_float($served) || stripos((string) $written, 'e') !== false || stripos((string) $served, 'e') !== false) {
+        if (is_float($written) || is_float($served)) {
             return (float) $written === (float) $served;
         }
 
-        return self::decimal((string) $written) === self::decimal((string) $served);
+        try {
+            return BigDecimal::of(trim((string) $written))->isEqualTo(trim((string) $served));
+        } catch (MathException) {
+            return false;
+        }
     }
 
-    private static function decimal(string $number): string
+    /**
+     * @return null|array<array-key, mixed>
+     */
+    private static function decoded(mixed $value): null|array
     {
-        $number = trim($number);
-        $negative = str_starts_with($number, '-');
-        [$whole, $fraction] = array_pad(explode('.', ltrim($number, '+-'), 2), 2, '');
-        $whole = ltrim($whole, '0');
-        $fraction = rtrim($fraction, '0');
-        $digits = ($whole === '' ? '0' : $whole).($fraction === '' ? '' : '.'.$fraction);
+        if (! is_string($value) || ! json_validate($value)) {
+            return null;
+        }
 
-        return $negative && $digits !== '0' ? '-'.$digits : $digits;
+        $decoded = json_decode(
+            json: $value,
+            associative: true,
+        );
+
+        return is_array($decoded) ? $decoded : null;
     }
 
     private static function canonical(mixed $value): mixed

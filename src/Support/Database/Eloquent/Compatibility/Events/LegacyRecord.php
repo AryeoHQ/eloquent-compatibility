@@ -459,7 +459,7 @@ final class LegacyRecord
             $values[$successor->getKeyName()] = json_encode($probe, JSON_THROW_ON_ERROR);
         }
 
-        $standIn = $probe === null ? '' : ', '.$retained.' AS (SELECT * FROM '.$retained.' UNION ALL SELECT * FROM jsonb_populate_record(NULL::'.$retained.', CAST(? AS jsonb)))';
+        $standIn = $probe === null ? '' : ', '.$retained.' AS (SELECT * FROM jsonb_populate_record(NULL::'.$retained.', CAST(? AS jsonb)))';
         $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
         $catalog = $nulls === [] ? [] : (new ColumnCatalog($connection))->of($successor->getTable());
         $columns = $catalog === [] ? 'populated.*' : implode(', ', array_map(
@@ -488,7 +488,7 @@ final class LegacyRecord
         }
 
         return $connection->select(
-            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).')'.$standIn.' SELECT '.implode(
+            'WITH '.$table.' AS NOT MATERIALIZED ('.($hard ? $others : $others.' UNION ALL '.$row).')'.$standIn.' SELECT '.implode(
                 separator: ', ',
                 array: $select,
             ).' FROM '.$retained.' '.ViewCompiler::root(
@@ -714,11 +714,15 @@ final class LegacyRecord
 
     private function placeholder(Model $successor): string
     {
-        $type = (new ColumnCatalog($successor->getConnection(), throughSearchPath: true))->type($successor->getTable(), $successor->getKeyName());
+        $column = (new ColumnCatalog(
+            connection: $successor->getConnection(),
+            throughSearchPath: true,
+        ))->of($successor->getTable())[$successor->getKeyName()] ?? null;
+        $type = $column === null ? null : $column->baseType ?? $column->type;
 
         return match (true) {
             $type === 'uuid' => '00000000-0000-0000-0000-000000000000',
-            in_array($type, ['integer', 'bigint', 'smallint', 'numeric'], true) => '0',
+            SqlFragments::isInteger($type), SqlFragments::isDecimal($type) => '0',
             default => '',
         };
     }

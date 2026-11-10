@@ -82,6 +82,7 @@ final class Staging
     public function related(string $class): null|Model
     {
         $related = $this->relation($class);
+        $this->refuseDeleting($related, 'related()');
         $model = $this->models[$related->table] ?? null;
 
         if ($this->forwarding !== null && $model !== $this->forwarding) {
@@ -103,6 +104,7 @@ final class Staging
      */
     public function relatedOrNew(string $class): Model
     {
+        $this->refuseDeleting($this->relation($class), 'relatedOrNew()');
         $existing = $this->related($class);
 
         if ($existing !== null) {
@@ -272,6 +274,24 @@ final class Staging
             model: $this->map->model,
             operation: 'an operation that names '.class_basename($class),
             because: 'The map relates no '.class_basename($class).' under its root '.class_basename($this->map->primary->model).', so the unit of work holds no such successor.',
+        );
+    }
+
+    private function refuseDeleting(Related $related, string $method): void
+    {
+        if (! array_key_exists(
+            key: $related->table,
+            array: $this->deletions,
+        )) {
+            return;
+        }
+
+        $name = class_basename($related->model);
+
+        throw CompatibilityWriteRefused::unsupported(
+            model: $this->map->model,
+            operation: "an operation that calls {$method} for {$name} after deleteRelated()",
+            because: "The unit of work deletes that {$name} after the saves, so a change to it would be saved and then deleted.",
         );
     }
 
