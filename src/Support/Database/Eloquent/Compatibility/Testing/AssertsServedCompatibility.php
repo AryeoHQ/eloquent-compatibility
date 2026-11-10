@@ -77,9 +77,11 @@ trait AssertsServedCompatibility
         }
         if ($map->legacyInitializer === null) {
             $uninitialized = [];
+            $legacy = new $model;
+            $allocated = [$legacy->getKeyName(), $map->successorKey, ...($legacy->usesUniqueIds() ? $legacy->uniqueIds() : [])];
 
             foreach ((new ColumnCatalog($connection, throughSearchPath: true))->of($views === null ? $map->table : ViewCompiler::retainedTable($map)) as $name => $column) {
-                if ($column->needsAValue() && ! in_array($name, [(new $model)->getKeyName(), $map->successorKey], true) && $map->legacyOnly([$name]) !== []) {
+                if ($column->needsAValue() && ! in_array($name, $allocated, true) && $map->legacyOnly([$name]) !== []) {
                     $uninitialized[] = $name;
                 }
             }
@@ -110,7 +112,7 @@ trait AssertsServedCompatibility
                     operator: '=',
                     value: $root->getKey(),
                 )->exists(),
-                'nativeCreate inserts no '.ViewCompiler::retainedTable($map).' row for the new '.class_basename($map->primary->model).'. Use '.CarriesLegacy::class.' on '.class_basename($map->primary->model).', and create it inside a transaction.',
+                'nativeCreate inserts no '.ViewCompiler::retainedTable($map).' row for the new '.class_basename($map->primary->model).'. Use '.CarriesLegacy::class.' on '.class_basename($map->primary->model).'.',
             );
 
             foreach ($siblings as $sibling) {

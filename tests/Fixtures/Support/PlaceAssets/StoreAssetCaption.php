@@ -10,11 +10,11 @@ use Support\Database\Eloquent\Compatibility\Write\Successors;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\FileMetadata;
 
+/**
+ * @implements WritesAttribute<PlaceAsset>
+ */
 final class StoreAssetCaption implements WritesAttribute
 {
-    /**
-     * @param  Successors<PlaceAsset>  $successors
-     */
     public function write(Successors $successors, mixed $value, Change $change): void
     {
         $asset = $successors->root();

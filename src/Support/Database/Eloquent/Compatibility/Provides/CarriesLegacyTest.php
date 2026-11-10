@@ -7,12 +7,14 @@ namespace Support\Database\Eloquent\Compatibility\Provides;
 use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -40,6 +42,7 @@ final class CarriesLegacyTest extends TestCase
     {
         $this->installListings();
         $next = (int) DB::scalar('select last_value + 1 from listings_id_seq');
+        InitializeLegacyListing::$seen = [];
 
         $seen = DB::transaction(function (): array {
             $job = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
@@ -54,6 +57,7 @@ final class CarriesLegacyTest extends TestCase
         $this->assertSame('JOB-Birch House', $row['mls_number']);
         $this->assertSame(['Birch House', 'JOB-Birch House'], [Listing::query()->findOrFail($next)->title, Listing::query()->findOrFail($next)->mls_number]);
         $this->assertSame($job, ListingTables::jobOf($next));
+        $this->assertSame([[$next, $job]], InitializeLegacyListing::$seen);
 
         DB::beginTransaction();
         $rolledBack = Job::query()->create(['name' => 'Cedar House', 'company_id' => ListingTables::COMPANY]);
@@ -96,6 +100,72 @@ final class CarriesLegacyTest extends TestCase
         }
 
         $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
+    }
+
+    #[Test]
+    public function it_keeps_no_root_of_a_native_save_or_ignore_outside_any_transaction_whose_retained_row_insert_fails(): void
+    {
+        $this->installListings();
+        DB::statement("alter table listings_retained add column required_note text not null default 'none'");
+        DB::statement('alter table listings_retained alter column required_note drop default');
+
+        try {
+            (new Job(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]))->saveOrIgnore();
+            $this->fail('The create did not fail.');
+        } catch (QueryException $exception) {
+            $this->assertSame('23502', $exception->getCode());
+        }
+
+        $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
+    }
+
+    #[Test]
+    public function it_keeps_no_root_of_a_native_create_outside_any_transaction_whose_legacy_model_installs_before_the_insert_and_whose_retained_row_insert_fails(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        DB::statement("alter table listings add column required_note text not null default 'none'");
+        DB::statement('alter table listings alter column required_note drop default');
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        $installed = false;
+        Event::listen('eloquent.creating: '.Job::class, function () use (&$installed): void {
+            if ($installed) {
+                return;
+            }
+
+            $installed = true;
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+        });
+
+        try {
+            Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+            $this->fail('The create did not fail.');
+        } catch (QueryException $exception) {
+            $this->assertSame('23502', $exception->getCode());
+        }
+
+        $this->assertTrue($installed);
+        $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
+    }
+
+    #[Test]
+    public function it_hands_the_legacy_initializer_the_related_successors_loaded_and_locked(): void
+    {
+        $this->installListings();
+        $statements = [];
+        DB::listen(function (QueryExecuted $query) use (&$statements): void {
+            if (preg_match('/^select .* from "(places|job_sites)"/s', $query->sql, $match) === 1) {
+                $statements[] = [$match[1], str_ends_with($query->sql, ' for update')];
+            }
+        });
+
+        DB::transaction(fn () => Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY]));
+
+        $this->assertSame([['places', true], ['job_sites', true]], $statements);
     }
 
     #[Test]

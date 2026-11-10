@@ -82,7 +82,7 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  array<array-key, Successors<Model>>  $graphs
+     * @param  array<array-key, Staging<Model>>  $graphs
      * @return array<class-string<Model>, list<int|string>>
      */
     public function touched(array $graphs): array
@@ -107,6 +107,12 @@ final readonly class UnitOfWork
             }
         }
 
+        foreach ($this->map->morphs as $variant) {
+            if ($variant->target !== null) {
+                $touched[$variant->target->model] ??= [];
+            }
+        }
+
         foreach ($touched as $class => $keys) {
             $keys = array_values(array_unique($keys, SORT_REGULAR));
             sort($keys);
@@ -119,8 +125,47 @@ final readonly class UnitOfWork
     }
 
     /**
+     * @param  Staging<Model>  $graph
+     * @param  array<string, mixed>  $values
+     * @return Staging<Model>
+     */
+    public function links(Staging $graph, array $values, bool $lock): Staging
+    {
+        $map = $graph->map;
+        $named = [];
+
+        foreach ($map->attributes as $name => $attribute) {
+            $owner = $map->owners[$name];
+            $value = $values[$name] ?? null;
+
+            if ($owner !== $map->primary && $value !== null && $attribute->readOnlyBecause() !== null && $attribute->storesColumn() && $attribute->invertible() && $attribute->column() === $owner->key) {
+                $named[$owner->table] = $this->stored($map, $attribute, $name, $value);
+            }
+        }
+
+        $models = [];
+
+        foreach ($map->related as $related) {
+            $parent = $models[$related->parentTable] ?? null;
+
+            if (array_key_exists($related->table, $named)) {
+                $query = $this->successor($related->model)->newQueryWithoutScopes()->whereKey($named[$related->table]);
+                $models[$related->table] = ($lock ? $query->lockForUpdate() : $query)->first();
+            } elseif ($parent !== null && ! $related->belongsTo) {
+                $models[$related->table] = $this->find($related, $parent, $lock);
+            }
+        }
+
+        return new Staging(
+            map: $map,
+            root: $graph->root(),
+            models: $models,
+        );
+    }
+
+    /**
      * @param  array<class-string<Model>, list<int|string>>  $scoped
-     * @param  array<array-key, Successors<Model>>  $graphs
+     * @param  array<array-key, Staging<Model>>  $graphs
      */
     public function refuseMoved(array $scoped, array $graphs): void
     {
@@ -184,7 +229,7 @@ final readonly class UnitOfWork
 
     /**
      * @param  array<array-key, array{ResolvedMap, Model}>  $roots
-     * @return array<array-key, Successors<Model>>
+     * @return array<array-key, Staging<Model>>
      */
     public function graphs(array $roots, bool $lock): array
     {
@@ -216,7 +261,7 @@ final readonly class UnitOfWork
         $graphs = [];
 
         foreach ($roots as $index => [$variant, $root]) {
-            $graphs[$index] = new Successors(
+            $graphs[$index] = new Staging(
                 map: $variant,
                 root: $root,
                 models: $models[$index],
@@ -227,11 +272,11 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $values
      * @param  array<string, float|int>  $amounts
      */
-    public function assign(Successors $graph, Model $record, Model $original, array $values, array $amounts, Origin $origin, bool $creating, bool $deleting = false, bool $restoring = false): void
+    public function assign(Staging $graph, Model $record, Model $original, array $values, array $amounts, Origin $origin, bool $creating, bool $deleting = false, bool $restoring = false): void
     {
         $map = $graph->map;
         $skipped = $creating ? [] : $this->trashed($graph, $record, $values, $deleting, $restoring);
@@ -241,6 +286,22 @@ final readonly class UnitOfWork
                 $key = (string) $key;
 
                 if (! str_starts_with($key, $name.'->')) {
+                    continue;
+                }
+
+                if ($attribute->readOnlyBecause() !== null) {
+                    $this->readOnlyPath(
+                        graph: $graph,
+                        attribute: $attribute,
+                        change: new Change(
+                            record: $record,
+                            original: $original,
+                            attribute: $name,
+                            origin: $origin,
+                        ),
+                        value: $value,
+                    );
+
                     continue;
                 }
 
@@ -274,7 +335,7 @@ final readonly class UnitOfWork
             $operation = $attribute->operation();
 
             if ($operation !== null) {
-                $this->operation($operation)->write($graph, $value, $change);
+                $this->operation($operation)->write($graph->successors(), $value, $change);
 
                 continue;
             }
@@ -291,9 +352,9 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    public function initialize(Successors $graph, Model $record, Origin $origin): void
+    public function initialize(Staging $graph, Model $record, Origin $origin): void
     {
         $initializer = $this->map->successorsInitializer;
 
@@ -307,44 +368,74 @@ final readonly class UnitOfWork
             throw new LogicException("The initializer {$initializer} does not implement ".InitializesSuccessors::class.'.');
         }
 
-        $instance->initialize($graph, new Creation(
+        $instance->initialize($graph->successors(), new Creation(
             record: $record,
             origin: $origin,
         ));
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    public function save(Successors $graph, Model $legacy): void
+    public function save(Staging $graph, Model $legacy): void
     {
+        $classes = self::timestampedClasses($graph);
+
+        foreach ($graph->held() as $model) {
+            if (! $model->exists && $model->usesTimestamps() && in_array($model::class, $classes, true)) {
+                $model->updateTimestamps();
+            }
+        }
+
         $this->saveNode(
             graph: $graph,
             table: $graph->map->primary->table,
             legacy: $legacy,
+            classes: $classes,
         );
 
         foreach ($graph->deletions() as $model) {
-            $this->run($legacy, $model, fn () => $model->delete());
+            $this->run($legacy, $model, fn () => self::untimestamped($classes, fn () => $model->delete()));
         }
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @template TResult
+     *
+     * @param  list<class-string<Model>>  $classes
+     * @param  Closure(): TResult  $write
+     * @return TResult
      */
-    public function act(Successors $graph, Model $legacy): void
+    private static function untimestamped(array $classes, Closure $write): mixed
     {
-        $classes = array_values(array_unique(array_map(
+        return $classes === [] ? $write() : Model::withoutTimestampsOn($classes, $write);
+    }
+
+    /**
+     * @param  Staging<Model>  $graph
+     * @return list<class-string<Model>>
+     */
+    private static function timestampedClasses(Staging $graph): array
+    {
+        return array_values(array_unique(array_map(
             callback: fn (Model $model) => $model::class,
-            array: array_values(array_filter($graph->held(), fn (Model $model) => $graph->timestamped($model)))),
-        ));
+            array: array_values(array_filter($graph->held(), fn (Model $model) => $graph->timestamped($model))),
+        )));
+    }
+
+    /**
+     * @param  Staging<Model>  $graph
+     */
+    public function act(Staging $graph, Model $legacy): void
+    {
+        $classes = self::timestampedClasses($graph);
 
         for ($actions = $graph->actions(); $actions !== []; $actions = $graph->actions()) {
             foreach ($actions as $action) {
                 $this->holding(
                     legacy: $legacy,
                     models: $graph->held(),
-                    write: fn () => $classes === [] ? $action() : Model::withoutTimestampsOn($classes, $action),
+                    write: fn () => self::untimestamped($classes, $action),
                 );
             }
         }
@@ -379,9 +470,9 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function readOnly(Successors $graph, Attribute $attribute, string $name, mixed $value, Change $change, bool $creating): void
+    private function readOnly(Staging $graph, Attribute $attribute, string $name, mixed $value, Change $change, bool $creating): void
     {
         $stored = $attribute->storesColumn() && $attribute->invertible();
 
@@ -416,9 +507,31 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function assignsCreated(Successors $graph, Attribute $attribute, string $name, mixed $value): bool
+    private function readOnlyPath(Staging $graph, Attribute $attribute, Change $change, mixed $value): void
+    {
+        if (! $attribute->ignoresWrites()) {
+            throw CompatibilityWriteRefused::readOnly(
+                model: $graph->map->model,
+                attribute: $change->attribute,
+                key: self::keyOf($change->original),
+                because: (string) $attribute->readOnlyBecause(),
+            );
+        }
+
+        if ($value !== null) {
+            Event::dispatch(new WriteIgnored(
+                change: $change,
+                value: $value,
+            ));
+        }
+    }
+
+    /**
+     * @param  Staging<Model>  $graph
+     */
+    private function assignsCreated(Staging $graph, Attribute $attribute, string $name, mixed $value): bool
     {
         $owner = $graph->map->owners[$name];
         $stored = $this->stored($graph->map, $attribute, $name, $value);
@@ -462,9 +575,9 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function assignInverse(Successors $graph, Attribute $attribute, string $name, mixed $value): void
+    private function assignInverse(Staging $graph, Attribute $attribute, string $name, mixed $value): void
     {
         $map = $graph->map;
         $owner = $map->owners[$name];
@@ -494,9 +607,9 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function assignPath(Successors $graph, Attribute $attribute, string $name, string $path, mixed $value): void
+    private function assignPath(Staging $graph, Attribute $attribute, string $name, string $path, mixed $value): void
     {
         $map = $graph->map;
         $owner = $map->owners[$name];
@@ -511,9 +624,9 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function assignColumn(Successors $graph, Model $model, string $column, null|string $path, mixed $stored): void
+    private function assignColumn(Staging $graph, Model $model, string $column, null|string $path, mixed $stored): void
     {
         if ($path !== null) {
             $model->forceFill([$column.'->'.$path => $stored]);
@@ -529,11 +642,11 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $values
      * @return array<string, true>
      */
-    private function trashed(Successors $graph, Model $record, array $values, bool $deleting, bool $restoring): array
+    private function trashed(Staging $graph, Model $record, array $values, bool $deleting, bool $restoring): array
     {
         $map = $graph->map;
         $root = $graph->root();
@@ -609,10 +722,10 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, float|int>  $amounts
      */
-    private function add(Successors $graph, array $amounts): void
+    private function add(Staging $graph, array $amounts): void
     {
         $map = $graph->map;
         $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
@@ -653,9 +766,10 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
+     * @param  list<class-string<Model>>  $classes
      */
-    private function saveNode(Successors $graph, string $table, Model $legacy): void
+    private function saveNode(Staging $graph, string $table, Model $legacy, array $classes): void
     {
         $model = $graph->model($table);
 
@@ -674,7 +788,12 @@ final readonly class UnitOfWork
                 continue;
             }
 
-            $this->saveNode($graph, $related->table, $legacy);
+            $this->saveNode(
+                graph: $graph,
+                table: $related->table,
+                legacy: $legacy,
+                classes: $classes,
+            );
 
             if ($graph->created($related->table) || $graph->linked($related->table)) {
                 self::assignRaw($model, array_filter([
@@ -685,10 +804,7 @@ final readonly class UnitOfWork
         }
 
         if ((! $model->exists || $model->isDirty()) && ! $graph->deferred($model)) {
-            $save = $model->exists && $graph->timestamped($model)
-                ? fn () => Model::withoutTimestampsOn([$model::class], fn () => $model->save())
-                : fn () => $model->save();
-            $this->run($legacy, $model, $save);
+            $this->run($legacy, $model, fn () => self::untimestamped($classes, fn () => $model->save()));
         }
 
         foreach ($graph->map->related as $related) {
@@ -716,7 +832,12 @@ final readonly class UnitOfWork
                 self::assignRaw($child, [$related->relatedKey => $model->getAttribute($related->parentKey)]);
             }
 
-            $this->saveNode($graph, $related->table, $legacy);
+            $this->saveNode(
+                graph: $graph,
+                table: $related->table,
+                legacy: $legacy,
+                classes: $classes,
+            );
         }
     }
 
@@ -774,7 +895,8 @@ final readonly class UnitOfWork
     }
 
     /**
-     * @param  class-string<WritesAttribute>  $operation
+     * @param  class-string<WritesAttribute<covariant Model>>  $operation
+     * @return WritesAttribute<Model>
      */
     private function operation(string $operation): WritesAttribute
     {

@@ -95,11 +95,16 @@ final readonly class MassWriter
             $written = 0;
             $keyName = (new $this->map->model)->getKeyName();
             $renamed = $retained[$keyName] ?? null;
+            $stored = $this->retainedValues(
+                roots: array_keys($roots),
+                names: [...array_keys($retained), ...array_keys(array_diff_key($retainedAmounts, $retained))],
+            );
+            $rootOf = array_flip($roots);
 
             foreach ($records as $key => [$original, $graph]) {
                 $values = is_int($renamed) || is_string($renamed) ? [...$mapped, $keyName => $renamed] : $mapped;
                 $after = clone $original;
-                $after->setRawAttributes(array_replace($original->getAttributes(), array_filter(
+                $after->setRawAttributes(array_replace($original->getAttributes(), $stored[(string) ($rootOf[$key] ?? '')] ?? [], array_filter(
                     array: $mapped,
                     callback: fn (int|string $name) => ! str_contains((string) $name, '->'),
                     mode: ARRAY_FILTER_USE_KEY,
@@ -129,18 +134,18 @@ final readonly class MassWriter
                     continue;
                 }
 
-                $chosen = $writer->chosen($after, $original, $graph, $mapped, []);
-
-                if ($chosen !== $graph->map && $this->map->morphHolding($graph->root()->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null) !== null && $this->map->morphFor($original) === $chosen) {
-                    $chosen = $graph->map;
-                }
-
                 $written += $writer->apply(
                     legacy: $after,
                     key: $key,
                     graph: $graph,
                     original: $original,
-                    chosen: $chosen,
+                    chosen: $writer->chosen(
+                        legacy: $after,
+                        original: $original,
+                        graph: $graph,
+                        mapped: $mapped,
+                        added: [],
+                    ),
                     values: $values,
                     mapped: $mapped,
                 );
@@ -166,7 +171,7 @@ final readonly class MassWriter
     }
 
     /**
-     * @param  Closure(array<int|string, array{Model, Successors<Model>}>, array<int|string, int|string>): int  $write
+     * @param  Closure(array<int|string, array{Model, Staging<Model>}>, array<int|string, int|string>): int  $write
      */
     private function each(QueryBuilder $keys, Closure $write): int
     {
@@ -214,6 +219,39 @@ final readonly class MassWriter
                 return $records === [] ? 0 : $write($records, array_flip(array_map(strval(...), $held)));
             });
         });
+    }
+
+    /**
+     * @param  list<int|string>  $roots
+     * @param  list<int|string>  $names
+     * @return array<string, array<string, mixed>>
+     */
+    private function retainedValues(array $roots, array $names): array
+    {
+        $columns = array_values(array_unique(array_map(
+            callback: fn (int|string $name) => Str::before((string) $name, '->'),
+            array: $names,
+        )));
+
+        if ($columns === [] || $roots === []) {
+            return [];
+        }
+
+        $retained = ViewCompiler::retainedTable($this->map);
+        $values = [];
+
+        foreach (array_chunk($roots, 1000) as $chunk) {
+            foreach ($this->connection->table($retained)->useWritePdo()->whereIn($retained.'.'.$this->map->successorKey, $chunk)->get([$this->map->successorKey, ...$columns]) as $row) {
+                $row = (array) $row;
+                $root = $row[$this->map->successorKey] ?? null;
+
+                if (is_int($root) || is_string($root)) {
+                    $values[(string) $root] = array_intersect_key($row, array_flip($columns));
+                }
+            }
+        }
+
+        return $values;
     }
 
     /**

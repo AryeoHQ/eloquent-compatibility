@@ -8,6 +8,9 @@ use Support\Database\Eloquent\Compatibility\Contracts\InitializesSuccessors;
 use Support\Database\Eloquent\Compatibility\Write\Creation;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 
+/**
+ * @implements InitializesSuccessors<Order>
+ */
 final class InitializeOrder implements InitializesSuccessors
 {
     public function initialize(Successors $successors, Creation $creation): void

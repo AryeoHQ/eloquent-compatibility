@@ -24,7 +24,7 @@ use Support\Database\Eloquent\Compatibility\Write\Applying;
 use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\Origin;
-use Support\Database\Eloquent\Compatibility\Write\Successors;
+use Support\Database\Eloquent\Compatibility\Write\Staging;
 use Throwable;
 use WeakMap;
 
@@ -580,12 +580,12 @@ final class Forwarder
                     throw new LogicException("The operation {$operation} does not implement ".WritesAttribute::class.'.');
                 }
 
-                $instance->write(new Successors(
+                $instance->write((new Staging(
                     map: $this->served,
                     root: $this->dependent === null ? $successor : (new $this->served->primary->model)->setConnection($successor->getConnectionName()),
                     models: $this->dependent === null ? [] : [$this->dependent->table => $successor],
                     forwarding: $successor,
-                ), $value, $change);
+                ))->successors(), $value, $change);
 
                 continue;
             }

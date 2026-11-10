@@ -43,10 +43,10 @@ final class Compatibility
     /** @var null|class-string<ManagesDependents> */
     private null|string $dependents = null;
 
-    /** @var null|class-string<InitializesSuccessors> */
+    /** @var null|class-string<InitializesSuccessors<covariant Model>> */
     private null|string $successorsInitializer = null;
 
-    /** @var null|class-string<InitializesLegacy> */
+    /** @var null|class-string<InitializesLegacy<covariant Model>> */
     private null|string $legacyInitializer = null;
 
     /** @var null|class-string<ScopesWrites> */
@@ -223,7 +223,7 @@ final class Compatibility
     }
 
     /**
-     * @param  class-string<InitializesSuccessors>  $initializer
+     * @param  class-string<InitializesSuccessors<covariant Model>>  $initializer
      */
     public function successorsInitializedBy(string $initializer): self
     {
@@ -238,7 +238,7 @@ final class Compatibility
     }
 
     /**
-     * @param  class-string<InitializesLegacy>  $initializer
+     * @param  class-string<InitializesLegacy<covariant Model>>  $initializer
      */
     public function legacyInitializedBy(string $initializer): self
     {

@@ -13,6 +13,9 @@ use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Transition;
 use Support\Database\Eloquent\StateMachines\StateMachine;
 use Support\Database\Eloquent\StateMachines\Triggers\Trigger;
 
+/**
+ * @implements WritesAttribute<Job>
+ */
 final class TransitionListingStatus implements WritesAttribute
 {
     private const array STATES = [
@@ -21,9 +24,6 @@ final class TransitionListingStatus implements WritesAttribute
         'Sold' => LifecycleStatus::Closed,
     ];
 
-    /**
-     * @param  Successors<Job>  $successors
-     */
     public function write(Successors $successors, mixed $value, Change $change): void
     {
         $job = $successors->root();

@@ -777,7 +777,7 @@ final class PlaceAssetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no youtube_embed_url.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'is_featured',
@@ -786,11 +786,11 @@ final class PlaceAssetTest extends TestCase
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'original_file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no original_file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'size_kb',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no size_kb.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',
@@ -798,7 +798,7 @@ final class PlaceAssetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'is_featured',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no is_featured.', ignoreWrites: true),
                                     ))));
             }
         };
@@ -850,7 +850,7 @@ final class PlaceAssetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no youtube_embed_url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
@@ -859,7 +859,7 @@ final class PlaceAssetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'size_kb',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no size_kb.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',

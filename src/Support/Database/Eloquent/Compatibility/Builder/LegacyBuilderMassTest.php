@@ -156,12 +156,12 @@ final class LegacyBuilderMassTest extends TestCase
 
         $this->assertSame([
             [1, "select set_config('TimeZone', ?, true)"],
-            [1, 'select listings'],
             [1, 'select listings_retained'],
             [1, 'select jobs for update'],
             [1, 'select listings_retained'],
             [1, 'select places for update'],
             [1, 'select job_sites for update'],
+            [1, 'select listings'],
             [1, 'select listings'],
             [1, 'update jobs'],
             [1, 'select listings'],

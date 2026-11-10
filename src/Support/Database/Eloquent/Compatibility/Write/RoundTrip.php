@@ -19,12 +19,12 @@ final readonly class RoundTrip
     public function __construct(private ResolvedMap $map, private Connection $connection) {}
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $written
      * @param  array<string, float|int>  $added
      * @return null|array<string, mixed>
      */
-    public function check(Successors $graph, Model $legacy, Model $original, int|string $key, array $written, array $added, Origin $origin): null|array
+    public function check(Staging $graph, Model $legacy, Model $original, int|string $key, array $written, array $added, Origin $origin): null|array
     {
         $row = $this->connection->table($this->map->table)->useWritePdo()->where($legacy->getKeyName(), $key)->first();
 
@@ -120,9 +120,30 @@ final readonly class RoundTrip
             $written === null || $served === null => $written === $served,
             $written instanceof DateTimeInterface || $served instanceof DateTimeInterface => false,
             is_bool($written) || is_bool($served) => filter_var($written, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) === filter_var($served, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE),
-            is_numeric($written) && is_numeric($served) => (float) $written === (float) $served,
+            is_numeric($written) && is_numeric($served) => self::numericallySame(written: $written, served: $served),
             default => ExternalAttributes::same($served, $written),
         };
+    }
+
+    private static function numericallySame(int|float|string $written, int|float|string $served): bool
+    {
+        if (is_float($written) || is_float($served) || stripos((string) $written, 'e') !== false || stripos((string) $served, 'e') !== false) {
+            return (float) $written === (float) $served;
+        }
+
+        return self::decimal((string) $written) === self::decimal((string) $served);
+    }
+
+    private static function decimal(string $number): string
+    {
+        $number = trim($number);
+        $negative = str_starts_with($number, '-');
+        [$whole, $fraction] = array_pad(explode('.', ltrim($number, '+-'), 2), 2, '');
+        $whole = ltrim($whole, '0');
+        $fraction = rtrim($fraction, '0');
+        $digits = ($whole === '' ? '0' : $whole).($fraction === '' ? '' : '.'.$fraction);
+
+        return $negative && $digits !== '0' ? '-'.$digits : $digits;
     }
 
     private static function canonical(mixed $value): mixed
@@ -139,9 +160,9 @@ final readonly class RoundTrip
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function checkComputed(Successors $graph, int|string $key, string $name, Attribute $attribute, mixed $value): void
+    private function checkComputed(Staging $graph, int|string $key, string $name, Attribute $attribute, mixed $value): void
     {
         $owner = $graph->map->owners[$name];
         $successor = $graph->model($owner->table)?->fresh();

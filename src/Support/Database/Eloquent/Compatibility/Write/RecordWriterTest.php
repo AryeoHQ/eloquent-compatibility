@@ -570,7 +570,7 @@ final class RecordWriterTest extends TestCase
                         )
                         ->attribute(
                             name: 'featured',
-                            definition: fn (Attribute $attribute) => $attribute->fixed(false),
+                            definition: fn (Attribute $attribute) => $attribute->fixed(false)->readOnly(because: 'No listing is featured any more.', ignoreWrites: false),
                         ));
             }
         };
@@ -582,7 +582,7 @@ final class RecordWriterTest extends TestCase
 
         $this->assertSame(['The MLS assigns its own numbers.', true], [$externalRefusal->because, str_ends_with($externalRefusal->refused, ' record 3 cannot change $mls_number')]);
         $this->assertStringStartsWith('Leave mls_number unchanged in writes through ', $externalRefusal->instead);
-        $this->assertStringEndsWith('::$featured cannot take a write. Why: The attribute always reads false, so it cannot store true. Instead: Write a value its conversions can store, or write the stored column through the successor model.', $fixedRefusal->getMessage());
+        $this->assertSame(['No listing is featured any more.', true], [$fixedRefusal->because, str_ends_with($fixedRefusal->refused, ' record 3 cannot change $featured')]);
         $this->assertSame($before, $this->snapshot());
     }
 

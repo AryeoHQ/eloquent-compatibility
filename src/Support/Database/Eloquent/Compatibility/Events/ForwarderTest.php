@@ -13,7 +13,6 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
-use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -646,12 +645,23 @@ final class ForwarderTest extends TestCase
         $photo->update(['filename' => 'oak-porch.jpg']);
         $read = implode("\n", array_column(DB::getQueryLog(), 'query'));
         DB::disableQueryLog();
+        $updated = $this->seen;
+        $this->seen = [];
+        $lease = File::query()->create(['filename' => 'birch-lease.pdf', 'mime_type' => 'application/pdf']);
+        $tour = File::query()->create(['filename' => 'tour.mp4', 'mime_type' => 'video/mp4']);
 
         $this->assertStringContainsString('"photos_retained"', $read);
         $this->assertStringNotContainsString('"legacy_files_retained"', $read);
         $this->assertSame([
             ['saving', 'Photo', 1, 'oak-porch.jpg'], ['updating', 'Photo', 1, 'oak-porch.jpg'], ['updated', 'Photo', 1, 'oak-porch.jpg'], ['saved', 'Photo', 1, 'oak-porch.jpg'],
-        ], $this->seen);
+        ], $updated);
+        $this->assertSame([
+            ['created', 'LegacyFile', 3, 'birch-lease.pdf'], ['saved', 'LegacyFile', 3, 'birch-lease.pdf'],
+        ], array_values(array_filter($this->seen, fn (array $seen) => in_array($seen[0], ['created', 'saved'], true))));
+        $this->assertSame([[true, false], [false, false]], array_map(fn (File $file) => [
+            DB::table('legacy_files_retained')->where('file_id', $file->id)->exists(),
+            DB::table('photos_retained')->where('file_id', $file->id)->exists(),
+        ], [$lease, $tour]));
     }
 
     #[Test]
@@ -662,16 +672,23 @@ final class ForwarderTest extends TestCase
         FileTables::seedMedia();
         FileTables::install();
         FileTables::installMedia();
-        $this->listen(Video::class, ['updating', 'updated'], fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url, $video->getOriginal('youtube_embed_url')]);
+        $this->listen(Video::class, ['creating', 'created', 'updating', 'updated'], fn (Video $video) => [$video->id, $video->original_file_name, $video->youtube_embed_url, $video->getOriginal('youtube_embed_url')]);
         $this->listen(InteractiveContent::class, self::EVENTS, fn (InteractiveContent $content) => [$content->id]);
 
         File::query()->whereKey(FileTables::fileOf(table: 'videos', id: 2))->firstOrFail()->update(['embed_url' => 'https://youtu.be/oak-2']);
         File::query()->whereKey(FileTables::fileOf(table: 'videos', id: 3))->firstOrFail()->update(['filename' => 'drone-2.mov']);
+        $walk = File::query()->create(['filename' => 'walk.mp4', 'mime_type' => 'video/mp4']);
 
         $this->assertSame([
             ['updating', 2, null, 'https://youtu.be/oak-2', 'https://youtu.be/oak'], ['updated', 2, null, 'https://youtu.be/oak-2', 'https://youtu.be/oak'],
             ['updating', 3, 'drone-2.mov', null, null], ['updated', 3, 'drone-2.mov', null, null],
+            ['creating', null, 'walk.mp4', null, null], ['created', 4, 'walk.mp4', null, null],
         ], $this->seen);
+        $this->assertSame([true, false, false], [
+            DB::table('videos_retained')->where('file_id', $walk->id)->exists(),
+            DB::table('photos_retained')->where('file_id', $walk->id)->exists(),
+            DB::table('legacy_files_retained')->where('file_id', $walk->id)->exists(),
+        ]);
     }
 
     #[Test]
@@ -757,8 +774,12 @@ final class ForwarderTest extends TestCase
         $oak->update(['merged_into_job_id' => Job::query()->whereKey(ListingTables::jobOf(3))->value('id')]);
         $hidden = Listing::query()->find(1);
         $oak->update(['merged_into_job_id' => null]);
+        $birch = Job::query()->create(['name' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'merged_into_job_id' => Job::query()->whereKey(ListingTables::jobOf(3))->value('id')]);
+        $created = DB::table('listings')->where('title', 'Birch House')->exists();
+        $birch->update(['merged_into_job_id' => null]);
 
         $this->assertSame([[], null, true], [$this->seen, $hidden, Listing::query()->find(1) !== null]);
+        $this->assertSame([false, true], [$created, DB::table('listings')->where('title', 'Birch House')->exists()]);
     }
 
     #[Test]
@@ -983,7 +1004,6 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_no_write_a_job_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
     {
-        Date::setTestNow('2026-06-07 10:00:00');
         Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
             Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);
             Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
@@ -999,7 +1019,6 @@ final class ForwarderTest extends TestCase
     #[Test]
     public function it_forwards_no_write_a_job_saved_listener_makes_to_the_record_a_legacy_create_is_creating_before_the_create_reads_its_key(): void
     {
-        Date::setTestNow('2026-06-07 10:00:00');
         Event::listen('eloquent.saved: '.Job::class, function (Job $job): void {
             if ($job->wasRecentlyCreated && ! Place::query()->where('job_id', $job->id)->exists()) {
                 Place::query()->create(['job_id' => $job->id, 'street' => '9 Birch St']);

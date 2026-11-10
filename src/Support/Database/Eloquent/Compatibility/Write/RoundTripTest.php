@@ -8,8 +8,10 @@ use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -21,6 +23,7 @@ use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\WriteFileMimeType;
+use Tests\Fixtures\Support\Listings\ConfiguredJob;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -39,6 +42,64 @@ final class RoundTripTest extends TestCase
         FileTables::drop();
 
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_refuses_a_write_of_a_long_numeric_value_that_reads_back_another_value_past_the_precision_of_a_float(): void
+    {
+        DB::statement('create table tallies (id serial primary key, name text not null, total numeric(30, 2), created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, total numeric(30, 2))');
+        DB::table('tallies')->insert([['name' => 'Oak', 'total' => '1']]);
+        $tally = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'tallies';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $tally): Compatibility
+            {
+                return $tally
+                    ->retainedIn('tallies_retained')
+                    ->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'total', definition: fn (Attribute $attribute) => $attribute->from('total')));
+            }
+        };
+        Event::listen('eloquent.saving: '.ConfiguredJob::class, function (ConfiguredJob $job): void {
+            if ($job->getAttribute('total') === '12345678901234567890') {
+                $job->setAttribute('total', '12345678901234567891');
+            }
+        });
+
+        try {
+            Compatibility::prepare($tally::class);
+            DB::statement('update tallies set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, total) select job_id, name, total from tallies');
+            Compatibility::install(
+                model: $tally::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            try {
+                $tally->newQuery()->findOrFail(1)->update(['total' => '12345678901234567890']);
+                $refusal = 'no refusal';
+            } catch (CompatibilityWriteRefused $exception) {
+                $refusal = $exception->getMessage();
+            }
+
+            $total = DB::table('configured_jobs')->value('total');
+            $rounded = $tally->newQuery()->findOrFail(1)->update(['total' => '7']);
+        } finally {
+            DB::statement('drop view if exists tallies');
+            DB::statement('drop table if exists tallies, tallies_retained, tallies_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('tallies'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertStringContainsString("cannot take this write of \$total. Why: The write stores '12345678901234567890', and the view now serves total as '12345678901234567891.00'", $refusal);
+        $this->assertSame(['1.00', true], [$total, $rounded]);
     }
 
     #[Test]

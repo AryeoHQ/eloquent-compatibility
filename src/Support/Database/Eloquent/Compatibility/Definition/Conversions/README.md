@@ -28,7 +28,7 @@ Each class implements `Conversion`:
 
 An attribute may chain several conversions. `Attribute::read()` applies them in declaration order. `Attribute::write()` and `Attribute::filter()` apply them in reverse. Each step receives the SQL type the previous step produced, so `Attribute::exact()` can judge every step against its real input type.
 
-`fixed()` and `readAs()` replace the chain. An attribute that declares either one has no other conversion.
+`fixed()` and `readAs()` replace the chain. An attribute that declares either one has no other conversion. Neither has an inverse, so a `fixed()` attribute also declares `readOnly()`, and a `readAs()` attribute declares `writtenBy()` or `readOnly()`.
 
 ## The classes
 

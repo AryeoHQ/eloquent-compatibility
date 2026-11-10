@@ -34,7 +34,7 @@ class OperationMustReferenceRelatedSuccessorTest extends RuleTestCase
         $this->analyse(files: $this->withMaps('Operations/WriteOrderShipment.php'), expectedErrors: [
             [
                 'Operation Tests\Fixtures\Tooling\Operations\WriteOrderShipment must reference a related successor, and no map that names it relates Tests\Fixtures\Tooling\Operations\Shipment.',
-                15,
+                18,
             ],
         ]);
     }
@@ -45,11 +45,11 @@ class OperationMustReferenceRelatedSuccessorTest extends RuleTestCase
         $this->analyse(files: $this->withMaps('Operations/InitializeOrder.php', 'Operations/InitializeLegacyOrder.php'), expectedErrors: [
             [
                 'Operation Tests\Fixtures\Tooling\Operations\InitializeOrder must reference a related successor, and no map that names it relates Tests\Fixtures\Tooling\Operations\Invoice.',
-                15,
+                18,
             ],
             [
                 'Operation Tests\Fixtures\Tooling\Operations\InitializeLegacyOrder must reference a related successor, and no map that names it relates Tests\Fixtures\Tooling\Operations\Shipment.',
-                15,
+                18,
             ],
         ]);
     }
@@ -66,7 +66,7 @@ class OperationMustReferenceRelatedSuccessorTest extends RuleTestCase
         $this->analyse(files: $this->withMaps('Operations/WriteOrderTotal.php'), expectedErrors: [
             [
                 'Operation Tests\Fixtures\Tooling\Operations\WriteOrderTotal must reference a related successor, and no map that names it relates Tests\Fixtures\Tooling\Operations\Order.',
-                15,
+                18,
             ],
         ]);
     }
@@ -77,7 +77,7 @@ class OperationMustReferenceRelatedSuccessorTest extends RuleTestCase
         $this->analyse(files: $this->withMaps('Operations/WriteInvoiceCustomer.php'), expectedErrors: [
             [
                 'Operation Tests\Fixtures\Tooling\Operations\WriteInvoiceCustomer must reference a related successor, and no map that names it relates Tests\Fixtures\Tooling\Operations\Customer.',
-                16,
+                19,
             ],
         ]);
     }

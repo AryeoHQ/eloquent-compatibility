@@ -71,12 +71,12 @@ final class Brochure extends Model implements Compatible
                             )
                             ->attribute(
                                 name: 'url',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                             ))
                         ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                             ->attribute(
                                 name: 'file_name',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'url',

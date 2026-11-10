@@ -72,16 +72,16 @@ final class FloorPlan extends Model implements Compatible
                             )
                             ->attribute(
                                 name: 'url',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no url.', ignoreWrites: true),
                             ))
                         ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                             ->attribute(
                                 name: 'file_name',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'mime_type',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no mime_type.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'url',

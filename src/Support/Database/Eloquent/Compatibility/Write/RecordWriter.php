@@ -53,13 +53,27 @@ final readonly class RecordWriter
                 );
             }
 
-            $graph = new Successors(
+            $graph = new Staging(
                 map: $variant,
                 root: $root,
                 models: [],
             );
 
-            return $this->unit->scoped($this->unit->touched([$graph]), function () use ($legacy, $values, $mapped, $retained, $variant, $root, $graph): int|string {
+            $touched = $this->unit->scopes() ? $this->unit->touched([$this->unit->links(
+                graph: $graph,
+                values: $mapped,
+                lock: false,
+            )]) : [];
+
+            return $this->unit->scoped($touched, function () use ($legacy, $values, $mapped, $retained, $variant, $root, $graph, $touched): int|string {
+                if ($this->unit->scopes()) {
+                    $this->unit->refuseMoved($touched, [$this->unit->links(
+                        graph: $graph,
+                        values: $mapped,
+                        lock: true,
+                    )]);
+                }
+
                 $original = $legacy->newInstance();
 
                 if ($variant->target !== null) {
@@ -116,7 +130,7 @@ final readonly class RecordWriter
             $values = $this->untouched($legacy, $values, $touched);
             [$mapped, $retained] = $this->split($legacy, $values, $key);
 
-            return $this->written($legacy, $key, $mapped, [], function (Successors $graph, Model $original, ResolvedMap $chosen) use ($legacy, $key, $values, $mapped, $retained, $deleting, $restoring): int {
+            return $this->written($legacy, $key, $mapped, [], function (Staging $graph, Model $original, ResolvedMap $chosen) use ($legacy, $key, $values, $mapped, $retained, $deleting, $restoring): int {
                 $retained = $this->guard($legacy, $key, $values, [], $retained, $chosen === $graph->map ? null : $chosen);
                 $this->retain($key, $graph->root(), $retained, []);
 
@@ -136,11 +150,11 @@ final readonly class RecordWriter
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $values
      * @param  array<string, mixed>  $mapped
      */
-    public function apply(Model $legacy, int|string $key, Successors $graph, Model $original, ResolvedMap $chosen, array $values, array $mapped, bool $deleting = false, bool $restoring = false): int
+    public function apply(Model $legacy, int|string $key, Staging $graph, Model $original, ResolvedMap $chosen, array $values, array $mapped, bool $deleting = false, bool $restoring = false): int
     {
         [$graph, $mapped] = $this->moved($graph, $chosen, $original, $mapped);
         $this->unit->assign(
@@ -169,7 +183,7 @@ final readonly class RecordWriter
             [$mapped, $retained] = $this->split($legacy, $extra, $key);
             [$added, $retainedAmounts] = $this->amounts($amounts);
 
-            return $this->written($legacy, $key, $mapped, $added, function (Successors $graph, Model $original) use ($legacy, $key, $amounts, $extra, $mapped, $retained, $added, $retainedAmounts): int {
+            return $this->written($legacy, $key, $mapped, $added, function (Staging $graph, Model $original) use ($legacy, $key, $amounts, $extra, $mapped, $retained, $added, $retainedAmounts): int {
                 $retained = $this->guard($legacy, $key, $extra, $amounts, $retained);
                 $this->retain($key, $graph->root(), $retained, array_diff_key($retainedAmounts, $retained));
                 $this->unit->assign(
@@ -201,7 +215,7 @@ final readonly class RecordWriter
     public function delete(Model $legacy): int
     {
         return $this->unit->transaction(function () use ($legacy): int {
-            return $this->written($legacy, UnitOfWork::keyOf($legacy), [], [], function (Successors $graph, Model $original, ResolvedMap $chosen) use ($legacy): int {
+            return $this->written($legacy, UnitOfWork::keyOf($legacy), [], [], function (Staging $graph, Model $original, ResolvedMap $chosen) use ($legacy): int {
                 ExternalAttributes::resolveAll($legacy);
                 $root = $graph->root();
                 $this->unit->run($legacy, $root, fn () => $root->forceDelete());
@@ -214,14 +228,13 @@ final readonly class RecordWriter
     /**
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
-     * @param  Closure(Successors<Model>, Model, ResolvedMap): int  $write
+     * @param  Closure(Staging<Model>, Model, ResolvedMap): int  $write
      */
     private function written(Model $legacy, int|string $key, array $mapped, array $added, Closure $write): int
     {
-        $original = $this->original($legacy, $key);
         $rootKey = $this->rootKeyOf($legacy, $key);
 
-        if ($original === null || $rootKey === null) {
+        if ($rootKey === null) {
             return 0;
         }
 
@@ -237,7 +250,7 @@ final readonly class RecordWriter
             $touched = $this->unit->touched($this->unit->graphs([[$this->variantOf($root), $root]], lock: false));
         }
 
-        return $this->unit->scoped($touched, function () use ($legacy, $original, $rootKey, $mapped, $added, $touched, $write): int {
+        return $this->unit->scoped($touched, function () use ($legacy, $key, $rootKey, $mapped, $added, $touched, $write): int {
             $root = $this->unit->roots([$rootKey], lock: true)[$rootKey] ?? null;
 
             if ($root === null) {
@@ -247,18 +260,29 @@ final readonly class RecordWriter
             $current = $this->variantOf($root);
             $graph = $this->unit->graphs([[$current, $root]], lock: true)[0];
             $this->unit->refuseMoved($touched, [$graph]);
+            $original = $this->original($legacy, $key);
 
-            return $write($graph, $original, $this->chosen($legacy, $original, $graph, $mapped, $added));
+            if ($original === null) {
+                return 0;
+            }
+
+            return $write($graph, $original, $this->chosen(
+                legacy: $legacy,
+                original: $original,
+                graph: $graph,
+                mapped: $mapped,
+                added: $added,
+            ));
         });
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $values
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
      */
-    public function finish(Model $legacy, int|string $key, Successors $graph, Model $original, array $values, array $mapped, array $added): int
+    public function finish(Model $legacy, int|string $key, Staging $graph, Model $original, array $values, array $mapped, array $added): int
     {
         $this->unit->save($graph, $legacy);
         $this->unit->act($graph, $legacy);
@@ -319,11 +343,11 @@ final readonly class RecordWriter
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
      */
-    public function chosen(Model $legacy, Model $original, Successors $graph, array $mapped, array $added): ResolvedMap
+    public function chosen(Model $legacy, Model $original, Staging $graph, array $mapped, array $added): ResolvedMap
     {
         if ($this->map->morphs === [] || $added !== []) {
             return $graph->map;
@@ -342,15 +366,19 @@ final readonly class RecordWriter
             $this->refuseUnsupplied($legacy, UnitOfWork::keyOf($original), $type, $chosen, $mapped);
         }
 
+        if ($current !== null && $this->map->morphFor($original) === $chosen) {
+            return $graph->map;
+        }
+
         return $chosen;
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      * @param  array<string, mixed>  $mapped
-     * @return array{Successors<Model>, array<string, mixed>}
+     * @return array{Staging<Model>, array<string, mixed>}
      */
-    private function moved(Successors $graph, ResolvedMap $chosen, Model $original, array $mapped): array
+    private function moved(Staging $graph, ResolvedMap $chosen, Model $original, array $mapped): array
     {
         $current = $graph->map;
         $holding = $this->map->morphs === [] ? $current : $this->map->morphHolding($graph->root()->getAttributes()[(string) $this->map->morph?->typeColumn] ?? null);
@@ -368,7 +396,7 @@ final readonly class RecordWriter
         }
 
         $old = $current->target === null || $holding === null ? null : $graph->model($current->target->table);
-        $moved = new Successors(
+        $moved = new Staging(
             map: $chosen,
             root: $graph->root(),
             models: $models,
@@ -486,9 +514,9 @@ final readonly class RecordWriter
     }
 
     /**
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function refuseRepointed(Model $legacy, Successors $graph, null|int|string $key): void
+    private function refuseRepointed(Model $legacy, Staging $graph, null|int|string $key): void
     {
         $morph = $this->map->morph;
         $related = $graph->map->target;
@@ -524,9 +552,9 @@ final readonly class RecordWriter
 
     /**
      * @param  null|array<string, mixed>  $served
-     * @param  Successors<Model>  $graph
+     * @param  Staging<Model>  $graph
      */
-    private function refuseStoredMorph(Model $legacy, null|int|string $key, null|array $served, ResolvedMap $held, Successors $graph, null|Model $original = null): void
+    private function refuseStoredMorph(Model $legacy, null|int|string $key, null|array $served, ResolvedMap $held, Staging $graph, null|Model $original = null): void
     {
         if ($this->map->morphs === [] || $served === null || $held->target === null || $graph->model($held->target->table) === null) {
             return;

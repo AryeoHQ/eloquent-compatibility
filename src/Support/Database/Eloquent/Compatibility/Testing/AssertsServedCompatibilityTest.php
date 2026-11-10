@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Testing;
 use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
@@ -156,7 +157,7 @@ final class AssertsServedCompatibilityTest extends TestCase
         $this->install();
 
         $this->assertStringStartsWith(
-            'nativeCreate inserts no listings_retained row for the new Job. Use '.CarriesLegacy::class.' on Job, and create it inside a transaction.',
+            'nativeCreate inserts no listings_retained row for the new Job. Use '.CarriesLegacy::class.' on Job.',
             $this->failureOf(
                 model: Listing::class,
                 nativeCreate: function (): Job {
@@ -182,6 +183,44 @@ final class AssertsServedCompatibilityTest extends TestCase
                 model: FloorPlan::class,
                 nativeCreate: fn () => PlaceAsset::query()->create(['legacy_type' => 'floorplan', 'asset_type' => 'place_asset_file', 'asset_id' => AssetFile::query()->create(['filename' => 'pine-plan.pdf'])->getKey()]),
             ),
+        );
+    }
+
+    #[Test]
+    public function it_passes_when_the_one_legacy_only_not_null_column_with_no_default_is_a_unique_id_the_legacy_model_allocates(): void
+    {
+        $this->installFloorPlans(classified: true);
+        DB::statement('alter table floorplans_retained alter column uuid drop default');
+        $model = (new class extends Model implements Compatible
+        {
+            use HasUuids;
+            use ServesCompatibility;
+
+            protected $table = 'floorplans';
+
+            protected $guarded = [];
+
+            /**
+             * @return list<string>
+             */
+            public function uniqueIds(): array
+            {
+                return ['uuid'];
+            }
+
+            public static function compatibility(Compatibility $floorPlan): Compatibility
+            {
+                return FloorPlan::compatibility($floorPlan);
+            }
+        })::class;
+        $this->app->instance(ServedModels::class, self::servedOnly(
+            model: $model,
+            files: new Filesystem,
+        ));
+
+        $this->assertServesCompatibility(
+            model: $model,
+            nativeCreate: self::floorPlan(),
         );
     }
 
@@ -291,6 +330,34 @@ final class AssertsServedCompatibilityTest extends TestCase
         }
 
         $this->fail("assertServesCompatibility({$model}) passed.");
+    }
+
+    /**
+     * @param  class-string<Model&Compatible>  $model
+     */
+    private static function servedOnly(string $model, Filesystem $files): ServedModels
+    {
+        $cache = (string) tempnam(
+            directory: sys_get_temp_dir(),
+            prefix: 'compatibility-served-',
+        );
+        $files->put(
+            path: $cache,
+            contents: '<?php return '.var_export(
+                value: [$model],
+                return: true,
+            ).';',
+        );
+        $served = new ServedModels(
+            cache: $cache,
+            scans: false,
+            withoutCache: false,
+            files: $files,
+        );
+        $served->all();
+        $files->delete($cache);
+
+        return $served;
     }
 
     private function install(): void

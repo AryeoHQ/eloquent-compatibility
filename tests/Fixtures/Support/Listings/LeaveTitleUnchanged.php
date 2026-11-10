@@ -8,10 +8,10 @@ use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 
+/**
+ * @implements WritesAttribute<Job>
+ */
 final class LeaveTitleUnchanged implements WritesAttribute
 {
-    /**
-     * @param  Successors<Job>  $successors
-     */
     public function write(Successors $successors, mixed $value, Change $change): void {}
 }

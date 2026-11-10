@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\InterleavingWriteScope;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -48,6 +49,8 @@ final class UnitOfWorkTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
         RecordingWriteScope::$received = [];
+        InterleavingWriteScope::$received = [];
+        InterleavingWriteScope::$interleave = null;
     }
 
     protected function tearDown(): void
@@ -139,6 +142,127 @@ final class UnitOfWorkTest extends TestCase
         $this->assertCount(1, RecordingWriteScope::$received);
         $this->assertSame($jobs, RecordingWriteScope::$received[0][Job::class]);
         $this->assertSame(['9 Shared St', '9 Shared St'], Place::query()->whereIn('job_id', $jobs)->pluck('street')->all());
+    }
+
+    #[Test]
+    public function it_reads_the_original_of_a_write_after_the_lock_so_a_commit_made_after_the_scope_read_is_kept(): void
+    {
+        $job = ListingTables::jobOf(1);
+        config(['database.connections.concurrent' => config('database.connections.'.config('database.default'))]);
+        InterleavingWriteScope::$interleave = function () use ($job): void {
+            DB::connection('concurrent')->table('jobs')->where('id', $job)->update(['price_cents' => 99900]);
+        };
+        $listing = $this->interleaved()->newQuery()->findOrFail(1);
+
+        $listing->increment('price', 1);
+
+        $this->assertCount(1, InterleavingWriteScope::$received);
+        $this->assertSame(100000, DB::table('jobs')->where('id', $job)->value('price_cents'));
+        $this->assertSame('1000.00', $this->interleaved()->newQuery()->findOrFail(1)->getAttribute('price'));
+    }
+
+    #[Test]
+    public function it_keeps_the_legacy_updated_at_of_a_create_whose_job_created_listener_saves_the_job_a_second_later(): void
+    {
+        Event::listen('eloquent.created: '.Job::class, function (Job $job): void {
+            usleep(1_100_000);
+            Job::query()->findOrFail($job->id)->update(['price_cents' => 1]);
+        });
+
+        $created = Listing::query()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'updated_at' => '2026-03-01 08:00:00']);
+
+        $this->assertSame(['2026-03-01 08:00:00', '0.01'], [$created->refresh()->updated_at?->format('Y-m-d H:i:s'), $created->price]);
+        $this->assertNotNull(DB::table('jobs')->where('id', ListingTables::jobOf($created->id))->value('created_at'));
+    }
+
+    #[Test]
+    public function it_hands_the_write_scope_the_key_of_an_existing_place_a_create_links(): void
+    {
+        $place = (string) Place::query()->where('job_id', ListingTables::jobOf(1))->value('id');
+
+        $created = $this->linking()->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place]);
+
+        $job = (string) ListingTables::jobOf($created->getKey());
+        $this->assertSame([[Job::class => [], Place::class => [$place]]], InterleavingWriteScope::$received);
+        $this->assertSame($job, Place::query()->whereKey($place)->value('job_id'));
+    }
+
+    #[Test]
+    public function it_refuses_with_a_retryable_error_when_the_place_a_create_links_moves_after_the_write_scope_ran(): void
+    {
+        $place = (string) Place::query()->where('job_id', ListingTables::jobOf(1))->value('id');
+        $listings = DB::table('listings_retained')->count();
+        InterleavingWriteScope::$interleave = function () use ($place): void {
+            DB::table('places')->where('id', $place)->delete();
+        };
+
+        try {
+            $this->linking()->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place]);
+            $this->fail('The create was not refused.');
+        } catch (CompatibilityWriteRefused $refusal) {
+            $this->assertStringContainsString('cannot take this write now, because its Place rows moved after the write scope ran', $refusal->getMessage());
+        }
+
+        $this->assertSame($listings, DB::table('listings_retained')->count());
+        $this->assertSame((string) ListingTables::jobOf(1), Place::query()->whereKey($place)->value('job_id'));
+    }
+
+    private function linking(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'place_id', definition: fn (Attribute $attribute) => $attribute->from('id')->readOnly(because: 'A listing keeps its place.', ignoreWrites: false))))
+                    ->writesWithin(InterleavingWriteScope::class);
+            }
+        };
+    }
+
+    private function interleaved(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+            use SoftDeletes;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            protected function casts(): array
+            {
+                return ['price' => 'decimal:2', 'status' => ListingStatus::class, 'latitude' => 'float'];
+            }
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->attribute(name: 'price', definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'street', definition: fn (Attribute $attribute) => $attribute->from('street'))))
+                    ->writesWithin(InterleavingWriteScope::class);
+            }
+        };
     }
 
     /**

@@ -29,15 +29,9 @@ final class RetainedRows
 
     public function __construct(private readonly ResolvedMap $map, private readonly ConnectionInterface $connection) {}
 
-    public static function served(Model $root): bool
+    public static function carries(Model $root): bool
     {
-        foreach (self::carriers($root) as $map) {
-            if (self::installed($root->getConnection(), $map)) {
-                return true;
-            }
-        }
-
-        return false;
+        return self::carriers($root) !== [];
     }
 
     public static function carry(Model $root): void
@@ -70,6 +64,20 @@ final class RetainedRows
             $legacy->setUniqueIds();
         }
 
+        $sequence = $legacy->getKey() === null ? $this->connection->scalar('select pg_get_serial_sequence(?, ?)', [SqlFragments::identifier(ViewCompiler::retainedTable($this->map)), $legacy->getKeyName()]) : null;
+
+        if (is_string($sequence)) {
+            $legacy->setAttribute(
+                key: $legacy->getKeyName(),
+                value: $this->connection->scalar('select nextval(cast(? as regclass))', [$sequence]),
+            );
+        }
+
+        $legacy->setAttribute(
+            key: $this->map->successorKey,
+            value: UnitOfWork::keyOf($root),
+        );
+
         $initializer = $this->map->legacyInitializer;
 
         if ($initializer !== null) {
@@ -82,8 +90,8 @@ final class RetainedRows
             $graphs = (new UnitOfWork(
                 map: $this->map,
                 connection: $root->getConnection(),
-            ))->graphs([[$this->map, $root]], lock: false);
-            $instance->initialize($graphs[0], new Creation(
+            ))->graphs([[$this->map, $root]], lock: true);
+            $instance->initialize($graphs[0]->successors(), new Creation(
                 record: $legacy,
                 origin: Origin::Live,
             ));

@@ -71,7 +71,7 @@ final class AttributeTest extends TestCase
     #[Test]
     public function it_reads_a_fixed_value_from_no_column_and_cannot_be_written(): void
     {
-        $attribute = (new Attribute('videos', 'mime_type'))->fixed(null)->resolve();
+        $attribute = (new Attribute('videos', 'mime_type'))->fixed(null)->readOnly(because: 'A link has no MIME type.', ignoreWrites: true)->resolve();
 
         $this->assertEquals([new Fixed(null)], $attribute->conversions());
         $this->assertSame([null, 'NULL', false], [$attribute->column(), $attribute->read('links'), $attribute->invertible()]);
@@ -194,6 +194,7 @@ final class AttributeTest extends TestCase
         yield 'computed with a column' => [fn (Attribute $attribute) => $attribute->from('name')->computedAs(read: fn (mixed $jobs) => $jobs)->resolve(), 'is computedAs(), so it reads no column and takes no conversion'];
         yield 'computed that says no write' => [fn (Attribute $attribute) => $attribute->computedAs(read: fn (mixed $jobs) => $jobs)->resolve(), 'has no inverse, so its read says no write; declare writtenBy() or readOnly()'];
         yield 'written by and read-only' => [fn (Attribute $attribute) => $attribute->from('name')->writtenBy(LeaveTitleUnchanged::class)->readOnly('Assigned upstream.', ignoreWrites: false)->resolve(), 'is both writtenBy() and readOnly(), and an attribute has one operation'];
+        yield 'fixed that says no write' => [fn (Attribute $attribute) => $attribute->fixed(null)->resolve(), 'has no inverse, so its read says no write; declare writtenBy() or readOnly()'];
         yield 'fixed and written by' => [fn (Attribute $attribute) => $attribute->fixed(null)->writtenBy(LeaveTitleUnchanged::class)->resolve(), 'is fixed(), so it reads one value and no operation writes it'];
         yield 'a fallback without a column' => [fn (Attribute $attribute) => $attribute->readAs('1')->orFrom(successor: Place::class, column: 'street')->writtenBy(LeaveTitleUnchanged::class)->resolve(), 'reads as raw SQL with readAs(), so it takes no other conversion'];
     }

@@ -74,16 +74,16 @@ final class Video extends Model implements Compatible
                             )
                             ->attribute(
                                 name: 'youtube_embed_url',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no youtube_embed_url.', ignoreWrites: true),
                             ))
                         ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                             ->attribute(
                                 name: 'original_file_name',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no original_file_name.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'size_kb',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no size_kb.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'youtube_embed_url',

@@ -40,7 +40,7 @@ final class Attribute
 
     private null|string $readAs = null;
 
-    /** @var null|class-string<WritesAttribute> */
+    /** @var null|class-string<WritesAttribute<covariant Model>> */
     private null|string $operation = null;
 
     private null|Closure $computed = null;
@@ -201,7 +201,7 @@ final class Attribute
     }
 
     /**
-     * @param  class-string<WritesAttribute>  $operation
+     * @param  class-string<WritesAttribute<covariant Model>>  $operation
      */
     public function writtenBy(string $operation): self
     {
@@ -250,7 +250,7 @@ final class Attribute
     }
 
     /**
-     * @return null|class-string<WritesAttribute>
+     * @return null|class-string<WritesAttribute<covariant Model>>
      */
     public function operation(): null|string
     {
@@ -331,7 +331,7 @@ final class Attribute
             $this->orFrom !== null && $this->column === null => 'reads orFrom() without from(), so it has no column to read first',
             $this->operation !== null && $this->readOnly !== null => 'is both writtenBy() and readOnly(), and an attribute has one operation',
             $this->column === null && $this->fixed === null && $this->readAs === null && $this->computed === null => 'names no column; give it from(), fixed(), readAs() or computedAs()',
-            ! $declares && $this->fixed === null && ! $this->invertible() => 'has no inverse, so its read says no write; declare writtenBy() or readOnly()',
+            ! $declares && ! $this->invertible() => 'has no inverse, so its read says no write; declare writtenBy() or readOnly()',
             default => null,
         };
 

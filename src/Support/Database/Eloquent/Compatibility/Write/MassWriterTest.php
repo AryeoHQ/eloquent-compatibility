@@ -20,6 +20,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Events\WriteIgnored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
@@ -31,6 +32,7 @@ use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\WriteTitleSeeingRecord;
 use Tests\TestCase;
 
 #[CoversClass(MassWriter::class)]
@@ -898,6 +900,114 @@ final class MassWriterTest extends TestCase
         $this->assertSame([1, 100, 1, 101], [$one, $hundred, $single, $deleted]);
         $this->assertSame([0, 0, 0], [Job::withTrashed()->whereKey($oak->id)->count(), DB::table('places')->where('job_id', $oak->id)->count(), DB::table('listings_retained')->where('job_id', $oak->id)->count()]);
         $this->assertSame(2, Job::withTrashed()->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_json_path_write_into_a_read_only_attribute_and_discards_one_into_an_attribute_that_ignores_writes(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::table('settings_holders')->insert([['name' => 'Oak', 'settings' => '{"color": "red"}']]);
+        $refusing = $this->settingsHolder(ignoreWrites: false);
+        $ignoring = $this->settingsHolder(ignoreWrites: true);
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = [$event->change->attribute, $event->value];
+        });
+
+        try {
+            Compatibility::prepare($refusing::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, settings) select job_id, name, settings from settings_holders');
+            Compatibility::install(
+                model: $refusing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $refusal = $this->refusal(fn () => $refusing->newQuery()->whereKey(1)->update(['settings->color' => 'blue']));
+            $discarded = $ignoring->newQuery()->whereKey(1)->update(['settings->color' => 'green', 'name' => 'Oak Lodge']);
+            $stored = [DB::table('configured_jobs')->value('settings'), DB::table('configured_jobs')->value('name')];
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('settings_holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame(['Settings follow the job.', true], [$refusal->because, str_ends_with($refusal->refused, ' record 1 cannot change $settings')]);
+        $this->assertSame([1, ['{"color": "red"}', 'Oak Lodge'], [['settings', 'green']]], [$discarded, $stored, $ignored]);
+    }
+
+    private function settingsHolder(bool $ignoreWrites): Model
+    {
+        $holder = $ignoreWrites ? new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return MassWriterTest::settingsMap($holder, ignoreWrites: true);
+            }
+        } : new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return MassWriterTest::settingsMap($holder, ignoreWrites: false);
+            }
+        };
+
+        return $holder;
+    }
+
+    public static function settingsMap(Compatibility $holder, bool $ignoreWrites): Compatibility
+    {
+        $holder->retainedIn('settings_holders_retained');
+
+        return $ignoreWrites
+            ? $holder->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute(name: 'settings', definition: fn (Attribute $attribute) => $attribute->from('settings')->readOnly(because: 'Settings follow the job.', ignoreWrites: true)))
+            : $holder->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute(name: 'settings', definition: fn (Attribute $attribute) => $attribute->from('settings')->readOnly(because: 'Settings follow the job.', ignoreWrites: false)));
+    }
+
+    #[Test]
+    public function it_hands_an_operation_of_a_mixed_mass_update_the_record_with_the_retained_values_the_update_wrote(): void
+    {
+        $seen = count(WriteTitleSeeingRecord::$records);
+        $titled = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(WriteTitleSeeingRecord::class)));
+            }
+        };
+
+        $updated = $titled->newQuery()->whereKey(1)->update(['title' => 'Oak Manor', 'mls_number' => 'MLS-1B', 'views' => DB::raw('views + 1')]);
+
+        $this->assertSame(1, $updated);
+        $this->assertSame([['Oak Manor', 'MLS-1B', 6]], array_map(fn (array $record) => [$record['title'] ?? null, $record['mls_number'] ?? null, $record['views'] ?? null], array_slice(WriteTitleSeeingRecord::$records, $seen)));
     }
 
     private function createCompanies(): void

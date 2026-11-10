@@ -8,11 +8,11 @@ use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 
+/**
+ * @implements WritesAttribute<File>
+ */
 final class WriteLowercaseFileMimeType implements WritesAttribute
 {
-    /**
-     * @param  Successors<File>  $successors
-     */
     public function write(Successors $successors, mixed $value, Change $change): void
     {
         $file = $successors->root();

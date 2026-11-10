@@ -44,8 +44,8 @@ final readonly class ResolvedMap
      * @param  array<string, Guard>  $guards
      * @param  array<class-string, string>  $withoutForwarding
      * @param  null|class-string<ManagesDependents>  $dependents
-     * @param  null|class-string<InitializesSuccessors>  $successorsInitializer
-     * @param  null|class-string<InitializesLegacy>  $legacyInitializer
+     * @param  null|class-string<InitializesSuccessors<covariant Model>>  $successorsInitializer
+     * @param  null|class-string<InitializesLegacy<covariant Model>>  $legacyInitializer
      * @param  null|class-string<ScopesWrites>  $scope
      * @param  null|class-string<Model>  $variant
      */

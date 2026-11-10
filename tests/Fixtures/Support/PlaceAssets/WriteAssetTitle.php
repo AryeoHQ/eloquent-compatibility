@@ -8,11 +8,11 @@ use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 
+/**
+ * @implements WritesAttribute<PlaceAsset>
+ */
 final class WriteAssetTitle implements WritesAttribute
 {
-    /**
-     * @param  Successors<PlaceAsset>  $successors
-     */
     public function write(Successors $successors, mixed $value, Change $change): void
     {
         $successors->root()->title = is_string($value) ? $value : null;

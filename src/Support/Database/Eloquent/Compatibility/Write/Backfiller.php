@@ -777,12 +777,12 @@ final readonly class Backfiller
 
         $record = (new $this->map->model)->setConnection($this->connectionName)->newInstance([], true)->setRawAttributes([$this->key => $key, $name => $value], true);
         $owner = $branch->owners[$name];
-        $instance->write(new Successors(
+        $instance->write((new Staging(
             map: $branch,
             root: $owner === $branch->primary ? $successor : (new $branch->primary->model)->setConnection($this->connectionName),
             models: $owner === $branch->primary ? [] : [$owner->table => $successor],
             forwarding: $successor,
-        ), $value, new Change(
+        ))->successors(), $value, new Change(
             record: $record,
             original: $record,
             attribute: $name,
