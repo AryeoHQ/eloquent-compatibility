@@ -14,6 +14,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversTrait;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
@@ -138,6 +139,7 @@ final class CarriesLegacyTest extends TestCase
         $this->assertFalse(DB::table('jobs')->where('name', 'Birch House')->exists());
     }
 
+    #[RequiresMethod(Model::class, 'saveOrIgnore')]
     #[Test]
     public function it_keeps_no_root_of_a_native_save_or_ignore_outside_any_transaction_whose_retained_row_insert_fails(): void
     {
