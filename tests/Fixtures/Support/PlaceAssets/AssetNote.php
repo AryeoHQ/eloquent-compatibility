@@ -16,6 +16,8 @@ final class AssetNote extends Model
 {
     use HasUuids;
 
+    public $timestamps = false;
+
     protected $table = 'asset_notes';
 
     protected $guarded = [];

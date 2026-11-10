@@ -8,7 +8,8 @@ use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\Ledger;
+use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
 final readonly class Preparer
 {
@@ -32,7 +33,8 @@ final readonly class Preparer
             transaction: [
                 ...$checks,
                 ...$this->successorKey($map),
-                ...Backfiller::storage(
+                ...Watermark::storage($map->table),
+                ...Ledger::storage(
                     map: $map,
                     connection: $connection,
                 ),
@@ -186,8 +188,8 @@ final readonly class Preparer
             .'  IF NOT '.self::uniqueKey($map)." THEN\n"
             ."    RAISE EXCEPTION '%', ".$refusal("{$map->table}.{$map->successorKey} has no unique index of its own").";\n"
             ."  END IF;\n"
-            .'  IF '.self::relation(Backfiller::ledger($map->table))." IS NULL THEN\n"
-            ."    RAISE EXCEPTION '%', ".$refusal(Backfiller::ledger($map->table).' does not exist').";\n"
+            .'  IF '.self::relation(Ledger::table($map->table))." IS NULL THEN\n"
+            ."    RAISE EXCEPTION '%', ".$refusal(Ledger::table($map->table).' does not exist').";\n"
             ."  END IF;\nEND\n\$compatibility\$"];
 
         foreach ($map->related as $related) {

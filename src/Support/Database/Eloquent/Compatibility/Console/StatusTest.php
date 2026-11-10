@@ -153,6 +153,23 @@ final class StatusTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_the_pass_a_backfilling_model_started_and_its_refused_and_failed_rows(): void
+    {
+        Compatibility::prepare(Listing::class);
+        DB::update("update listings set status = 'Archived' where id = 3");
+        DB::update("update listings set price = 'NaN' where id = 1");
+
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertFailed();
+
+        [$stage, $detail] = $this->stage();
+        $this->assertSame('backfilling', $stage);
+        $this->assertMatchesRegularExpression('/^pass 1, watermark \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, 1 refused, 1 failed$/', $detail);
+    }
+
+    #[Test]
     public function it_refuses_a_name_that_matches_no_served_model(): void
     {
         $this->artisan(

@@ -380,8 +380,8 @@ final class AssertsServedCompatibilityTest extends TestCase
             parameters: ['model' => FloorPlan::class],
         )->assertSuccessful();
 
-        if ($classified) {
-            PlaceAssetTables::classify(FloorPlan::class);
+        if (! $classified) {
+            DB::table('place_assets')->update(['legacy_type' => null]);
         }
 
         Compatibility::install(

@@ -255,17 +255,17 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
-    public function it_prints_the_query_that_counts_the_legacy_rows_a_hide_rule_hides_at_install(): void
+    public function it_prints_no_whole_table_scan_under_the_lock_and_only_an_indexed_probe_for_a_null_successor_key(): void
     {
         Artisan::call(
             command: 'compatibility:sql',
             parameters: ['operation' => 'install', 'model' => Listing::class],
         );
+        $printed = Artisan::output();
 
-        $this->assertStringContainsString(
-            '  SELECT count(*) INTO hidden_rows FROM "listings" WHERE EXISTS (SELECT FROM "jobs" WHERE "jobs"."id" = "listings"."job_id" AND (COALESCE(("merged_into_job_id" is not null), false)));',
-            Artisan::output(),
-        );
+        $this->assertStringNotContainsString('INTO hidden_rows', $printed);
+        $this->assertStringNotContainsString('NOT EXISTS (SELECT FROM "jobs"', $printed);
+        $this->assertStringContainsString('  IF EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" IS NULL) THEN', $printed);
     }
 
     /**
@@ -384,7 +384,7 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_print_an_operation_that_reads_an_external_attribute_between_its_statements(): void
+    public function it_prints_an_install_over_a_computed_attribute_and_refuses_to_print_a_rollback_that_restores_it_through_php(): void
     {
         FileTables::create();
         FileTables::seed();
@@ -399,19 +399,8 @@ final class CompileSqlTest extends TestCase
             command: 'compatibility:sql',
             parameters: ['operation' => 'install', 'model' => Photo::class],
         )
-            ->expectsOutputToContain('Compatibility::install() reads the computedAs() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
-            ->doesntExpectOutputToContain('BEGIN;')
-            ->assertFailed();
-
-        $file = sys_get_temp_dir().'/compatibility-photos-'.getmypid().'.sql';
-
-        $this->artisan(
-            command: 'compatibility:sql',
-            parameters: ['operation' => 'install', 'model' => Photo::class, '--output' => $file],
-        )
-            ->expectsOutputToContain('Compatibility::install() reads the computedAs() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
-            ->assertFailed();
-        $this->assertFileDoesNotExist($file);
+            ->expectsOutputToContain('BEGIN;')
+            ->assertSuccessful();
 
         Compatibility::install(
             model: Photo::class,
@@ -443,7 +432,7 @@ final class CompileSqlTest extends TestCase
         $output = Artisan::output();
 
         $this->assertSame(0, $exitCode);
-        $this->assertStringContainsString("\n-- Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.\n-- Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of listings. Run Compatibility::install() instead.\n", $output);
+        $this->assertStringContainsString("\n-- Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.\n-- Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of listings. Run Compatibility::install() instead.\n-- Under its lock, Compatibility::install() also inserts in PHP the listings row of each natively created root, and this SQL omits those inserts.\n", $output);
         $this->assertStringContainsString("\n\nALTER TABLE \"listings\" RENAME TO \"listings_retained\"\n;\n\n", $output);
         $this->assertStringEndsWith("\n;\n\nCOMMIT;\n", $output);
         $this->assertSame(['r', 'Oak Manor'], [

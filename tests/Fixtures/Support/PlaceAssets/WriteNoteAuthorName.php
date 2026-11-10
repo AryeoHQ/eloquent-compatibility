@@ -15,6 +15,10 @@ final class WriteNoteAuthorName implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $successors->relatedOrNew(NoteAuthor::class)->name = is_string($value) ? $value : null;
+        $name = is_string($value) ? $value : null;
+        ($name === null ? $successors->related(NoteAuthor::class) : $successors->relatedOrNew(NoteAuthor::class))?->setAttribute(
+            key: 'name',
+            value: $name,
+        );
     }
 }

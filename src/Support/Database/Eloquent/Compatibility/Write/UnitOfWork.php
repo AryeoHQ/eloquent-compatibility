@@ -32,7 +32,7 @@ final readonly class UnitOfWork
 {
     public const int CHUNK = 1000;
 
-    public function __construct(private ResolvedMap $map, private Connection $connection) {}
+    public function __construct(private ResolvedMap $map, private Connection $connection, private bool $locksRetained = true) {}
 
     /**
      * @template TResult
@@ -352,7 +352,7 @@ final readonly class UnitOfWork
     {
         $retained = $this->map->retainedTable;
 
-        if ($retained === null || $roots === []) {
+        if (! $this->locksRetained || $retained === null || $roots === []) {
             return;
         }
 

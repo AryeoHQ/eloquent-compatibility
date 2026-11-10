@@ -15,6 +15,10 @@ final class WriteNoteBody implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $successors->relatedOrNew(AssetNote::class)->body = is_string($value) ? $value : null;
+        $body = is_string($value) ? $value : null;
+        ($body === null ? $successors->related(AssetNote::class) : $successors->relatedOrNew(AssetNote::class))?->setAttribute(
+            key: 'body',
+            value: $body,
+        );
     }
 }

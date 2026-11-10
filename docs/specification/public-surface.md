@@ -120,7 +120,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 | Command | Does |
 | :-- | :-- |
 | `compatibility:backfill {model} {--chunk=1000} {--margin=300}` | runs one backfill pass, prints counts by status and reason, and exits non-zero when any row is refused or failed |
-| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, served records whose root no longer matches the map's `when()`, and trashed rows separately |
+| `compatibility:check {--model=*} {--limit=100}` | reads only, and reports legacy rows without a successor, values that differ, shared successors that serve two legacy records, served records whose root no longer matches the map's `when()`, member roots that no retained row names after install, and trashed rows separately |
 | `compatibility:sql {operation} {model} {--filters} {--output=}` | prints the statements of an operation and every object that depends on the legacy table, for review; it refuses no install because of a watermark |
 | `compatibility:status {--model=*}` | prints the stage of every discovered legacy model, or of the models `--model` names; a backfilling model also shows its pass count, its watermark, and its refused and failed counts |
 | `compatibility:cache` | discovers the served models and caches the list |
@@ -132,7 +132,7 @@ The package has no configuration of its own. Each tuning value is a named argume
 
 `compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed.
 
-`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. It also says that the printed SQL omits the legacy rows install inserts in PHP under its lock for natively created roots. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
 
 The commands are public by name. Their classes are internal.
 

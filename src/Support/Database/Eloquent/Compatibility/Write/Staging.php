@@ -243,6 +243,17 @@ final class Staging
         return $actions;
     }
 
+    public function pending(): bool
+    {
+        foreach ($this->held() as $model) {
+            if (! $model->exists || $model->isDirty()) {
+                return true;
+            }
+        }
+
+        return $this->deletions !== [] || $this->actions !== [];
+    }
+
     /**
      * @return list<Model>
      */

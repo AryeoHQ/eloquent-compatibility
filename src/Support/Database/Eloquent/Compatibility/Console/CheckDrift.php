@@ -103,10 +103,35 @@ final class CheckDrift extends Command
      */
     private function findings(array $findings): void
     {
-        $this->table(
-            ['Model', 'Check', 'Record', 'Detail'],
-            array_map(fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail], $findings),
-        );
+        $live = array_values(array_filter(
+            array: $findings,
+            callback: fn (DriftFinding $finding) => ! $finding->trashed,
+        ));
+        $trashed = array_values(array_filter(
+            array: $findings,
+            callback: fn (DriftFinding $finding) => $finding->trashed,
+        ));
+
+        if ($live !== []) {
+            $this->table(
+                headers: ['Model', 'Check', 'Record', 'Detail'],
+                rows: array_map(
+                    callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
+                    array: $live,
+                ),
+            );
+        }
+
+        if ($trashed !== []) {
+            $this->line('Trashed records:');
+            $this->table(
+                headers: ['Model', 'Check', 'Record', 'Detail'],
+                rows: array_map(
+                    callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
+                    array: $trashed,
+                ),
+            );
+        }
     }
 
     private function refuse(string $message): int

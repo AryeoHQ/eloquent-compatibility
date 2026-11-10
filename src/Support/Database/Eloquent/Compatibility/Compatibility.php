@@ -26,6 +26,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 
 final class Compatibility
 {
@@ -87,7 +88,7 @@ final class Compatibility
         self::run($model, Statements::prepare(...));
     }
 
-    public static function install(string $model, CarbonInterval $statementTimeout): void
+    public static function install(string $model, CarbonInterval $statementTimeout, int $passSize = 1000, null|CarbonInterval $margin = null): void
     {
         $map = self::of($model)->resolve();
         $connection = self::connection($map);
@@ -96,11 +97,14 @@ final class Compatibility
             (new Installer($connection))->install(
                 map: $map,
                 statementTimeout: $statementTimeout,
-                compile: fn () => self::logged(
+                passSize: $passSize,
+                margin: $margin ?? CarbonInterval::seconds(Backfiller::MARGIN),
+                compile: fn (null|Closure $nativeRoots) => self::logged(
                     map: $map,
                     statements: Statements::install(
                         map: $map,
                         connection: $connection,
+                        nativeRoots: $nativeRoots,
                     ),
                 ),
             );

@@ -32,7 +32,7 @@ final class RoundTrip
     /** @var null|WeakMap<Connection, array<class-string<Model>, list<string>>> */
     private static null|WeakMap $numeric = null;
 
-    public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection) {}
+    public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection, private readonly null|string $servedSelect = null, private readonly null|string $unhiddenSelect = null) {}
 
     public static function forget(): void
     {
@@ -48,7 +48,10 @@ final class RoundTrip
      */
     public function check(Staging $graph, Model $legacy, Model $original, int|string $key, array $written, array $added, Origin $origin): null|array
     {
-        $row = $this->connection->table($this->map->table)->useWritePdo()->where($legacy->getKeyName(), $key)->first();
+        $row = $this->read(
+            keyName: $legacy->getKeyName(),
+            key: $key,
+        );
         $served = $row === null ? $this->hidden(
             keyName: $legacy->getKeyName(),
             key: $key,
@@ -147,11 +150,56 @@ final class RoundTrip
         return $hidden ? null : $served;
     }
 
+    public function read(string $keyName, int|string $key): null|object
+    {
+        return $this->servedSelect === null ? $this->connection->table($this->map->table)->useWritePdo()->where(
+            column: $keyName,
+            operator: '=',
+            value: $key,
+        )->first() : $this->through(
+            select: $this->servedSelect,
+            keyName: $keyName,
+            key: $key,
+        );
+    }
+
+    public function agrees(Model $legacy, string $name, mixed $written, mixed $served): bool
+    {
+        return self::same(
+            legacy: $legacy,
+            name: $name,
+            written: $written,
+            served: $served,
+            numeric: fn (): bool => $this->numeric($legacy, $name),
+        )[0];
+    }
+
+    private function through(string $select, string $keyName, int|string $key): null|object
+    {
+        $record = SqlFragments::identifier($this->map->table);
+
+        return $this->connection->selectOne(
+            query: 'SELECT * FROM ('.$select.') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($keyName).' = ?',
+            bindings: [$key],
+            useReadPdo: false,
+        );
+    }
+
     /**
      * @return null|array<string, mixed>
      */
     private function hidden(string $keyName, int|string $key): null|array
     {
+        if ($this->unhiddenSelect !== null) {
+            $row = $this->through(
+                select: $this->unhiddenSelect,
+                keyName: $keyName,
+                key: $key,
+            );
+
+            return $row === null ? null : (array) $row;
+        }
+
         $compiled = self::$unhidden ??= new WeakMap;
         $selects = $compiled[$this->connection] ?? [];
         $selects[$this->map->model] ??= (new ViewCompiler(
@@ -173,6 +221,14 @@ final class RoundTrip
     }
 
     public function skips(Attribute $attribute, Origin $origin): bool
+    {
+        return self::skipped(
+            attribute: $attribute,
+            origin: $origin,
+        );
+    }
+
+    public static function skipped(Attribute $attribute, Origin $origin): bool
     {
         return match (true) {
             $attribute->ignoresWrites() => true,

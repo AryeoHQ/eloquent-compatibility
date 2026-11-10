@@ -26,6 +26,8 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 
 `compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` only when it creates a legacy row, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
 
+After install, `compatibility:check` reports each member root that no retained row names. A query-builder insert into the root table bypasses `Provides\CarriesLegacy`, so the view serves no record for that root ([The writer boundary](#the-writer-boundary)). The check excludes a root that a `deleted` ledger row names, because a pass trashed it on purpose.
+
 ## Prepare
 
 `Compatibility::prepare()` runs on the live legacy table, before the first pass:
@@ -143,10 +145,10 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 
 ### Before the lock
 
-1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`. It also refuses when `<legacy>_backfill` is missing, and the refusal names `prepare()`.
+1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`. It also refuses when `<legacy>_backfill` or the model's `compatibility_backfills` row is missing, and the refusal names `prepare()`.
 2. It takes the advisory lock that every pass takes, and holds it until install ends. Install's own passes run under it, and any other pass of this model refuses.
 3. When no pass has completed, so the model's watermark is NULL, it runs one full pass first. That holds for a model that was never backfilled, for an empty ledger, and for a re-install after a rollback. A first install therefore never drops a mapped value that no pass has written, and a re-install keeps the legacy edits made after the rollback. Before that pass, install refuses a legacy table without an `updated_at` column its legacy model writes, so the refusal comes before any write. An installed model runs no pass.
-4. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them.
+4. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them. When five passes in a row each still change the outcome of `passSize:` rows or more, install refuses, and names `compatibility:backfill`, because live writes outpace its catch-up.
 5. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
 6. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail.
 
@@ -154,7 +156,7 @@ These whole-table proofs never run under the lock.
 
 ### Under the lock
 
-1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)).
+1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)). When the pass refuses a row, or a row's write fails, install rolls back and refuses, naming each reason and the first keys. The gate refused such rows before the lock, so only a write that lands after the gate causes it.
 2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one.
 3. `ManagesDependents::beforeInstall()`.
 4. The rename of the legacy table to the retained table.

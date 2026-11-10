@@ -16,5 +16,6 @@ final readonly class DriftFinding
         public DriftCheck $check,
         public string $record,
         public string $detail,
+        public bool $trashed = false,
     ) {}
 }

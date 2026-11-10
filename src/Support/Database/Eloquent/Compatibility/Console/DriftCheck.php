@@ -23,4 +23,6 @@ enum DriftCheck: string
     case OutsideMembership = 'outside when()';
 
     case GuardRefuses = 'guard refuses';
+
+    case Unserved = 'unserved root';
 }

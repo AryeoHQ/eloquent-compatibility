@@ -11,8 +11,9 @@ use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
+use Support\Database\Eloquent\Compatibility\Write\Ledger;
+use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
 final readonly class Statements
 {
@@ -65,7 +66,10 @@ final readonly class Statements
         );
     }
 
-    public static function install(ResolvedMap $map, ConnectionInterface $connection): self
+    /**
+     * @param  null|Closure(ConnectionInterface): void  $nativeRoots
+     */
+    public static function install(ResolvedMap $map, ConnectionInterface $connection, null|Closure $nativeRoots = null): self
     {
         $legacyKind = self::kind(
             connection: $connection,
@@ -158,37 +162,18 @@ final readonly class Statements
         $mapped = array_values(array_diff(array_keys($legacy), $map->legacyOnly(array_keys($legacy))));
         usort($mapped, fn (string $first, string $second) => $legacy[$second]->alwaysGenerated <=> $legacy[$first]->alwaysGenerated);
         $defaults = array_filter($legacy, fn (Column $column, string $name) => $column->default !== null && ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH);
-        $hidden = self::reportHidden(
-            map: $map,
-            key: $key,
-        );
         [$readGrants, $grant] = self::grants($map->table, $legacyTable, array_keys(array_filter($legacy, fn (Column $column, string $name) => ! ($map->attributes[$name] ?? null)?->isExternal(), ARRAY_FILTER_USE_BOTH)));
         $unfinished = (new Preparer($columnCatalog))->unfinished($map);
-        $verifications = [
-            ...($map->morphs === [] ? [] : [fn (ConnectionInterface $connection) => (new Backfiller(
-                map: $map,
-                connection: $connection,
-            ))->refuseMisplaced()]),
-            ...array_map(
-                callback: fn (string $name) => fn (ConnectionInterface $connection) => ExternalAttributes::verify(
-                    map: $map,
-                    connection: $connection,
-                    name: $name,
-                ),
-                array: $external,
-            ),
-        ];
         $notNull = SqlFragments::identifier(self::notNullName($map));
         $foreign = SqlFragments::identifier(self::foreignName($map));
 
         $transaction = [
             "LOCK TABLE {$legacyTable} IN SHARE ROW EXCLUSIVE MODE",
             ...$unfinished,
-            self::refuseMissingRoots(
+            self::refuseNullKeys(
                 map: $map,
                 key: $key,
             ),
-            ...($hidden === null ? [] : [$hidden]),
             $readGrants,
         ];
         $beforeInstall = count($transaction) - 1;
@@ -202,6 +187,10 @@ final readonly class Statements
                     array: $mapped,
                 ),
             )]),
+        ];
+        $dropped = count($transaction) - 1;
+        $transaction = [
+            ...$transaction,
             "ALTER TABLE {$retainedTable} ADD CONSTRAINT {$notNull} CHECK ({$successorKey} IS NOT NULL) NOT VALID",
             "COMMENT ON TABLE {$retainedTable} IS ".SqlFragments::literal(self::capture(
                 connection: $connection,
@@ -217,7 +206,7 @@ final readonly class Statements
         $afterInstall = count($transaction) - 1;
         $transaction = [
             ...$transaction,
-            Backfiller::forgetStatement($map),
+            Watermark::forgetStatement($map->table),
             "ALTER TABLE {$retainedTable} ADD CONSTRAINT {$foreign} FOREIGN KEY ({$successorKey}) REFERENCES {$primary} ({$primaryKey}) ON DELETE CASCADE NOT VALID",
         ];
         $hooks = self::hooks(
@@ -228,7 +217,7 @@ final readonly class Statements
         return new self(
             operation: 'install',
             transaction: $transaction,
-            steps: $verifications === [] ? [] : [count($unfinished) + 1 => $verifications],
+            steps: $nativeRoots === null ? [] : [$dropped => [$nativeRoots]],
             hooks: $hooks,
             notes: self::dependentNotes(
                 connection: $connection,
@@ -395,7 +384,7 @@ final readonly class Statements
     public static function retire(ResolvedMap $map, ConnectionInterface $connection): self
     {
         $retainedName = ViewCompiler::retainedTable($map);
-        $ledger = Backfiller::ledger($map->table);
+        $ledger = Ledger::table($map->table);
 
         $legacyKind = self::kind(
             connection: $connection,
@@ -412,7 +401,7 @@ final readonly class Statements
                 transaction: self::kind(
                     connection: $connection,
                     table: $ledger,
-                ) === null ? [] : [Backfiller::forgetStatement($map), 'DROP TABLE IF EXISTS '.SqlFragments::identifier($ledger)],
+                ) === null ? [] : [Watermark::forgetStatement($map->table), 'DROP TABLE IF EXISTS '.SqlFragments::identifier($ledger)],
             );
         }
 
@@ -465,7 +454,7 @@ final readonly class Statements
             transaction: [
                 'DROP VIEW '.SqlFragments::identifier($map->table),
                 'DROP TABLE '.SqlFragments::identifier($retainedName),
-                Backfiller::forgetStatement($map),
+                Watermark::forgetStatement($map->table),
                 'DROP TABLE IF EXISTS '.SqlFragments::identifier($ledger),
             ],
             notes: [
@@ -639,20 +628,16 @@ final readonly class Statements
         return $hooks;
     }
 
-    private static function refuseMissingRoots(ResolvedMap $map, string $key): string
+    private static function refuseNullKeys(ResolvedMap $map, string $key): string
     {
         $legacyTable = SqlFragments::identifier($map->table);
-        $primary = SqlFragments::identifier($map->primary->table);
-        $successorKey = "{$legacyTable}.".SqlFragments::identifier($map->successorKey);
-        $missing = "FROM {$legacyTable} WHERE {$successorKey} IS NULL OR NOT EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($map->primary->key)." = {$successorKey})";
+        $missing = "FROM {$legacyTable} WHERE {$legacyTable}.".SqlFragments::identifier($map->successorKey).' IS NULL';
         $legacyKey = "{$legacyTable}.".SqlFragments::identifier($key);
-        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot install: ")
-            .' || missing || '.SqlFragments::literal(" {$map->table} rows have no {$map->primary->table} row that their {$map->successorKey} names; the first are {$key} ")
+        $refusal = SqlFragments::literal("Compatibility map '{$map->table}' cannot install: {$map->table} rows have no {$map->successorKey}, so the view would serve none of them; the first are {$key} ")
             .' || first_keys || '.SqlFragments::literal('. Backfill them before install().');
 
-        return "DO \$compatibility\$\nDECLARE\n  missing bigint;\n  first_keys text;\nBEGIN\n"
-            ."  SELECT count(*) INTO missing {$missing};\n"
-            ."  IF missing > 0 THEN\n"
+        return "DO \$compatibility\$\nDECLARE\n  first_keys text;\nBEGIN\n"
+            ."  IF EXISTS (SELECT {$missing}) THEN\n"
             ."    SELECT string_agg(CAST(missing_key AS text), ', ' ORDER BY missing_key) INTO first_keys FROM (SELECT {$legacyKey} {$missing} ORDER BY {$legacyKey} LIMIT 5) AS first_missing (missing_key);\n"
             ."    RAISE EXCEPTION '%', {$refusal};\n"
             ."  END IF;\nEND\n\$compatibility\$";
@@ -709,28 +694,6 @@ final readonly class Statements
 
         return "FROM {$legacyTable} WHERE EXISTS (SELECT FROM {$primary} WHERE {$primary}.".SqlFragments::identifier($map->primary->key)." = {$legacyTable}.".SqlFragments::identifier($map->successorKey).' AND ('
             .implode(' OR ', array_map(fn (string $condition) => 'COALESCE(('.$condition.'), false)', $conditions)).'))';
-    }
-
-    private static function reportHidden(ResolvedMap $map, string $key): null|string
-    {
-        $hidden = self::hiddenRows($map);
-
-        if ($hidden === null) {
-            return null;
-        }
-
-        $legacyTable = SqlFragments::identifier($map->table);
-        $legacyKey = "{$legacyTable}.".SqlFragments::identifier($key);
-        $notice = SqlFragments::literal("Compatibility map '{$map->table}' install hides ")
-            .' || hidden_rows || '.SqlFragments::literal(" {$map->table} rows, because a hide() rule matches their {$map->primary->table} row; the first are {$key} ")
-            .' || first_keys || '.SqlFragments::literal('.');
-
-        return "DO \$compatibility\$\nDECLARE\n  hidden_rows bigint;\n  first_keys text;\nBEGIN\n"
-            ."  SELECT count(*) INTO hidden_rows {$hidden};\n"
-            ."  IF hidden_rows > 0 THEN\n"
-            ."    SELECT string_agg(CAST(hidden_key AS text), ', ' ORDER BY hidden_key) INTO first_keys FROM (SELECT {$legacyKey} {$hidden} ORDER BY {$legacyKey} LIMIT 5) AS first_hidden (hidden_key);\n"
-            ."    RAISE NOTICE '%', {$notice};\n"
-            ."  END IF;\nEND\n\$compatibility\$";
     }
 
     /**

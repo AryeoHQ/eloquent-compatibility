@@ -86,6 +86,24 @@ final class CheckDriftTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_the_findings_of_trashed_records_in_a_table_of_their_own(): void
+    {
+        DB::unprepared("update listings set title = 'Oak Home' where id = 1");
+        DB::unprepared("update listings set title = 'Pine Loft' where id = 2");
+
+        $this->artisan('compatibility:check', ['--model' => [Listing::class]])
+            ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
+                [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
+            ])
+            ->expectsOutput('Trashed records:')
+            ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
+                [Listing::class, 'values differ', 'listings#2', 'listings holds other values for title than the view would serve from jobs'],
+            ])
+            ->expectsOutputToContain('2 drift findings in 1 served model.')
+            ->assertFailed();
+    }
+
+    #[Test]
     public function it_finds_the_legacy_model_by_the_class_name_of_one_served_model(): void
     {
         $this->artisan('compatibility:check', ['--model' => ['Listing']])

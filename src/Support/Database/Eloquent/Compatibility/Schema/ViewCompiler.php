@@ -42,6 +42,20 @@ final readonly class ViewCompiler
         );
     }
 
+    public function beforeInstall(ResolvedMap $map, bool $hides = true): string
+    {
+        $legacy = $this->columnCatalog->of($map->table);
+
+        return $this->select(
+            map: $map,
+            shape: $legacy,
+            defaultsOn: $map->table,
+            retained: $legacy,
+            hides: $hides,
+            from: $map->table,
+        );
+    }
+
     public function unhidden(ResolvedMap $map): string
     {
         $retainedTable = self::retainedTable($map);
@@ -261,7 +275,7 @@ final readonly class ViewCompiler
      * @param  array<string, Column>  $shape
      * @param  array<string, Column>  $retained
      */
-    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, bool $hides = true): string
+    private function select(ResolvedMap $map, array $shape, string $defaultsOn, array $retained, bool $hides = true, null|string $from = null): string
     {
         $retainedTable = self::retainedTable($map);
 
@@ -291,7 +305,7 @@ final readonly class ViewCompiler
         $columns = array_map(fn (string $read, string $name) => $read.' AS '.SqlFragments::identifier($name), $reads, array_keys($reads));
 
         return "SELECT\n  ".implode(",\n  ", $columns)
-            ."\nFROM ".SqlFragments::identifier($retainedTable)
+            ."\nFROM ".($from === null ? '' : SqlFragments::identifier($from).' AS ').SqlFragments::identifier($retainedTable)
             ."\n".self::root(
                 map: $map,
                 retained: $retainedTable,

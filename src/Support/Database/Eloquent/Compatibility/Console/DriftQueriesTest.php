@@ -234,18 +234,16 @@ final class DriftQueriesTest extends TestCase
     }
 
     #[Test]
-    public function it_names_a_legacy_row_whose_external_attribute_differs_from_its_external_read_before_install(): void
+    public function it_compares_no_computed_attribute_before_install(): void
     {
         $this->backfilled(Image::class);
         DB::update("update place_images set mime_type = 'image/gif' where id = 1");
 
-        $this->assertSame([
-            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
-        ], $this->find(Image::class));
+        $this->assertSame([], $this->find(Image::class));
     }
 
     #[Test]
-    public function it_reads_external_attributes_only_until_the_limit_of_records_is_reached(): void
+    public function it_names_a_stored_value_that_differs_beside_a_computed_one_it_does_not_compare(): void
     {
         $this->backfilled(Image::class);
         DB::update("update place_images set file_name = 'side.jpg' where id = 1");
@@ -253,10 +251,6 @@ final class DriftQueriesTest extends TestCase
 
         $this->assertSame([
             [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
-        ], $this->find(Image::class, 1));
-        $this->assertSame([
-            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
-            [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
         ], $this->find(Image::class, 2));
     }
 
@@ -264,16 +258,29 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Video|PlaceVideo>  $model
      */
     #[Test]
-    #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'place_videos holds other values for youtube_embed_url than the view would serve from place_assets', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() refuses it'])]
-    public function it_names_a_legacy_row_that_sits_in_another_successor_than_its_selector_chooses_before_install(string $model, string $drift, string $record, string $differs, string $misplaced): void
+    #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() refuses it'])]
+    public function it_names_a_legacy_row_that_sits_in_another_successor_than_its_selector_chooses_before_install(string $model, string $drift, string $record, string $misplaced): void
     {
         $this->backfilled($model);
         DB::unprepared($drift);
 
         $this->assertSame([
-            [$model, 'values differ', $record, $differs],
             [$model, 'misplaced', $record, $misplaced],
         ], $this->find($model));
+    }
+
+    #[Test]
+    public function it_names_after_install_a_member_root_no_retained_row_names_unless_a_deleted_ledger_row_names_it(): void
+    {
+        $this->installed(Listing::class);
+        $unserved = '019a5e3c-8f00-7000-8000-000000000021';
+        $deleted = '019a5e3c-8f00-7000-8000-000000000022';
+        DB::table('jobs')->insert([['id' => $unserved, 'name' => 'Raw job', 'company_id' => ListingTables::COMPANY], ['id' => $deleted, 'name' => 'Deleted job', 'company_id' => ListingTables::COMPANY]]);
+        DB::table('listings_backfill')->insert(['legacy_id' => 99, 'successor_id' => $deleted, 'status' => 'deleted', 'attempts' => 1, 'attempted_at' => now()]);
+
+        $this->assertSame([
+            [Listing::class, 'unserved root', "jobs#{$unserved}", "it matches the when() of Listing and no listings_retained row names it, so the view serves no record for it; an insert into jobs that bypassed Job's model created it"],
+        ], $this->find(Listing::class));
     }
 
     #[Test]
@@ -397,10 +404,7 @@ final class DriftQueriesTest extends TestCase
 
         $this->assertSame([
             ...($install ? [] : [
-                [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for file_name than the view would serve from place_assets'],
                 [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for file_name than the view would serve from place_assets'],
-                [Image::class, 'values differ', 'place_images#1', 'place_images holds other values for mime_type than its computedAs() read returns'],
-                [Image::class, 'values differ', 'place_images#2', 'place_images holds other values for mime_type than its computedAs() read returns'],
             ]),
             [Image::class, 'no morph target', 'place_images#1', "its asset_type 'place_brochure' names no target relatedMorph() declares"],
             [Image::class, 'no morph target', 'place_images#2', 'its asset_files row does not exist'],

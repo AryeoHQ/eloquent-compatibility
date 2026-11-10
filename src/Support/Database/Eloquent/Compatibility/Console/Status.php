@@ -15,7 +15,8 @@ use Support\Database\Eloquent\Compatibility\Schema\Preparer;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
-use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\Ledger;
+use Support\Database\Eloquent\Compatibility\Write\Watermark;
 use Throwable;
 
 final class Status extends Command
@@ -104,13 +105,13 @@ final class Status extends Command
         );
         $ledger = Statements::kind(
             connection: $connection,
-            table: Backfiller::ledger($map->table),
+            table: Ledger::table($map->table),
         ) !== null;
         $pass = Statements::kind(
             connection: $connection,
-            table: Backfiller::BACKFILLS,
+            table: Watermark::TABLE,
         ) === null ? null : $connection->scalar(
-            query: 'select pass from '.SqlFragments::identifier(Backfiller::BACKFILLS).' where legacy_type = ?',
+            query: 'select pass from '.SqlFragments::identifier(Watermark::TABLE).' where legacy_type = ?',
             bindings: [$map->table],
             useReadPdo: false,
         );
@@ -168,15 +169,15 @@ final class Status extends Command
 
     private static function progress(ResolvedMap $map, ConnectionInterface $connection, int $pass, bool $ledger): string
     {
-        $counts = $ledger ? (array) $connection->selectOne(
-            query: "select count(*) filter (where status = 'refused') as refused, count(*) filter (where status = 'failed') as failed from ".SqlFragments::identifier(Backfiller::ledger($map->table))." where status in ('refused', 'failed')",
-            useReadPdo: false,
-        ) : [];
-
-        return "pass {$pass}, watermark ".((new Backfiller(
+        $counts = $ledger ? (new Ledger(
             map: $map,
             connection: $connection,
-        ))->remembered() ?? 'none').', '.(int) ($counts['refused'] ?? 0).' refused, '.(int) ($counts['failed'] ?? 0).' failed';
+        ))->counts() : ['refused' => 0, 'failed' => 0];
+
+        return "pass {$pass}, watermark ".((new Watermark(
+            legacyType: $map->table,
+            connection: $connection,
+        ))->remembered() ?? 'none').", {$counts['refused']} refused, {$counts['failed']} failed";
     }
 
     private function refuse(string $message): int
