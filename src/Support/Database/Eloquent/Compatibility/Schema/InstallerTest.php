@@ -8,6 +8,7 @@ use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\DeadlockException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -51,12 +52,15 @@ use Tests\Fixtures\Support\Listings\UnstampedJob;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversClass(Installer::class)]
 #[CoversClass(Statements::class)]
 #[CoversClass(Compatibility::class)]
 final class InstallerTest extends TestCase
 {
+    private const string DEADLOCK = "DO \$\$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01'; END \$\$";
+
     /** @var list<string> */
     protected $connectionsToTransact = [];
 
@@ -2536,6 +2540,78 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
+    public function it_rolls_back_and_retries_when_postgresql_ends_the_lock_of_a_final_pass_row_as_a_deadlock(): void
+    {
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertSuccessful();
+        $this->listenToTheLog();
+        $writer = $this->writer();
+        $wrote = false;
+        $locked = false;
+        $armed = false;
+        $deadlocked = false;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$wrote, &$locked, &$armed, &$deadlocked): void {
+            if ($deadlocked || $query->connectionName !== DB::getDefaultConnection()) {
+                return;
+            }
+
+            if (! $wrote && str_starts_with($query->sql, 'LOCK TABLE ') && str_ends_with($query->sql, ' IN SHARE UPDATE EXCLUSIVE MODE')) {
+                $wrote = true;
+                $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+            } elseif ($query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $locked = true;
+            } elseif ($locked && $query->sql === 'SAVEPOINT compatibility_backfill_row') {
+                $armed = true;
+            } elseif ($armed && str_ends_with($query->sql, 'for update')) {
+                $deadlocked = true;
+                DB::statement(self::DEADLOCK);
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([true, 'v', 'Oak Manor'], [$deadlocked, $this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+        $this->assertSame([['warning', true]], $this->attempts('SQLSTATE 40P01'));
+    }
+
+    #[Test]
+    public function it_surfaces_a_deadlock_inside_a_caller_s_transaction_without_a_retry_and_frees_its_advisory_lock_with_that_transaction(): void
+    {
+        $this->listenToTheLog();
+        $deadlocked = false;
+        DB::listen(function (QueryExecuted $query) use (&$deadlocked): void {
+            if (! $deadlocked && str_starts_with($query->sql, 'ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign"')) {
+                $deadlocked = true;
+                DB::statement(self::DEADLOCK);
+            }
+        });
+        DB::beginTransaction();
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $surfaced = 'no exception';
+        } catch (Throwable $exception) {
+            $surfaced = $exception::class.' '.$exception->getPrevious()?->getCode();
+        } finally {
+            DB::rollBack(0);
+        }
+
+        $taken = $this->writer()->scalar("select pg_try_advisory_lock(hashtextextended('compatibility_backfills:listings', 0))");
+        $this->writer()->scalar("select pg_advisory_unlock(hashtextextended('compatibility_backfills:listings', 0))");
+
+        $this->assertSame(DeadlockException::class.' 40P01', $surfaced);
+        $this->assertSame([[], 'r', true], [$this->attempts('SQLSTATE'), $this->kind('listings'), $taken]);
+    }
+
+    #[Test]
     public function it_refuses_once_its_final_pass_spends_the_lock_budget_and_names_the_row_it_reached(): void
     {
         $this->backfiller(Listing::class)->run();
@@ -3535,6 +3611,26 @@ final class InstallerTest extends TestCase
         Event::listen(MessageLogged::class, function (MessageLogged $logged): void {
             $this->logged[] = [$logged->level, $logged->message];
         });
+    }
+
+    /**
+     * @return list<array{string, bool}>
+     */
+    private function attempts(string $cause): array
+    {
+        return array_values(array_map(
+            callback: fn (array $logged) => [$logged[0], str_contains(
+                haystack: $logged[1],
+                needle: "Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, {$cause}",
+            )],
+            array: array_filter(
+                array: $this->logged,
+                callback: fn (array $logged) => str_contains(
+                    haystack: $logged[1],
+                    needle: ' could not take a lock, ',
+                ),
+            ),
+        ));
     }
 
     private function holdUntilReleased(string $sql): string

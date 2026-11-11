@@ -138,11 +138,25 @@ final class BackfillTest extends TestCase
     #[Test]
     public function it_prints_the_markup_and_control_characters_of_a_reason_as_text(): void
     {
-        DB::update('update listings set status = ? where id = 3', ["<href=https://example.invalid>Archived</>\e[31m"]);
+        DB::update('update listings set status = ? where id = 3', ["<href=https://example.invalid>Archived</>\e[31m\u{9B}2J\u{9D}52;c;aGk=\u{9C}"]);
 
         $this->artisan('compatibility:backfill', ['model' => Listing::class])
-            ->expectsOutput("1 refused: A listing status is Draft, Active or Sold, and '<href=https://example.invalid>Archived</>\\x1B[31m' is none of them. (id 3)")
+            ->expectsOutput("1 refused: A listing status is Draft, Active or Sold, and '<href=https://example.invalid>Archived</>\\x1B[31m\\x9B2J\\x9D52;c;aGk=\\x9C' is none of them. (id 3)")
             ->assertFailed();
+    }
+
+    #[Test]
+    public function it_records_a_failed_row_s_data_exception_by_its_sqlstate_and_condition_without_the_rejected_value(): void
+    {
+        DB::statement('alter table jobs alter column name type integer using 0');
+        DB::update("update listings set title = 'SECRET-' || id");
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutput('3 failed: Illuminate\Database\QueryException: SQLSTATE[22P02]: Invalid text representation (id 1, 2, 3)')
+            ->doesntExpectOutputToContain('SECRET')
+            ->assertFailed();
+
+        $this->assertSame([0, 3], [DB::scalar("select count(*) from listings_backfill where reason like '%SECRET%'"), DB::scalar("select count(*) from listings_backfill where status = 'failed'")]);
     }
 
     #[Test]

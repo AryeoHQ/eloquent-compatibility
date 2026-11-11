@@ -8,6 +8,7 @@ use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\DeadlockException;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Config;
@@ -35,6 +36,8 @@ final class Backfiller
     private const string SAVEPOINT = 'compatibility_backfill_row';
 
     private const array WAITED_STATES = ['55P03', '40P01'];
+
+    private const string DATA_EXCEPTION = '22';
 
     private readonly ColumnCatalog $catalog;
 
@@ -148,6 +151,19 @@ final class Backfiller
             before: $before,
             progress: null,
         );
+    }
+
+    public static function waited(Throwable $exception): null|QueryException
+    {
+        while ($exception instanceof DeadlockException && $exception->getPrevious() !== null) {
+            $exception = $exception->getPrevious();
+        }
+
+        return $exception instanceof QueryException && in_array(
+            needle: $exception->getCode(),
+            haystack: self::WAITED_STATES,
+            strict: true,
+        ) ? $exception : null;
     }
 
     public function refuseUnconvergeable(int $passSize): void
@@ -343,11 +359,7 @@ final class Backfiller
             $this->connection->unprepared('ROLLBACK TO SAVEPOINT '.self::SAVEPOINT);
             $this->connection->unprepared('RELEASE SAVEPOINT '.self::SAVEPOINT);
 
-            if ($exception instanceof QueryException && in_array(
-                needle: $exception->getCode(),
-                haystack: self::WAITED_STATES,
-                strict: true,
-            )) {
+            if (self::waited($exception) !== null) {
                 if (! $scoped || $retried) {
                     throw $exception;
                 }
@@ -1109,11 +1121,23 @@ final class Backfiller
     private static function reason(Throwable $exception): string
     {
         $message = $exception instanceof QueryException ? $exception->getPrevious()?->getMessage() ?? $exception->getMessage() : $exception->getMessage();
-
-        return $exception::class.': '.strtok(
+        $first = (string) strtok(
             string: $message,
             token: "\n",
         );
+
+        if ($exception instanceof QueryException && str_starts_with(
+            haystack: (string) $exception->getCode(),
+            needle: self::DATA_EXCEPTION,
+        ) && preg_match(
+            pattern: '/^SQLSTATE\[[0-9A-Z]{5}\]: [^:]+/',
+            subject: $first,
+            matches: $condition,
+        ) === 1) {
+            $first = $condition[0];
+        }
+
+        return $exception::class.': '.$first;
     }
 
     private static function rootKeyOf(mixed $key): null|int|string

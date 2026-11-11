@@ -466,6 +466,35 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
+    public function it_retries_once_a_row_whose_lock_postgresql_ends_as_a_deadlock_and_records_its_write_instead_of_a_failure(): void
+    {
+        $armed = false;
+        $deadlocked = false;
+        DB::listen(function (QueryExecuted $query) use (&$armed, &$deadlocked): void {
+            if ($deadlocked || $query->connectionName !== DB::getDefaultConnection()) {
+                return;
+            }
+
+            if ($query->sql === 'SAVEPOINT compatibility_backfill_row') {
+                $armed = true;
+            } elseif ($armed && str_ends_with($query->sql, 'for update')) {
+                $deadlocked = true;
+                DB::statement("DO \$\$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01'; END \$\$");
+            }
+        });
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutput('Walked 3 listings rows and 0 whose legacy row is gone: 3 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.')
+            ->assertSuccessful();
+
+        $this->assertTrue($deadlocked);
+        $this->assertSame([['created', 1], ['created', 1], ['created', 1]], array_map(
+            callback: fn (array $row) => [$row['status'], $row['attempts']],
+            array: $this->rows('select status, attempts from listings_backfill order by legacy_id'),
+        ));
+    }
+
+    #[Test]
     public function it_reads_the_candidates_of_an_incremental_pass_one_chunk_at_a_time_and_walks_each_of_them(): void
     {
         $listing = $this->namedListing();

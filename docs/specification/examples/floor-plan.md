@@ -48,7 +48,7 @@ final class FloorPlanMap
 
 `floorplans` has a `deleted_at`, so the map declares it as Listing's map does. `deleted_at` and `updated_at` run the default operations of Eloquent-managed columns ([Operations: Eloquent-managed columns](../operations.md#eloquent-managed-columns)). A legacy soft delete queues the `PlaceAsset`'s `delete()`, and a legacy `forceDelete()` runs its `forceDelete()`. The `index` operation's `move()` saves the `PlaceAsset` again under `Model::withoutTimestampsOn()`, so the `PlaceAsset` keeps the legacy `updated_at`.
 
-`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent, so the parent's floor plans end in legacy order ([Operations: positions](../operations.md#positions)). `position()` lands in M5b, so this map cannot run until then ([Status](../README.md#status)).
+`index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent, so the parent's floor plans end in legacy order ([Operations: positions](../operations.md#positions)). `position()` waits on [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14), so this map cannot run until it ships ([Status](../README.md#status)).
 
 Positions number within each eloquent-ordering parent, so a legacy reader that needs one sequence per listing must read `readAs()` with an operation instead.
 
@@ -146,7 +146,7 @@ final class InitializeLegacyPhoto implements InitializesLegacy
 
 ## The write scope
 
-`MediaWriteScope` applies eloquent-ordering's rule: lock the parents first. It runs inside the package's transaction, so it opens none of its own. It calls Aryeo's own use of eloquent-ordering to take that lock order. From M5b, the package requires eloquent-ordering for `position()`, but takes no lock order from it. `OrderedParents::lockFirst()` stands for the routine that eloquent-ordering must publish.
+`MediaWriteScope` applies eloquent-ordering's rule: lock the parents first. It runs inside the package's transaction, so it opens none of its own. It calls Aryeo's own use of eloquent-ordering to take that lock order. Once [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14) ships, the package requires eloquent-ordering for `position()`, but takes no lock order from it. `OrderedParents::lockFirst()` stands for the routine that eloquent-ordering must publish.
 
 ```php
 final class MediaWriteScope implements ScopesWrites

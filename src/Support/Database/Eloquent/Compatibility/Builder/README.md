@@ -23,7 +23,7 @@ where "listings"."job_id" in (select "jobs"."id" from "jobs" where ("jobs"."pric
   and "listings"."deleted_at" is null
 ```
 
-Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the root table through the view's own joins: a plain join where a unique index proves one row, and a lateral join otherwise. The subquery reads that proof through the read connection, so the replica can serve it. That connection cannot build the temporary index that verifies an `atMostOne()` index, so the subquery joins such a relation laterally.
+Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the root table through the view's own joins: a plain join for a `relatedMorph()` target or where a unique index proves one row, and a lateral join otherwise. The subquery reads that proof through the read connection, so the replica can serve it. That connection cannot build the temporary index that verifies an `atMostOne()` index, so the subquery joins such a relation laterally.
 
 Everything that does not touch a converted attribute passes through to Laravel unchanged. So does every query before install, while the legacy name is still a table.
 

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 require __DIR__.'/../vendor/autoload.php';
 
-$root = dirname(__DIR__);
+$root = $argv[1] ?? dirname(__DIR__);
 $package = 'Support\\Database\\Eloquent\\Compatibility\\';
 $external = [
     'Connection' => Illuminate\Database\Connection::class,
@@ -22,37 +22,8 @@ $external = [
     'ShouldQueue' => Illuminate\Contracts\Queue\ShouldQueue::class,
     'SoftDeletes' => Illuminate\Database\Eloquent\SoftDeletes::class,
 ];
-$illustrative = 'an illustrative Aryeo name from the worked examples';
-$ordering = 'eloquent-ordering, which the package requires from M5b, decision 43';
-$removed = 'a removed name the specification cites on purpose';
-$unresolved = [
-    '\\Compatibility' => 'a namespace suffix, not a class',
-    'App\\Entities\\Listings\\Compatibility' => $illustrative,
-    'App\\Entities\\Listings\\Listing' => $illustrative,
-    'ChangeListingAddress' => $illustrative,
-    'InitializeFloorPlanAsset' => $illustrative,
-    'InitializeLegacyFloorPlan' => $illustrative,
-    'InitializeLegacyPhoto' => $illustrative,
-    'InitializeListingJob' => $illustrative,
-    'Listing::makeUuid()' => $illustrative,
-    'ListingDependents' => $illustrative,
-    'ListingMap' => $illustrative,
-    'ListingWriteScope' => $illustrative,
-    'MediaWriteScope' => $illustrative,
-    'PlaceAsset::factory()' => $illustrative,
-    'PublishOrDraftJob' => $illustrative,
-    'SetDownloadsPermission' => $illustrative,
-    'WriteDisplayType' => $illustrative,
-    'DB::table()' => 'a facade method, which reflection cannot see',
-    'IsOrdered' => $ordering,
-    'OrderedParents::lockFirst()' => 'stands for a routine eloquent-ordering must publish, M5b, decision 43',
-    'Placement::after()' => $ordering,
-    'Placement::at()' => $ordering,
-    'Placement::before()' => $ordering,
-    'Compatibility::state()' => $removed,
-    'Compatibility::uninstall()' => $removed,
-    'Definition\\Successors' => $removed,
-];
+/** @var array<string, string> $unresolved */
+$unresolved = require $root.'/bin/doc-names-unresolved.php';
 $allowlisted = [];
 
 $exists = fn (string $class): bool => class_exists($class) || interface_exists($class) || trait_exists($class);
@@ -77,7 +48,7 @@ $files = function (string $directory, string $pattern): array {
 
 $classes = [];
 
-foreach ([...$files($root.'/src', '*.php'), ...$files($root.'/tests', '*.php')] as $path) {
+foreach ($files($root.'/src', '*.php') as $path) {
     $source = (string) file_get_contents($path);
     $namespace = preg_match('/^namespace\s+([^;]+);/m', $source, $match) === 1 ? $match[1].'\\' : '';
     preg_match_all('/^(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/m', $source, $declarations);
@@ -226,7 +197,7 @@ foreach ($documents as $document) {
                     }
 
                     if ($allowed) {
-                        $problems[] = $at."`{$label}` now resolves, so the unresolved allowlist in bin/check-doc-names.php must drop it";
+                        $problems[] = $at."`{$label}` now resolves, so the unresolved allowlist in bin/doc-names-unresolved.php must drop it";
                     }
                 } catch (UnexpectedValueException $e) {
                     if (! $allowed) {
@@ -257,7 +228,7 @@ foreach ($documents as $document) {
 }
 
 foreach (array_diff_key($unresolved, $allowlisted) as $label => $reason) {
-    $problems[] = "bin/check-doc-names.php: the unresolved allowlist lists `{$label}` ({$reason}), which no checked document names";
+    $problems[] = "bin/doc-names-unresolved.php: the unresolved allowlist lists `{$label}` ({$reason}), which no checked document names";
 }
 
 foreach ($problems as $problem) {
