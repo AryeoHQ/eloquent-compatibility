@@ -836,7 +836,7 @@ final class RecordWriterTest extends TestCase
     public function it_keeps_the_updated_at_touch_of_a_legacy_only_write_when_updated_at_is_itself_legacy_only(): void
     {
         DB::statement('create table holders (id serial primary key, name text not null, note text, created_at timestamp(0), updated_at timestamp(0))');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb)');
         DB::table('holders')->insert([['name' => 'Oak', 'note' => 'a', 'created_at' => '2026-01-01 00:00:00', 'updated_at' => '2026-01-01 00:00:00']]);
         $holder = new class extends Model implements Compatible
         {
@@ -980,7 +980,7 @@ final class RecordWriterTest extends TestCase
     public function it_reads_filters_and_writes_an_attribute_that_falls_back_to_a_companion_column_once_installed(): void
     {
         DB::statement('create table holders (id serial primary key, name text not null, city text, created_at timestamp(0), updated_at timestamp(0))');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, city text)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb, city text)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb, city text)');
         DB::table('holders')->insert([['name' => 'Oak', 'city' => 'Seattle'], ['name' => 'Pine', 'city' => 'Tacoma']]);
         $holder = new class extends Model implements Compatible

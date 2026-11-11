@@ -10,10 +10,13 @@ use DateTimeImmutable;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Log;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
@@ -27,6 +30,8 @@ final class Backfiller
     public const int MARGIN = 300;
 
     private const string SAVEPOINT = 'compatibility_backfill_row';
+
+    private const array WAITED_STATES = ['55P03', '40P01'];
 
     private readonly ColumnCatalog $catalog;
 
@@ -59,18 +64,29 @@ final class Backfiller
         );
     }
 
-    public function run(int $chunk = self::CHUNK, null|CarbonInterval $margin = null): Pass
+    /**
+     * @param  null|Closure(Pass, int|string, int|string): void  $progress
+     */
+    public function run(int $chunk = self::CHUNK, null|CarbonInterval $margin = null, null|Closure $progress = null): Pass
     {
         $this->watermark->hold('backfill');
 
         try {
             $this->refuseUnwalkable($chunk);
             $since = $this->since($margin);
+
+            if ($since !== null) {
+                $this->updatedAtOf('backfill');
+            }
+
             $started = $this->watermark->start();
             $pass = $this->walk(
                 chunk: $chunk,
                 since: $since,
                 scoped: true,
+                deletes: true,
+                before: null,
+                progress: $progress,
             );
             $this->watermark->finish(
                 started: $started,
@@ -97,28 +113,57 @@ final class Backfiller
                 pass: $pass,
                 rows: fn () => $this->rowsOf($batch),
                 scoped: true,
+                before: null,
             );
         }
 
         return $pass;
     }
 
-    public function finalPass(null|CarbonInterval $margin): Pass
+    public function deletions(): Pass
+    {
+        $this->roundTrip();
+        $pass = new Pass;
+        $this->deleteGone(
+            pass: $pass,
+            scoped: true,
+        );
+
+        return $pass;
+    }
+
+    /**
+     * @param  Closure(int|string): void  $before
+     */
+    public function finalPass(null|CarbonInterval $margin, Closure $before): Pass
     {
         return $this->walk(
             chunk: self::CHUNK,
             since: $this->since($margin),
             scoped: false,
+            deletes: false,
+            before: $before,
+            progress: null,
         );
     }
 
-    public function refuseUnconvergeable(): void
+    public function refuseUnconvergeable(int $passSize): void
     {
         if ($this->updatedAt() === null) {
             throw InvalidCompatibilityMap::cannot(
                 map: $this->map->table,
                 operation: 'install',
                 because: "{$this->map->table} has no updated_at column its legacy model writes, so install() cannot limit its catch-up to the rows written since the backfill, and would walk every legacy row while it holds the lock",
+            );
+        }
+
+        $unstamped = (int) $this->connection->table($this->map->table)->useWritePdo()->whereNull($this->updatedAtOf('install'))->count();
+
+        if ($unstamped >= $passSize) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $this->map->table,
+                operation: 'install',
+                because: "{$unstamped} {$this->map->table} rows have a NULL ".$this->updatedAtOf('install').", and every pass walks them again, the final pass under the lock included; install() takes the lock only while fewer than its passSize of {$passSize} do. Stamp ".$this->updatedAtOf('install').' on those rows, then install again',
             );
         }
     }
@@ -128,79 +173,99 @@ final class Backfiller
         return $this->watermark->remembered();
     }
 
-    private function walk(int $chunk, null|string $since, bool $scoped): Pass
+    /**
+     * @param  null|Closure(int|string): void  $before
+     * @param  null|Closure(Pass, int|string, int|string): void  $progress
+     */
+    private function walk(int $chunk, null|string $since, bool $scoped, bool $deletes, null|Closure $before, null|Closure $progress): Pass
     {
         $this->roundTrip();
         $pass = new Pass;
+        $last = null;
 
-        if ($since === null) {
-            $last = null;
+        do {
+            $read = new Pass;
+            $keys = $since === null ? null : $this->candidates(
+                since: $since,
+                after: $last,
+                chunk: $chunk,
+            );
+            $rows = $this->chunk(
+                pass: $read,
+                rows: $keys === null ? fn () => $this->rowsAfter(
+                    last: $last,
+                    chunk: $chunk,
+                ) : fn () => $this->rowsOf($keys),
+                scoped: $scoped,
+                before: $before,
+            );
+            $walked = $keys ?? array_map(
+                callback: fn (array $row) => self::keyOf($row[$this->key] ?? null),
+                array: $rows,
+            );
+            $pass->absorb($read);
 
-            do {
-                $read = $this->chunk(
-                    pass: $pass,
-                    rows: fn () => $this->rowsAfter(
-                        last: $last,
-                        chunk: $chunk,
-                    ),
-                    scoped: $scoped,
-                );
-                $last = $read === [] ? $last : self::keyOf(end($read)[$this->key] ?? null);
-            } while (count($read) === $chunk);
-        } else {
-            foreach (array_chunk(array: $this->candidates($since), length: $chunk) as $batch) {
-                $this->chunk(
-                    pass: $pass,
-                    rows: fn () => $this->rowsOf($batch),
-                    scoped: $scoped,
-                );
+            if ($walked !== [] && $progress !== null) {
+                $progress($read, $walked[0], $walked[array_key_last($walked)]);
             }
-        }
 
-        $this->deleteGone(
-            pass: $pass,
-            scoped: $scoped,
-        );
+            $last = $walked === [] ? $last : $walked[array_key_last($walked)];
+        } while (count($walked) === $chunk);
+
+        if ($deletes) {
+            $this->deleteGone(
+                pass: $pass,
+                scoped: $scoped,
+            );
+        }
 
         return $pass;
     }
 
     /**
      * @param  Closure(): list<array<string, mixed>>  $rows
+     * @param  null|Closure(int|string): void  $before
      * @return list<array<string, mixed>>
      */
-    private function chunk(Pass $pass, Closure $rows, bool $scoped): array
+    private function chunk(Pass $pass, Closure $rows, bool $scoped, null|Closure $before): array
     {
-        return $this->connection->transaction(function () use ($pass, $rows, $scoped): array {
-            $zone = $this->inApplicationZone();
-            $read = $rows();
-            $previous = $this->ledger->statuses(array_map(
-                callback: fn (array $row) => self::keyOf($row[$this->key] ?? null),
-                array: $read,
-            ));
+        if ($this->commitsEachRow($scoped)) {
+            $read = $this->connection->transaction(function () use ($rows): array {
+                $zone = $this->inApplicationZone();
+                $read = $rows();
+                $this->restoreZone($zone);
+
+                return $read;
+            });
+            $previous = $this->previous($read);
 
             foreach ($read as $row) {
-                $key = self::keyOf($row[$this->key] ?? null);
-                $named = self::rootKeyOf($row[$this->map->successorKey] ?? null);
-                [$outcome, $successor, $reason] = $this->attempt(
-                    write: fn () => $this->write(
-                        key: $key,
-                        named: $named,
-                        scoped: $scoped,
-                    ),
-                    successor: $named,
-                );
-                $this->ledger->record(
-                    key: $key,
-                    successor: $successor,
-                    outcome: $outcome,
-                    reason: $reason,
-                );
-                $pass->record(
-                    key: $key,
-                    outcome: $outcome,
-                    previous: $previous[(string) $key] ?? null,
-                    reason: $reason,
+                $this->connection->transaction(fn () => $this->row(
+                    pass: $pass,
+                    row: $row,
+                    previous: $previous,
+                    scoped: $scoped,
+                    before: $before,
+                ));
+            }
+
+            $pass->walked += count($read);
+
+            return $read;
+        }
+
+        return $this->connection->transaction(function () use ($pass, $rows, $scoped, $before): array {
+            $zone = $this->inApplicationZone();
+            $read = $rows();
+            $previous = $this->previous($read);
+
+            foreach ($read as $row) {
+                $this->row(
+                    pass: $pass,
+                    row: $row,
+                    previous: $previous,
+                    scoped: $scoped,
+                    before: $before,
                 );
             }
 
@@ -211,11 +276,66 @@ final class Backfiller
         });
     }
 
+    private function commitsEachRow(bool $scoped): bool
+    {
+        return $scoped && $this->map->scope !== null;
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $read
+     * @return array<string, Outcome>
+     */
+    private function previous(array $read): array
+    {
+        return $this->ledger->statuses(array_map(
+            callback: fn (array $row) => self::keyOf($row[$this->key] ?? null),
+            array: $read,
+        ));
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @param  array<string, Outcome>  $previous
+     * @param  null|Closure(int|string): void  $before
+     */
+    private function row(Pass $pass, array $row, array $previous, bool $scoped, null|Closure $before): void
+    {
+        $key = self::keyOf($row[$this->key] ?? null);
+        $named = self::rootKeyOf($row[$this->map->successorKey] ?? null);
+
+        if ($before !== null) {
+            $before($key);
+        }
+
+        [$outcome, $successor, $reason] = $this->attempt(
+            write: fn () => $this->write(
+                key: $key,
+                named: $named,
+                scoped: $scoped,
+            ),
+            key: $key,
+            successor: $named,
+            scoped: $scoped,
+        );
+        $this->ledger->record(
+            key: $key,
+            successor: $successor,
+            outcome: $outcome,
+            reason: $reason,
+        );
+        $pass->record(
+            key: $key,
+            outcome: $outcome,
+            previous: $previous[(string) $key] ?? null,
+            reason: $reason,
+        );
+    }
+
     /**
      * @param  Closure(): array{Outcome, null|int|string}  $write
      * @return array{Outcome, null|int|string, null|string}
      */
-    private function attempt(Closure $write, null|int|string $successor): array
+    private function attempt(Closure $write, int|string $key, null|int|string $successor, bool $scoped, bool $retried = false): array
     {
         $this->connection->unprepared('SAVEPOINT '.self::SAVEPOINT);
 
@@ -225,7 +345,31 @@ final class Backfiller
             $this->connection->unprepared('ROLLBACK TO SAVEPOINT '.self::SAVEPOINT);
             $this->connection->unprepared('RELEASE SAVEPOINT '.self::SAVEPOINT);
 
-            return [$exception instanceof Refusal ? Outcome::Refused : Outcome::Failed, $successor, $exception->getMessage()];
+            if ($exception instanceof QueryException && in_array(
+                needle: $exception->getCode(),
+                haystack: self::WAITED_STATES,
+                strict: true,
+            )) {
+                if (! $scoped || $retried) {
+                    throw $exception;
+                }
+
+                return $this->attempt(
+                    write: $write,
+                    key: $key,
+                    successor: $successor,
+                    scoped: $scoped,
+                    retried: true,
+                );
+            }
+
+            if ($exception instanceof Refusal || $exception instanceof CompatibilityWriteRefused) {
+                return [Outcome::Refused, $successor, $exception->getMessage()];
+            }
+
+            Log::warning("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} failed", ['exception' => $exception]);
+
+            return [Outcome::Failed, $successor, self::reason($exception)];
         }
 
         $this->connection->unprepared('RELEASE SAVEPOINT '.self::SAVEPOINT);
@@ -347,6 +491,16 @@ final class Backfiller
      */
     private function update(UnitOfWork $unit, RecordWriter $writer, int|string $key, int|string $rootKey, array $row, array $touched, bool $scoped): array
     {
+        $legacy = $this->legacy($row);
+
+        if ($this->mapped(
+            legacy: $legacy,
+            key: $key,
+            row: $row,
+        ) === []) {
+            return [Outcome::Unchanged, $rootKey];
+        }
+
         $root = $unit->roots(
             keys: [$rootKey],
             lock: true,
@@ -368,13 +522,10 @@ final class Backfiller
             );
         }
 
-        $legacy = $this->legacy($row);
-        $served = $this->roundTrip()->read(
+        $served = $this->roundTrip()->served(
             keyName: $this->key,
             key: $key,
-        );
-        $served = $served === null ? [] : (array) $served;
-        $original = $this->legacy($served);
+        ) ?? [];
         $mapped = $this->changed(
             variant: $this->variantFor($legacy),
             legacy: $legacy,
@@ -390,10 +541,27 @@ final class Backfiller
             legacy: $legacy,
             key: $key,
             graph: $graph,
-            original: $original,
+            original: $this->legacy($served),
             mapped: $mapped,
             roundTrip: $this->roundTrip(),
         ) ? Outcome::Updated : Outcome::Unchanged, $rootKey];
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private function mapped(Model $legacy, int|string $key, array $row): array
+    {
+        return $this->changed(
+            variant: $this->variantFor($legacy),
+            legacy: $legacy,
+            row: $row,
+            served: $this->roundTrip()->served(
+                keyName: $this->key,
+                key: $key,
+            ) ?? [],
+        );
     }
 
     /**
@@ -559,31 +727,59 @@ final class Backfiller
     private function deleteGone(Pass $pass, bool $scoped): void
     {
         foreach (array_chunk(array: $this->ledger->gone(), length: self::CHUNK) as $batch) {
+            if ($this->commitsEachRow($scoped)) {
+                foreach ($batch as [$key, $successor, $status]) {
+                    $this->connection->transaction(fn () => $this->gone(
+                        pass: $pass,
+                        key: $key,
+                        successor: $successor,
+                        status: $status,
+                        scoped: $scoped,
+                    ));
+                }
+
+                continue;
+            }
+
             $this->connection->transaction(function () use ($batch, $pass, $scoped): void {
                 foreach ($batch as [$key, $successor, $status]) {
-                    [$outcome, , $reason] = $this->attempt(
-                        write: fn () => [$this->delete(
-                            key: $key,
-                            successor: $successor,
-                            scoped: $scoped,
-                        ), $successor],
-                        successor: $successor,
-                    );
-                    $this->ledger->record(
+                    $this->gone(
+                        pass: $pass,
                         key: $key,
                         successor: $successor,
-                        outcome: $outcome,
-                        reason: $reason,
-                    );
-                    $pass->record(
-                        key: $key,
-                        outcome: $outcome,
-                        previous: $status,
-                        reason: $reason,
+                        status: $status,
+                        scoped: $scoped,
                     );
                 }
             });
         }
+    }
+
+    private function gone(Pass $pass, int|string $key, null|int|string $successor, Outcome $status, bool $scoped): void
+    {
+        $pass->gone++;
+        [$outcome, , $reason] = $this->attempt(
+            write: fn () => [$this->delete(
+                key: $key,
+                successor: $successor,
+                scoped: $scoped,
+            ), $successor],
+            key: $key,
+            successor: $successor,
+            scoped: $scoped,
+        );
+        $this->ledger->record(
+            key: $key,
+            successor: $successor,
+            outcome: $outcome,
+            reason: $reason,
+        );
+        $pass->record(
+            key: $key,
+            outcome: $outcome,
+            previous: $status,
+            reason: $reason,
+        );
     }
 
     private function delete(int|string $key, null|int|string $successor, bool $scoped): Outcome
@@ -715,13 +911,9 @@ final class Backfiller
     /**
      * @return list<int|string>
      */
-    private function candidates(string $since): array
+    private function candidates(string $since, null|int|string $after, int $chunk): array
     {
-        $column = $this->updatedAt() ?? throw InvalidCompatibilityMap::cannot(
-            map: $this->map->table,
-            operation: 'backfill',
-            because: "{$this->map->table} has no updated_at column of ".class_basename($this->map->model).', so no watermark limits a pass',
-        );
+        $column = $this->updatedAtOf('backfill');
         $legacy = SqlFragments::identifier($this->map->table);
         $key = SqlFragments::identifier($this->key);
         $updated = SqlFragments::identifier($column);
@@ -729,18 +921,28 @@ final class Backfiller
             table: $this->map->table,
             column: $column,
         )) ? SqlFragments::inApplicationZone('CAST(? AS timestamptz)') : 'CAST(? AS timestamptz)';
+        $past = $after === null ? '' : ' AND %s > ?';
 
         return array_values(array_map(
             callback: fn (object $row) => self::keyOf(((array) $row)['key'] ?? null),
             array: $this->connection->select(
-                query: "SELECT {$key} AS key FROM {$legacy} WHERE {$updated} >= {$bound}"
-                    ." UNION SELECT {$key} FROM {$legacy} WHERE {$updated} IS NULL"
-                    .' UNION SELECT legacy_id FROM '.SqlFragments::identifier(Ledger::table($this->map->table))." WHERE status IN ('refused', 'failed')"
-                    .' ORDER BY 1',
-                bindings: [$since],
+                query: "SELECT {$key} AS key FROM {$legacy} WHERE {$updated} >= {$bound}".sprintf($past, $key)
+                    ." UNION SELECT {$key} FROM {$legacy} WHERE {$updated} IS NULL".sprintf($past, $key)
+                    .' UNION SELECT legacy_id FROM '.SqlFragments::identifier(Ledger::table($this->map->table))." WHERE status IN ('refused', 'failed')".sprintf($past, 'legacy_id')
+                    .' ORDER BY 1 LIMIT ?',
+                bindings: $after === null ? [$since, $chunk] : [$since, $after, $after, $after, $chunk],
                 useReadPdo: false,
             ),
         ));
+    }
+
+    private function updatedAtOf(string $operation): string
+    {
+        return $this->updatedAt() ?? throw InvalidCompatibilityMap::cannot(
+            map: $this->map->table,
+            operation: $operation,
+            because: "{$this->map->table} has no updated_at column of ".class_basename($this->map->model).', so no watermark limits a pass',
+        );
     }
 
     private function since(null|CarbonInterval $margin): null|string
@@ -793,6 +995,7 @@ final class Backfiller
             map: $this->map,
             connection: $this->connectionOf(),
             locksRetained: false,
+            hides: false,
         );
     }
 
@@ -905,6 +1108,16 @@ final class Backfiller
                 useReadPdo: false,
             );
         }
+    }
+
+    private static function reason(Throwable $exception): string
+    {
+        $message = $exception instanceof QueryException ? $exception->getPrevious()?->getMessage() ?? $exception->getMessage() : $exception->getMessage();
+
+        return $exception::class.': '.strtok(
+            string: $message,
+            token: "\n",
+        );
     }
 
     private static function rootKeyOf(mixed $key): null|int|string

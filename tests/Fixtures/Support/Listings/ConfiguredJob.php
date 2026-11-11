@@ -17,7 +17,7 @@ final class ConfiguredJob extends Model
 {
     use HasUuids;
 
-    public $timestamps = false;
+    public const UPDATED_AT = null;
 
     protected $table = 'configured_jobs';
 

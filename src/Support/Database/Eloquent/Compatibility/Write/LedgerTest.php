@@ -40,15 +40,15 @@ final class LedgerTest extends TestCase
     }
 
     #[Test]
-    public function it_types_the_ledger_by_the_legacy_key_and_the_root_key_and_indexes_only_its_refused_and_failed_rows(): void
+    public function it_types_the_ledger_by_the_legacy_key_and_the_root_key_and_indexes_its_blocking_rows_and_the_roots_of_its_deleted_rows(): void
     {
         $this->assertSame(
             [['column_name' => 'legacy_id', 'data_type' => 'integer'], ['column_name' => 'successor_id', 'data_type' => 'uuid'], ['column_name' => 'status', 'data_type' => 'text'], ['column_name' => 'reason', 'data_type' => 'text'], ['column_name' => 'attempts', 'data_type' => 'integer'], ['column_name' => 'attempted_at', 'data_type' => 'timestamp with time zone']],
             array_map(fn (object $row) => (array) $row, DB::select("select column_name, data_type from information_schema.columns where table_name = 'listings_backfill' order by ordinal_position")),
         );
         $this->assertSame(
-            ['CREATE INDEX listings_backfill_status_index ON public.listings_backfill USING btree (status) WHERE (status = ANY (ARRAY[\'refused\'::text, \'failed\'::text]))'],
-            array_column(DB::select("select indexdef from pg_indexes where tablename = 'listings_backfill' and indexname <> 'listings_backfill_pkey'"), 'indexdef'),
+            ['CREATE INDEX listings_backfill_deleted_index ON public.listings_backfill USING btree (successor_id) WHERE (status = \'deleted\'::text)', 'CREATE INDEX listings_backfill_status_index ON public.listings_backfill USING btree (status) WHERE (status = ANY (ARRAY[\'refused\'::text, \'failed\'::text]))'],
+            array_column(DB::select("select indexdef from pg_indexes where tablename = 'listings_backfill' and indexname <> 'listings_backfill_pkey' order by indexname"), 'indexdef'),
         );
         $this->assertSame([], DB::select("select conname from pg_constraint where conrelid = 'listings_backfill'::regclass and contype = 'f'"));
     }
@@ -98,7 +98,7 @@ final class LedgerTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::cannot(
             map: 'listings',
             operation: 'install',
-            because: '7 listings rows are refused or failed in listings_backfill, and no row installs before every row can be served: 6 refused because blank title (id 1, 2, 3, 4, 5); 1 failed because lost connection (id 9). Fix each row, run php artisan compatibility:backfill '.Listing::class.', then install again',
+            because: '7 listings rows are refused or failed in listings_backfill, and no row installs before every row can be served: 6 refused because blank title (id 1, 2, 3, 4, 5); 1 failed because lost connection (id 9). Fix each row, run php artisan compatibility:backfill \''.Listing::class.'\', then install again',
         ));
 
         $ledger->refuseBlocked('install');

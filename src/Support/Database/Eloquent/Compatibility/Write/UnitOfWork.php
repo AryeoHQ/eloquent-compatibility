@@ -32,7 +32,7 @@ final readonly class UnitOfWork
 {
     public const int CHUNK = 1000;
 
-    public function __construct(private ResolvedMap $map, private Connection $connection, private bool $locksRetained = true) {}
+    public function __construct(private ResolvedMap $map, private Connection $connection, private bool $locksRetained = true, private bool $hides = true) {}
 
     /**
      * @template TResult
@@ -338,7 +338,7 @@ final readonly class UnitOfWork
         $primary = $this->map->primary;
         $query = $this->successor($primary->model)->newModelQuery()->whereKey($keys)->orderBy($primary->table.'.'.$primary->key);
 
-        foreach (ViewCompiler::hidden($this->map) as $condition) {
+        foreach ($this->hides ? ViewCompiler::hidden($this->map) : [] as $condition) {
             $query->whereRaw('NOT COALESCE(('.$condition.'), false)');
         }
 

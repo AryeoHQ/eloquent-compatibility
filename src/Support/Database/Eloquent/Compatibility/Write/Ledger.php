@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Illuminate\Database\ConnectionInterface;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Console\Backfill;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -14,6 +15,8 @@ use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 final class Ledger
 {
     public const int FIRST_KEYS = 5;
+
+    public const int FIRST_REASONS = 10;
 
     private readonly string $key;
 
@@ -65,6 +68,10 @@ final class Ledger
                 map: $map->table,
                 name: $ledger.'_status_index',
             )).' ON '.SqlFragments::identifier($ledger)." (status) WHERE status IN ('refused', 'failed')",
+            'CREATE INDEX IF NOT EXISTS '.SqlFragments::identifier(SqlFragments::objectName(
+                map: $map->table,
+                name: $ledger.'_deleted_index',
+            )).' ON '.SqlFragments::identifier($ledger)." (successor_id) WHERE status = 'deleted'",
         ];
     }
 
@@ -111,10 +118,13 @@ final class Ledger
             query: "INSERT INTO {$ledger} AS ledger (legacy_id, successor_id, status, reason, attempts, attempted_at)"
                 ." VALUES (CAST(? AS {$this->types[0]}), CAST(? AS {$this->types[1]}), ?, ?, 1, now())"
                 .' ON CONFLICT (legacy_id) DO UPDATE SET successor_id = COALESCE(excluded.successor_id, ledger.successor_id), status = excluded.status, reason = excluded.reason, attempts = ledger.attempts + 1, attempted_at = excluded.attempted_at',
-            bindings: [$key, $successor, $outcome->value, $reason === null ? null : str_replace(
-                search: "\0",
-                replace: '',
-                subject: $reason,
+            bindings: [$key, $successor, $outcome->value, $reason === null ? null : mb_scrub(
+                string: str_replace(
+                    search: "\0",
+                    replace: '',
+                    subject: $reason,
+                ),
+                encoding: 'UTF-8',
             )],
         );
     }
@@ -149,6 +159,7 @@ final class Ledger
             callback: fn (object $row) => (int) ($row->rows ?? 0),
             array: $rows,
         ));
+        $more = count($rows) - self::FIRST_REASONS;
 
         throw InvalidCompatibilityMap::cannot(
             map: $this->map->table,
@@ -157,9 +168,13 @@ final class Ledger
                 separator: '; ',
                 array: array_map(
                     callback: fn (object $row) => (int) ($row->rows ?? 0).' '.(string) ($row->status ?? '').' because '.(string) ($row->reason ?? '').' ('.$this->key.' '.(is_string($row->first_keys ?? null) ? $row->first_keys : '').')',
-                    array: $rows,
+                    array: array_slice(
+                        array: $rows,
+                        offset: 0,
+                        length: self::FIRST_REASONS,
+                    ),
                 ),
-            ).'. Fix each row, run php artisan compatibility:backfill '.$this->map->model.', then install again',
+            ).($more > 0 ? "; and {$more} more ".($more === 1 ? 'reason' : 'reasons') : '').'. Fix each row, run '.Backfill::command($this->map->model).', then install again',
         );
     }
 

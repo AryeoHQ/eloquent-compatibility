@@ -163,6 +163,22 @@ final class RoundTrip
         );
     }
 
+    /**
+     * @return null|array<string, mixed>
+     */
+    public function served(string $keyName, int|string $key): null|array
+    {
+        $row = $this->read(
+            keyName: $keyName,
+            key: $key,
+        );
+
+        return $row === null ? $this->hidden(
+            keyName: $keyName,
+            key: $key,
+        ) : (array) $row;
+    }
+
     public function agrees(Model $legacy, string $name, mixed $written, mixed $served): bool
     {
         return self::same(

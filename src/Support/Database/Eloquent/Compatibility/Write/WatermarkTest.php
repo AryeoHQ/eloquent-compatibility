@@ -97,7 +97,7 @@ final class WatermarkTest extends TestCase
         $second->hold('install');
         $second->release();
 
-        $this->assertSame("Compatibility map 'listings' cannot install: another backfill pass or install of listings holds its advisory lock, and each legacy model runs one pass at a time; wait for it to finish, then install again.", $refusal);
+        $this->assertSame("Compatibility map 'listings' cannot install: another backfill pass or install of listings holds its advisory lock, hashtextextended('compatibility_backfills:listings', 0), and each legacy model runs one pass at a time; wait for it to finish, then install again. pg_locks names the session that holds it, with locktype 'advisory'.", $refusal);
     }
 
     #[Test]

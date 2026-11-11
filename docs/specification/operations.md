@@ -341,10 +341,10 @@ Legacy readers therefore see no v2-created listing until install. Declined: mirr
 An operation or an initializer refuses with `throw Refusal::because('...')`.
 
 - **A live write.** The unit of work rolls back, and the caller receives a `Refusal` whose message names the legacy model, the record key or a new record, the attribute and the operation or initializer class, ahead of the reason. The consumer's own `Refusal` is its previous exception.
-- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues.
+- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues. A `CompatibilityWriteRefused` on a backfill row is recorded as `refused` too.
 - **Install's native-root insert.** Install catches nothing under its lock, so the refusal aborts install, and names the root's key and the reason.
 
-Any other exception on a backfill row rolls back that row's savepoint too, and records the row as `failed`.
+Any other exception on a backfill row rolls back that row's savepoint too, and records the row as `failed`, except a lock timeout or a deadlock, which the pass retries ([Lifecycle: a pass](lifecycle.md#a-pass)).
 
 ## The write scope
 

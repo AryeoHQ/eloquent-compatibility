@@ -267,7 +267,7 @@ final class CarriesLegacyTest extends TestCase
     public function it_inserts_the_retained_row_of_a_native_create_through_a_subclass_of_the_root_its_map_serves_from(): void
     {
         DB::statement('create table holders (id serial primary key, name text not null, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz)');
         DB::table('holders')->insert([['name' => 'Oak']]);
         $holder = new class extends Model implements Compatible
         {

@@ -82,6 +82,34 @@ final readonly class Watermark
         return is_int($pass) ? $pass : null;
     }
 
+    /**
+     * @return null|array{started: null|string, finished: null|string, rows: null|int}
+     */
+    public function progress(): null|array
+    {
+        if (! $this->exists()) {
+            return null;
+        }
+
+        $row = $this->connection->selectOne(
+            query: "select to_char(pass_started_at at time zone 'UTC', '".self::SECONDS."') as started, to_char(pass_finished_at at time zone 'UTC', '".self::SECONDS."') as finished, pass_rows as rows from ".SqlFragments::identifier(self::TABLE).' where legacy_type = ?',
+            bindings: [$this->legacyType],
+            useReadPdo: false,
+        );
+
+        if ($row === null) {
+            return null;
+        }
+
+        $row = (array) $row;
+
+        return [
+            'started' => is_string($row['started'] ?? null) ? $row['started'] : null,
+            'finished' => is_string($row['finished'] ?? null) ? $row['finished'] : null,
+            'rows' => is_int($row['rows'] ?? null) ? $row['rows'] : null,
+        ];
+    }
+
     public function start(): string
     {
         $started = $this->connection->selectOne(
@@ -116,7 +144,7 @@ final readonly class Watermark
             throw InvalidCompatibilityMap::cannot(
                 map: $this->legacyType,
                 operation: $operation,
-                because: "another backfill pass or install of {$this->legacyType} holds its advisory lock, and each legacy model runs one pass at a time; wait for it to finish, then {$operation} again",
+                because: "another backfill pass or install of {$this->legacyType} holds its advisory lock, hashtextextended('".self::LOCK."{$this->legacyType}', 0), and each legacy model runs one pass at a time; wait for it to finish, then {$operation} again. pg_locks names the session that holds it, with locktype 'advisory'",
             );
         }
     }

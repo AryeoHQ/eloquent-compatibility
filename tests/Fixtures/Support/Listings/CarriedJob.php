@@ -17,7 +17,7 @@ class CarriedJob extends Model
     use CarriesLegacy;
     use HasUuids;
 
-    public $timestamps = false;
+    public const UPDATED_AT = null;
 
     protected $table = 'configured_jobs';
 

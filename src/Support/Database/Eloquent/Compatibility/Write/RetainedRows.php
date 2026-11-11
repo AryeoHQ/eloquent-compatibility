@@ -77,13 +77,14 @@ final class RetainedRows
      * @param  null|list<int|string>  $among
      * @return list<int|string>
      */
-    public function unserved(string $table, null|array $among = null, null|string $since = null): array
+    public function unserved(string $table, null|array $among = null, null|string $since = null, null|int $limit = null): array
     {
         $members = $this->members();
         $root = $members->getModel();
         $legacy = SqlFragments::identifier($table);
         $qualified = $members->qualifyColumn($this->map->primary->key);
-        $members->whereRaw('NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->map->successorKey).' = '.SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($this->map->primary->key).')');
+        $rootKey = SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($this->map->primary->key);
+        $members->whereRaw('NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->map->successorKey).' = '.$rootKey.')');
 
         $ledger = new Ledger(
             map: $this->map,
@@ -91,33 +92,47 @@ final class RetainedRows
         );
 
         if ($ledger->exists()) {
-            $members->whereRaw('NOT EXISTS ('.$ledger->deletedRoots(SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($this->map->primary->key)).')');
+            $members->whereRaw('NOT EXISTS ('.$ledger->deletedRoots($rootKey).')');
         }
 
-        $created = $root->usesTimestamps() ? $root->getCreatedAtColumn() : null;
-
         if ($among !== null || $since !== null) {
-            $members->where(function ($bounded) use ($among, $since, $qualified, $created): void {
+            $catalog = new ColumnCatalog(
+                connection: $this->connection,
+                throughWriteConnection: true,
+            );
+            $created = $root->usesTimestamps() ? $root->getCreatedAtColumn() : null;
+            $members->where(function (Builder $bounded) use ($among, $since, $rootKey, $root, $created, $catalog): void {
                 if ($among !== null) {
-                    $bounded->orWhereIn(
-                        column: $qualified,
-                        values: $among === [] ? [null] : $among,
+                    $bounded->orWhereRaw(
+                        sql: $rootKey.' = any(cast(? as '.($catalog->type(
+                            table: $root->getTable(),
+                            column: $this->map->primary->key,
+                        ) ?? 'text').'[]))',
+                        bindings: [SqlFragments::arrayLiteral($among)],
                     );
                 }
 
                 if ($since !== null && $created !== null) {
-                    $bounded->orWhere(
-                        column: $bounded->qualifyColumn($created),
-                        operator: '>=',
-                        value: $since,
+                    $bounded->orWhereRaw(
+                        sql: SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($created).' >= '.(SqlFragments::isNaive($catalog->type(
+                            table: $root->getTable(),
+                            column: $created,
+                        )) ? SqlFragments::inApplicationZone('CAST(? AS timestamptz)') : 'CAST(? AS timestamptz)'),
+                        bindings: [$since],
                     );
                 }
             });
         }
 
+        $members->orderBy($qualified);
+
+        if ($limit !== null) {
+            $members->limit($limit);
+        }
+
         return array_values(array_map(
             callback: fn (mixed $key) => is_int($key) || is_string($key) ? $key : throw new LogicException("{$this->map->primary->table} holds a row with no key."),
-            array: $members->orderBy($qualified)->toBase()->pluck($qualified)->all(),
+            array: $members->toBase()->pluck($qualified)->all(),
         ));
     }
 

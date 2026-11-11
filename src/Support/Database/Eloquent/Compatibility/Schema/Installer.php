@@ -12,6 +12,8 @@ use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Log;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Console\Backfill;
+use Support\Database\Eloquent\Compatibility\Console\CheckDrift;
 use Support\Database\Eloquent\Compatibility\Console\DriftQueries;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -165,7 +167,8 @@ final readonly class Installer
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
-        $backfiller->refuseUnconvergeable();
+        $backfiller->refuseUnconvergeable($passSize);
+        $this->refuseUnwindowed($map);
 
         if ($remembered === null) {
             $backfiller->run(margin: $margin);
@@ -196,6 +199,8 @@ final readonly class Installer
             backfiller: $backfiller,
             ledger: $ledger,
         );
+        $backfiller->deletions();
+        $ledger->refuseBlocked('install');
         $hidden = Statements::hiddenBeforeTheLock(
             map: $map,
             connection: $this->connection,
@@ -237,7 +242,16 @@ final readonly class Installer
                     $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
                     self::refuseBlockedFinal(
                         map: $map,
-                        pass: $backfiller->finalPass($margin),
+                        pass: $backfiller->finalPass(
+                            margin: $margin,
+                            before: fn (int|string $key) => self::refuseSpent(
+                                map: $map,
+                                started: $started,
+                                budget: $budget,
+                                moment: 'before',
+                                statement: "the final pass's write of {$map->table} ".(new $map->model)->getKeyName()." {$key}",
+                            ),
+                        ),
                     );
                     $this->apply(
                         statements: $install,
@@ -263,6 +277,34 @@ final readonly class Installer
         );
     }
 
+    private function refuseUnwindowed(ResolvedMap $map): void
+    {
+        $root = new $map->primary->model;
+        $catalog = new ColumnCatalog(
+            connection: $this->connection,
+            throughWriteConnection: true,
+        );
+        $created = $root->usesTimestamps() ? $root->getCreatedAtColumn() : null;
+
+        if ($created === null || $catalog->type(
+            table: $map->primary->table,
+            column: $created,
+        ) === null) {
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'install',
+                because: class_basename($map->primary->model)." stamps no created_at column on {$map->primary->table}, so install() cannot find a root created natively between its read of native roots and its lock, and the view would serve no record for that root. Give ".class_basename($map->primary->model).' timestamps, then install again',
+            );
+        }
+
+        if (! $catalog->leadsAnIndex(
+            table: $map->primary->table,
+            column: $created,
+        )) {
+            Log::warning("Compatibility map '{$map->table}' install: no index leads with {$map->primary->table}.{$created}, so the read of natively created roots under the lock scans {$map->primary->table}. Create one before install with CREATE INDEX CONCURRENTLY ON ".SqlFragments::identifier($map->primary->table).' ('.SqlFragments::identifier($created).')');
+        }
+    }
+
     private function prove(ResolvedMap $map, Backfiller $backfiller, Ledger $ledger): void
     {
         $ledger->refuseBlocked('install');
@@ -270,7 +312,7 @@ final readonly class Installer
         [$missing, $differing] = $proof->proof($map);
         $flagged = array_values(array_unique(
             array: [...$missing, ...$differing],
-            flags: SORT_REGULAR,
+            flags: SORT_STRING,
         ));
 
         if ($flagged === []) {
@@ -278,6 +320,7 @@ final readonly class Installer
         }
 
         sort($flagged);
+        Log::info("Compatibility map '{$map->table}' install: its proofs flagged ".count($flagged)." {$map->table} rows, which it catches up before it proves them again");
         $backfiller->catchUp($flagged);
         $ledger->refuseBlocked('install');
         [$missing, $differing] = $proof->proof(
@@ -298,7 +341,7 @@ final readonly class Installer
             throw InvalidCompatibilityMap::cannot(
                 map: $map->table,
                 operation: 'install',
-                because: count($differing)." {$map->table} rows still hold other values than their successors serve after install caught them up; the first are {$key} ".self::first($differing).'. Run php artisan compatibility:check '.$map->model.' to see each value, fix it, then install again',
+                because: count($differing)." {$map->table} rows still hold other values than their successors serve after install caught them up; the first are {$key} ".self::first($differing).'. Run '.CheckDrift::command($map->model).' to see each value, fix it, then install again',
             );
         }
     }
@@ -315,6 +358,17 @@ final readonly class Installer
             foreach ($counts as $reason => $count) {
                 $reasons[] = "{$count} {$status} because {$reason}";
             }
+        }
+
+        $more = count($reasons) - Ledger::FIRST_REASONS;
+        $reasons = array_slice(
+            array: $reasons,
+            offset: 0,
+            length: Ledger::FIRST_REASONS,
+        );
+
+        if ($more > 0) {
+            $reasons[] = "and {$more} more ".($more === 1 ? 'reason' : 'reasons');
         }
 
         throw InvalidCompatibilityMap::cannot(
@@ -376,6 +430,7 @@ final readonly class Installer
     {
         for ($pass = 1; ; $pass++) {
             $caughtUp = $backfiller->run(margin: $margin);
+            Log::info("Compatibility map '{$map->table}' install: catch-up pass {$pass} walked {$caughtUp->walked} {$map->table} rows and {$caughtUp->gone} whose legacy row is gone, and changed the outcome of {$caughtUp->changed}: {$caughtUp->count(Outcome::Refused)} refused, {$caughtUp->count(Outcome::Failed)} failed");
 
             if ($caughtUp->changed === 0 || $caughtUp->changed < $passSize) {
                 return;
@@ -385,7 +440,7 @@ final readonly class Installer
                 throw InvalidCompatibilityMap::cannot(
                     map: $map->table,
                     operation: 'install',
-                    because: "its catch-up pass {$pass} still changed the outcome of {$caughtUp->changed} legacy rows, and install() takes the lock only once a pass changes fewer than {$passSize}. Run php artisan compatibility:backfill ".$map->model.' again, then install()',
+                    because: "its catch-up pass {$pass} still changed the outcome of {$caughtUp->changed} legacy rows, and install() takes the lock only once a pass changes fewer than {$passSize}. Run ".Backfill::command($map->model).' again, then install()',
                 );
             }
         }

@@ -12,7 +12,9 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Outcome;
+use Support\Database\Eloquent\Compatibility\Write\Pass;
 
 final class Backfill extends Command
 {
@@ -55,30 +57,40 @@ final class Backfill extends Command
             ))->run(
                 chunk: (int) $chunk,
                 margin: CarbonInterval::seconds((int) $margin),
+                progress: fn (Pass $written, int|string $first, int|string $last) => $this->raw("Wrote {$map->table} {$first} to {$last}: ".self::counts($written).'.'),
             );
         } catch (InvalidCompatibilityMap|LogicException $exception) {
             return $this->refuse($exception->getMessage());
         }
 
-        $this->line("Walked {$pass->walked} {$map->table} rows: ".implode(
-            separator: ', ',
-            array: array_map(
-                callback: fn (Outcome $outcome) => $pass->count($outcome).' '.$outcome->value,
-                array: Outcome::cases(),
-            ),
-        ).'.');
+        $this->line("Walked {$pass->walked} {$map->table} rows and {$pass->gone} whose legacy row is gone: ".self::counts($pass).'.');
+        $key = (new $map->model)->getKeyName();
+        $printed = 0;
+        $groups = 0;
 
         foreach ($pass->reasons as $status => $reasons) {
             foreach ($reasons as $reason => $count) {
-                $this->line("{$count} {$status}: {$reason}");
+                $groups++;
+
+                if ($printed < Ledger::FIRST_REASONS) {
+                    $printed++;
+                    $this->raw("{$count} {$status}: {$reason} ({$key} ".implode(
+                        separator: ', ',
+                        array: $pass->reasonKeys[$status][$reason] ?? [],
+                    ).')');
+                }
             }
+        }
+
+        if ($groups > $printed) {
+            $this->line('And '.($groups - $printed).' more '.($groups - $printed === 1 ? 'reason' : 'reasons').' in '.Ledger::table($map->table).'.');
         }
 
         $this->line('Watermark: '.($pass->watermark ?? 'none'));
 
         if ($pass->blocked()) {
             $this->output->getErrorStyle()->writeln(
-                messages: "{$map->table} has refused or failed rows, and install() refuses until a pass writes them. Fix each row, then run php artisan compatibility:backfill {$models[0]} again.",
+                messages: "{$map->table} has refused or failed rows, which ".Ledger::table($map->table).' records with their reasons, and install() refuses until a pass writes them. Fix each row, then run '.self::command($models[0]).' again.',
                 type: OutputStyle::OUTPUT_RAW,
             );
 
@@ -86,6 +98,38 @@ final class Backfill extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    public static function command(string $model): string
+    {
+        return "php artisan compatibility:backfill '".str_replace(
+            search: "'",
+            replace: "'\\''",
+            subject: $model,
+        )."'";
+    }
+
+    private static function counts(Pass $pass): string
+    {
+        return implode(
+            separator: ', ',
+            array: array_map(
+                callback: fn (Outcome $outcome) => $pass->count($outcome).' '.$outcome->value,
+                array: Outcome::cases(),
+            ),
+        );
+    }
+
+    private function raw(string $line): void
+    {
+        $this->output->writeln(
+            messages: (string) preg_replace_callback(
+                pattern: '/[\x00-\x1F\x7F]/',
+                callback: fn (array $control) => sprintf('\\x%02X', ord($control[0])),
+                subject: $line,
+            ),
+            type: OutputStyle::OUTPUT_RAW,
+        );
     }
 
     private function refuse(string $message): int

@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Compatibility\Schema\Column;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
+use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Origin;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
@@ -75,7 +76,8 @@ final readonly class DriftQueries
         $legacy = SqlFragments::identifier($map->table);
         $legacyKey = $legacy.'.'.SqlFragments::identifier(self::key($map));
         $successorKey = $legacy.'.'.SqlFragments::identifier($map->successorKey);
-        [$within, $bindings] = self::among(
+        [$within, $bindings] = $this->among(
+            map: $map,
             column: $legacyKey,
             among: $among,
         );
@@ -114,7 +116,7 @@ final readonly class DriftQueries
         );
         $differing = array_values(array_unique(
             array: [...$differing, ...$misplaced],
-            flags: SORT_REGULAR,
+            flags: SORT_STRING,
         ));
         sort($differing);
 
@@ -200,13 +202,12 @@ final readonly class DriftQueries
                 ),
                 detail: 'it matches the when() of '.class_basename($map->model)." and no {$retained} row names it, so the view serves no record for it; an insert into {$map->primary->table} that bypassed ".class_basename($map->primary->model).'\'s model created it',
             ),
-            array: array_slice(
-                array: (new RetainedRows(
-                    map: $map,
-                    connection: $this->connection,
-                ))->unserved($retained),
-                offset: 0,
-                length: $limit,
+            array: (new RetainedRows(
+                map: $map,
+                connection: $this->connection,
+            ))->unserved(
+                table: $retained,
+                limit: $limit,
             ),
         ));
     }
@@ -215,20 +216,19 @@ final readonly class DriftQueries
      * @param  null|list<int|string>  $among
      * @return array{string, list<int|string>}
      */
-    private static function among(string $column, null|array $among): array
+    private function among(ResolvedMap $map, string $column, null|array $among): array
     {
         if ($among === null) {
             return ['', []];
         }
 
-        return [" AND {$column} IN (".implode(
-            separator: ', ',
-            array: array_fill(
-                start_index: 0,
-                count: count($among),
-                value: '?',
-            ),
-        ).')', $among];
+        return [" AND {$column} = any(cast(? as ".((new ColumnCatalog(
+            connection: $this->connection,
+            throughWriteConnection: true,
+        ))->type(
+            table: $map->table,
+            column: self::key($map),
+        ) ?? 'text').'[]))', [SqlFragments::arrayLiteral($among)]];
     }
 
     /**
@@ -407,7 +407,8 @@ final readonly class DriftQueries
             map: $map,
             table: $retained,
         ) : ['', []];
-        [$within, $amongBindings] = self::among(
+        [$within, $amongBindings] = $this->among(
+            map: $map,
             column: $legacyKey,
             among: $among,
         );
@@ -460,6 +461,7 @@ final readonly class DriftQueries
             .' '.ViewCompiler::root(
                 map: $map,
                 retained: ViewCompiler::retainedTable($map),
+                hides: false,
             )
             .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($map)))
             .($filters === [] ? '' : ' WHERE '.implode(' AND ', $filters)).') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
@@ -590,7 +592,8 @@ final readonly class DriftQueries
             map: $map,
             table: $legacy,
         ) : ['', []];
-        [$within, $amongBindings] = self::among(
+        [$within, $amongBindings] = $this->among(
+            map: $map,
             column: $legacyKey,
             among: $among,
         );
@@ -635,7 +638,7 @@ final readonly class DriftQueries
             return ['', []];
         }
 
-        $bound = SqlFragments::isNaive($shape[$updatedAt]->type) ? SqlFragments::inApplicationZone('CAST(? AS timestamptz)') : 'CAST(? AS timestamptz)';
+        $bound = SqlFragments::isNaive($shape[$updatedAt]->type) ? SqlFragments::inApplicationZone("(CAST(? AS timestamptz) - interval '".Backfiller::MARGIN." seconds')") : "(CAST(? AS timestamptz) - interval '".Backfiller::MARGIN." seconds')";
 
         $column = $table.'.'.SqlFragments::identifier($updatedAt);
 

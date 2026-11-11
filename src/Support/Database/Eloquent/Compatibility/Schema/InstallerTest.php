@@ -45,6 +45,7 @@ use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\NameJobFromTitle;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\UnstampedJob;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
@@ -617,7 +618,13 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertSame([['info', "Compatibility map 'listings' install: hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1. Install read this count before it took its lock."]], $loggedBeforeTheLock);
+        $this->assertSame([['info', "Compatibility map 'listings' install: hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1. Install read this count before it took its lock."]], array_values(array_filter(
+            array: $loggedBeforeTheLock ?? [],
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' hides ',
+            ),
+        )));
         $this->assertSame([2, 3], array_map(intval(...), array_column(DB::select('select id from listings order by id'), 'id')));
     }
 
@@ -767,6 +774,35 @@ final class InstallerTest extends TestCase
         $this->assertTrue($reverted);
         $this->assertStringStartsWith("Compatibility map 'listings' cannot install: 1 listings rows still hold other values than their successors serve after install caught them up; the first are id 1.", $refusal);
         $this->assertSame('r', $this->kind('listings'));
+        $this->assertSame(1, preg_match(
+            pattern: "/ Run php artisan compatibility:check --model='([^']+)' to see each value, /",
+            subject: $refusal,
+            matches: $printed,
+        ));
+        $this->artisan('compatibility:check', ['--model' => [$printed[1]]])
+            ->expectsOutputToContain('values differ')
+            ->assertExitCode(1);
+    }
+
+    #[Test]
+    public function it_logs_each_catch_up_pass_before_its_lock_with_its_counts_and_the_keys_its_proofs_flag(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::update("update jobs set name = 'Renamed natively' where id = ?", [ListingTables::jobOf(1)]);
+        $this->listenToTheLog();
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([
+            ['info', "Compatibility map 'listings' install: catch-up pass 1 walked 0 listings rows and 0 whose legacy row is gone, and changed the outcome of 0: 0 refused, 0 failed"],
+            ['info', "Compatibility map 'listings' install: its proofs flagged 1 listings rows, which it catches up before it proves them again"],
+        ], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => $logged[0] === 'info',
+        )));
     }
 
     #[Test]
@@ -1874,7 +1910,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $exception) {
-            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still changed the outcome of 1100 legacy rows, and install() takes the lock only once a pass changes fewer than 1000. Run php artisan compatibility:backfill ".Listing::class.' again, then install()', $exception->getMessage());
+            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still changed the outcome of 1100 legacy rows, and install() takes the lock only once a pass changes fewer than 1000. Run php artisan compatibility:backfill '".Listing::class."' again, then install()", $exception->getMessage());
         }
 
         $this->assertSame([5, 'r'], [$passes, $this->kind('listings')]);
@@ -2222,14 +2258,13 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_deletes_at_install_the_job_of_a_listing_hard_deleted_after_an_off_lock_pass_read_its_deletions(): void
+    public function it_reads_its_deletions_before_the_lock_and_leaves_live_for_the_check_the_job_of_a_listing_hard_deleted_after_its_last_read(): void
     {
         $this->backfiller(Listing::class)->run();
         $writer = $this->writer();
-        $deleted = false;
-        DB::listen(function (QueryExecuted $query) use ($writer, &$deleted): void {
-            if (! $deleted && $query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM')) {
-                $deleted = true;
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
                 $writer->delete('delete from listings where id = 3');
             }
         });
@@ -2239,9 +2274,232 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertTrue($deleted);
-        $this->assertSame([1, 2], array_column($this->listings(), 'id'));
-        $this->assertSame([3, true], [DB::table('jobs')->count(), DB::scalar("select deleted_at is not null from jobs where name = 'Elm Cottage'")]);
+        $this->assertSame([2, [1, 2]], [$reads, array_column($this->listings(), 'id')]);
+        $this->assertSame([3, false], [DB::table('jobs')->count(), DB::scalar("select deleted_at is not null from jobs where name = 'Elm Cottage'")]);
+        $this->artisan('compatibility:check', ['--model' => [Listing::class]])
+            ->expectsOutputToContain('unserved')
+            ->assertExitCode(1);
+    }
+
+    #[Test]
+    public function it_rolls_back_and_retries_when_its_final_pass_waits_on_a_live_writer_of_a_root_past_its_lock_timeout(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $this->listenToTheLog();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+                $this->holdConcurrently(
+                    sql: 'select id from jobs where id = (select job_id from listings where id = 1) for update',
+                    seconds: 3,
+                );
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(4),
+        );
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+        $this->assertSame([['warning', true]], array_values(array_map(
+            callback: fn (array $logged) => [$logged[0], str_contains(
+                haystack: $logged[1],
+                needle: "Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03",
+            )],
+            array: array_filter(
+                array: $this->logged,
+                callback: fn (array $logged) => $logged[0] === 'warning' && str_contains(
+                    haystack: $logged[1],
+                    needle: ' attempt ',
+                ),
+            ),
+        )));
+    }
+
+    #[Test]
+    public function it_refuses_once_its_final_pass_spends_the_lock_budget_and_names_the_row_it_reached(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->unprepared('create or replace function slow_job_update() returns trigger language plpgsql as $$ begin perform pg_sleep(0.6); return new; end $$; create trigger slow_job_update before update on jobs for each row execute function slow_job_update()');
+                $writer->update("update listings set title = title || ' Revised', updated_at = localtimestamp(0)");
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(1),
+            );
+            $this->fail('Install held its lock past its statementTimeout.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringContainsString("ms statementTimeout before the step the final pass's write of listings id 3, so it rolled back.", $exception->getMessage());
+        } finally {
+            DB::unprepared('drop function if exists slow_job_update() cascade');
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_carries_more_natively_created_roots_than_postgresql_binds_parameters_in_one_statement(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::statement("insert into jobs (name, company_id, created_at, updated_at) select 'Native ' || n, ?, now() - interval '1 day', now() - interval '1 day' from generate_series(1, 65536) as n", [ListingTables::COMPANY]);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(600),
+        );
+
+        $this->assertSame(65539, DB::table('listings')->count());
+    }
+
+    #[Test]
+    public function it_refuses_before_any_write_a_root_model_that_stamps_no_created_at(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: UnstampedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+        Compatibility::prepare($listing::class);
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::cannot(
+            map: 'listings',
+            operation: 'install',
+            because: 'UnstampedJob stamps no created_at column on jobs, so install() cannot find a root created natively between its read of native roots and its lock, and the view would serve no record for that root. Give UnstampedJob timestamps, then install again',
+        ));
+
+        try {
+            Compatibility::install(
+                model: $listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+        } finally {
+            $this->assertSame([3, 'r'], [DB::table('jobs')->count(), $this->kind('listings')]);
+        }
+    }
+
+    #[Test]
+    public function it_carries_a_root_created_natively_inside_its_window_into_a_wall_clock_created_at_in_the_application_zone(): void
+    {
+        config(['app.timezone' => 'America/Chicago']);
+        DB::statement('alter table jobs alter column created_at type timestamp(0) without time zone');
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->insert("insert into jobs (name, company_id, created_at, updated_at) values ('Native job', ?, now() at time zone 'America/Chicago', now())", [ListingTables::COMPANY]);
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([2, true], [$reads, DB::table('listings')->where('title', 'Native job')->exists()]);
+    }
+
+    #[Test]
+    public function it_warns_before_its_lock_when_no_index_leads_with_the_created_at_of_the_root_and_not_once_one_does(): void
+    {
+        $this->listenToTheLog();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        Compatibility::rollback(Listing::class);
+        Compatibility::prepare(Listing::class);
+        DB::statement('create index jobs_created_at_index on jobs (created_at)');
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([['warning', "Compatibility map 'listings' install: no index leads with jobs.created_at, so the read of natively created roots under the lock scans jobs. Create one before install with CREATE INDEX CONCURRENTLY ON \"jobs\" (\"created_at\")"]], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => $logged[0] === 'warning',
+        )));
+    }
+
+    #[Test]
+    public function it_catches_up_each_of_two_text_keys_that_compare_equal_as_numbers(): void
+    {
+        DB::statement('truncate jobs cascade');
+        DB::statement('create table codes (code text primary key, title text not null, company_id uuid not null, created_at timestamp(0), updated_at timestamp(0))');
+        DB::table('codes')->insert([
+            ['code' => '01', 'title' => 'First code', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-01-01 10:00:00', 'updated_at' => '2026-01-01 10:00:00'],
+            ['code' => '1', 'title' => 'Second code', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-01-01 10:00:00', 'updated_at' => '2026-01-01 10:00:00'],
+        ]);
+        $code = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $incrementing = false;
+
+            protected $keyType = 'string';
+
+            protected $primaryKey = 'code';
+
+            protected $table = 'codes';
+
+            public static function compatibility(Compatibility $code): Compatibility
+            {
+                return $code
+                    ->retainedIn('codes_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+
+        try {
+            Compatibility::prepare($code::class);
+            $this->artisan('compatibility:backfill', ['model' => $code::class])->assertExitCode(0);
+            DB::delete('delete from jobs where id in (select job_id from codes)');
+
+            Compatibility::install(
+                model: $code::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $this->assertSame(['01', '1'], DB::table('codes')->orderBy('code')->pluck('code')->all());
+        } finally {
+            DB::statement("do \$\$ begin if exists (select from pg_views where viewname = 'codes') then drop view codes; end if; end \$\$");
+            DB::statement('drop table if exists codes_retained, codes, codes_backfill cascade');
+            DB::delete("delete from compatibility_backfills where legacy_type = 'codes'");
+        }
     }
 
     #[Test]
@@ -2281,7 +2539,27 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_takes_the_lock_once_a_pass_changes_no_outcome_although_it_still_walks_a_thousand_rows_with_a_null_updated_at(): void
+    public function it_refuses_before_any_write_while_as_many_rows_as_its_pass_size_have_a_null_updated_at(): void
+    {
+        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), null from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+        $this->backfiller(Listing::class)->run();
+        $passes = (int) DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'");
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('Install took its lock with 1,100 rows whose updated_at is NULL.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame("Compatibility map 'listings' cannot install: 1100 listings rows have a NULL updated_at, and every pass walks them again, the final pass under the lock included; install() takes the lock only while fewer than its passSize of 1000 do. Stamp updated_at on those rows, then install again.", $exception->getMessage());
+        }
+
+        $this->assertSame(['r', $passes], [$this->kind('listings'), (int) DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'")]);
+    }
+
+    #[Test]
+    public function it_takes_the_lock_and_walks_the_rows_with_a_null_updated_at_while_fewer_than_its_pass_size_have_one(): void
     {
         DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), null from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
         $this->backfiller(Listing::class)->run();
@@ -2295,9 +2573,10 @@ final class InstallerTest extends TestCase
         Compatibility::install(
             model: Listing::class,
             statementTimeout: CarbonInterval::seconds(30),
+            passSize: 2000,
         );
 
-        $this->assertSame([1100, 1100], $walked);
+        $this->assertSame([1100], $walked);
         $this->assertSame(['v', 1103], [$this->kind('listings'), DB::table('listings')->count()]);
     }
 
@@ -2462,6 +2741,13 @@ final class InstallerTest extends TestCase
         );
 
         $this->assertSame(["locked\n", "committed\n", 2, 'v'], [$holding, $released, $attempts, $this->kind('listings')]);
+        $this->logged = array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' attempt ',
+            ),
+        ));
         $this->assertCount(2, $this->logged);
         $this->assertSame('warning', $this->logged[0][0]);
         $this->assertMatchesRegularExpression("/^Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03 on ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY \\(\"job_id\"\\) REFERENCES \"jobs\" \\(\"id\"\\) ON DELETE CASCADE NOT VALID after \\d+ ms, so it rolled back and retries$/", $this->logged[0][1]);
@@ -2902,7 +3188,13 @@ final class InstallerTest extends TestCase
         $this->assertSame([
             ['info', "Compatibility map 'listings' install: view listing_titles depends on listings"],
             ['info', "Compatibility map 'listings' rollback: view listing_titles depends on listings"],
-        ], $this->logged);
+        ], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' depends on ',
+            ),
+        )));
     }
 
     #[Test]

@@ -6,8 +6,11 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -15,9 +18,12 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\RefuseWithCutTitle;
 use Tests\TestCase;
 
 #[CoversClass(Backfill::class)]
@@ -51,9 +57,17 @@ final class BackfillTest extends TestCase
         $printed = explode("\n", trim(Artisan::output()));
 
         $this->assertSame(0, $exit);
-        $this->assertSame('Walked 3 listings rows: 3 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.', $printed[0]);
-        $this->assertMatchesRegularExpression('/^Watermark: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/', $printed[1]);
-        $this->assertCount(2, $printed);
+        $this->assertSame([
+            'Wrote listings 1 to 2: 2 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.',
+            'Wrote listings 3 to 3: 1 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.',
+            'Walked 3 listings rows and 0 whose legacy row is gone: 3 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.',
+        ], array_slice(
+            array: $printed,
+            offset: 0,
+            length: 3,
+        ));
+        $this->assertMatchesRegularExpression('/^Watermark: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/', $printed[3]);
+        $this->assertCount(4, $printed);
         $this->assertSame(3, DB::scalar('select count(*) from jobs'));
     }
 
@@ -65,8 +79,19 @@ final class BackfillTest extends TestCase
 
         $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class]);
 
-        $this->assertSame([0, 'Walked 1 listings rows: 0 created, 1 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[0]]);
+        $this->assertSame([0, 'Walked 1 listings rows and 0 whose legacy row is gone: 0 created, 1 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[1]]);
         $this->assertSame('Pine Loft', DB::table('jobs')->where(column: 'id', operator: '=', value: ListingTables::jobOf(2))->value('name'));
+    }
+
+    #[Test]
+    public function it_counts_the_ledger_rows_whose_legacy_row_is_gone_beside_the_rows_it_walked(): void
+    {
+        Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+        DB::delete('delete from listings where id = 3');
+
+        $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+
+        $this->assertSame([0, 'Walked 0 listings rows and 1 whose legacy row is gone: 0 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 1 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[0]]);
     }
 
     #[Test]
@@ -78,7 +103,7 @@ final class BackfillTest extends TestCase
         Artisan::call('compatibility:backfill', ['model' => Listing::class, '--margin' => '60']);
         $narrow = explode("\n", trim(Artisan::output()))[0];
         Artisan::call('compatibility:backfill', ['model' => Listing::class]);
-        $wide = explode("\n", trim(Artisan::output()))[0];
+        $wide = explode("\n", trim(Artisan::output()))[1];
 
         $this->assertSame(['Walked 0 listings rows', 'Walked 1 listings rows'], [substr($narrow, 0, 22), substr($wide, 0, 22)]);
     }
@@ -89,19 +114,110 @@ final class BackfillTest extends TestCase
         DB::update("update listings set status = 'Archived' where id = 3");
 
         $this->artisan('compatibility:backfill', ['model' => Listing::class])
-            ->expectsOutput('Walked 3 listings rows: 2 created, 0 updated, 0 unchanged, 1 refused, 0 failed, 0 deleted.')
-            ->expectsOutput("1 refused: A listing status is Draft, Active or Sold, and 'Archived' is none of them.")
-            ->expectsOutputToContain('listings has refused or failed rows, and install() refuses until a pass writes them.')
+            ->expectsOutput('Wrote listings 1 to 3: 2 created, 0 updated, 0 unchanged, 1 refused, 0 failed, 0 deleted.')
+            ->expectsOutput('Walked 3 listings rows and 0 whose legacy row is gone: 2 created, 0 updated, 0 unchanged, 1 refused, 0 failed, 0 deleted.')
+            ->expectsOutput("1 refused: A listing status is Draft, Active or Sold, and 'Archived' is none of them. (id 3)")
+            ->expectsOutputToContain("listings has refused or failed rows, which listings_backfill records with their reasons, and install() refuses until a pass writes them. Fix each row, then run php artisan compatibility:backfill 'Tests\\Fixtures\\Support\\Listings\\Listing' again.")
             ->assertFailed();
 
         $this->assertSame(2, DB::scalar('select count(*) from jobs'));
     }
 
     #[Test]
+    public function it_prints_the_markup_and_control_characters_of_a_reason_as_text(): void
+    {
+        DB::update('update listings set status = ? where id = 3', ["<href=https://example.invalid>Archived</>\e[31m"]);
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutput("1 refused: A listing status is Draft, Active or Sold, and '<href=https://example.invalid>Archived</>\\x1B[31m' is none of them. (id 3)")
+            ->assertFailed();
+    }
+
+    #[Test]
+    public function it_records_a_failed_row_by_its_exception_class_and_first_line_without_its_values_and_logs_the_exception(): void
+    {
+        DB::statement("alter table jobs add constraint jobs_name_is_not_secret check (name not like 'SECRET%')");
+        DB::update("update listings set title = 'SECRET-' || id where id in (1, 3)");
+        $logged = [];
+        Event::listen(MessageLogged::class, function (MessageLogged $message) use (&$logged): void {
+            $logged[] = [$message->level, $message->message, ($message->context['exception'] ?? null) instanceof QueryException];
+        });
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutput('2 failed: Illuminate\Database\QueryException: SQLSTATE[23514]: Check violation: 7 ERROR:  new row for relation "jobs" violates check constraint "jobs_name_is_not_secret" (id 1, 3)')
+            ->assertFailed();
+
+        $this->assertSame([0, 1], [DB::scalar("select count(*) from listings_backfill where reason like '%SECRET%'"), DB::scalar("select count(distinct reason) from listings_backfill where status = 'failed'")]);
+        $this->assertSame([
+            ['warning', "Compatibility map 'listings' backfill: the write of listings id 1 failed", true],
+            ['warning', "Compatibility map 'listings' backfill: the write of listings id 3 failed", true],
+        ], $logged);
+    }
+
+    #[Test]
+    public function it_prints_and_install_names_the_ten_largest_reasons_and_counts_the_others(): void
+    {
+        DB::statement("insert into listings (title, company_id, status) select 'Barn ' || n, ?, 'Archived ' || n from generate_series(1, 12) as n", [ListingTables::COMPANY]);
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutput('And 2 more reasons in listings_backfill.')
+            ->assertFailed();
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('Install took its lock with refused rows.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertSame([10, true], [substr_count(
+                haystack: $exception->getMessage(),
+                needle: ' refused because ',
+            ), str_contains(
+                haystack: $exception->getMessage(),
+                needle: '; and 2 more reasons. Fix each row',
+            )]);
+        }
+    }
+
+    #[Test]
+    public function it_records_a_reason_cut_inside_a_character_as_valid_text_and_writes_the_other_rows(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(RefuseWithCutTitle::class),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+        DB::update("update listings set title = 'Élan' where id = 2");
+
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])->assertFailed();
+
+        $this->assertSame([['refused', 'The title ? is cut.'], ['refused', 'The title O is cut.']], array_map(
+            callback: fn (object $row) => [$row->status, $row->reason],
+            array: DB::select('select status, reason from listings_backfill where legacy_id in (1, 2) order by legacy_id desc'),
+        ));
+    }
+
+    #[Test]
     public function it_finds_the_legacy_model_by_the_class_name_of_a_served_model(): void
     {
         $this->artisan('compatibility:backfill', ['model' => 'Listing'])
-            ->expectsOutputToContain('Walked 3 listings rows: 3 created')
+            ->expectsOutputToContain('Walked 3 listings rows and 0 whose legacy row is gone: 3 created')
             ->assertSuccessful();
     }
 

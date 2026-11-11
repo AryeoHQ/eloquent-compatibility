@@ -174,10 +174,14 @@ final class Status extends Command
             connection: $connection,
         ))->counts() : ['refused' => 0, 'failed' => 0];
 
-        return "pass {$pass}, watermark ".((new Watermark(
+        $watermark = new Watermark(
             legacyType: $map->table,
             connection: $connection,
-        ))->remembered() ?? 'none').", {$counts['refused']} refused, {$counts['failed']} failed";
+        );
+        $progress = $watermark->progress();
+        $finished = $progress['finished'] ?? null;
+
+        return "pass {$pass} started ".($progress['started'] ?? 'never').', '.($finished === null ? 'not finished' : "finished {$finished} after ".($progress['rows'] ?? 0).' rows').', watermark '.($watermark->remembered() ?? 'none').", {$counts['refused']} refused, {$counts['failed']} failed";
     }
 
     private function refuse(string $message): int

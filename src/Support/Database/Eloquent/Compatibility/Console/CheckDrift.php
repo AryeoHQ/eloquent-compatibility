@@ -134,6 +134,15 @@ final class CheckDrift extends Command
         }
     }
 
+    public static function command(string $model): string
+    {
+        return "php artisan compatibility:check --model='".str_replace(
+            search: "'",
+            replace: "'\\''",
+            subject: $model,
+        )."'";
+    }
+
     private function refuse(string $message): int
     {
         $this->output->getErrorStyle()->writeln($message, OutputStyle::OUTPUT_RAW);

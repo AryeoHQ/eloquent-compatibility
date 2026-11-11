@@ -55,7 +55,7 @@ final class RoundTripTest extends TestCase
     public function it_refuses_a_write_of_a_long_numeric_value_that_reads_back_another_value_past_the_precision_of_a_float(): void
     {
         DB::statement('create table tallies (id serial primary key, name text not null, total numeric(30, 2), created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, total numeric(30, 2))');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb, total numeric(30, 2))');
         DB::table('tallies')->insert([['name' => 'Oak', 'total' => '1']]);
         $tally = new class extends Model implements Compatible
         {
@@ -503,7 +503,7 @@ final class RoundTripTest extends TestCase
     private function holding(Model $holder, string $columns, array $row, array $copied, Closure $write): mixed
     {
         DB::statement('create table holders (id serial primary key, name text not null, '.$columns.', created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb, stamped_at timestamp(0) without time zone, lit boolean)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb, stamped_at timestamp(0) without time zone, lit boolean)');
         DB::table('holders')->insert($row);
         $copy = implode('', array_map(fn (string $column) => ', '.$column, $copied));
 

@@ -143,6 +143,7 @@ CREATE TABLE listings_backfill (
 );
 
 CREATE INDEX ON listings_backfill (status) WHERE status IN ('refused', 'failed');
+CREATE INDEX ON listings_backfill (successor_id) WHERE status = 'deleted';
 ```
 
 | Column | Holds |
@@ -150,11 +151,11 @@ CREATE INDEX ON listings_backfill (status) WHERE status IN ('refused', 'failed')
 | `legacy_id` | the legacy row's key, typed as the legacy key; no foreign key to the legacy table, so the row outlives a deleted legacy row |
 | `successor_id` | the root successor last written, typed as the root's key |
 | `status` | `created`, `updated`, `unchanged`, `refused`, `failed` or `deleted` |
-| `reason` | the refusal's reason, or the error of a failed row |
+| `reason` | the refusal's reason, or the exception class and first message line of a failed row |
 | `attempts` | how many passes attempted the row |
 | `attempted_at` | when a pass last wrote the row |
 
-The partial index lets every pass find the `refused` and `failed` rows without a scan. The table's name obeys the identifier limit ([0009](../decisions/0009-map-names-fit-the-object-name-limit.md)).
+The first partial index lets every pass find the `refused` and `failed` rows without a scan. The second lets install's native-root read exclude the roots a `deleted` row names without a scan. The table's name obeys the identifier limit ([0009](../decisions/0009-map-names-fit-the-object-name-limit.md)).
 
 When install finishes, the package deletes the legacy model's row from `compatibility_backfills`. It never drops `compatibility_backfills`. The table holds one row per legacy model, so dropping it would erase the watermarks of models not yet installed. Each legacy model installs independently, and that rule needs those watermarks.
 

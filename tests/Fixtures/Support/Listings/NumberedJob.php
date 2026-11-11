@@ -12,7 +12,7 @@ use Illuminate\Database\Eloquent\Model;
  */
 final class NumberedJob extends Model
 {
-    public $timestamps = false;
+    public const UPDATED_AT = null;
 
     protected $table = 'numbered_jobs';
 

@@ -14,6 +14,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Contracts\ScopesWrites;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Definition\Targets;
@@ -35,6 +36,7 @@ use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\NameJobFromTitle;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\TransactionRecordingWriteScope;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
@@ -60,6 +62,7 @@ final class BackfillerTest extends TestCase
         WriteFileMimeType::$origins = [];
         WriteAssetFileMimeType::$seen = [];
         RecordingWriteScope::$received = [];
+        TransactionRecordingWriteScope::$received = [];
     }
 
     protected function tearDown(): void
@@ -304,7 +307,7 @@ final class BackfillerTest extends TestCase
             $this->backfiller(Listing::class)->run();
             $this->fail('The pass did not refuse.');
         } catch (InvalidCompatibilityMap $exception) {
-            $this->assertSame("Compatibility map 'listings' cannot backfill: another backfill pass or install of listings holds its advisory lock, and each legacy model runs one pass at a time; wait for it to finish, then backfill again.", $exception->getMessage());
+            $this->assertSame("Compatibility map 'listings' cannot backfill: another backfill pass or install of listings holds its advisory lock, hashtextextended('compatibility_backfills:listings', 0), and each legacy model runs one pass at a time; wait for it to finish, then backfill again. pg_locks names the session that holds it, with locktype 'advisory'.", $exception->getMessage());
         } finally {
             DB::disconnect('second');
         }
@@ -347,6 +350,113 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
+    public function it_commits_each_row_of_a_scoped_map_with_its_ledger_row_before_the_scope_of_the_next_row_runs(): void
+    {
+        $listing = $this->scopedListing(TransactionRecordingWriteScope::class);
+
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])->assertExitCode(0);
+
+        $received = TransactionRecordingWriteScope::$received;
+        $this->assertSame([0, 1, 2], array_column(
+            array: $received,
+            column_key: 'ledger',
+        ));
+        $this->assertCount(3, array_unique(array_column(
+            array: $received,
+            column_key: 'transaction',
+        )));
+    }
+
+    #[Test]
+    public function it_retries_once_a_row_whose_lock_wait_times_out_and_records_its_write_instead_of_a_failure(): void
+    {
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        DB::update("update listings set title = 'Oak Manor', updated_at = '2030-01-01 00:00:00' where id = 1");
+        [$process, $pipes] = $this->transaction(
+            sql: 'select id from jobs where id = (select job_id from listings where id = 1) for update',
+            seconds: 1,
+        );
+        fgets($pipes[1]);
+        DB::statement("set lock_timeout = '600ms'");
+
+        try {
+            $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        } finally {
+            DB::statement('reset lock_timeout');
+            proc_close($process);
+        }
+
+        $this->assertSame(['updated', 'Oak Manor'], [DB::scalar('select status from listings_backfill where legacy_id = 1'), DB::scalar('select jobs.name from jobs join listings on listings.job_id = jobs.id where listings.id = 1')]);
+    }
+
+    #[Test]
+    public function it_reads_the_candidates_of_an_incremental_pass_one_chunk_at_a_time_and_walks_each_of_them(): void
+    {
+        $listing = $this->namedListing();
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])->assertExitCode(0);
+        DB::update("update listings set title = '', updated_at = '2030-01-01 00:00:00' where id = 1");
+        DB::update("update listings set updated_at = '2030-01-01 00:00:00' where id = 2");
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])->assertExitCode(1);
+        DB::update("update listings set title = 'Oak House', updated_at = '2026-01-02 11:30:00' where id = 1");
+        DB::update('update listings set updated_at = null where id = 3');
+        $candidates = [];
+        DB::listen(function (QueryExecuted $query) use (&$candidates): void {
+            if (str_contains(
+                haystack: $query->sql,
+                needle: ' UNION SELECT legacy_id FROM ',
+            )) {
+                $candidates[] = [str_ends_with(
+                    haystack: $query->sql,
+                    needle: ' LIMIT ?',
+                ), $query->bindings[array_key_last($query->bindings)]];
+            }
+        });
+
+        $this->artisan('compatibility:backfill', ['model' => $listing::class, '--chunk' => '1'])->assertExitCode(0);
+
+        $this->assertSame(array_fill(0, 4, [true, 1]), $candidates);
+        $this->assertSame([[1, 'unchanged', 3], [2, 'unchanged', 3], [3, 'updated', 2]], array_map(
+            callback: fn (array $row) => [$row['legacy_id'], $row['status'], $row['attempts']],
+            array: $this->rows('select legacy_id, status, attempts from listings_backfill order by legacy_id'),
+        ));
+    }
+
+    #[Test]
+    public function it_refuses_an_incremental_pass_over_a_table_without_updated_at_before_it_counts_the_pass(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $timestamps = false;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])->assertExitCode(0);
+
+        $this->artisan('compatibility:backfill', ['model' => $listing::class])
+            ->expectsOutputToContain('so no watermark limits a pass')
+            ->assertExitCode(1);
+
+        $this->assertSame([1, true], [DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'"), DB::scalar("select pass_finished_at is not null from compatibility_backfills where legacy_type = 'listings'")]);
+    }
+
+    #[Test]
     public function it_refuses_a_catch_up_row_whose_operation_loses_the_value_through_the_round_trip(): void
     {
         $this->backfiller(Listing::class)->run();
@@ -355,7 +465,7 @@ final class BackfillerTest extends TestCase
 
         $pass = $this->backfiller($listing::class)->run();
 
-        $this->assertSame(1, $pass->count(Outcome::Failed));
+        $this->assertSame([1, 0], [$pass->count(Outcome::Refused), $pass->count(Outcome::Failed)]);
         $this->assertSame('Oak House', DB::scalar('select jobs.name from jobs join listings on listings.job_id = jobs.id where listings.id = 1'));
         $this->assertStringContainsString('$title', (string) DB::scalar('select reason from listings_backfill where legacy_id = 1'));
     }
@@ -397,15 +507,15 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
-    public function it_fails_a_row_whose_dependent_its_relation_would_not_read_back_and_writes_the_others(): void
+    public function it_refuses_a_row_whose_dependent_its_relation_would_not_read_back_and_writes_the_others(): void
     {
         $listing = $this->seattleListing(withAttributes: false);
 
         $pass = $this->backfiller($listing::class)->run();
 
-        $this->assertSame([1, 2], [$pass->count(Outcome::Created), $pass->count(Outcome::Failed)]);
+        $this->assertSame([1, 2], [$pass->count(Outcome::Created), $pass->count(Outcome::Refused)]);
         $this->assertSame([1, 0], [DB::scalar('select count(*) from jobs'), DB::scalar('select count(*) from places')]);
-        $this->assertSame(['failed', 'created', 'failed'], array_column($this->rows('select status from listings_backfill order by legacy_id'), 'status'));
+        $this->assertSame(['refused', 'created', 'refused'], array_column($this->rows('select status from listings_backfill order by legacy_id'), 'status'));
     }
 
     #[Test]
@@ -422,7 +532,7 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
-    public function it_fails_a_row_whose_legacy_value_its_conversions_cannot_store_and_writes_the_others(): void
+    public function it_refuses_a_row_whose_legacy_value_its_conversions_cannot_store_and_writes_the_others(): void
     {
         DB::update("update listings set status = 'Archived' where id = 3");
         $listing = new class extends Model implements Compatible
@@ -453,7 +563,7 @@ final class BackfillerTest extends TestCase
 
         $pass = $this->backfiller($listing::class)->run();
 
-        $this->assertSame([2, 1], [$pass->count(Outcome::Created), $pass->count(Outcome::Failed)]);
+        $this->assertSame([2, 1], [$pass->count(Outcome::Created), $pass->count(Outcome::Refused)]);
         $this->assertSame(2, DB::scalar('select count(*) from jobs'));
         $this->assertStringContainsString("mapping() maps no stored value to 'Archived'", (string) DB::scalar('select reason from listings_backfill where legacy_id = 3'));
     }
@@ -795,6 +905,69 @@ final class BackfillerTest extends TestCase
         );
     }
 
+    #[Test]
+    public function it_catches_up_a_legacy_edit_to_a_record_whose_root_a_hide_rule_hides(): void
+    {
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        DB::update('update jobs set merged_into_job_id = (select job_id from listings where id = 3) where id = (select job_id from listings where id = 1)');
+        DB::update("update listings set title = 'Oak Manor', updated_at = '2030-01-01 00:00:00' where id = 1");
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+
+        $this->assertSame(['updated', 'Oak Manor'], [DB::scalar('select status from listings_backfill where legacy_id = 1'), DB::scalar('select jobs.name from jobs join listings on listings.job_id = jobs.id where listings.id = 1')]);
+    }
+
+    #[Test]
+    public function it_soft_deletes_the_root_a_hide_rule_hides_once_its_legacy_row_is_gone(): void
+    {
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        $job = (string) DB::scalar('select job_id from listings where id = 3');
+        DB::update('update jobs set merged_into_job_id = (select job_id from listings where id = 1) where id = ?', [$job]);
+        DB::delete('delete from listings where id = 3');
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+
+        $this->assertSame(['deleted', true], [DB::scalar('select status from listings_backfill where legacy_id = 3'), DB::table('jobs')->where('id', $job)->whereNotNull('deleted_at')->exists()]);
+    }
+
+    #[Test]
+    public function it_catches_up_at_install_a_native_edit_to_a_root_a_hide_rule_hides(): void
+    {
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        DB::update("update jobs set merged_into_job_id = (select job_id from listings where id = 3), name = 'Renamed natively' where id = (select job_id from listings where id = 1)");
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame('Oak House', DB::scalar('select jobs.name from jobs join listings_retained on listings_retained.job_id = jobs.id where listings_retained.id = 1'));
+    }
+
+    #[Test]
+    public function it_takes_no_row_lock_while_it_walks_an_unchanged_row_again(): void
+    {
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+        DB::update("update jobs set updated_at = '2030-01-01 00:00:00'");
+        DB::update("update listings set updated_at = '2030-01-01 00:00:00'");
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (str_contains(
+                haystack: strtolower($query->sql),
+                needle: 'for update',
+            )) {
+                $locks[] = $query->sql;
+            }
+        });
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
+
+        $this->assertSame([[], ['unchanged', 'unchanged', 'unchanged']], [$locks, array_map(
+            callback: fn (array $row) => $row['status'],
+            array: $this->rows('select status from listings_backfill order by legacy_id'),
+        )]);
+    }
+
     private function namedListing(): Model
     {
         return new class extends Model implements Compatible
@@ -882,11 +1055,17 @@ final class BackfillerTest extends TestCase
         };
     }
 
-    private function scopedListing(): Model
+    /**
+     * @param  class-string<ScopesWrites>  $scope
+     */
+    private function scopedListing(string $scope = RecordingWriteScope::class): Model
     {
-        return new class extends Model implements Compatible
+        $listing = new class extends Model implements Compatible
         {
             use ServesCompatibility;
+
+            /** @var class-string<ScopesWrites> */
+            public static string $scope = RecordingWriteScope::class;
 
             protected $table = 'listings';
 
@@ -894,7 +1073,7 @@ final class BackfillerTest extends TestCase
             {
                 return $listing
                     ->retainedIn('listings_retained')
-                    ->writesWithin(RecordingWriteScope::class)
+                    ->writesWithin(self::$scope)
                     ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                         ->attribute(
                             name: 'title',
@@ -910,6 +1089,10 @@ final class BackfillerTest extends TestCase
                         ));
             }
         };
+
+        $listing::$scope = $scope;
+
+        return $listing;
     }
 
     private function computedFloorPlan(): Model

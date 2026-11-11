@@ -302,6 +302,25 @@ final class MorphTargetTest extends TestCase
     }
 
     #[Test]
+    public function it_moves_a_catch_up_row_into_the_target_its_legacy_edit_chooses(): void
+    {
+        PlaceAssetTables::brochures();
+        Compatibility::prepare(Brochure::class);
+        $this->artisan('compatibility:backfill', ['model' => Brochure::class])->assertExitCode(0);
+        DB::update("update place_brochures set hosted = false, file_name = null, url = 'https://guide.example/oak', updated_at = localtimestamp(0) + interval '1 day' where id = 1");
+
+        $this->artisan('compatibility:backfill', ['model' => Brochure::class])->assertExitCode(0);
+        Compatibility::install(
+            model: Brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $asset = $this->asset('place_brochure', 1);
+        $this->assertSame(['place_asset_link', 'https://guide.example/oak'], [$asset['asset_type'], DB::table('asset_links')->where('id', $asset['asset_id'])->value('url')]);
+        $this->assertSame([1, 'Guide', null, 'https://guide.example/oak'], [Brochure::query()->findOrFail(1)->id, Brochure::query()->findOrFail(1)->title, Brochure::query()->findOrFail(1)->file_name, Brochure::query()->findOrFail(1)->url]);
+    }
+
+    #[Test]
     public function it_keeps_the_place_asset_and_the_target_of_a_legacy_row_whose_key_changed(): void
     {
         PlaceAssetTables::brochures();

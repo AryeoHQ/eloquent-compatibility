@@ -189,6 +189,7 @@ final readonly class RecordWriter
             graph: $graph,
             mapped: $mapped,
             added: [],
+            byHeldTarget: true,
         );
         [$graph, $mapped] = $this->moved($graph, $chosen, $original, $mapped);
         $this->unit->assign(
@@ -463,7 +464,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
      */
-    public function chosen(Model $legacy, Model $original, Staging $graph, array $mapped, array $added): ResolvedMap
+    public function chosen(Model $legacy, Model $original, Staging $graph, array $mapped, array $added, bool $byHeldTarget = false): ResolvedMap
     {
         if ($this->map->morphs === [] || $added !== []) {
             return $graph->map;
@@ -482,7 +483,7 @@ final readonly class RecordWriter
             $this->refuseUnsupplied($legacy, UnitOfWork::keyOf($original), $type, $chosen, $mapped);
         }
 
-        if ($current !== null && $this->map->morphFor($original) === $chosen) {
+        if ($current !== null && ($byHeldTarget ? $current : $this->map->morphFor($original)) === $chosen) {
             return $graph->map;
         }
 

@@ -42,21 +42,27 @@ It allocates nothing on the successors. Running it again changes nothing. [Stora
 
 ## The backfill
 
-`compatibility:backfill {model}` runs one pass. A pass walks the legacy rows by key, in chunks, and writes each row in its own savepoint ([0023](../decisions/0023-the-backfill-records-an-outcome-per-row.md)).
+`compatibility:backfill {model}` runs one pass. A pass reads the legacy rows by key, in chunks, and writes each row in its own savepoint ([0023](../decisions/0023-the-backfill-records-an-outcome-per-row.md)). A map without `writesWithin()` writes each chunk in one transaction. A map that declares `writesWithin()` commits each row in its own transaction, so the chunk is only a read batch. Each row then runs its write scope, the package's locks, its write and its ledger row, and commits. A savepoint's release keeps its row locks, so in one chunk transaction a row's scope would run while the package still held the locks of the rows before it.
 
 ### A pass
 
-1. The pass takes a session-level advisory lock, `pg_try_advisory_lock`, keyed on the legacy model's `legacy_type`. It holds the lock for the whole pass, across its chunk transactions, and releases it when the pass ends. When another pass or an install holds the lock, the pass refuses with a named error, and does not wait.
+1. The pass takes a session-level advisory lock, `pg_try_advisory_lock(hashtextextended('compatibility_backfills:<legacy>', 0))`. It holds the lock for the whole pass, across its transactions, and releases it when the pass ends. When another pass or an install holds the lock, the pass refuses with a named error, and does not wait. The error names the lock, so `pg_locks` finds the session that holds it.
 2. The pass records its start, read from the database clock.
 3. The first pass walks every row. Each later pass walks:
    - rows whose `updated_at` is at or after the watermark minus the margin,
    - rows whose `updated_at` is NULL,
    - rows whose ledger status is `refused` or `failed`.
+
+   It reads these keys one chunk at a time, in key order, so a pass holds one chunk of keys in memory. Before it counts the pass, a later pass refuses a legacy table without an `updated_at` column its legacy model writes.
 4. Each row is written in its own savepoint, through the operations, and its ledger row is upserted. Inside the savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. When the key names an existing root, the row takes the update path. The test reads the root's table without global scopes, so a trashed root exists. When the key is NULL, the create path creates a root and fills the key. When the key names no row, the create path creates the root with that key value, so the identity holds ([Storage: the successor key](storage.md#the-successor-key)).
 5. The pass handles deletions: ledger rows whose status is not `deleted` and whose legacy row is gone.
 6. The pass sets the watermark to its recorded start.
 
-A failure rolls back that row only, and the chunk continues.
+A failure rolls back that row only, and the chunk continues. A row that waits past a lock timeout (`55P03`) or deadlocks (`40P01`) is not recorded as `failed`. The pass retries it once. When the retry waits too, the pass ends without moving its watermark, so the next pass walks the row again.
+
+Before it compares a walked row, the update path reads the root, its successors and the served values without a lock. It locks the root and its successors only when a value differs, and then compares again. An unchanged row therefore takes no row lock.
+
+`compatibility:backfill` prints one line per chunk, with its first and last key and its counts by status.
 
 ### The watermark and its margin
 
@@ -73,11 +79,13 @@ The ledger records one outcome per legacy row:
 | `created` | the pass created the row's successors |
 | `updated` | the pass changed at least one successor |
 | `unchanged` | every successor already served the legacy values |
-| `refused` | an operation or initializer refused the row, with its reason |
-| `failed` | the row's write raised an error, recorded as the reason |
+| `refused` | an operation or initializer refused the row, or the package refused the write with a `CompatibilityWriteRefused`, with its reason |
+| `failed` | the row's write raised another error, recorded as the reason |
 | `deleted` | the legacy row is gone, and the pass deleted its successor |
 
-`compatibility:backfill` prints the counts by status, and the refusals by reason. It exits non-zero when any row is `refused` or `failed`.
+A `failed` row's reason is the exception's class and the first line of its message. For a database error, that line is the driver's, which names the SQLSTATE and the constraint and carries neither the bindings nor the connection. The package writes the whole exception to the Laravel log, with the legacy key. A refusal's reason is its message. The ledger stores every reason as valid UTF-8 without NUL bytes.
+
+`compatibility:backfill` prints the counts by status. They cover the walked rows and the ledger rows whose legacy row is gone, and the command prints both totals. It prints each reason with its count and its first keys, ten reasons at most, and the count of the others. It prints a reason as text: its console markup stays literal, and each control character prints as `\xNN`. It exits non-zero when any row is `refused` or `failed`, and it names `<legacy>_backfill`. Every command it prints for the operator quotes the model's class.
 
 ### Retries
 
@@ -146,17 +154,18 @@ Install runs in one transaction ([0024](../decisions/0024-install-is-one-transac
 ### Before the lock
 
 1. Install refuses before any work when an object depends on the legacy table and the map declares no `dependents()`. It also refuses when `<legacy>_backfill` or the model's `compatibility_backfills` row is missing, and the refusal names `prepare()`.
-2. It takes the advisory lock that every pass takes, and holds it until install ends. Install's own passes run under it, and any other pass of this model refuses.
+2. It takes the advisory lock that every pass takes, and holds it until install ends. Install's own passes run under it, and any other pass of this model refuses. Before any write, install refuses a legacy table whose rows with a NULL `updated_at` reach its `passSize:`. Every pass walks those rows, the final pass under the lock included, so install names the count and the remedy: stamp `updated_at` on those rows. It also refuses a root model that stamps no `created_at` column, because the native-root window under the lock reads that column ([Under the lock](#under-the-lock), step 6). When no index leads with the root's `created_at`, install writes a warning to the Laravel log, because that read then scans the root's table under the lock. Install does not refuse then. Create the index before install, with `CREATE INDEX CONCURRENTLY`.
 3. When no pass has completed, so the model's watermark is NULL, it runs one full pass first. That holds for a model that was never backfilled, for an empty ledger, and for a re-install after a rollback. A first install therefore never drops a mapped value that no pass has written, and a re-install keeps the legacy edits made after the rollback. Before that pass, install refuses a legacy table without an `updated_at` column its legacy model writes, so the refusal comes before any write. An installed model runs no pass.
-4. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them. When five passes in a row each still change the outcome of `passSize:` rows or more, install refuses, and names `compatibility:backfill`, because live writes outpace its catch-up.
+4. It runs passes until one changes the outcome of fewer rows than its `passSize:` argument, 1,000 by default. The count covers the rows whose successors the pass created, updated or deleted, and the rows whose ledger status changed. It does not count the rows the pass walked and left as they were. Every pass still walks the rows whose `updated_at` is NULL, and the `refused` and `failed` rows. A pass that changes no row always stops the loop, and install proceeds to its gate, which refuses on `refused` or `failed` rows and names them. When five passes in a row each still change the outcome of `passSize:` rows or more, install refuses, and names `compatibility:backfill`, because live writes outpace its catch-up. Install writes one line to the Laravel log per pass, with its walked, gone, changed, refused and failed counts.
 5. It records the start time of its read of native roots. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. It writes nothing for these roots, and it reports their count.
-6. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail.
+6. It proves the install gate: the ledger, existence and values. It catches up the keys the existence proof and the value proof flag, proves those keys again, and refuses only when they still fail. It logs the count of flagged keys.
+7. It handles the deletions one last time, as a pass does, and refuses on a `refused` or `failed` row again.
 
-These whole-table proofs never run under the lock.
+These whole-table proofs and the deletion read never run under the lock. A legacy row hard-deleted after that last deletion read leaves its root live, and the view serves no record for it. `compatibility:check` reports that root as an unserved root after install ([The source of truth](#the-source-of-truth)).
 
 ### Under the lock
 
-1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)). When the pass refuses a row, or a row's write fails, install rolls back and refuses, naming each reason and the first keys. The gate refused such rows before the lock, so only a write that lands after the gate causes it.
+1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)). It handles no deletions. When the pass refuses a row, or a row's write fails, install rolls back and refuses, naming each reason and the first keys. The gate refused such rows before the lock, so only a write that lands after the gate causes it. A row that waits past the lock timeout, deadlocks or is cancelled is not a row failure: install rolls back, and retries or reports the spent budget as it does for every statement under the lock.
 2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one.
 3. `ManagesDependents::beforeInstall()`.
 4. The rename of the legacy table to the retained table.
@@ -167,7 +176,7 @@ These whole-table proofs never run under the lock.
 9. `ManagesDependents::afterInstall()`.
 10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)).
 
-Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
+Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, before each row of the final pass, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
 
 Declined: a per-statement timeout only. Nothing would then bound the hold, and PostgreSQL 14 has no `transaction_timeout`.
 

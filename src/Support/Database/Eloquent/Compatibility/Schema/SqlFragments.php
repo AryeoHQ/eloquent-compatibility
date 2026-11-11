@@ -259,6 +259,20 @@ final class SqlFragments
         return "'".str_replace("'", "''", $value)."'";
     }
 
+    /**
+     * @param  list<int|string>  $values
+     */
+    public static function arrayLiteral(array $values): string
+    {
+        return '{'.implode(
+            separator: ',',
+            array: array_map(
+                callback: fn (int|string $value) => '"'.addcslashes((string) $value, '"\\').'"',
+                array: $values,
+            ),
+        ).'}';
+    }
+
     public static function like(string $prefix): string
     {
         return self::literal(addcslashes($prefix, '\\_%').'%');
