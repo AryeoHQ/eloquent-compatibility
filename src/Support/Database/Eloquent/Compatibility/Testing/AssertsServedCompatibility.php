@@ -9,7 +9,9 @@ use Closure;
 use Illuminate\Container\Container;
 use Illuminate\Database\Eloquent\Model;
 use LogicException;
+use PHPUnit\Exception as PHPUnitException;
 use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\AssertionFailedError;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Console\DriftFinding;
@@ -97,7 +99,10 @@ trait AssertsServedCompatibility
         try {
             if ($views === null) {
                 try {
-                    Compatibility::install($model, statementTimeout: CarbonInterval::minutes(1));
+                    Compatibility::install(
+                        model: $model,
+                        statementTimeout: CarbonInterval::minutes(1),
+                    );
                 } catch (CompatibilityException|LogicException $exception) {
                     Assert::fail("Compatibility::install() of {$model} refuses inside the test's transaction: {$exception->getMessage()}");
                 }
@@ -105,8 +110,10 @@ trait AssertsServedCompatibility
 
             try {
                 $root = $nativeCreate();
+            } catch (PHPUnitException $exception) {
+                throw $exception;
             } catch (Throwable $exception) {
-                Assert::fail('nativeCreate fails to create a '.class_basename($map->primary->model).' natively: '.$exception::class.": {$exception->getMessage()}");
+                throw new AssertionFailedError('nativeCreate fails to create a '.class_basename($map->primary->model).' natively: '.$exception::class.": {$exception->getMessage()}", 0, $exception); // @phpstan-ignore new.internalClass, method.internalClass
             }
 
             Assert::assertInstanceOf($map->primary->model, $root, "nativeCreate creates no {$map->primary->model} to serve as the root of a new {$model}; return the root it creates.");

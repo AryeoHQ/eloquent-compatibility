@@ -1167,14 +1167,13 @@ final class InstallerTest extends TestCase
                 model: Listing::class,
                 statementTimeout: CarbonInterval::seconds(30),
             );
-            $this->fail('Compatibility::install() ran inside a caller\'s transaction after a pass left a watermark.');
+            $this->fail('install() did not refuse.');
         } catch (LogicException $exception) {
             $this->assertSame('Compatibility::install() catches up listings in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.', $exception->getMessage());
+            $this->assertSame([1, 'r', null], [DB::transactionLevel(), $this->kind('listings'), $this->kind('listings_retained')]);
         } finally {
             DB::rollBack();
         }
-
-        $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
     }
 
     #[Test]
@@ -3208,6 +3207,27 @@ final class InstallerTest extends TestCase
         });
 
         $this->assertSame([['7s', '3s'], ['7s', '3s']], $timeouts);
+    }
+
+    #[Test]
+    public function it_restores_the_statement_and_lock_timeouts_of_the_caller_s_transaction_after_it_installs_an_installed_model_inside_it(): void
+    {
+        $timeouts = DB::transaction(function (): array {
+            DB::statement("set local statement_timeout = '7s'");
+            DB::statement("set local lock_timeout = '3s'");
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            return [DB::scalar('show statement_timeout'), DB::scalar('show lock_timeout'), $this->kind('listings')];
+        });
+
+        $this->assertSame(['7s', '3s', 'v'], $timeouts);
     }
 
     #[Test]

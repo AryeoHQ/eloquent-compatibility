@@ -61,8 +61,8 @@ Each class answers from its types. For example:
 
 ## Adding a conversion
 
-1. Add a `final readonly` class here that implements `Conversion`.
-2. Add a fluent method on `Attribute` that validates its arguments, then calls `convert()`. A closure argument goes through `ResolvedMap::refuseCaptures()`, so the map stays free of state.
+1. Add a `final readonly` class here that implements `Conversion`, and mark it `@internal`.
+2. Add a fluent method on `Attribute` that validates its arguments, then calls `convert()`. A closure argument goes through `ResolvedMap::refuseCaptures()`, so the map stays free of state. List the method in the `Definition\Attribute` table of [`public-surface.md`](../../../../../../../docs/specification/public-surface.md).
 3. Return null from `Conversion::filter()` for every operator you cannot invert exactly. Null keeps the filter on the view, which is correct. A wrong inverse returns wrong rows.
 4. Return false from `Conversion::exact()` whenever you are unsure. False costs an index, and a wrong true costs correctness.
 5. Test it beside the class, and through `LegacyBuilderReadTest`, which compares each translated filter against the same filter run directly on the installed view.

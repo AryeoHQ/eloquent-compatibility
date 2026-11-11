@@ -149,6 +149,25 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_answers_whether_the_legacy_name_is_the_installed_view_before_and_after_install(): void
+    {
+        ListingTables::create();
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        $prepared = Compatibility::serves(Listing::class);
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertSuccessful();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([false, true], [$prepared, Compatibility::serves(Listing::class)]);
+    }
+
+    #[Test]
     public function it_prepares_installs_rolls_back_and_retires_a_floor_plan_whose_successor_key_prepare_adds(): void
     {
         PlaceAssetTables::create();

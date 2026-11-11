@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Exceptions\SuccessorsMoved;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\ClearListingAddress;
 use Tests\Fixtures\Support\Listings\ClearListingSite;
@@ -132,7 +133,7 @@ final class UnitOfWorkTest extends TestCase
         try {
             $listing->update(['title' => 'Oak Manor']);
             $this->fail('The write was not refused.');
-        } catch (CompatibilityWriteRefused $refusal) {
+        } catch (SuccessorsMoved $refusal) {
             $this->assertStringContainsString('cannot take this write now, because its JobSite rows moved after the write scope ran', $refusal->getMessage());
             $this->assertStringEndsWith('Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.', $refusal->getMessage());
         }
@@ -245,7 +246,7 @@ final class UnitOfWorkTest extends TestCase
         try {
             $this->linking()->newQuery()->create(['title' => 'Birch House', 'company_id' => ListingTables::COMPANY, 'place_id' => $place]);
             $this->fail('The create was not refused.');
-        } catch (CompatibilityWriteRefused $refusal) {
+        } catch (SuccessorsMoved $refusal) {
             $this->assertStringContainsString('cannot take this write now, because its Place rows moved after the write scope ran', $refusal->getMessage());
         }
 

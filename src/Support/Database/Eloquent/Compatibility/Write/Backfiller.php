@@ -17,6 +17,7 @@ use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
+use Support\Database\Eloquent\Compatibility\Exceptions\SuccessorsMoved;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -360,7 +361,7 @@ final class Backfiller
                 );
             }
 
-            if ($exception instanceof Refusal || $exception instanceof CompatibilityWriteRefused) {
+            if ($exception instanceof Refusal || $exception instanceof CompatibilityWriteRefused || $exception instanceof SuccessorsMoved) {
                 return [Outcome::Refused, $successor, $exception->getMessage()];
             }
 

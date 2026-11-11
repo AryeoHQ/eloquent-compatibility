@@ -49,7 +49,7 @@ final class CompatibilityWriteRefusedTest extends TestCase
             'Tests\Fixtures\Support\Listings\Listing record 7 cannot take this write of $title. Why: The write stores \'Oak Manor\', and the view now serves title as \'OAK MANOR\', so the record would not read back what was written. Instead: Make the operation of title store a value its read serves back.',
             'Tests\Fixtures\Support\Listings\Listing cannot take this write now, because its JobSite rows moved after the write scope ran. Why: The write scope received 1 key, and the package then locked 0 keys. It locked [], which the scope never received, and no longer found [a1], so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
             'Tests\Fixtures\Support\Files\File cannot take this create, because its legacy model changed between its creating event and its insert. Why: The package raised the legacy saving and creating events to no legacy model, and the inserted File row joins Photo and LegacyFile, so a column that when() reads changed after the creating event. Instead: Set every column that when() reads before the insert, in the create\'s attributes or in a listener of File, rather than in a database default or trigger.',
-        ], array_map(fn (CompatibilityWriteRefused $refusal) => $refusal->getMessage(), $refusals));
+        ], array_map(fn (CompatibilityException $refusal) => $refusal->getMessage(), $refusals));
         $this->assertContainsOnlyInstancesOf(CompatibilityException::class, $refusals);
     }
 
@@ -66,14 +66,14 @@ final class CompatibilityWriteRefusedTest extends TestCase
             array: range(1, 12),
         )];
 
-        $because = CompatibilityWriteRefused::successorsMoved(
+        $message = CompatibilityWriteRefused::successorsMoved(
             model: Listing::class,
             successor: JobSite::class,
             scoped: $scoped,
             locked: $locked,
-        )->because;
+        )->getMessage();
 
-        $this->assertSame('The write scope received 203 keys, and the package then locked 214 keys. It locked [n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, and 2 more], which the scope never received, and no longer found [k7], so it would write a row the scope never ordered.', $because);
+        $this->assertStringContainsString('. Why: The write scope received 203 keys, and the package then locked 214 keys. It locked [n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, and 2 more], which the scope never received, and no longer found [k7], so it would write a row the scope never ordered. Instead: ', $message);
     }
 
     #[Test]

@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 
@@ -154,6 +155,14 @@ final class Compatibility
             model: $model,
             statements: Statements::retire(...),
         );
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function serves(string $model): bool
+    {
+        return ServedTable::serves(new $model);
     }
 
     public function retainedIn(string $table): self

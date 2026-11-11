@@ -46,9 +46,9 @@ trait ServesCompatibility
 
     /**
      * @param  QueryBuilder  $query
-     * @return LegacyBuilder<$this>
+     * @return Builder<$this>
      */
-    public function newEloquentBuilder($query): LegacyBuilder
+    public function newEloquentBuilder($query): Builder
     {
         /** @var LegacyBuilder<$this> $builder */
         $builder = new LegacyBuilder($query);

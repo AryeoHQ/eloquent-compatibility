@@ -105,14 +105,18 @@ final readonly class Installer
             connection: $this->connection,
             table: $map->table,
         ) !== 'r') {
-            $this->locked(
-                map: $map,
-                budget: $budget,
-                install: function () use ($map, $compile): bool {
-                    $this->lockSchema($map->tables());
+            $this->restoring(
+                outside: $outside,
+                settings: ['statement_timeout', 'lock_timeout'],
+                run: fn () => $this->locked(
+                    map: $map,
+                    budget: $budget,
+                    install: function () use ($map, $compile): bool {
+                        $this->lockSchema($map->tables());
 
-                    return $compile(null)->transaction !== [];
-                },
+                        return $compile(null)->transaction !== [];
+                    },
+                ),
             );
 
             return;

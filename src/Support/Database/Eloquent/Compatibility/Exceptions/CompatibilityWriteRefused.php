@@ -53,7 +53,7 @@ final class CompatibilityWriteRefused extends CompatibilityException
      * @param  list<string>  $scoped
      * @param  list<string>  $locked
      */
-    public static function successorsMoved(string $model, string $successor, array $scoped, array $locked): self
+    public static function successorsMoved(string $model, string $successor, array $scoped, array $locked): SuccessorsMoved
     {
         $keys = fn (array $keys): string => '['.implode(
             separator: ', ',
@@ -65,11 +65,7 @@ final class CompatibilityWriteRefused extends CompatibilityException
         ).(count($keys) > 10 ? ', and '.(count($keys) - 10).' more' : '').']';
         $counted = fn (array $keys): string => count($keys).(count($keys) === 1 ? ' key' : ' keys');
 
-        return new self(
-            refused: "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran',
-            because: 'The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered.',
-            instead: 'Retry the write in a new transaction; the outermost transaction of the application is the retry point.',
-        );
+        return new SuccessorsMoved("{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran. Why: The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.');
     }
 
     /**
