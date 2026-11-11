@@ -419,7 +419,7 @@ final class PreparerTest extends TestCase
             ->servedFrom(root: Place::class, key: 'job_id', successor: fn (Successor $place) => $place
                 ->related(
                     relation: fn (Place $place) => $place->job(),
-                    definition: fn (Successor $job) => $job->atMostOne(because: 'A place has one job.'),
+                    successor: fn (Successor $job) => $job->atMostOne(because: 'A place has one job.'),
                 ))
             ->resolve();
 
@@ -436,7 +436,7 @@ final class PreparerTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(Place::class)->where('moved_in_at', '>=', new DateTimeImmutable('2026-01-01')),
-                    definition: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
+                    successor: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
                 ))
             ->resolve();
 
@@ -461,7 +461,7 @@ final class PreparerTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', new DateTimeImmutable('2026-01-01')),
-                    definition: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
+                    successor: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
                 ))
             ->resolve();
 
@@ -491,7 +491,7 @@ final class PreparerTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                 ->related(
                     relation: fn (Job $job) => $job->hasOne(Place::class)->where('created_at', '>=', '2026-01-01 00:00:00+09'),
-                    definition: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
+                    successor: fn (Successor $place) => $place->atMostOne(because: 'One current address.'),
                 ))
             ->resolve();
 
@@ -520,7 +520,7 @@ final class PreparerTest extends TestCase
             ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
                 ->related(
                     relation: fn (Job $job) => $job->rootPlace(),
-                    definition: fn (Successor $place) => $place->atMostOne(because: 'One address.'),
+                    successor: fn (Successor $place) => $place->atMostOne(because: 'One address.'),
                 ))
             ->resolve();
 

@@ -8,17 +8,25 @@ use Closure;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Events\Dispatcher;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use LogicException;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Write\Applying;
+use Support\Database\Eloquent\Compatibility\Write\Change;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
+use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
+use Support\Database\Eloquent\Compatibility\Write\Staging;
+use Support\Database\Eloquent\Compatibility\Write\UnitOfWork;
 use Throwable;
 use WeakMap;
 
@@ -77,6 +85,8 @@ final class Forwarder
 
     private const array STORED_BEFORE = ['saving', 'restoring'];
 
+    private const array BEFORE_INSERT = ['saving', 'creating'];
+
     /** @var WeakMap<Model, list<Sequence>> */
     private WeakMap $sequences;
 
@@ -91,6 +101,12 @@ final class Forwarder
 
     /** @var null|WeakMap<object, true> */
     private static null|WeakMap $emitted = null;
+
+    /** @var null|WeakMap<Model, list<array{self, Sequence}>> */
+    private static null|WeakMap $deferred = null;
+
+    /** @var null|WeakMap<Model, array<class-string<Model>, bool>> */
+    private static null|WeakMap $chosen = null;
 
     private function __construct(private readonly ResolvedMap $map, private readonly ResolvedMap $served, private readonly null|Related $dependent)
     {
@@ -225,7 +241,17 @@ final class Forwarder
         $sequence = $sequences[$top];
         $saved = $event !== 'restored' || $sequence->last === 'saved';
         $sequence->last = $event;
-        $result = $this->raise($event, $successor, $sequence, $ahead, $saved);
+        $result = in_array($event, self::BEFORE_INSERT, true) && $this->defers($successor) ? $this->defer(
+            event: $event,
+            successor: $successor,
+            sequence: $sequence,
+        ) : $this->raise(
+            event: $event,
+            successor: $successor,
+            sequence: $sequence,
+            ahead: $ahead,
+            saved: $saved,
+        );
 
         if ($result === false && $sequence->start === 'restoring' && $event !== 'restoring') {
             $sequence->vetoed = true;
@@ -245,6 +271,82 @@ final class Forwarder
         }
 
         return $result;
+    }
+
+    public static function creating(Model $successor, bool $proceeds): null|false
+    {
+        $deferred = self::$deferred ??= new WeakMap;
+        $chosen = self::$chosen ??= new WeakMap;
+        $pending = $deferred[$successor] ?? [];
+
+        unset($deferred[$successor], $chosen[$successor]);
+
+        if (! $proceeds) {
+            return null;
+        }
+
+        $choices = [];
+
+        foreach (self::BEFORE_INSERT as $event) {
+            foreach ($pending as [$forwarder, $sequence]) {
+                if (! in_array($event, $sequence->deferred, true)) {
+                    continue;
+                }
+
+                if ($forwarder->raise(event: $event, successor: $successor, sequence: $sequence, ahead: true, saved: true, deferred: true) === false) {
+                    $sequence->vetoed = true;
+
+                    return false;
+                }
+
+                $admits = $sequence->record?->admits();
+
+                if ($event === 'creating' && $admits !== null) {
+                    $choices[$forwarder->map->model] = $admits;
+                }
+            }
+        }
+
+        $chosen[$successor] = $choices;
+
+        return null;
+    }
+
+    /**
+     * @return array<class-string<Model>, bool>
+     */
+    public static function chosen(Model $successor): array
+    {
+        $chosen = self::$chosen ??= new WeakMap;
+        $choices = $chosen[$successor] ?? [];
+
+        unset($chosen[$successor]);
+
+        return $choices;
+    }
+
+    private function defers(Model $successor): bool
+    {
+        return $this->dependent === null
+            && ! $successor->exists
+            && in_array(
+                needle: CarriesLegacy::class,
+                haystack: class_uses_recursive($successor),
+                strict: true,
+            )
+            && RetainedRows::shares($successor);
+    }
+
+    private function defer(string $event, Model $successor, Sequence $sequence): null
+    {
+        $sequence->deferred[] = $event;
+
+        if ($event === 'creating' && $sequence->record !== null) {
+            $deferred = self::$deferred ??= new WeakMap;
+            $deferred[$successor] = [...$deferred[$successor] ?? [], [$this, $sequence]];
+        }
+
+        return null;
     }
 
     private function forwarded(string $event, Model $successor, bool $object): bool
@@ -368,7 +470,7 @@ final class Forwarder
         }
     }
 
-    private function raise(string $event, Model $successor, Sequence $sequence, bool $ahead, bool $saved): null|false
+    private function raise(string $event, Model $successor, Sequence $sequence, bool $ahead, bool $saved, bool $deferred = false): null|false
     {
         $record = $sequence->record;
 
@@ -416,7 +518,15 @@ final class Forwarder
                     }
 
                     if ($ahead) {
-                        $this->mapBack($legacy, $before, $successor, $event, $record->removes, $this->dependent === null || $record->serves($key));
+                        $this->mapBack(
+                            legacy: $legacy,
+                            before: $before,
+                            successor: $successor,
+                            event: $event,
+                            removes: $record->removes,
+                            serves: $this->dependent === null || $record->serves($key),
+                            deferred: $deferred,
+                        );
                     }
                 }
             }
@@ -486,7 +596,17 @@ final class Forwarder
         }
 
         [$columns, $json, $reads] = $this->compiled[$view] ??= LegacyRecord::compile($this->map, $this->served, $successor);
-        $record = LegacyRecord::read($this->map, $this->served, $this->dependent, $columns, $json, $reads, $successor, $removes);
+        $record = LegacyRecord::read(
+            map: $this->map,
+            served: $this->served,
+            dependent: $this->dependent,
+            columns: $columns,
+            json: $json,
+            reads: $reads,
+            successor: $successor,
+            removes: $removes,
+            membership: $this->defers($successor),
+        );
 
         if ($record === null) {
             return null;
@@ -510,7 +630,7 @@ final class Forwarder
     /**
      * @param  array<string, mixed>  $before
      */
-    private function mapBack(Model $legacy, array $before, Model $successor, string $event, bool $removes, bool $serves): void
+    private function mapBack(Model $legacy, array $before, Model $successor, string $event, bool $removes, bool $serves, bool $deferred): void
     {
         $inserts = $this->dependent === null && ! $successor->exists;
 
@@ -535,9 +655,15 @@ final class Forwarder
                 $attribute === null => 'No successor model stores it, so the forwarded write has nowhere to put it.',
                 $this->served->owners[$name]->model !== $successor::class => 'It lives on '.class_basename($this->served->owners[$name]->model).', and the forwarded event belongs to a save of '.class_basename($successor).'.',
                 ! $serves => 'The written '.class_basename($successor).' no longer serves this '.class_basename($legacy).', so the forwarded write cannot store it there.',
-                $attribute->runsTransitions() => 'It is declared transitions(), so only a write through '.class_basename($legacy).' can run the trigger that changes it.',
-                $attribute->isExternal() => $attribute->declinedBecause() ?? (in_array($event, self::STORED_BEFORE, true) ? null : 'It is declared external(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so the write closure reaches no save."),
-                ! $attribute->isWritable() && ! ($inserts && $attribute->readOnlyBecause() !== null && $attribute->column() !== null) => $attribute->readOnlyBecause() ?? 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
+                $attribute->ignoresWrites() => null,
+                $attribute->isExternal() && $attribute->operation() !== null => match (true) {
+                    $deferred => "It is declared computedAs(), and the package raised the legacy {$event} event after the saving and creating listeners of ".class_basename($successor).' ran, because several legacy models share '.class_basename($successor).', so its operation reaches no save.',
+                    in_array($event, self::STORED_BEFORE, true) => null,
+                    default => 'It is declared computedAs(), and '.class_basename($successor)." raised its {$event} event after its own saving listeners ran, so its operation reaches no save.",
+                },
+                $attribute->operation() !== null => 'It is writtenBy() '.class_basename($attribute->operation()).', and only a write through '.class_basename($legacy).' runs its operation, which may stage other successors.',
+                $attribute->readOnlyBecause() !== null => $inserts && $attribute->invertible() ? null : $attribute->readOnlyBecause(),
+                ! $attribute->invertible() => 'It is declared fixed(), so it stores no column of '.class_basename($successor).'.',
                 default => null,
             };
 
@@ -545,8 +671,46 @@ final class Forwarder
                 throw CompatibilityWriteRefused::byForwardedMutation($legacy::class, $name, $successor, (string) $because);
             }
 
-            if ($attribute->isExternal()) {
-                $attribute->writeExternally($successor, $value);
+            $change = new Change(
+                record: $legacy,
+                original: $legacy->newInstance([], true)->setRawAttributes($baseline, true),
+                attribute: $name,
+                origin: Origin::Live,
+            );
+
+            if ($attribute->ignoresWrites()) {
+                if ($value !== null) {
+                    Event::dispatch(new WriteIgnored(
+                        change: $change,
+                        value: $value,
+                    ));
+                }
+
+                continue;
+            }
+
+            $operation = $attribute->operation();
+
+            if ($operation !== null) {
+                $instance = UnitOfWork::resolve(
+                    class: $operation,
+                    interface: WritesAttribute::class,
+                    role: 'operation',
+                );
+
+                UnitOfWork::hook(
+                    run: fn () => $instance->write((new Staging(
+                        map: $this->served,
+                        root: $this->dependent === null ? $successor : (new $this->served->primary->model)->setConnection($successor->getConnectionName()),
+                        models: $this->dependent === null ? [] : [$this->dependent->table => $successor],
+                        forwarding: $successor,
+                    ))->successors(), $value, $change),
+                    origin: Origin::Live,
+                    model: $legacy::class,
+                    key: $inserts ? null : UnitOfWork::keyOrNull($legacy),
+                    attribute: $name,
+                    class: $operation,
+                );
 
                 continue;
             }

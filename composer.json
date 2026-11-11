@@ -30,9 +30,11 @@
     },
     "require": {
         "php": "^8.4",
+        "brick/math": "^0.14.2 || ^0.15 || ^0.16 || ^0.17 || ^0.18 || ^0.19 || ^0.20 || ^1.0",
         "ext-pdo_pgsql": "*",
         "laravel/framework": "12.x || ^13",
         "ext-mbstring": "*",
+        "ext-filter": "*",
         "phpstan/phpstan": "^2.1",
         "nikic/php-parser": "^5.7",
         "nesbot/carbon": "^3.8.4"
@@ -44,9 +46,6 @@
         "orchestra/testbench": "^10.6 || ^11",
         "orchestra/testbench-core": "^10.7 || ^11",
         "phpunit/phpunit": "^12.4.1 || ^13"
-    },
-    "suggest": {
-        "aryeo/eloquent-state-machines": "Runs a successor's state-machine trigger for a legacy write of a transitions() attribute. Version 0.0.34 supports PHP 8.4; later versions need PHP 8.5."
     },
     "config": {
         "allow-plugins": {

@@ -44,6 +44,7 @@ final class Image extends Model implements Compatible
     {
         return $image
             ->retainedIn('place_images_retained')
+            ->successorsInitializedBy(ClassifyPlaceAsset::class)
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_image'))
                 ->attribute(
@@ -69,9 +70,8 @@ final class Image extends Model implements Compatible
                             ->attribute(
                                 name: 'mime_type',
                                 definition: fn (Attribute $attribute) => $attribute
-                                    ->external(
-                                        read: fn (Collection $files): Values => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                                        write: fn (AssetFile $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                                    ->computedAs(read: fn (Collection $files): Values => AssetFile::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType))
+                                    ->writtenBy(WriteAssetFileMimeType::class),
                             ))));
     }
 }

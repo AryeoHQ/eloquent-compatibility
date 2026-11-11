@@ -59,7 +59,7 @@ An operation makes in-memory assignments only. The package saves. A domain actio
 | `root()` | the root successor, loaded and locked; on a create, the new root |
 | `related(class-string<T> $class)` | the related successor of that class, loaded and locked, or `null` when the row is absent |
 | `relatedOrNew(class-string<T> $class)` | the related successor, or a new instance the package saves with the others |
-| `deleteRelated(class-string<Model> $class)` | deletes the related successor through its model, after the saves |
+| `deleteRelated(class-string<Model> $class)` | deletes the related successor through its model, after the saves; a later `related()` or `relatedOrNew()` of that class in the same write refuses |
 | `afterSave(Closure $action)` | queues an action that runs after the saves, in the order queued |
 
 A morph has one target at a time, and a related row can be missing, so `related()` returns `null|T`. `relatedOrNew()` covers the case where the row must exist.
@@ -97,18 +97,20 @@ Declined: `Change` with a null `attribute` and an empty `original`. An initializ
 One legacy write runs these steps, in this order:
 
 1. **Scope.** The package opens its transaction. It resolves the successors the write touches with an unlocked read, and calls the write scope with their keys inside that transaction. It takes no lock of its own before this step.
-2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root and the touched related rows `FOR UPDATE`, parents first. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
+2. **Lock.** Inside the scope, the package loads the record's successors. It locks the root, its retained row and the touched related rows `FOR UPDATE`, parents first. The touched related rows are every related successor the map declares under the root, because an operation names the successors it writes only when it runs. It then checks that the keys it locked equal the keys the scope received. On a difference, it refuses the write with a retryable error and rolls the unit of work back.
 3. **Assign.** The package runs the operation of every changed attribute, in declaration order. Operations assign in memory and queue `afterSave()` actions.
 4. **Save.** The package saves each changed successor model once. It then applies every `deleteRelated()`.
-5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor.
+5. **Act.** The package runs the `afterSave()` actions in order. A domain action such as `publish()` or eloquent-ordering's `move()` saves on its own, with its own events. When the write assigns a successor's updated-at column, the actions run under `Model::withoutTimestampsOn()` for that successor's class.
 6. **Verify.** The package reads the record back through the view and runs the round-trip check.
 7. **Forward.** The package forwards one legacy event.
 
 A legacy record delete runs a delete step in place of steps 3 to 6 ([Eloquent-managed columns](#eloquent-managed-columns)).
 
+A mass write calls the scope once, with the keys of every record. It then locks every root and its retained row, in key order, before it locks any related row. It runs its records in chunks of 1,000: for each chunk, one statement per related table locks that table's rows in key order, and the unit of work runs once for each record of the chunk. No statement binds more than one chunk of keys, and the records of one chunk are in memory at a time.
+
 The scope runs inside the package's transaction, so the locks the scope takes hold until the package's work commits.
 
-`$listing->update(['is_draft' => false, 'downloads_enabled' => true, 'address_id' => 9])` therefore locks the Job, the Place, the JobSite and the state row. It runs `PublishOrDraftJob`, `SetDownloadsPermission` and `ChangeListingAddress`, and saves each changed row once. `publish()` then saves the Job again, as v2's own publish does.
+`$listing->update(['is_draft' => false, 'downloads_enabled' => true, 'address_id' => 9])` therefore locks the Job, its retained row, the Place, its Address, the JobSite and the state row. It runs `PublishOrDraftJob`, `SetDownloadsPermission` and `ChangeListingAddress`, and saves each changed row once. `publish()` then saves the Job again, as v2's own publish does.
 
 ### Events
 
@@ -132,7 +134,11 @@ After a write, every written attribute must read back its new value through the 
 
 The round trip binds an operation to its attribute's read. `address_id` reads the `id` of the Address that the Place points at. `ChangeListingAddress` must therefore leave the Place pointing at the Address whose `id` is the written value.
 
-Before install, no view exists. The check then reads the record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
+The check compares values the way the legacy model's casts do. A JSON object compares by its keys and values, in any key order. A `DateTimeInterface` value compares in the legacy model's date format. Two numbers compare by value only when the view column or the legacy cast is numeric, so a text value such as `00123` compares exactly. A JSON-path write, such as `settings->color`, compares the value at that path. A path write into a NULL column writes nothing, as it does natively, so the check skips it.
+
+A `hide()` rule can hide the record after the write, whether the write itself, a successor listener or a trigger trips it. The check then reads the record through the map's column expressions without its `hide()` conditions, filtered to the record's key. A hide that keeps every written value passes, and a hide that loses one refuses the write. When that read also finds no row, a listener or a trigger removed the record, and the check refuses the write.
+
+Before install, no view exists, and a legacy write goes to the legacy table without reaching the check. Only a backfill row reaches it then, and the check reads that record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
 
 ### What the comparisons skip
 
@@ -151,12 +157,12 @@ A `position()` attribute is compared by its parent's legacy order before install
 A legacy-only column holds a value that no successor column holds and no read computes ([The map: legacy-only columns](the-map.md#legacy-only-columns)). The application refreshes it through the legacy model. A legacy write whose changed columns are all legacy-only, apart from the `updated_at` that Eloquent touches:
 
 - writes the retained row;
-- drops Eloquent's `updated_at` touch, and writes nothing for `updated_at`;
+- drops Eloquent's `updated_at` touch, and writes nothing for `updated_at`, when the map reads `updated_at` from a successor; a legacy-only `updated_at` keeps the touch, which writes only the retained row;
 - runs no operation and saves no successor: steps 3 to 6 of [the unit of work](#the-unit-of-work) do nothing, so no successor event fires;
 - forwards one legacy event sequence at step 7, as any Eloquent update does;
 - fires nothing under `saveQuietly()`, which suppresses that legacy event sequence as it does in Eloquent.
 
-Eloquent's `update()` and `save()` stamp `updated_at` before they write. Listing maps `updated_at` to `jobs.updated_at`, so the touch alone would save the Job and fire its four events. The package therefore drops the touch, and the legacy `updated_at` keeps the value the root serves.
+Eloquent's `update()` and `save()` stamp `updated_at` before they write. Listing maps `updated_at` to `jobs.updated_at`, so the touch alone would save the Job and fire its four events. The package therefore drops the touch, and the legacy `updated_at` keeps the value the root serves. A map that leaves `updated_at` legacy-only keeps the touch, because it saves no successor.
 
 ## Eloquent-managed columns
 
@@ -164,7 +170,7 @@ Eloquent manages a successor's soft-delete and updated-at columns itself. Their 
 
 - **Soft delete.** A mapped change of the root's soft-delete column does not assign the column. A non-NULL value queues the root's `delete()` as an `afterSave()` action, and NULL queues its `restore()`. When the root's trashed state already matches the value, the operation assigns the value instead.
 - **The deletion date.** `delete()` always stamps the current time. After `delete()`, the package therefore writes the legacy `deleted_at` and `updated_at` onto the root's row with a base-query `UPDATE`, which fires no further events. A backfilled trashed row keeps its original deletion date, and the round trip holds.
-- **Updated-at.** An assigned updated-at column keeps the legacy value through step 4, Save, even when that value equals the stored one. The package runs step 5, Act, under `Model::withoutTimestampsOn([...])` for that successor. A domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, therefore keeps the legacy value, and the round trip holds.
+- **Updated-at.** An assigned updated-at column keeps the legacy value through step 4, Save, even when that value equals the stored one. The package runs each save and delete of step 4, and step 5, Act, under `Model::withoutTimestampsOn([...])` for that successor's class. A successor the write creates gets its `created_at` stamped first, when the write leaves that column unassigned. A listener or an owner touch that saves the successor again during a save, or a domain action that saves again, such as `publish()` or eloquent-ordering's `move()`, therefore keeps the legacy value, and the round trip holds.
 - **Hard delete.** From install onward, a legacy record delete runs the root's `forceDelete()` as its own step. The step runs after step 2, Lock, and replaces steps 3 to 6, because a delete writes no attribute. Step 7 then forwards the legacy delete's events. The successor key's `ON DELETE CASCADE`, which install adds, carries the delete through the retained row ([Storage](storage.md#the-successor-key)).
 
 The successor's `deleting`, `deleted`, `restoring` and `restored` events therefore fire on the delete path. The rule that every package path writes a successor through its model ([0017](../decisions/0017-successors-are-written-through-their-models.md)) holds there too. The deletion date's `UPDATE` is the one named exception to that rule. It runs after the model's `deleting` and `deleted` events have fired, and it writes only the two timestamps.
@@ -179,7 +185,7 @@ Declined: plain assignment of the soft-delete column. The successor would then f
 
 A create is a write of every supplied attribute against an empty original. The attribute operations run first, in declaration order. `successorsInitializedBy()` then runs once on the new root.
 
-A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. When that id names an existing Place, such as one that outlived a force-deleted Job, the default operation links that Place and creates nothing. `job_site_id` follows the same rule. The recreation of a root through the create path therefore never collides with a related row that survived it. Listing declares the three attributes with `ignoreWrites: false`, so an update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
+A `readOnly()` attribute's default operation assigns the inverse on a create, into the successor row this create creates. A Listing create therefore assigns `company_id` to its new Job. A Listing created with a reserved `place_id` creates its Place with that id. When that id names an existing Place whose Job is gone, such as one that outlived a force-deleted Job, the create links that Place and creates nothing. The create links it before step 3, so every operation of the create sees the linked Place, whatever order the map declares its attributes in. When the named Place still belongs to an existing Job, trashed or not, the create refuses with a named reason. `job_site_id` follows the same rule. The recreation of a root through the create path therefore never collides with a related row that survived it. Listing declares the three attributes with `ignoreWrites: false`, so an update of `company_id`, `place_id` or `job_site_id` refuses. Moving a Job to another Place is a v2 domain action with its own rules, so the package never re-keys a related row.
 
 A `readOnly()` attribute with no stored column has no inverse, and [Read-only attributes with no stored column](#read-only-attributes-with-no-stored-column) states its rule.
 
@@ -194,7 +200,7 @@ A create through the legacy model runs with `Origin::Live`. The backfill creates
 - **`ignoreWrites: false`.** The attribute refuses writes. An update of the attribute refuses. On a create, the default operation assigns the inverse into a successor row this create creates. An attribute with no stored column follows [the rule below](#read-only-attributes-with-no-stored-column).
 - **`ignoreWrites: true`.** Every path accepts a write to the attribute and discards it: a live create, a live update, a mass write, a backfill create and a catch-up row. No path compares the attribute ([What the comparisons skip](#what-the-comparisons-skip)). A create still assigns the inverse into a successor row it creates, where the attribute has an inverse.
 
-A discarded non-NULL write dispatches `Events\WriteIgnored`, with two limits on the backfill's paths. Catch-up dispatches nothing. A backfill create dispatches only for a value it does not assign into a row it creates. `Origin::Backfill` events are therefore bounded to one per row and attribute, and none fires under install's lock. The event carries the write's `Write\Change` and the discarded value. A discarded NULL dispatches nothing, so a create whose `$attributes` defaults hold NULL stays silent. [The map: read-only attributes](the-map.md#read-only-attributes) states when a map flips the flag.
+A discarded non-NULL write dispatches `Events\WriteIgnored`, synchronously, inside the write's transaction and under its locks. A listener that throws therefore fails the write it observes, and a slow listener holds every lock of the write. Queue a listener that reports to a service outside the request, and dispatch it after commit (`ShouldQueue` with `$afterCommit`). The event has two limits on the backfill's paths. Catch-up dispatches nothing. A backfill create dispatches only for a value it does not assign into a row it creates. `Origin::Backfill` events are therefore bounded to one per row and attribute, and none fires under install's lock. The event carries the write's `Write\Change` and the discarded value. A discarded NULL dispatches nothing, so a create whose `$attributes` defaults hold NULL stays silent. [The map: read-only attributes](the-map.md#read-only-attributes) states when a map flips the flag.
 
 ### Read-only attributes with no stored column
 
@@ -303,15 +309,23 @@ The reverse direction. An application creates a successor natively, and the succ
 
 `Provides\CarriesLegacy` takes an `ACCESS SHARE` lock on each legacy table whose `when()` the new root matches, before it checks whether that legacy model is installed. It locks no other legacy table. A native create therefore waits for the `ACCESS EXCLUSIVE` lock of an install it would join, and afterward it sees the installed state. A native floor plan create waits for FloorPlan's install, and not for Photo's.
 
-`Provides\CarriesLegacy` refuses a native create outside a transaction. An insert in a statement of its own could fail and leave a successor that no legacy reader sees, and nothing would report it. Every native create of a member successor therefore runs in a transaction.
+`Provides\CarriesLegacy` opens a transaction around the insert when the caller has none, for a root class that a discovered map serves, or a subclass of one. It does so whether or not that map is installed, and decides inside the transaction, under the `ACCESS SHARE` lock, whether to insert the legacy row. The `creating` event, the root insert, the retained-row insert and the `created` event then commit or roll back together, through `save()` and through `saveOrIgnore()`. A create through those two paths therefore leaves no successor without its legacy row. Inside a caller's transaction, the trait opens nothing. A successor that overrides `performInsert()`, `performInsertOrIgnore()` or `fireModelEvent()` itself conflicts with the trait.
 
-When the map compiles, it refuses a legacy-only NOT NULL column that nothing initializes. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
+The trait sees only a model insert. A query-builder insert into the root table (`Job::query()->insert()`, `upsert()`, `insertUsing()`, `DB::table('jobs')`) and an insert through another class over the root table that is not a subclass of the map's root insert no legacy row, so the view does not serve that root. [Lifecycle: the writer boundary](lifecycle.md#the-writer-boundary) lists these writers.
+
+`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Map compilation reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
 
+A native create on a root that several discovered maps share forwards its legacy events only to the legacy model whose `when()` admits the new row. The package raises that model's `saving` and `creating` after the successor's own `creating` event returns, and before the insert. `when()` therefore reads the values that every successor `saving` and `creating` listener set, including the `Creating` listener that sets a discriminator ([The map: membership](the-map.md#membership)). A legacy veto from either event stops the insert. `created` and `saved` follow the insert. A root that one map serves keeps the earlier order, in which the legacy `saving` and `creating` run ahead of the successor's own listeners.
+
+On a shared root, a legacy `saving` listener therefore runs after the successor's `saving` and `creating` listeners, and no successor listener sees a change it makes. The package refuses that listener's change of a `computedAs()` attribute, because the attribute's operation reaches no successor `saving` listener.
+
+When the inserted row joins another legacy model than the one the `creating` event chose, the package refuses the create inside its transaction with `CompatibilityWriteRefused::membershipMoved()`. A database default, a trigger, or a legacy `creating` listener that changes a column `when()` reads causes it.
+
 ### Native successors before install
 
-`Provides\CarriesLegacy` does nothing before install, so a root created natively then gets no legacy row. Install never inserts a row for such a root before its lock ([Lifecycle: install](lifecycle.md#install)):
+`Provides\CarriesLegacy` inserts no legacy row before install, so a root created natively then gets none. Install never inserts a row for such a root before its lock ([Lifecycle: install](lifecycle.md#install)):
 
 - **Before the lock**, install records the start time of its read. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. Install writes nothing for these roots, and it reports their count.
 - **Under the lock**, after the final pass, the rename and the drop of the mapped columns, install inserts one retained row per root. The set holds each key the pre-lock read found, plus every member root whose `created_at` is at or after the read's start time minus the margin. Install anti-joins both against the retained table's successor key, so a root the final pass just created is excluded. It also excludes every root that a `deleted` ledger row names in `successor_id`, because the application hard-deleted that root's legacy row.
@@ -326,7 +340,7 @@ Legacy readers therefore see no v2-created listing until install. Declined: mirr
 
 An operation or an initializer refuses with `throw Refusal::because('...')`.
 
-- **A live write.** The unit of work rolls back, and the caller receives the refusal.
+- **A live write.** The unit of work rolls back, and the caller receives a `Refusal` whose message names the legacy model, the record key or a new record, the attribute and the operation or initializer class, ahead of the reason. The consumer's own `Refusal` is its previous exception.
 - **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues.
 - **Install's native-root insert.** Install catches nothing under its lock, so the refusal aborts install, and names the root's key and the reason.
 
@@ -350,21 +364,11 @@ final class ListingWriteScope implements ScopesWrites
 - Install's final catch-up pass and rollback's refill never call the scope, and run no key re-check. Their table lock serializes them against live writes. Rollback waits for in-flight writes to commit, so its refill reads only committed successors. A scope there would deadlock with a live write that holds its scope lock and reads through the view.
 - `$successors` holds the keys of the successors the write touches, by class. A successor the write creates has no key yet, so its class is present with an empty list. A scope that must lock a parent before a create then knows the create happens.
 - The scope runs `$write` and returns its result. The package's transaction is already open, so the scope's own locks hold until the package's work commits. A scope needs no transaction of its own.
-- The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root and the touched related rows always comes inside the scope, last.
+- A scope that catches an exception of `$write` does not commit the refused write: the package rethrows the exception after `run()` returns. A scope that returns without calling `$write` refuses with `CompatibilityWriteRefused::unscoped()`, because the write would report success and store nothing.
+- The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root, its retained row and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
-- A difference refuses with a retryable error. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
+- A difference refuses with a retryable error, `CompatibilityWriteRefused::successorsMoved()`, which extends `Exceptions\CompatibilityException`. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
 - The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.
-
-## Open questions
-
-### 1. The error for moved successor keys
-
-The lock step refuses with a retryable error when the locked keys differ from the keys the scope received. The spec names no class for it. `Write\Refusal` is the refusal an operation or initializer throws, and nothing marks it retryable.
-
-- **A.** A new internal exception under `Exceptions\`.
-- **B.** `Write\Refusal`, with a flag that marks it retryable.
-
-The session did not settle this. Either one extends `Exceptions\CompatibilityException`, which [the public surface](public-surface.md#classes) publishes, so a caller catches it by that supported type.

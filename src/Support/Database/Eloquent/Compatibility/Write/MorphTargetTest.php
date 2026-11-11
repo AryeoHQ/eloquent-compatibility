@@ -34,10 +34,12 @@ use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\Fixtures\Support\PlaceAssets\TrashableAssetFile;
 use Tests\Fixtures\Support\PlaceAssets\Video;
+use Tests\Fixtures\Support\PlaceAssets\WriteAssetTitle;
+use Tests\Fixtures\Support\PlaceAssets\WriteNoteAuthorName;
+use Tests\Fixtures\Support\PlaceAssets\WriteNoteBody;
 use Tests\TestCase;
 
 #[CoversClass(RecordWriter::class)]
-#[CoversClass(MorphMove::class)]
 #[CoversClass(ExternalAttributes::class)]
 #[CoversClass(Backfiller::class)]
 #[CoversClass(MassWriter::class)]
@@ -355,7 +357,7 @@ final class MorphTargetTest extends TestCase
 
         $kept = Brochure::query()->whereKey(2)->update(['hosted' => 'off', 'pages' => 3]);
 
-        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url', $refusal);
         $this->assertSame([true, $before], [Brochure::query()->findOrFail(1)->hosted, $this->asset('place_brochure', 1)]);
         $this->assertSame([1, false, 3, 'place_asset_link'], [$kept, Brochure::query()->findOrFail(2)->hosted, Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
     }
@@ -376,7 +378,7 @@ final class MorphTargetTest extends TestCase
         $second = DB::connection('second');
         $renamed = null;
         DB::listen(function (QueryExecuted $query) use (&$renamed, $second): void {
-            if ($renamed !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'CREATE TEMPORARY TABLE') || ! str_contains($query->sql, 'compatibility_selected')) {
+            if ($renamed !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_contains($query->sql, '"compatibility_keys"')) {
                 return;
             }
 
@@ -408,8 +410,9 @@ final class MorphTargetTest extends TestCase
         config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
         $second = DB::connection('second');
         $blocked = null;
-        DB::listen(function (QueryExecuted $query) use (&$blocked, $second, $file): void {
-            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_starts_with($query->sql, 'delete from "pg_temp"."compatibility_selected"')) {
+        $selects = 0;
+        DB::listen(function (QueryExecuted $query) use (&$blocked, &$selects, $second, $file): void {
+            if ($blocked !== null || $query->connectionName !== DB::getDefaultConnection() || ! str_contains($query->sql, '"compatibility_keys"') || ++$selects < 2) {
                 return;
             }
 
@@ -466,7 +469,7 @@ final class MorphTargetTest extends TestCase
         }
 
         $this->assertSame([1, 2, 'place_asset_link'], [$kept, Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
-        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url', $refusal);
         $this->assertSame(12, Brochure::query()->findOrFail(1)->pages);
     }
 
@@ -484,7 +487,7 @@ final class MorphTargetTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringContainsString('It would move record 2 from AssetLink to TrashableAssetFile', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 2 from AssetLink to TrashableAssetFile without $file_name', $refusal);
         $this->assertSame([9, 'place_asset_link'], [Brochure::query()->findOrFail(2)->pages, $this->asset('place_brochure', 2)['asset_type']]);
     }
 
@@ -493,18 +496,18 @@ final class MorphTargetTest extends TestCase
     {
         $video = $this->sizedVideo();
 
-        $kept = $video->newQuery()->whereKey(3)->increment('size_kb', 0.0004);
+        $kept = $video->newQuery()->whereKey(3)->increment('size_kb', -1);
 
         try {
-            $video->newQuery()->whereKey(3)->increment('size_kb', 0.0006);
+            $video->newQuery()->whereKey(3)->increment('size_kb', 2);
             $refusal = 'no refusal';
         } catch (CompatibilityWriteRefused $exception) {
             $refusal = $exception->getMessage();
         }
 
-        $this->assertSame([1, '512.000', 'place_asset_file'], [$kept, Video::query()->findOrFail(3)->size_kb, $this->asset('place_video', 3)['asset_type']]);
-        $this->assertStringContainsString('It would move record 3 from AssetFile to AssetLink', $refusal);
-        $this->assertSame('512.000', Video::query()->findOrFail(3)->size_kb);
+        $this->assertSame([1, '511.000', 'place_asset_file'], [$kept, Video::query()->findOrFail(3)->size_kb, $this->asset('place_video', 3)['asset_type']]);
+        $this->assertStringContainsString('cannot run a write that stores record 3 in AssetFile where relatedMorph() chooses AssetLink', $refusal);
+        $this->assertSame('511.000', Video::query()->findOrFail(3)->size_kb);
     }
 
     #[Test]
@@ -527,7 +530,7 @@ final class MorphTargetTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringContainsString('It would move record 3 from AssetFile to AssetLink', $refusal);
+        $this->assertStringContainsString('cannot run a write that stores record 3 in AssetFile where relatedMorph() chooses AssetLink', $refusal);
         $this->assertSame(['512.000', 'place_asset_file', null], [Video::query()->findOrFail(3)->size_kb, $this->asset('place_video', 3)['asset_type'], Video::query()->find(30)]);
 
         $renumbered = $video->newQuery()->whereKey(3)->increment('size_kb', 100, ['id' => 30]);
@@ -551,7 +554,7 @@ final class MorphTargetTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringContainsString('It would move record 2 from AssetLink to TrashableAssetFile', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 2 from AssetLink to TrashableAssetFile without $file_name', $refusal);
         $this->assertSame([['hosted' => false], 'place_asset_link'], [$brochure->newQuery()->findOrFail(2)->getAttribute('metadata'), $this->asset('place_brochure', 2)['asset_type']]);
 
         $kept = $brochure->newQuery()->whereKey(2)->update(['metadata->tier' => 'gold']);
@@ -590,20 +593,25 @@ final class MorphTargetTest extends TestCase
     public function it_refuses_a_mass_write_whose_read_as_projection_changes_the_target_its_choose_closure_reads_and_changes_nothing(): void
     {
         $brochure = $this->installed($this->titledBrochure(), fn () => null);
+        DB::table('place_assets')->where(
+            column: 'id',
+            operator: '=',
+            value: $this->asset('place_brochure', 1)['id'],
+        )->update(['title' => 'Guide']);
 
         try {
-            $brochure->newQuery()->whereKey(1)->update(['title' => 'embed']);
+            $brochure->newQuery()->whereKey(1)->update(['title' => 'EMBED']);
             $refusal = 'no refusal';
         } catch (CompatibilityWriteRefused $exception) {
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url', $refusal);
         $this->assertSame(['Guide', TrashableAssetFile::class], [$this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']]);
 
-        $kept = $brochure->newQuery()->whereKey(1)->update(['title' => 'manual']);
+        $kept = $brochure->newQuery()->whereKey(1)->update(['title' => 'MANUAL']);
 
-        $this->assertSame([1, 'MANUAL', 'manual', TrashableAssetFile::class], [$kept, $brochure->newQuery()->findOrFail(1)->getAttribute('title'), $this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']]);
+        $this->assertSame([1, 'MANUAL', 'MANUAL', TrashableAssetFile::class], [$kept, $brochure->newQuery()->findOrFail(1)->getAttribute('title'), $this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']]);
     }
 
     #[Test]
@@ -714,7 +722,7 @@ final class MorphTargetTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_that_changes_the_target_its_choose_closure_reads_with_an_external_attribute_and_changes_nothing(): void
+    public function it_refuses_a_mass_write_that_moves_a_record_into_a_target_whose_required_value_it_does_not_supply_and_changes_nothing(): void
     {
         Schema::create('asset_notes', function (Blueprint $table): void {
             $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
@@ -741,8 +749,44 @@ final class MorphTargetTest extends TestCase
             Schema::dropIfExists('asset_notes');
         }
 
-        $this->assertStringContainsString('It would move record 1 from TrashableAssetFile to AssetLink', $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url through its compatibility map. Why: The move keeps the values the view serves for the attributes of AssetLink, and asset_links.url needs a value the write does not supply.', $refusal);
         $this->assertSame([['Guide', TrashableAssetFile::class], [1, 'Manual', TrashableAssetFile::class]], [$refused, $written]);
+    }
+
+    #[Test]
+    public function it_refuses_a_move_into_a_target_whose_required_column_a_written_by_attribute_owns_when_the_write_does_not_supply_it(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id');
+            $table->string('body')->nullable();
+        });
+
+        try {
+            $brochure = $this->installed($this->linkWrittenBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
+            $refusals = [];
+
+            foreach ([fn () => $brochure->newQuery()->whereKey(1)->update(['title' => 'Embed']), fn () => $brochure->newQuery()->findOrFail(1)->update(['title' => 'Embed'])] as $write) {
+                try {
+                    $write();
+                    $refusals[] = 'no refusal';
+                } catch (CompatibilityWriteRefused $exception) {
+                    $refusals[] = $exception->getMessage();
+                }
+            }
+
+            $refused = [$this->asset('place_brochure', 1)['title'], $this->asset('place_brochure', 1)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        foreach ($refusals as $refusal) {
+            $this->assertStringContainsString('cannot run a write that moves record 1 from TrashableAssetFile to AssetLink without $url through its compatibility map. Why: The move keeps the values the view serves for the attributes of AssetLink, and asset_links.url needs a value the write does not supply.', $refusal);
+        }
+
+        $this->assertSame(['Guide', TrashableAssetFile::class], $refused);
     }
 
     #[Test]
@@ -777,6 +821,40 @@ final class MorphTargetTest extends TestCase
         $this->assertSame([1, 3, TrashableAssetFile::class], $written);
     }
 
+    #[Test]
+    public function it_saves_a_record_whose_choose_closure_already_picks_another_target_from_an_external_attribute_when_the_write_keeps_that_pick(): void
+    {
+        Schema::create('asset_notes', function (Blueprint $table): void {
+            $table->uuid('id')->primary()->default(new Expression('gen_random_uuid()'));
+            $table->uuid('place_asset_id');
+            $table->string('body')->nullable();
+        });
+
+        try {
+            $brochure = $this->installed($this->annotatedBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
+            DB::table('place_assets')->where(
+                column: 'id',
+                operator: '=',
+                value: DB::table('place_brochures')->where(
+                    column: 'id',
+                    operator: '=',
+                    value: 1,
+                )->value('place_asset_id'),
+            )->update(['title' => 'Embed']);
+            $record = $brochure->newQuery()->findOrFail(1);
+            $record->setAttribute('pages', 3);
+
+            $saved = $record->save();
+            $written = [$saved, $brochure->newQuery()->findOrFail(1)->getAttribute('pages'), $this->asset('place_brochure', 1)['asset_type']];
+        } finally {
+            PlaceAssetTables::drop();
+            Schema::dropIfExists('asset_notes');
+        }
+
+        $this->assertSame([true, 3, TrashableAssetFile::class], $written);
+    }
+
     private function pagedBrochure(): Model
     {
         return new class extends Model implements Compatible
@@ -807,9 +885,7 @@ final class MorphTargetTest extends TestCase
                         )
                         ->attribute(
                             name: 'title',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => $asset->getAttribute('title')])->all(),
-                                write: fn (PlaceAsset $asset, null|string $title) => $asset->title = $title),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $assets): array => $assets->mapWithKeys(fn (Model $asset) => [$asset->getKey() => $asset->getAttribute('title')])->all())->writtenBy(WriteAssetTitle::class),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (int) $brochure->getAttribute('pages') >= 10 ? TrashableAssetFile::class : AssetLink::class,
@@ -821,12 +897,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -882,16 +958,16 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no youtube_embed_url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'original_file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no original_file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'size_kb',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no size_kb.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'youtube_embed_url',
@@ -978,12 +1054,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -1027,10 +1103,8 @@ final class MorphTargetTest extends TestCase
                         )
                         ->related(
                             relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
-                            definition: fn (Successor $note) => $note
-                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $notes): array => MorphTargetTest::read($notes),
-                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body)),
+                            successor: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $notes): array => MorphTargetTest::read($notes))->writtenBy(WriteNoteBody::class)),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
@@ -1042,12 +1116,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -1087,7 +1161,7 @@ final class MorphTargetTest extends TestCase
                         )
                         ->attribute(
                             name: 'title',
-                            definition: fn (Attribute $attribute) => $attribute->from('title')->readAs('upper("place_assets"."title")')->writeTo(fn (mixed $title): mixed => $title),
+                            definition: fn (Attribute $attribute) => $attribute->from('title')->readAs('upper("place_assets"."title")')->writtenBy(WriteAssetTitle::class),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'EMBED' || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
@@ -1099,12 +1173,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -1148,7 +1222,7 @@ final class MorphTargetTest extends TestCase
                         )
                         ->related(
                             relation: fn (PlaceAsset $asset) => $asset->belongsTo(AssetNote::class, 'note_id'),
-                            definition: fn (Successor $note) => $note
+                            successor: fn (Successor $note) => $note
                                 ->attribute('pins', fn (Attribute $attribute) => $attribute->from('pins')),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
@@ -1161,12 +1235,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -1210,14 +1284,10 @@ final class MorphTargetTest extends TestCase
                         )
                         ->related(
                             relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
-                            definition: fn (Successor $note) => $note
-                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
-                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body))
+                            successor: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all())->writtenBy(WriteNoteBody::class))
                                 ->related(fn (AssetNote $note) => $note->hasOne(NoteAuthor::class, 'asset_note_id'), fn (Successor $author) => $author
-                                    ->attribute('author', fn (Attribute $attribute) => $attribute->external(
-                                        read: fn (Collection $authors): array => $authors->mapWithKeys(fn (Model $author) => [$author->getKey() => $author->getAttribute('name')])->all(),
-                                        write: fn (NoteAuthor $author, null|string $name) => $author->name = $name))),
+                                    ->attribute('author', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $authors): array => $authors->mapWithKeys(fn (Model $author) => [$author->getKey() => $author->getAttribute('name')])->all())->writtenBy(WriteNoteAuthorName::class))),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => (bool) $brochure->getAttribute('hosted') ? TrashableAssetFile::class : AssetLink::class,
@@ -1229,12 +1299,12 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
@@ -1278,10 +1348,8 @@ final class MorphTargetTest extends TestCase
                         )
                         ->related(
                             relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
-                            definition: fn (Successor $note) => $note
-                                ->attribute('note', fn (Attribute $attribute) => $attribute->external(
-                                    read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all(),
-                                    write: fn (AssetNote $note, null|string $body) => $note->body = $body)),
+                            successor: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all())->writtenBy(WriteNoteBody::class)),
                         )
                         ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
                             choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'Embed' && $brochure->getAttribute('note') !== null || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
@@ -1293,16 +1361,78 @@ final class MorphTargetTest extends TestCase
                                     )
                                     ->attribute(
                                         name: 'url',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
                                     ))
                                 ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                                     ->attribute(
                                         name: 'file_name',
-                                        definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                                     )
                                     ->attribute(
                                         name: 'url',
                                         definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
+            }
+        };
+    }
+
+    private function linkWrittenBrochure(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'place_brochures';
+
+            protected $guarded = [];
+
+            public function getMorphClass()
+            {
+                return 'place_brochure';
+            }
+
+            public static function compatibility(Compatibility $brochure): Compatibility
+            {
+                return $brochure
+                    ->retainedIn('place_brochures_retained')
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->attribute(
+                            name: 'created_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('created_at'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        )
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('title'),
+                        )
+                        ->related(
+                            relation: fn (PlaceAsset $asset) => $asset->hasOne(AssetNote::class, 'place_asset_id'),
+                            successor: fn (Successor $note) => $note
+                                ->attribute('note', fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $notes): array => $notes->mapWithKeys(fn (Model $note) => [$note->getKey() => $note->getAttribute('body')])->all())->writtenBy(WriteNoteBody::class)),
+                        )
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $brochure): string => $brochure->getAttribute('title') === 'Embed' && $brochure->getAttribute('note') !== null || ! (bool) $brochure->getAttribute('hosted') ? AssetLink::class : TrashableAssetFile::class,
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: TrashableAssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'A TrashableAssetFile stores no url.', ignoreWrites: true),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url')->writtenBy(WriteAssetTitle::class),
                                     ))));
             }
         };

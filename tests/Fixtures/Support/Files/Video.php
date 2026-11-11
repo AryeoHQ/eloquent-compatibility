@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Files;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
@@ -46,6 +47,7 @@ final class Video extends Model implements Compatible
             ->retainedIn('videos_retained')
             ->guard('embed host', fn (Video $after, Video $before) => $after->youtube_embed_url !== null && ! str_starts_with($after->youtube_embed_url, 'https://youtu.be/'), because: 'The listing page plays embeds from YouTube only.', instead: 'Write a https://youtu.be/ link.')
             ->servedFrom(root: File::class, key: 'file_id', successor: fn (Successor $file) => $file
+                ->when(fn (Builder $files) => $files->where(fn (Builder $members) => $members->where(column: 'mime_type', operator: 'like', value: 'video/%')->orWhereNotNull('embed_url')))
                 ->attribute(
                     name: 'created_at',
                     definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -61,9 +63,8 @@ final class Video extends Model implements Compatible
                 ->attribute(
                     name: 'mime_type',
                     definition: fn (Attribute $attribute) => $attribute
-                        ->external(
-                            read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType),
-                            write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                        ->computedAs(read: fn (Collection $files): Values => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType))
+                        ->writtenBy(WriteFileMimeType::class),
                 )
                 ->attribute(
                     name: 'size_kb',

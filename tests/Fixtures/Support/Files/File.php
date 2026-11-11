@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection as Values;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 
 /**
  * @property string $id
@@ -22,6 +23,7 @@ use Illuminate\Support\Collection as Values;
  */
 final class File extends Model
 {
+    use CarriesLegacy;
     use HasUuids;
 
     protected $table = 'files';

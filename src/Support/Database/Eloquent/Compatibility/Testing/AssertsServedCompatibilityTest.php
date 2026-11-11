@@ -7,11 +7,13 @@ namespace Support\Database\Eloquent\Compatibility\Testing;
 use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use PHPUnit\Exception as PHPUnitException;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
@@ -19,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Discovery\InheritedServed;
 use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
@@ -149,6 +152,79 @@ final class AssertsServedCompatibilityTest extends TestCase
     }
 
     #[Test]
+    public function it_fails_when_a_native_create_inserts_no_retained_row(): void
+    {
+        $this->install();
+
+        $this->assertStringStartsWith(
+            'nativeCreate inserts no listings_retained row for the new Job. Use '.CarriesLegacy::class.' on Job.',
+            $this->failureOf(
+                model: Listing::class,
+                nativeCreate: function (): Job {
+                    $id = (string) Str::uuid();
+                    DB::table('jobs')->insert(['id' => $id, 'name' => 'Birch House', 'company_id' => ListingTables::COMPANY]);
+
+                    return Job::query()->findOrFail($id);
+                },
+            ),
+        );
+    }
+
+    #[Test]
+    public function it_fails_when_a_legacy_only_not_null_column_has_no_default_and_the_map_no_legacy_initializer(): void
+    {
+        $this->installFloorPlans(classified: true);
+        DB::statement("alter table floorplans_retained add column drawn_by text not null default 'v1'");
+        DB::statement('alter table floorplans_retained alter column drawn_by drop default');
+
+        $this->assertStringStartsWith(
+            'The legacy-only column floorplans_retained.drawn_by is NOT NULL with no default, and the map of FloorPlan declares no legacyInitializedBy(), so a native create cannot fill it.',
+            $this->failureOf(
+                model: FloorPlan::class,
+                nativeCreate: fn () => PlaceAsset::query()->create(['legacy_type' => 'floorplan', 'asset_type' => 'place_asset_file', 'asset_id' => AssetFile::query()->create(['filename' => 'pine-plan.pdf'])->getKey()]),
+            ),
+        );
+    }
+
+    #[Test]
+    public function it_passes_when_the_one_legacy_only_not_null_column_with_no_default_is_a_unique_id_the_legacy_model_allocates(): void
+    {
+        $this->installFloorPlans(classified: true);
+        DB::statement('alter table floorplans_retained alter column uuid drop default');
+        $model = (new class extends Model implements Compatible
+        {
+            use HasUuids;
+            use ServesCompatibility;
+
+            protected $table = 'floorplans';
+
+            protected $guarded = [];
+
+            /**
+             * @return list<string>
+             */
+            public function uniqueIds(): array
+            {
+                return ['uuid'];
+            }
+
+            public static function compatibility(Compatibility $floorPlan): Compatibility
+            {
+                return FloorPlan::compatibility($floorPlan);
+            }
+        })::class;
+        $this->app->instance(ServedModels::class, self::servedOnly(
+            model: $model,
+            files: new Filesystem,
+        ));
+
+        $this->assertServesCompatibility(
+            model: $model,
+            nativeCreate: self::floorPlan(),
+        );
+    }
+
+    #[Test]
     public function it_fails_when_two_maps_when_match_one_native_root(): void
     {
         $this->installFloorPlans(classified: true);
@@ -254,6 +330,34 @@ final class AssertsServedCompatibilityTest extends TestCase
         }
 
         $this->fail("assertServesCompatibility({$model}) passed.");
+    }
+
+    /**
+     * @param  class-string<Model&Compatible>  $model
+     */
+    private static function servedOnly(string $model, Filesystem $files): ServedModels
+    {
+        $cache = (string) tempnam(
+            directory: sys_get_temp_dir(),
+            prefix: 'compatibility-served-',
+        );
+        $files->put(
+            path: $cache,
+            contents: '<?php return '.var_export(
+                value: [$model],
+                return: true,
+            ).';',
+        );
+        $served = new ServedModels(
+            cache: $cache,
+            scans: false,
+            withoutCache: false,
+            files: $files,
+        );
+        $served->all();
+        $files->delete($cache);
+
+        return $served;
     }
 
     private function install(): void

@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -20,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Events\WriteIgnored;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Company;
@@ -27,10 +29,14 @@ use Tests\Fixtures\Support\Listings\ConfiguredJob;
 use Tests\Fixtures\Support\Listings\DefaultedPlace;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\JobSite;
+use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\RefuseTitleOfThirdListing;
+use Tests\Fixtures\Support\Listings\WriteTitleSeeingRecord;
 use Tests\TestCase;
 
 #[CoversClass(MassWriter::class)]
@@ -78,7 +84,7 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_writes_each_owning_table_once_and_fires_no_model_events(): void
+    public function it_saves_each_changed_successor_of_each_record_once_and_forwards_no_legacy_event(): void
     {
         Event::fake();
 
@@ -115,23 +121,26 @@ final class MassWriterTest extends TestCase
             column: 'listings_retained.id',
             values: [1, 3],
         )->orderBy('listings_retained.id')->pluck('mls_number')->all());
-        $this->assertSame([], array_values(array_filter(array_keys(Event::dispatchedEvents()), fn (string $event) => str_starts_with($event, 'eloquent.'))));
+        $this->assertSame([], array_values(array_filter(array_keys(Event::dispatchedEvents()), fn (string $event) => str_starts_with($event, 'eloquent.') && str_ends_with($event, Listing::class))));
+        $this->assertSame([2, 2, 2], [count(Event::dispatched('eloquent.updated: '.Job::class)), count(Event::dispatched('eloquent.updated: '.Place::class)), count(Event::dispatched('eloquent.updated: '.JobSite::class))]);
     }
 
     #[Test]
-    public function it_runs_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
+    public function it_runs_the_unit_of_work_once_for_each_matching_record(): void
     {
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        DB::table('jobs')->insert(['name' => 'Single', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]);
-        self::serveNativeJobs();
+        self::createNativeJobs(count: 100, name: 'Bulk');
+        self::createNativeJobs(count: 1, name: 'Single');
         $write = ['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B'];
+        $saved = 0;
+        Event::listen('eloquent.saved: '.Job::class, function () use (&$saved): void {
+            $saved++;
+        });
 
-        $one = $this->statements(fn () => Listing::query()->where('title', 'Single')->update($write));
-        $hundred = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update($write));
+        $one = Listing::query()->where('title', 'Single')->update($write);
+        $single = $saved;
+        $hundred = Listing::query()->where('title', 'Bulk')->update($write);
 
-        $this->assertSame([1, 100], [$one[0], $hundred[0]]);
-        $this->assertSame($one[1], $hundred[1]);
+        $this->assertSame([1, 100, 1, 101], [$one, $hundred, $single, $saved]);
         $this->assertSame(101, DB::table('jobs')->where('price_cents', 200)->count());
         $this->assertSame(101, DB::table('places')->where('street', '5 Elm St')->whereNull('parent_id')->count());
         $this->assertSame(101, DB::table('job_sites')->where('latitude', 2.5)->count());
@@ -214,14 +223,14 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->hasOne(DefaultedPlace::class),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         ));
             }
         };
-        DB::table('jobs')->insert([['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY], ['name' => 'Cedar Lodge', 'company_id' => ListingTables::COMPANY]]);
-        self::serveNativeJobs();
+        self::createNativeJobs(count: 1, name: 'Birch Lodge');
+        self::createNativeJobs(count: 1, name: 'Cedar Lodge');
         $legacyId = fn (string $name): int => (int) DB::table('listings_retained')->where(
             column: 'job_id',
             operator: '=',
@@ -273,7 +282,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')),
                         ));
@@ -311,7 +320,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
-                            definition: fn (Successor $company) => $company
+                            successor: fn (Successor $company) => $company
                                 ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
                                     ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
                         ));
@@ -366,7 +375,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
-                            definition: fn (Successor $company) => $company
+                            successor: fn (Successor $company) => $company
                                 ->related(fn (Company $company) => $company->profile(), fn (Successor $profile) => $profile
                                     ->attribute('tagline', fn (Attribute $attribute) => $attribute->from('tagline'))),
                         ));
@@ -518,6 +527,46 @@ final class MassWriterTest extends TestCase
             [null, null, null],
         ], $rows);
         $this->assertSame(1, $sites);
+    }
+
+    #[Test]
+    public function it_refuses_a_json_path_write_that_a_successor_listener_changes_and_skips_one_into_a_null_column(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
+        DB::table('settings_holders')->insert([
+            ['name' => 'Oak', 'settings' => '{"color": "red"}'],
+            ['name' => 'Elm', 'settings' => null],
+        ]);
+        $holder = $this->sitedJsonHolder();
+        Event::listen('eloquent.saving: '.ConfiguredJob::class, function (ConfiguredJob $job): void {
+            if (($job->settings['color'] ?? null) === 'blue') {
+                $job->settings = [...$job->settings, 'color' => 'red'];
+            }
+        });
+
+        try {
+            Compatibility::prepare($holder::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, settings) select job_id, name, settings from settings_holders');
+            Compatibility::install(
+                model: $holder::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $refusal = $this->refusal(fn () => $holder->newQuery()->whereKey(1)->update(['settings->color' => 'blue']));
+            $skipped = $holder->newQuery()->whereKey(2)->update(['settings->color' => 'blue']);
+            $settings = DB::table('configured_jobs')->orderBy('name', 'desc')->pluck('settings')->all();
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, configured_sites, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type = 'settings_holders'; IF NOT EXISTS (SELECT FROM compatibility_backfills) THEN DROP TABLE compatibility_backfills; END IF; END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertStringContainsString("record 1 cannot take this write of \$settings->color. Why: The write stores 'blue', and the view now serves settings->color as 'red'", $refusal->getMessage());
+        $this->assertSame([1, ['{"color": "red"}', null]], [$skipped, $settings]);
     }
 
     #[Test]
@@ -686,7 +735,7 @@ final class MassWriterTest extends TestCase
 
         $refusal = $this->refusal(fn () => Listing::query()->whereKey(1)->update(['price->amount' => 5]));
 
-        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its conversions read the whole stored value, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
+        $this->assertSame(Listing::class.' cannot run a JSON path write of $price through its compatibility map. Why: Its read is not a plain column, so a path inside the legacy value has no one stored path. Instead: Write each record through Listing, or write the successor models directly.', $refusal->getMessage());
         $this->assertEquals($before, DB::table('jobs')->orderBy('id')->get()->all());
     }
 
@@ -741,7 +790,7 @@ final class MassWriterTest extends TestCase
         $readOnly = $this->refusal(fn () => Listing::query()->update(['company_id' => ListingTables::COMPANY]));
 
         $this->assertSame(Listing::class.'::$price cannot take a raw expression. Why: Its conversions read stored values, and SQL written for the legacy value does not pass through them. Instead: Write the computed value, or write the stored column through the successor model.', $raw->getMessage());
-        $this->assertSame(Listing::class.' records cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
+        $this->assertSame(Listing::class.' record 1 cannot change $company_id. Why: A job never changes company. Instead: Leave company_id unchanged in writes through Listing.', $readOnly->getMessage());
         $this->assertSame([125050, 9999], DB::table('jobs')->join(
             table: 'listings_retained',
             first: 'listings_retained.job_id',
@@ -783,12 +832,12 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_mass_write_of_an_attribute_that_runs_transitions(): void
+    public function it_runs_the_operation_of_a_state_write_for_each_record_of_a_mass_write(): void
     {
-        $refused = $this->refusal(fn () => Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]));
+        $updated = Listing::query()->where('status', ListingStatus::Active)->update(['title' => 'Oak Manor', 'status' => ListingStatus::Sold]);
 
-        $this->assertSame(Listing::class.'::$status cannot take a mass write. Why: It is declared transitions(), so each record\'s change runs its successor\'s state-machine trigger, and a set-based statement cannot run a trigger per row. Instead: Write the records one at a time through Listing.', $refused->getMessage());
-        $this->assertSame([['Oak House', 'live'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->join(
+        $this->assertSame(1, $updated);
+        $this->assertSame([['Oak Manor', 'closed'], ['Pine Flat', 'drafting'], ['Elm Cottage', 'closed']], DB::table('jobs')->join(
             table: 'listings_retained',
             first: 'listings_retained.job_id',
             operator: '=',
@@ -860,53 +909,149 @@ final class MassWriterTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_create_a_missing_dependent_whose_key_has_no_database_default(): void
+    public function it_creates_a_missing_dependent_through_its_model_when_its_key_has_no_database_default(): void
     {
         DB::statement('alter table places alter column id drop default');
 
-        $refused = $this->refusal(fn () => Listing::withTrashed()->whereKey([1, 2])->update(['title' => 'Renamed', 'street' => '2 Pine St']));
+        $updated = Listing::withTrashed()->whereKey([1, 2])->update(['title' => 'Renamed', 'street' => '2 Pine St']);
         Listing::query()->whereKey(1)->update(['street' => '2 Oak St']);
 
-        $this->assertSame(Listing::class.' cannot write $street in one statement to records that have no places row. Why: A set-based write creates the missing places rows in SQL, and places.id has no database default to key them. Instead: Write the records one at a time through Listing, or give places.id a database default.', $refused->getMessage());
-        $this->assertSame(['Oak House', 'Pine Flat'], Job::withTrashed()->whereIn(
+        $this->assertSame(2, $updated);
+        $this->assertSame(['Renamed', 'Renamed'], Job::withTrashed()->whereIn(
             column: 'id',
             values: DB::table('listings_retained')->whereIn(
                 column: 'id',
                 values: [1, 2],
             )->select('job_id'),
         )->orderBy('name')->pluck('name')->all());
-        $this->assertSame(['2 Oak St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
+        $this->assertSame(['2 Oak St', '2 Pine St', '3 Elm St'], DB::table('places')->orderBy('street')->pluck('street')->all());
     }
 
     #[Test]
-    public function it_binds_no_matched_key_into_a_statement(): void
-    {
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        $keys = DB::table('jobs')->where('name', 'Bulk')->pluck('id')->all();
-
-        [$updated] = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->update(['price' => '2.00', 'street' => '5 Elm St', 'latitude' => 2.5, 'mls_number' => 'MLS-B']));
-        $bound = (string) json_encode(array_column(DB::getQueryLog(), 'bindings'));
-
-        $this->assertSame(100, $updated);
-        $this->assertSame([], array_values(array_filter($keys, fn (mixed $key) => str_contains($bound, (string) $key))));
-    }
-
-    #[Test]
-    public function it_deletes_the_primary_rows_hard_in_the_same_number_of_statements_for_one_matching_row_and_for_a_hundred(): void
+    public function it_force_deletes_the_root_of_each_matching_record_through_its_model(): void
     {
         $oak = Job::query()->whereKey(ListingTables::jobOf(1))->firstOrFail();
-        DB::table('jobs')->insert(array_fill(0, 100, ['name' => 'Bulk', 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]));
-        self::serveNativeJobs();
-        Listing::query()->where('price', '>', 1000)->get();
+        self::createNativeJobs(count: 100, name: 'Bulk');
+        $deleted = 0;
+        Event::listen('eloquent.forceDeleted: '.Job::class, function () use (&$deleted): void {
+            $deleted++;
+        });
 
-        $one = $this->statements(fn () => Listing::query()->where('price', '>', 1000)->forceDelete());
-        $hundred = $this->statements(fn () => Listing::query()->where('title', 'Bulk')->forceDelete());
+        $one = Listing::query()->where('price', '>', 1000)->forceDelete();
+        $single = $deleted;
+        $hundred = Listing::query()->where('title', 'Bulk')->forceDelete();
 
-        $this->assertSame([1, 100], [$one[0], $hundred[0]]);
-        $this->assertSame($one[1], $hundred[1]);
+        $this->assertSame([1, 100, 1, 101], [$one, $hundred, $single, $deleted]);
         $this->assertSame([0, 0, 0], [Job::withTrashed()->whereKey($oak->id)->count(), DB::table('places')->where('job_id', $oak->id)->count(), DB::table('listings_retained')->where('job_id', $oak->id)->count()]);
         $this->assertSame(2, Job::withTrashed()->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_json_path_write_into_a_read_only_attribute_and_discards_one_into_an_attribute_that_ignores_writes(): void
+    {
+        DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, created_at timestamptz, updated_at timestamptz)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::table('settings_holders')->insert([['name' => 'Oak', 'settings' => '{"color": "red"}']]);
+        $refusing = $this->settingsHolder(ignoreWrites: false);
+        $ignoring = $this->settingsHolder(ignoreWrites: true);
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = [$event->change->attribute, $event->value];
+        });
+
+        try {
+            Compatibility::prepare($refusing::class);
+            DB::statement('update settings_holders set job_id = gen_random_uuid()');
+            DB::statement('insert into configured_jobs (id, name, settings) select job_id, name, settings from settings_holders');
+            Compatibility::install(
+                model: $refusing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $refusal = $this->refusal(fn () => $refusing->newQuery()->whereKey(1)->update(['settings->color' => 'blue']));
+            $discarded = $ignoring->newQuery()->whereKey(1)->update(['settings->color' => 'green', 'name' => 'Oak Lodge']);
+            $stored = [DB::table('configured_jobs')->value('settings'), DB::table('configured_jobs')->value('name')];
+        } finally {
+            DB::statement('drop view if exists settings_holders');
+            DB::statement('drop table if exists settings_holders, settings_holders_retained, settings_holders_backfill, configured_jobs cascade');
+            DB::unprepared("DO \$\$ BEGIN IF to_regclass('compatibility_backfills') IS NOT NULL THEN DELETE FROM compatibility_backfills WHERE legacy_type IN ('settings_holders'); END IF; END \$\$");
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame(['Settings follow the job.', true], [$refusal->because, str_ends_with($refusal->refused, ' record 1 cannot change $settings')]);
+        $this->assertSame([1, ['{"color": "red"}', 'Oak Lodge'], [['settings', 'green']]], [$discarded, $stored, $ignored]);
+    }
+
+    private function settingsHolder(bool $ignoreWrites): Model
+    {
+        $holder = $ignoreWrites ? new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return MassWriterTest::settingsMap($holder, ignoreWrites: true);
+            }
+        } : new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'settings_holders';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $holder): Compatibility
+            {
+                return MassWriterTest::settingsMap($holder, ignoreWrites: false);
+            }
+        };
+
+        return $holder;
+    }
+
+    public static function settingsMap(Compatibility $holder, bool $ignoreWrites): Compatibility
+    {
+        $holder->retainedIn('settings_holders_retained');
+
+        return $ignoreWrites
+            ? $holder->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute(name: 'settings', definition: fn (Attribute $attribute) => $attribute->from('settings')->readOnly(because: 'Settings follow the job.', ignoreWrites: true)))
+            : $holder->servedFrom(root: ConfiguredJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(name: 'name', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                ->attribute(name: 'settings', definition: fn (Attribute $attribute) => $attribute->from('settings')->readOnly(because: 'Settings follow the job.', ignoreWrites: false)));
+    }
+
+    #[Test]
+    public function it_hands_an_operation_of_a_mixed_mass_update_the_record_with_the_retained_values_the_update_wrote(): void
+    {
+        $seen = count(WriteTitleSeeingRecord::$records);
+        $titled = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(WriteTitleSeeingRecord::class)));
+            }
+        };
+
+        $updated = $titled->newQuery()->whereKey(1)->update(['title' => 'Oak Manor', 'mls_number' => 'MLS-1B', 'views' => DB::raw('views + 1')]);
+
+        $this->assertSame(1, $updated);
+        $this->assertSame([['Oak Manor', 'MLS-1B', 6]], array_map(fn (array $record) => [$record['title'] ?? null, $record['mls_number'] ?? null, $record['views'] ?? null], array_slice(WriteTitleSeeingRecord::$records, $seen)));
     }
 
     private function createCompanies(): void
@@ -919,23 +1064,6 @@ final class MassWriterTest extends TestCase
             $table->foreignUuid('company_id')->unique()->constrained('companies')->cascadeOnDelete();
             $table->string('tagline')->nullable();
         });
-    }
-
-    /**
-     * @return array{mixed, int}
-     */
-    private function statements(Closure $write): array
-    {
-        DB::flushQueryLog();
-        DB::enableQueryLog();
-
-        try {
-            $result = $write();
-        } finally {
-            DB::disableQueryLog();
-        }
-
-        return [$result, count(array_filter(DB::getQueryLog(), fn (array $query) => ! str_contains((string) $query['query'], 'pg_class')))];
     }
 
     private function lockConcurrently(string $sql): string
@@ -1003,6 +1131,274 @@ final class MassWriterTest extends TestCase
         };
     }
 
+    #[Test]
+    public function it_lets_the_extra_assignment_of_an_increment_win_over_its_amount_on_the_mass_and_the_record_path(): void
+    {
+        Listing::query()->whereKey(1)->increment('price', 1, ['price' => '10.00']);
+        $mass = DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('price_cents');
+        Listing::query()->findOrFail(1)->increment('price', 1, ['price' => '20.00']);
+
+        $this->assertSame([1000, 2000, '20.00'], [$mass, DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('price_cents'), Listing::query()->findOrFail(1)->price]);
+    }
+
+    #[Test]
+    public function it_hands_an_operation_of_a_mass_increment_the_record_with_the_incremented_value(): void
+    {
+        $seen = count(WriteTitleSeeingRecord::$records);
+
+        $this->titled()->newQuery()->whereKey(1)->increment('price', 1, ['title' => 'Oak Manor']);
+
+        $this->assertSame([['Oak Manor', '1251.50']], array_map(fn (array $record) => [$record['title'] ?? null, $record['price'] ?? null], array_slice(WriteTitleSeeingRecord::$records, $seen)));
+    }
+
+    #[Test]
+    public function it_hands_an_operation_of_a_query_builder_insert_the_record_of_the_supplied_row(): void
+    {
+        $seen = count(WriteTitleSeeingRecord::$records);
+        $titled = $this->titled();
+
+        $titled->newQuery()->insert(['title' => 'Birch', 'company_id' => ListingTables::COMPANY, 'mls_number' => 'MLS-X']);
+        $titled->newQuery()->insertGetId(['title' => 'Cedar', 'company_id' => ListingTables::COMPANY, 'mls_number' => 'MLS-Y']);
+        $titled->newQuery()->insertOrIgnore([['title' => 'Maple', 'company_id' => ListingTables::COMPANY, 'mls_number' => 'MLS-Z']]);
+
+        $this->assertSame([['Birch', 'MLS-X'], ['Cedar', 'MLS-Y'], ['Maple', 'MLS-Z']], array_map(fn (array $record) => [$record['title'] ?? null, $record['mls_number'] ?? null], array_slice(WriteTitleSeeingRecord::$records, $seen)));
+    }
+
+    #[Test]
+    public function it_refuses_an_increment_of_a_read_only_or_written_by_attribute_with_its_own_reason_and_discards_one_that_ignores_writes(): void
+    {
+        [$refusing, $operated, $ignoring] = $this->priced();
+        $ignored = [];
+        Event::listen(WriteIgnored::class, function (WriteIgnored $event) use (&$ignored): void {
+            $ignored[] = [$event->change->attribute, $event->value];
+        });
+
+        $messages = [
+            $this->refusal(fn () => $refusing->newQuery()->whereKey(1)->increment('price'))->getMessage(),
+            $this->refusal(fn () => $refusing->newQuery()->findOrFail(1)->increment('price'))->getMessage(),
+            $this->refusal(fn () => $operated->newQuery()->whereKey(1)->increment('price'))->getMessage(),
+        ];
+        $discarded = [$ignoring->newQuery()->whereKey(1)->increment('price', 5), $ignoring->newQuery()->findOrFail(1)->increment('price', 7)];
+
+        $this->assertSame([
+            $refusing::class.' records cannot change $price. Why: A price set in v2 stays. Instead: Leave price unchanged in writes through '.class_basename($refusing::class).'.',
+            $refusing::class.' record 1 cannot change $price. Why: A price set in v2 stays. Instead: Leave price unchanged in writes through '.class_basename($refusing::class).'.',
+            $operated::class.' cannot run an increment of $price through its compatibility map. Why: It is writtenBy() LeaveTitleUnchanged, and an increment runs no operation, so the amount reaches no write. Instead: Write each record through '.class_basename($operated::class).', or write the successor models directly.',
+        ], $messages);
+        $this->assertSame([[1, 1], [['price', 5], ['price', 7]], 125050], [$discarded, $ignored, DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('price_cents')]);
+    }
+
+    #[Test]
+    public function it_hands_an_operation_of_a_create_an_empty_original_whatever_attribute_defaults_the_legacy_model_declares(): void
+    {
+        $seen = count(WriteTitleSeeingRecord::$originals);
+        $defaulted = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            protected $attributes = ['mls_number' => 'MLS-0'];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(WriteTitleSeeingRecord::class)));
+            }
+        };
+
+        $defaulted->newQuery()->create(['title' => 'Birch', 'company_id' => ListingTables::COMPANY]);
+
+        $this->assertSame([[]], array_slice(WriteTitleSeeingRecord::$originals, $seen));
+    }
+
+    #[Test]
+    public function it_names_the_record_the_attribute_and_the_operation_of_a_consumer_refusal_on_a_live_write_and_keeps_the_refusal_as_its_cause(): void
+    {
+        $refusing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at'))
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(RefuseTitleOfThirdListing::class)));
+            }
+        };
+        $refusals = [];
+
+        foreach ([
+            fn () => $refusing->newQuery()->whereKey([1, 3])->update(['title' => 'Renamed']),
+            fn () => $refusing->newQuery()->create(['title' => 'Birch', 'company_id' => ListingTables::COMPANY]),
+        ] as $write) {
+            try {
+                $write();
+            } catch (Refusal $refusal) {
+                $refusals[] = [$refusal->getMessage(), $refusal->getPrevious()?->getMessage()];
+            }
+        }
+
+        $this->assertSame([
+            [$refusing::class.' record 3 cannot take this write of $title, because RefuseTitleOfThirdListing refused it: A title set in v2 cannot change through v1.', 'A title set in v2 cannot change through v1.'],
+            ['A new '.$refusing::class.' record cannot take this write of $title, because RefuseTitleOfThirdListing refused it: A title set in v2 cannot change through v1.', 'A title set in v2 cannot change through v1.'],
+        ], $refusals);
+        $this->assertSame('Oak House', DB::table('jobs')->where('id', ListingTables::jobOf(1))->value('name'));
+    }
+
+    #[Test]
+    public function it_locks_each_related_table_of_a_mass_write_with_one_statement_after_every_root_and_retained_row(): void
+    {
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (str_ends_with($query->sql, 'for update') || str_contains($query->sql, 'for update)')) {
+                $locks[] = (string) preg_replace('/^select .*? from "(\w+)".*$/s', '$1', $query->sql);
+            }
+        });
+
+        $updated = Listing::query()->whereKey([1, 3])->update(['mls_number' => 'MLS-X']);
+
+        $this->assertSame([2, ['jobs', 'listings_retained', 'places', 'job_sites']], [$updated, $locks]);
+    }
+
+    #[Test]
+    public function it_runs_the_write_scope_once_and_binds_at_most_one_chunk_of_keys_per_statement_for_a_mass_write_over_more_records_than_a_chunk(): void
+    {
+        $count = UnitOfWork::CHUNK + 1;
+        DB::statement("insert into jobs (id, name, company_id, price_cents, lifecycle_status, created_at, updated_at) select gen_random_uuid(), 'Bulk', ?, 100, 'live', now(), now() from generate_series(1, ?)", [ListingTables::COMPANY, $count]);
+        DB::statement("insert into places (job_id, street, city) select id, '1 Bulk St', 'Bulkton' from jobs where name = 'Bulk'");
+        DB::statement("insert into listings_retained (job_id, mls_number) select id, 'BULK' from jobs where name = 'Bulk'");
+        $scopes = count(RecordingWriteScope::$received);
+        $scoped = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name'))
+                        ->related(relation: fn (Job $job) => $job->rootPlace(), successor: fn (Successor $place) => $place
+                            ->attribute(name: 'city', definition: fn (Attribute $attribute) => $attribute->from('city'))))
+                    ->writesWithin(RecordingWriteScope::class);
+            }
+        };
+        $bound = 0;
+        DB::listen(function (QueryExecuted $query) use (&$bound): void {
+            $bound = max($bound, count($query->bindings));
+        });
+
+        $updated = $scoped->newQuery()->where('mls_number', 'BULK')->update(['city' => 'Tacoma']);
+
+        $received = array_slice(RecordingWriteScope::$received, $scopes);
+        $this->assertSame([$count, 1, $count, $count], [$updated, count($received), count($received[0][Job::class] ?? []), DB::table('places')->where('city', 'Tacoma')->count()]);
+        $this->assertSame(UnitOfWork::CHUNK + 1, $bound);
+    }
+
+    private function titled(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $guarded = [];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                        ->attribute(name: 'company_id', definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false))
+                        ->attribute(name: 'price', definition: fn (Attribute $attribute) => $attribute->from('price_cents')->dividedBy(100))
+                        ->attribute(name: 'title', definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(WriteTitleSeeingRecord::class)));
+            }
+        };
+    }
+
+    /**
+     * @return array{Model, Model, Model}
+     */
+    private function priced(): array
+    {
+        return [
+            new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                protected $guarded = [];
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return $listing
+                        ->retainedIn('listings_retained')
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                            ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                            ->attribute(name: 'price', definition: fn (Attribute $attribute) => $attribute->from('price_cents')->readOnly(because: 'A price set in v2 stays.', ignoreWrites: false)));
+                }
+            },
+            new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                protected $guarded = [];
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return $listing
+                        ->retainedIn('listings_retained')
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                            ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                            ->attribute(name: 'price', definition: fn (Attribute $attribute) => $attribute->from('price_cents')->writtenBy(LeaveTitleUnchanged::class)));
+                }
+            },
+            new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                protected $guarded = [];
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return $listing
+                        ->retainedIn('listings_retained')
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                            ->attribute(name: 'updated_at', definition: fn (Attribute $attribute) => $attribute->from('updated_at'))
+                            ->attribute(name: 'price', definition: fn (Attribute $attribute) => $attribute->from('price_cents')->readOnly(because: 'A price set in v2 stays.', ignoreWrites: true)));
+                }
+            },
+        ];
+    }
+
     private function sitedJsonHolder(): Model
     {
         return new class extends Model implements Compatible
@@ -1028,7 +1424,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (ConfiguredJob $job) => $job->site(),
-                            definition: fn (Successor $site) => $site
+                            successor: fn (Successor $site) => $site
                                 ->attribute('options', fn (Attribute $attribute) => $attribute->from('options')),
                         ));
             }
@@ -1056,7 +1452,7 @@ final class MassWriterTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->rootPlace(),
-                            definition: fn (Successor $place) => $place
+                            successor: fn (Successor $place) => $place
                                 ->attribute('street', fn (Attribute $attribute) => $attribute->from('street'))
                                 ->related(fn (Place $place) => $place->hasOne(JobSite::class, 'job_id', 'job_id'), fn (Successor $site) => $site
                                     ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude'))),
@@ -1065,8 +1461,12 @@ final class MassWriterTest extends TestCase
         };
     }
 
-    private static function serveNativeJobs(): void
+    private static function createNativeJobs(int $count, string $name): void
     {
-        DB::statement('insert into listings_retained (job_id) select jobs.id from jobs where not exists (select from listings_retained where listings_retained.job_id = jobs.id)');
+        DB::transaction(function () use ($count, $name): void {
+            for ($created = 0; $created < $count; $created++) {
+                Job::query()->create(['name' => $name, 'company_id' => ListingTables::COMPANY, 'price_cents' => 100]);
+            }
+        });
     }
 }

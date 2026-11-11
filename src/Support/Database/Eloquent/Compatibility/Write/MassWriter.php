@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Brick\Math\BigDecimal;
 use Closure;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
@@ -11,16 +12,11 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Builder as QueryBuilder;
-use Illuminate\Database\Query\Expression as RawExpression;
 use Illuminate\Database\QueryException;
-use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Str;
 use LogicException;
-use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
-use Support\Database\Eloquent\Compatibility\Definition\Conversions\MultipliedBy;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
-use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
@@ -29,21 +25,17 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final readonly class MassWriter
 {
-    private const string PINNED = 'pg_temp.compatibility_pinned';
-
-    private const string SELECTED = 'pg_temp.compatibility_selected';
-
-    private const string REACHED = 'pg_temp.compatibility_reached';
-
-    private const string EVALUATED = 'pg_temp.compatibility_evaluated';
-
     private const string TYPED = 'pg_temp.compatibility_typed';
 
-    private const string HELD = 'pg_temp.compatibility_held';
+    private UnitOfWork $unit;
 
-    private const int CHUNK = 500;
-
-    public function __construct(private ResolvedMap $map, private Connection $connection) {}
+    public function __construct(private ResolvedMap $map, private Connection $connection)
+    {
+        $this->unit = new UnitOfWork(
+            map: $map,
+            connection: $connection,
+        );
+    }
 
     public static function computesInSql(mixed $value): bool
     {
@@ -65,114 +57,344 @@ final readonly class MassWriter
     }
 
     /**
-     * @template TResult
-     *
-     * @param  Closure(): TResult  $write
-     * @return TResult
-     */
-    public function transaction(Closure $write): mixed
-    {
-        return $this->connection->transaction(function () use ($write): mixed {
-            $session = $this->connection->transactionLevel() > 1 ? $this->connection->scalar("select current_setting('TimeZone')") : null;
-            $this->connection->select("select set_config('TimeZone', ?, true)", [Config::string('app.timezone', 'UTC')]);
-            $result = $write();
-
-            if (is_string($session)) {
-                $this->connection->select("select set_config('TimeZone', ?, true)", [$session]);
-            }
-
-            return $result;
-        });
-    }
-
-    /**
      * @param  array<array-key, mixed>  $values
      * @param  array<array-key, float|int|numeric-string>  $amounts
      */
     public function update(QueryBuilder $keys, array $values, array $amounts = [], null|string $alias = null): int
     {
-        if ($this->map->morphs !== []) {
-            return $this->updateMorphs($keys, $values, $amounts, $alias ?? $this->map->table);
-        }
+        [$mapped, $retained] = $this->split($values);
+        [$added, $retainedAmounts] = $this->amounts($amounts);
+        $added = array_diff_key($added, $mapped);
 
-        return $this->updateOwned($keys, $values, $amounts, $alias);
-    }
+        return $this->each($keys, function (array $records, array $roots) use ($mapped, $retained, $added, $retainedAmounts, $alias): int {
+            $primary = $this->map->primary;
+            (new RetainedRows(
+                map: $this->map,
+                connection: $this->connection,
+            ))->update(
+                roots: $this->connection->table($primary->table)->whereIn($primary->table.'.'.$primary->key, array_keys($roots))->select($primary->table.'.'.$primary->key),
+                values: $retained,
+                amounts: array_diff_key($retainedAmounts, $retained),
+                alias: $alias,
+            );
+            $writer = new RecordWriter(
+                map: $this->map,
+                connection: $this->connection,
+            );
+            $written = 0;
+            $keyName = (new $this->map->model)->getKeyName();
+            $renamed = $retained[$keyName] ?? null;
+            $stored = $this->retainedValues(
+                roots: array_keys($roots),
+                names: [...array_keys($retained), ...array_keys(array_diff_key($retainedAmounts, $retained))],
+            );
+            $rootOf = array_flip($roots);
 
-    /**
-     * @param  array<array-key, mixed>  $values
-     * @param  array<array-key, float|int|numeric-string>  $amounts
-     */
-    private function updateOwned(QueryBuilder $keys, array $values, array $amounts, null|string $alias): int
-    {
-        [$stored, $retained] = $this->split($values);
-        [$added, $retainedAmounts] = $this->amounts($amounts, null);
+            foreach ($records as $key => [$original, $graph]) {
+                $values = is_int($renamed) || is_string($renamed) ? [...$mapped, $keyName => $renamed] : $mapped;
+                $after = clone $original;
+                $after->setRawAttributes(array_replace($original->getAttributes(), $stored[(string) ($rootOf[$key] ?? '')] ?? [], array_filter(
+                    array: $mapped,
+                    callback: fn (int|string $name) => ! str_contains((string) $name, '->'),
+                    mode: ARRAY_FILTER_USE_KEY,
+                )));
 
-        return $this->transaction(function () use ($keys, $stored, $retained, $added, $retainedAmounts, $alias): int {
-            $pinned = $this->pin($keys);
+                foreach ($added as $name => $amount) {
+                    $before = $original->getAttributes()[$name] ?? null;
 
-            if ($pinned > 0) {
-                $primary = $this->map->primary;
-                $related = array_values($this->map->related);
-                $reached = array_filter($related, fn (Related $related) => $this->withAmounts($stored[$related->table] ?? [], $added[$related->table] ?? []) !== []) !== [];
-
-                if ($reached) {
-                    $this->capture();
+                    if (is_numeric($before) && ! $this->map->attributes[$name]->ignoresWrites()) {
+                        $after->setAttribute(
+                            key: $name,
+                            value: (string) BigDecimal::of(self::number($before))->plus(self::number($amount)),
+                        );
+                    }
                 }
 
-                (new RetainedRows(
-                    map: $this->map,
-                    connection: $this->connection,
-                ))->update(
-                    roots: $this->pinned(),
-                    values: $retained,
-                    amounts: array_diff_key($retainedAmounts, $retained),
-                    alias: $alias,
+                if ($added !== []) {
+                    $this->unit->assign(
+                        graph: $graph,
+                        record: $after,
+                        original: $original,
+                        values: $mapped,
+                        amounts: $added,
+                        origin: Origin::Live,
+                        creating: false,
+                    );
+                    $renumbered = $retainedAmounts[$original->getKeyName()] ?? null;
+                    $written += $writer->finish(
+                        legacy: $after,
+                        key: $key,
+                        graph: $graph,
+                        original: $original,
+                        values: is_int($key) && is_int($renumbered) ? [...$values, $original->getKeyName() => $key + $renumbered] : $values,
+                        mapped: $mapped,
+                        added: $added,
+                    );
+
+                    continue;
+                }
+
+                $written += $writer->apply(
+                    legacy: $after,
+                    key: $key,
+                    graph: $graph,
+                    original: $original,
+                    chosen: $writer->chosen(
+                        legacy: $after,
+                        original: $original,
+                        graph: $graph,
+                        mapped: $mapped,
+                        added: [],
+                    ),
+                    values: $values,
+                    mapped: $mapped,
                 );
-                $values = $this->withAmounts($stored[$primary->table] ?? [], $added[$primary->table] ?? []);
-
-                if ($values !== []) {
-                    $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$primary->key, $this->pinned())->update($values);
-                }
-
-                foreach ($related as $index => $table) {
-                    $this->updateRelated($table, $index, $stored[$table->table] ?? [], $added[$table->table] ?? []);
-                }
-
-                if ($reached) {
-                    $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::REACHED));
-                }
             }
 
-            $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::PINNED));
-
-            return $pinned;
+            return $written;
         });
     }
 
     public function delete(QueryBuilder $keys): int
     {
-        return $this->transaction(function () use ($keys): int {
-            $primary = $this->map->primary;
-            $deleted = $this->pin($keys) > 0 ? (int) $this->successor($primary->model)->newModelQuery()->whereIn($primary->table.'.'.$primary->key, $this->pinned())->delete() : 0;
-            $this->connection->statement('DROP TABLE '.$this->connection->getQueryGrammar()->wrapTable(self::PINNED));
+        return $this->each($keys, function (array $records): int {
+            $deleted = 0;
+
+            foreach ($records as [$original, $graph]) {
+                $root = $graph->root();
+                $this->unit->run($original, $root, fn () => $root->forceDelete());
+                $deleted++;
+            }
 
             return $deleted;
         });
     }
 
     /**
-     * @param  array<array-key, float|int|numeric-string>  $amounts
-     * @return array{array<string, array<string, float|int>>, array<string, float|int>}
+     * @param  Closure(array<int|string, array{Model, Staging<Model>}>, array<int|string, int|string>): int  $write
      */
-    public function amounts(array $amounts, null|int|string $key): array
+    private function each(QueryBuilder $keys, Closure $write): int
     {
-        $added = [];
+        return $this->unit->transaction(function () use ($keys, $write): int {
+            $legacyKeys = $this->legacyKeys($keys);
+
+            if ($legacyKeys === []) {
+                return 0;
+            }
+
+            $rootKeys = $this->rootKeys($legacyKeys);
+            $writer = new RecordWriter(
+                map: $this->map,
+                connection: $this->connection,
+            );
+            $chunks = array_chunk(
+                array: $legacyKeys,
+                length: UnitOfWork::CHUNK,
+            );
+            $scoped = [];
+
+            if ($this->unit->scopes()) {
+                foreach ($chunks as $index => $chunk) {
+                    $scoped[$index] = $this->unit->touched($this->graphsOf(
+                        writer: $writer,
+                        roots: $this->unit->roots(
+                            keys: self::rootsOf(
+                                rootKeys: $rootKeys,
+                                chunk: $chunk,
+                            ),
+                            lock: false,
+                        ),
+                        lock: false,
+                    ));
+                }
+            }
+
+            return $this->unit->scoped(touched: UnitOfWork::merged($scoped), write: function () use ($keys, $rootKeys, $chunks, $scoped, $writer, $write): int {
+                $this->unit->lock(array_values(array_unique(
+                    array: $rootKeys,
+                    flags: SORT_REGULAR,
+                )));
+                $written = 0;
+
+                foreach ($chunks as $index => $chunk) {
+                    $locked = $this->graphsOf(
+                        writer: $writer,
+                        roots: $this->unit->roots(
+                            keys: self::rootsOf(
+                                rootKeys: $rootKeys,
+                                chunk: $chunk,
+                            ),
+                            lock: false,
+                        ),
+                        lock: true,
+                    );
+                    $this->unit->refuseMoved(
+                        scoped: $scoped[$index] ?? [],
+                        graphs: $locked,
+                    );
+                    $legacyKeys = $this->legacyKeys(
+                        keys: $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']),
+                        within: $chunk,
+                    );
+                    $originals = $this->originals($legacyKeys);
+                    $records = [];
+                    $held = [];
+
+                    foreach ($legacyKeys as $key) {
+                        $root = $rootKeys[$key] ?? null;
+                        $original = $originals[$key] ?? null;
+
+                        if ($root === null || $original === null || ! array_key_exists($root, $locked)) {
+                            continue;
+                        }
+
+                        $records[$key] = [$original, $locked[$root]];
+                        $held[$key] = $root;
+                    }
+
+                    $written += $records === [] ? 0 : $write($records, array_flip(array_map(strval(...), $held)));
+                }
+
+                return $written;
+            });
+        });
+    }
+
+    /**
+     * @param  array<int|string, Model>  $roots
+     * @return array<int|string, Staging<Model>>
+     */
+    private function graphsOf(RecordWriter $writer, array $roots, bool $lock): array
+    {
+        return $this->unit->graphs(array_map(
+            callback: fn (Model $root) => [$writer->variantOf($root), $root],
+            array: $roots,
+        ), lock: $lock);
+    }
+
+    /**
+     * @param  array<int|string, int|string>  $rootKeys
+     * @param  list<int|string>  $chunk
+     * @return list<int|string>
+     */
+    private static function rootsOf(array $rootKeys, array $chunk): array
+    {
+        $roots = array_values(array_unique(
+            array: array_intersect_key($rootKeys, array_flip($chunk)),
+            flags: SORT_REGULAR,
+        ));
+        sort($roots);
+
+        return $roots;
+    }
+
+    /**
+     * @param  list<int|string>  $roots
+     * @param  list<int|string>  $names
+     * @return array<string, array<string, mixed>>
+     */
+    private function retainedValues(array $roots, array $names): array
+    {
+        $columns = array_values(array_unique(array_map(
+            callback: fn (int|string $name) => Str::before((string) $name, '->'),
+            array: $names,
+        )));
+
+        if ($columns === [] || $roots === []) {
+            return [];
+        }
+
+        $retained = ViewCompiler::retainedTable($this->map);
+        $values = [];
+
+        foreach (array_chunk(array: $roots, length: UnitOfWork::CHUNK) as $chunk) {
+            foreach ($this->connection->table($retained)->useWritePdo()->whereIn($retained.'.'.$this->map->successorKey, $chunk)->get([$this->map->successorKey, ...$columns]) as $row) {
+                $row = (array) $row;
+                $root = $row[$this->map->successorKey] ?? null;
+
+                if (is_int($root) || is_string($root)) {
+                    $values[(string) $root] = array_intersect_key($row, array_flip($columns));
+                }
+            }
+        }
+
+        return $values;
+    }
+
+    /**
+     * @param  null|list<int|string>  $within
+     * @return list<int|string>
+     */
+    private function legacyKeys(QueryBuilder $keys, null|array $within = null): array
+    {
+        $key = (new $this->map->model)->getKeyName();
+        $query = $this->connection->query()->fromSub($keys, 'compatibility_keys')->distinct()->useWritePdo()->orderBy('compatibility_keys.'.$key);
+
+        if ($within !== null) {
+            $query->whereIn('compatibility_keys.'.$key, $within);
+        }
+
+        return array_values(array_filter(
+            array: $query->pluck('compatibility_keys.'.$key)->all(),
+            callback: fn (mixed $value) => is_int($value) || is_string($value),
+        ));
+    }
+
+    /**
+     * @param  list<int|string>  $legacyKeys
+     * @return array<int|string, int|string>
+     */
+    private function rootKeys(array $legacyKeys): array
+    {
+        $retained = ViewCompiler::retainedTable($this->map);
+        $key = (new $this->map->model)->getKeyName();
+        $roots = [];
+
+        foreach (array_chunk($legacyKeys, UnitOfWork::CHUNK) as $chunk) {
+            foreach ($this->connection->table($retained)->useWritePdo()->whereIn($retained.'.'.$key, $chunk)->whereNotNull($retained.'.'.$this->map->successorKey)->pluck($retained.'.'.$this->map->successorKey, $retained.'.'.$key) as $legacy => $root) {
+                if (is_int($root) || is_string($root)) {
+                    $roots[$legacy] = $root;
+                }
+            }
+        }
+
+        return $roots;
+    }
+
+    /**
+     * @param  list<int|string>  $legacyKeys
+     * @return array<int|string, Model>
+     */
+    private function originals(array $legacyKeys): array
+    {
+        $legacy = (new $this->map->model)->setConnection($this->connection->getName());
+        $originals = [];
+
+        foreach (array_chunk($legacyKeys, UnitOfWork::CHUNK) as $chunk) {
+            foreach ($this->connection->table($this->map->table)->useWritePdo()->whereIn($legacy->getKeyName(), $chunk)->get() as $row) {
+                $original = $legacy->newInstance([], true)->setRawAttributes((array) $row, true);
+                $originals[UnitOfWork::keyOf($original)] = $original;
+            }
+        }
+
+        ExternalAttributes::gather(array_values($originals), true);
+
+        return $originals;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{array<string, mixed>, array<string, mixed>}
+     */
+    private function split(array $values): array
+    {
+        $mapped = [];
         $retained = [];
 
-        foreach ($amounts as $name => $amount) {
-            $name = Str::afterLast((string) $name, '.');
-            $amount += 0;
-
+        foreach ($values as $key => $value) {
+            [$name, $path] = array_pad(explode('->', (string) $key, 2), 2, null);
+            $name = Str::afterLast($name, '.');
+            $within = $path === null ? '' : '->'.$path;
             $attribute = $this->map->attributes[$name] ?? null;
 
             if ($attribute === null && $name === $this->map->successorKey) {
@@ -185,21 +407,58 @@ final readonly class MassWriter
             }
 
             if ($attribute === null) {
-                $retained[$name] = $amount;
+                $retained[$name.$within] = $value;
 
                 continue;
             }
 
-            $this->refuse($name, $key);
-            $conversions = $attribute->conversions();
-            $column = $attribute->column();
+            self::refuseRaw($this->map, $name, $value);
 
-            if ($column === null || array_filter($conversions, fn (object $conversion) => ! $conversion instanceof DividedBy && ! $conversion instanceof MultipliedBy) !== []) {
-                throw CompatibilityWriteRefused::unsupported($this->map->model, "an increment of \${$name}", 'Its conversions are not linear, so an amount added to it has no one stored amount.');
+            if ($path !== null && ($attribute->column() === null || $attribute->conversions() !== [] || ! $attribute->invertible() || $attribute->operation() !== null)) {
+                throw CompatibilityWriteRefused::unsupported($this->map->model, "a JSON path write of \${$name}", 'Its read is not a plain column, so a path inside the legacy value has no one stored path.');
             }
 
-            $stored = $attribute->write($amount);
-            $added[$this->map->owners[$name]->table][$column] = is_int($stored) || is_float($stored) ? $stored : throw new LogicException("Attribute '{$name}' stored no number for the amount {$amount}.");
+            $mapped[$name.$within] = $value;
+        }
+
+        return [$mapped, $retained];
+    }
+
+    /**
+     * @param  array<array-key, float|int|numeric-string>  $amounts
+     * @return array{array<string, float|int>, array<string, float|int>}
+     */
+    private function amounts(array $amounts): array
+    {
+        $added = [];
+        $retained = [];
+
+        foreach ($amounts as $name => $amount) {
+            $name = Str::afterLast((string) $name, '.');
+            $amount += 0;
+
+            if ($name === $this->map->successorKey) {
+                throw CompatibilityWriteRefused::readOnly(
+                    model: $this->map->model,
+                    attribute: $name,
+                    key: null,
+                    because: 'The successor key binds each record to its '.class_basename($this->map->primary->model).', and a write that changes it would serve another root under the same legacy identity.',
+                );
+            }
+
+            $attribute = $this->map->attributes[$name] ?? null;
+
+            if ($attribute !== null) {
+                UnitOfWork::refuseIncrement(
+                    map: $this->map,
+                    attribute: $attribute,
+                    name: $name,
+                    key: null,
+                );
+                $added[$name] = $amount;
+            } else {
+                $retained[$name] = $amount;
+            }
         }
 
         return [$added, $retained];
@@ -319,317 +578,9 @@ final readonly class MassWriter
         return (array) $row;
     }
 
-    /**
-     * @param  array<array-key, mixed>  $values
-     * @param  array<array-key, float|int|numeric-string>  $amounts
-     */
-    private function updateMorphs(QueryBuilder $keys, array $values, array $amounts, string $alias): int
+    private static function number(int|float|string $value): string
     {
-        return $this->transaction(function () use ($keys, $values, $amounts, $alias): int {
-            $grammar = $this->connection->getQueryGrammar();
-            $key = (new $this->map->model)->getKeyName();
-            $selected = $this->connection->table(self::SELECTED)->select('key');
-            $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::SELECTED).' ON COMMIT DROP AS SELECT DISTINCT '.$grammar->wrap('keys.'.$key).' AS '.$grammar->wrap('key').' FROM ('.$keys->toSql().') AS '.$grammar->wrap('keys'), $keys->getBindings());
-            $primary = $this->map->primary;
-            $this->members($this->connection->table($primary->table))
-                ->whereIn($primary->table.'.'.$primary->key, $this->rootsOf($selected))
-                ->orderBy($primary->table.'.'.$primary->key)
-                ->lockForUpdate()
-                ->pluck($primary->table.'.'.$primary->key);
-
-            foreach ($this->map->morphs as $variant) {
-                $writer = new self($variant, $this->connection);
-                $writer->lockDependents($writer->members($this->connection->table($primary->table))->whereIn(
-                    column: $primary->table.'.'.$primary->key,
-                    values: $this->rootsOf($selected),
-                )->select($primary->table.'.'.$primary->key));
-            }
-
-            $this->connection->table(self::SELECTED)->whereNotIn('key', $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']))->delete();
-
-            [$mapped, $retained] = $this->byOwner($values);
-            [$mappedAmounts, $retainedAmounts] = $this->byOwner($amounts);
-            $assigned = self::named($values);
-            $whole = array_filter($retained, fn (int|string $name) => ! str_contains((string) $name, '->'), ARRAY_FILTER_USE_KEY);
-            $exact = array_diff_key(self::named($mappedAmounts), $assigned) === [] && array_filter(array_keys($assigned), fn (int|string $name) => str_contains((string) $name, '->')) === [] && ! $this->projectsMorphs() && $this->map->externals() === [];
-            $sums = [];
-
-            foreach (array_diff_key(self::named($retainedAmounts), $assigned) as $column => $amount) {
-                $sums[$column] = new RawExpression(SqlFragments::identifier($alias).'.'.SqlFragments::identifier($column).' + '.($amount + 0));
-            }
-
-            $reads = $this->evaluateOnce($selected, array_filter($whole, fn (mixed $value) => $value instanceof Expression) + $sums, $alias);
-            $literals = $this->typed(array_filter($whole, fn (mixed $value) => ! $value instanceof Expression));
-            $values = array_replace($values, $literals, array_intersect_key($reads, $retained));
-            $known = array_filter(self::named(array_replace($mapped, $literals)), fn (mixed $value) => ! self::computesInSql($value));
-            [$holding, $chosen] = $this->refuseMorphMoves($selected, $known, self::named($reads), $alias, $exact);
-            $held = $this->connection->table(self::HELD)->select('key');
-
-            if (! $exact) {
-                $successors = $this->members($this->connection->table($primary->table))
-                    ->whereIn($primary->table.'.'.$primary->key, $this->rootsOf($selected))
-                    ->select($primary->table.'.'.$primary->key.' as key');
-                $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::HELD).' ON COMMIT DROP AS '.$successors->toSql(), $successors->getBindings());
-            }
-
-            $updated = 0;
-            [$sharedValues, $ownValues] = $this->byShared($values);
-            [$sharedAmounts, $ownAmounts] = $this->byShared($amounts);
-
-            if ($sharedValues !== [] || $sharedAmounts !== []) {
-                $this->updateOwned($selected, $sharedValues, $sharedAmounts, $alias);
-            }
-
-            foreach ($holding as $variant) {
-                $updated += (new self($variant, $this->connection))->update($selected, $ownValues, $ownAmounts, $alias);
-            }
-
-            if (! $exact) {
-                $this->refuseMorphMoved($held, $chosen, $alias);
-                $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::HELD));
-            }
-
-            if ($reads !== []) {
-                $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::EVALUATED));
-            }
-
-            $this->connection->statement('DROP TABLE '.$grammar->wrapTable(self::SELECTED));
-
-            return $updated;
-        });
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @param  array<string, Expression>  $reads
-     * @return array{list<ResolvedMap>, array<array-key, array{int|string, ResolvedMap}>}
-     */
-    private function refuseMorphMoves(QueryBuilder $selected, array $values, array $reads, string $alias, bool $exact): array
-    {
-        $morph = $this->map->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' declares no relatedMorph().");
-        $key = (new $this->map->model)->getKeyName();
-        $holding = [];
-        $chosen = [];
-        $served = [];
-
-        foreach ($this->morphRows($alias.'.'.$key, $selected, $reads, $alias)->cursor()->chunk(self::CHUNK) as $chunk) {
-            $rows = array_map(fn (mixed $row) => $this->morphRow((array) $row, $reads), $chunk->values()->all());
-            $probes = $this->probes(array_column($rows, 0));
-
-            foreach ($rows as $index => [$before, $type, $evaluated, $successor]) {
-                $from = $this->map->morphHolding($type);
-                $record = $before[$key] ?? null;
-                $record = is_int($record) || is_string($record) ? $record : '';
-
-                if ($from === null) {
-                    throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that reaches record '.$record.', whose '.class_basename($this->map->primary->model).' stores '.(is_scalar($type) ? $morph->typeColumn.' '.SqlFragments::literal((string) $type) : 'no '.$morph->typeColumn), 'targets: declares no target for it, so no target statement would write the record, and the mass write would skip it.');
-                }
-
-                $holding[spl_object_id($from)] = $from;
-                $choice = $this->map->morphFor($probes[$index]);
-
-                if (is_int($successor) || is_string($successor)) {
-                    $chosen[$successor] = [$record, $choice];
-                }
-
-                if ($exact) {
-                    $served[spl_object_id($from)] ??= (new self($from, $this->connection))->served($values) ?? [];
-                    $this->refuseMorphMove($record, $from, $choice, (new $this->map->model)->setRawAttributes(array_replace($before, $values, $served[spl_object_id($from)], $evaluated)));
-                }
-            }
-        }
-
-        return [array_values($holding), $chosen];
-    }
-
-    /**
-     * @param  array<array-key, array{int|string, ResolvedMap}>  $chosen
-     */
-    private function refuseMorphMoved(QueryBuilder $held, array $chosen, string $alias): void
-    {
-        foreach ($this->morphRows($this->map->primary->table.'.'.$this->map->primary->key, $held, [], $alias)->cursor()->chunk(self::CHUNK) as $chunk) {
-            $rows = array_map(fn (mixed $row) => $this->morphRow((array) $row, []), $chunk->values()->all());
-            $probes = $this->probes(array_column($rows, 0));
-
-            foreach ($rows as $index => [, $type, , $successor]) {
-                $from = $this->map->morphHolding($type);
-
-                if ($from !== null && (is_int($successor) || is_string($successor)) && array_key_exists($successor, $chosen)) {
-                    $this->refuseMorphMove($chosen[$successor][0], $from, $chosen[$successor][1], $probes[$index]);
-                }
-            }
-        }
-    }
-
-    /**
-     * @param  list<array<string, mixed>>  $rows
-     * @return list<Model>
-     */
-    private function probes(array $rows): array
-    {
-        $probes = array_map(fn (array $row) => (new $this->map->model)->newInstance([], true)->setConnection($this->connection->getName())->setRawAttributes($row, true), $rows);
-        ExternalAttributes::gather($probes, true);
-
-        return $probes;
-    }
-
-    private function refuseMorphMove(int|string $record, ResolvedMap $from, ResolvedMap $chosen, Model $after): void
-    {
-        $to = $this->map->morphFor($after);
-
-        if ($to !== $from && $to !== $chosen) {
-            throw CompatibilityWriteRefused::unsupported($this->map->model, 'a mass write that changes what the relatedMorph() choose: closure picks', 'It would move record '.$record.' from '.class_basename((string) $from->target?->model).' to '.class_basename((string) $to->target?->model).', and a move creates and deletes each target through its model, one record at a time.');
-        }
-    }
-
-    /**
-     * @param  array<string, Expression>  $reads
-     */
-    private function morphRows(string $by, QueryBuilder $keys, array $reads, string $alias): QueryBuilder
-    {
-        $morph = $this->map->morph ?? throw new LogicException("Compatibility map '{$this->map->table}' declares no relatedMorph().");
-        $key = (new $this->map->model)->getKeyName();
-        $primary = $this->map->primary->table;
-        $grammar = $this->connection->getQueryGrammar();
-        $rows = $this->connection->table($alias === $this->map->table ? $this->map->table : $this->map->table.' as '.$alias)
-            ->select($alias.'.*')
-            ->selectRaw(SqlFragments::identifier($primary).'.'.SqlFragments::identifier($morph->typeColumn).' AS '.$grammar->wrap('compatibility_morph_type'))
-            ->selectRaw(SqlFragments::identifier($primary).'.'.SqlFragments::identifier($this->map->primary->key).' AS '.$grammar->wrap('compatibility_morph_successor'))
-            ->join($primary, $primary.'.'.$this->map->primary->key, '=', $alias.'.'.$this->map->successorKey)
-            ->whereIn($by, $keys)
-            ->orderBy($alias.'.'.$key);
-
-        foreach (array_values($reads) as $index => $read) {
-            $rows->selectRaw('('.$read->getValue($grammar).') as '.$grammar->wrap('compatibility_value_'.$index));
-        }
-
-        return $rows;
-    }
-
-    /**
-     * @param  array<string, mixed>  $row
-     * @param  array<string, Expression>  $reads
-     * @return array{array<string, mixed>, mixed, array<string, mixed>, mixed}
-     */
-    private function morphRow(array $row, array $reads): array
-    {
-        $type = $row['compatibility_morph_type'] ?? null;
-        $successor = $row['compatibility_morph_successor'] ?? null;
-        $evaluated = [];
-        unset($row['compatibility_morph_type'], $row['compatibility_morph_successor']);
-
-        foreach (array_keys($reads) as $index => $name) {
-            $evaluated[$name] = $row['compatibility_value_'.$index] ?? null;
-            unset($row['compatibility_value_'.$index]);
-        }
-
-        return [$row, $type, $evaluated, $successor];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $retained
-     * @return array<array-key, Expression>
-     */
-    private function evaluateOnce(QueryBuilder $selected, array $retained, string $alias): array
-    {
-        $expressions = array_filter($retained, fn (mixed $value) => $value instanceof Expression);
-
-        if ($expressions === []) {
-            return [];
-        }
-
-        $grammar = $this->connection->getQueryGrammar();
-        $evaluated = $grammar->wrapTable(self::EVALUATED);
-        $retainedTable = SqlFragments::identifier(ViewCompiler::retainedTable($this->map));
-        $legacy = SqlFragments::identifier($alias);
-        $from = SqlFragments::identifier($this->map->table).($alias === $this->map->table ? '' : ' AS '.$legacy);
-        $legacyKey = $legacy.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName());
-        $view = SqlFragments::identifier($this->map->table);
-        $shape = [$view.'.'.SqlFragments::identifier((new $this->map->model)->getKeyName()).' AS '.$grammar->wrap('key')];
-        $columns = [$grammar->wrap('key')];
-        $selects = [$legacyKey];
-        $reads = [];
-
-        foreach (array_keys($expressions) as $index => $name) {
-            $value = $expressions[$name];
-            $column = $grammar->wrap('value_'.$index);
-            $shape[] = $retainedTable.'.'.SqlFragments::identifier(Str::afterLast((string) $name, '.')).' AS '.$column;
-            $columns[] = $column;
-            $selects[] = '('.($value instanceof Expression ? (string) $value->getValue($grammar) : '').')';
-            $reads[$name] = new RawExpression('(SELECT evaluated.'.$column.' FROM '.$evaluated.' AS evaluated WHERE evaluated.'.$grammar->wrap('key').' = '.$legacyKey.')');
-        }
-
-        $this->connection->statement('CREATE TEMPORARY TABLE '.$evaluated.' ON COMMIT DROP AS SELECT '.implode(', ', $shape).' FROM '.$retainedTable.', '.$view.' WITH NO DATA');
-        $this->connection->insert('INSERT INTO '.$evaluated.' ('.implode(', ', $columns).') SELECT '.implode(', ', $selects).' FROM '.$from.' WHERE '.$legacyKey.' IN ('.$selected->toSql().')', $selected->getBindings());
-        $this->connection->statement('ALTER TABLE '.$evaluated.' ADD PRIMARY KEY ('.$grammar->wrap('key').')');
-        $this->connection->statement('ANALYZE '.$evaluated);
-
-        return $reads;
-    }
-
-    /**
-     * @template TValue
-     *
-     * @param  array<array-key, TValue>  $values
-     * @return array{array<array-key, TValue>, array<array-key, TValue>}
-     */
-    private function byOwner(array $values): array
-    {
-        $mapped = [];
-        $retained = [];
-
-        foreach ($values as $name => $value) {
-            $attribute = Str::afterLast((string) $name, '.');
-
-            if (array_key_exists(
-                key: $attribute,
-                array: $this->map->attributes,
-            )) {
-                $mapped[$name] = $value;
-            } else {
-                $retained[$name] = $value;
-            }
-        }
-
-        return [$mapped, $retained];
-    }
-
-    /**
-     * @template TValue
-     *
-     * @param  array<array-key, TValue>  $values
-     * @return array{array<array-key, TValue>, array<array-key, TValue>}
-     */
-    private function byShared(array $values): array
-    {
-        $shared = [];
-        $own = [];
-
-        foreach ($values as $key => $value) {
-            $name = Str::afterLast(explode('->', (string) $key, 2)[0], '.');
-            $owner = $this->map->owners[$name] ?? null;
-
-            if ($owner !== null && $owner !== $this->map->primary && ! $this->map->isMorphed($name)) {
-                $shared[$key] = $value;
-            } else {
-                $own[$key] = $value;
-            }
-        }
-
-        return [$shared, $own];
-    }
-
-    private function projectsMorphs(): bool
-    {
-        foreach ($this->map->morphs as $variant) {
-            foreach ($variant->attributes as $attribute) {
-                if (($attribute->conversions()[0] ?? null) instanceof ReadAs) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return is_float($value) ? json_encode(value: $value, flags: JSON_THROW_ON_ERROR) : (string) $value;
     }
 
     /**
@@ -647,363 +598,5 @@ final readonly class MassWriter
         }
 
         return $named;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $values
-     * @return array{array<string, array<string, mixed>>, array<string, mixed>}
-     */
-    private function split(array $values): array
-    {
-        $stored = [];
-        $retained = [];
-
-        foreach ($values as $key => $value) {
-            [$name, $path] = array_pad(explode('->', (string) $key, 2), 2, null);
-            $name = Str::afterLast($name, '.');
-            $within = $path === null ? '' : '->'.$path;
-
-            $attribute = $this->map->attributes[$name] ?? null;
-
-            if ($attribute === null && $name === $this->map->successorKey) {
-                throw CompatibilityWriteRefused::readOnly(
-                    model: $this->map->model,
-                    attribute: $name,
-                    key: null,
-                    because: 'The successor key binds each record to its '.class_basename($this->map->primary->model).', and a write that changes it would serve another root under the same legacy identity.',
-                );
-            }
-
-            if ($attribute === null) {
-                $retained[$name.$within] = $value;
-
-                continue;
-            }
-
-            $this->refuse($name, null);
-            self::refuseRaw($this->map, $name, $value);
-
-            if ($path !== null) {
-                $column = $attribute->column();
-
-                if ($column === null || $attribute->conversions() !== []) {
-                    throw CompatibilityWriteRefused::unsupported($this->map->model, "a JSON path write of \${$name}", 'Its conversions read the whole stored value, so a path inside the legacy value has no one stored path.');
-                }
-
-                $stored[$this->map->owners[$name]->table][$column.$within] = $value;
-
-                continue;
-            }
-
-            try {
-                $value = $attribute->write($value);
-            } catch (LogicException $exception) {
-                throw CompatibilityWriteRefused::unstorable($this->map->model, $name, $exception->getMessage());
-            }
-
-            $column = $attribute->column();
-
-            if ($column !== null) {
-                $stored[$this->map->owners[$name]->table][$column] = $value;
-            }
-        }
-
-        return [$stored, $retained];
-    }
-
-    private function refuse(string $name, null|int|string $key): void
-    {
-        $attribute = $this->map->attributes[$name];
-        $readOnly = $attribute->readOnlyBecause();
-        $refusal = match (true) {
-            $attribute->isExternal() => CompatibilityWriteRefused::external($this->map->model, $name),
-            $attribute->runsTransitions() => CompatibilityWriteRefused::transitions($this->map->model, $name),
-            $readOnly !== null => CompatibilityWriteRefused::readOnly($this->map->model, $name, $key, $readOnly),
-            default => null,
-        };
-
-        if ($refusal !== null) {
-            throw $refusal;
-        }
-    }
-
-    private function pin(QueryBuilder $keys): int
-    {
-        $primary = $this->map->primary;
-        $key = $primary->table.'.'.$primary->key;
-        $grammar = $this->connection->getQueryGrammar();
-
-        $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::PINNED).' ON COMMIT DROP AS SELECT '.$grammar->wrap($key).' AS '.$grammar->wrap('key').' FROM '.$grammar->wrapTable($primary->table).' WITH NO DATA');
-        $locked = $this->connection->table(self::PINNED)->insertUsing(
-            columns: ['key'],
-            query: $this->members($this->connection->table($primary->table))->select($key)->whereIn(
-                column: $key,
-                values: $this->rootsOf($keys),
-            )->orderBy($key)->lockForUpdate(),
-        );
-        $this->lockDependents($this->pinned());
-        $filter = $keys->cloneWithout(['orders', 'limit', 'offset'])->cloneWithoutBindings(['order']);
-        $moved = $this->connection->table(self::PINNED.' as pinned')->whereNotExists(fn (QueryBuilder $matching) => $this->members($matching->from($primary->table))->whereColumn(
-            first: $key,
-            operator: '=',
-            second: 'pinned.key',
-        )->whereIn(
-            column: $key,
-            values: $this->rootsOf($filter),
-        ))->delete();
-
-        return $locked - $moved;
-    }
-
-    private function rootsOf(QueryBuilder $keys): QueryBuilder
-    {
-        $retained = ViewCompiler::retainedTable($this->map);
-
-        return $this->connection->table($retained)->select($retained.'.'.$this->map->successorKey)->whereIn(
-            column: $retained.'.'.(new $this->map->model)->getKeyName(),
-            values: $keys,
-        );
-    }
-
-    private function members(QueryBuilder $query): QueryBuilder
-    {
-        $morph = $this->map->morph;
-        $target = $this->map->target;
-
-        return $morph === null || $target === null ? $query : $query->where($this->map->primary->table.'.'.$morph->typeColumn, $target->morphAlias);
-    }
-
-    public function lockDependentsOf(int|string $key): void
-    {
-        $this->lockDependents([$key]);
-    }
-
-    /**
-     * @param  QueryBuilder|list<int|string>  $keys
-     */
-    private function lockDependents(QueryBuilder|array $keys): void
-    {
-        $retained = $this->map->retainedTable;
-
-        if ($retained !== null) {
-            $successorKey = $retained.'.'.$this->map->successorKey;
-            $this->lock($this->connection->table($retained)->select($successorKey)->whereIn(
-                column: $successorKey,
-                values: $keys,
-            )->orderBy($successorKey));
-        }
-
-        foreach ($this->map->related as $related) {
-            $key = $related->table.'.'.$related->successor->key;
-            $this->lock($this->connection->table($related->table)->select($key)->whereIn($key, $this->reach($related, $keys)->whereNotNull($key)->select($key))->orderBy($key));
-        }
-    }
-
-    private function lock(QueryBuilder $rows): void
-    {
-        $this->connection->query()->fromSub($rows->lockForUpdate(), 'locked')->count();
-    }
-
-    private function pinned(): QueryBuilder
-    {
-        return $this->connection->table(self::PINNED)->select('key');
-    }
-
-    private function capture(): void
-    {
-        $primary = $this->map->primary;
-        $grammar = $this->connection->getQueryGrammar();
-        $columns = [];
-
-        foreach (array_values($this->map->related) as $index => $related) {
-            $columns[self::target($index)] = $grammar->wrap($related->table.'.'.$related->successor->key);
-            $columns[self::parentOf($index)] = self::parent($related);
-        }
-
-        $selects = implode(', ', array_map(fn (string $expression, string $name) => $expression.' AS '.$grammar->wrap($name), $columns, array_keys($columns)));
-        $reached = SqlFragments::identifier($primary->table).' '.implode(' ', ViewCompiler::laterals($this->map));
-        $this->connection->statement('CREATE TEMPORARY TABLE '.$grammar->wrapTable(self::REACHED).' ON COMMIT DROP AS SELECT '.$selects.' FROM '.$reached.' WITH NO DATA');
-        $this->connection->table(self::REACHED)->insertUsing(array_keys($columns), $this->connection->query()->fromRaw($reached)->selectRaw($selects)->whereIn($primary->table.'.'.$primary->key, $this->pinned()));
-    }
-
-    private function reached(): QueryBuilder
-    {
-        return $this->connection->table(self::REACHED);
-    }
-
-    private static function target(int $index): string
-    {
-        return 'target_'.$index;
-    }
-
-    private static function parentOf(int $index): string
-    {
-        return 'parent_'.$index;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @param  array<string, float|int>  $amounts
-     */
-    private function updateRelated(Related $related, int $index, array $values, array $amounts): void
-    {
-        $changes = $this->withAmounts($values, $amounts);
-
-        if ($changes === []) {
-            return;
-        }
-
-        $catalog = new ColumnCatalog($this->connection, throughSearchPath: true);
-        $whole = array_filter($values, fn (int|string $column) => ! str_contains((string) $column, '->'), ARRAY_FILTER_USE_KEY);
-        $creates = array_filter($whole, fn (mixed $value) => $value !== null) !== [] && $this->pinMissing($related, $index, $whole, $catalog);
-        $key = $related->table.'.'.$related->successor->key;
-        $this->successor($related->model)->newModelQuery()->whereIn($key, $this->reached()->whereNotNull(self::target($index))->select(self::target($index)))->update($changes);
-
-        if ($creates) {
-            $this->createMissing($related, $index, $whole, $catalog);
-        }
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     */
-    private function pinMissing(Related $related, int $index, array $values, ColumnCatalog $catalog): bool
-    {
-        $written = array_keys(array_filter($related->successor->attributes(), fn ($attribute) => array_key_exists((string) $attribute->column(), $values)));
-
-        if ($related->belongsTo && $this->reached()->whereNull(self::target($index))->exists()) {
-            throw CompatibilityWriteRefused::noRelatedRow($this->map->model, $written, $related->table, $related->parentTable);
-        }
-
-        if ($related->parentTable !== $this->map->primary->table && $this->reached()->whereNull(self::target($index))->whereNull(self::parentOf($index))->exists()) {
-            throw CompatibilityWriteRefused::noParentRow($this->map->model, $written, $related->table, $related->parentTable);
-        }
-
-        $key = $catalog->of($related->table)[$related->successor->key] ?? null;
-
-        if ($key !== null && $key->default === null && ! $key->generated) {
-            if ($this->reached()->whereNull(self::target($index))->whereNotNull(self::parentOf($index))->exists()) {
-                throw CompatibilityWriteRefused::noKeyDefault($this->map->model, $written, $related->table, $related->successor->key);
-            }
-
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     */
-    private function createMissing(Related $related, int $index, array $values, ColumnCatalog $catalog): void
-    {
-        $model = $this->successor($related->model);
-        $grammar = $this->connection->getQueryGrammar();
-        $parent = $grammar->wrap(self::parentOf($index));
-        $timestamps = [];
-
-        if ($model->usesTimestamps()) {
-            foreach ([$model->getCreatedAtColumn(), $model->getUpdatedAtColumn()] as $column) {
-                if ($column !== null) {
-                    $timestamps[$column] = $model->freshTimestampString();
-                }
-            }
-        }
-
-        $row = [...$timestamps, ...array_diff_key($model->getAttributes(), $timestamps), $related->relatedKey => new RawExpression($parent), ...$related->attributes, ...$values];
-
-        $selects = [];
-        $bindings = [];
-
-        foreach ($row as $column => $value) {
-            if ($value instanceof Expression) {
-                $selects[] = (string) $value->getValue($grammar);
-
-                continue;
-            }
-
-            $selects[] = 'CAST(? AS '.($catalog->type($related->table, (string) $column) ?? 'text').')';
-            $bindings = [...$bindings, ...$grammar->prepareBindingsForUpdate([], [(string) $column => $value])];
-        }
-
-        $source = $this->reached()->selectRaw(implode(', ', $selects), $bindings)->distinct(new RawExpression($parent))->whereNull(self::target($index))->whereNotNull(self::parentOf($index));
-        $model->newModelQuery()->insertUsing(array_map(fn (int|string $column) => (string) $column, array_keys($row)), $source);
-        $this->adopt($related, $index);
-    }
-
-    private function adopt(Related $reachable, int $index): void
-    {
-        $grammar = $this->connection->getQueryGrammar();
-        $children = array_filter(array_values($this->map->related), fn (Related $related) => $related->parentTable === $reachable->table);
-        $unresolved = 'reached.'.$grammar->wrap(self::target($index)).' IS NULL AND reached.'.$grammar->wrap(self::parentOf($index)).' IS NOT NULL';
-
-        foreach ($children as $child => $related) {
-            $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::parentOf($child)).' = '.$this->first($reachable, $index, $related->parentKey).' WHERE '.$unresolved.' AND reached.'.$grammar->wrap(self::parentOf($child)).' IS NULL AND reached.'.$grammar->wrap(self::target($child)).' IS NULL');
-        }
-
-        $this->connection->update('UPDATE '.$grammar->wrapTable(self::REACHED).' AS reached SET '.$grammar->wrap(self::target($index)).' = '.$this->first($reachable, $index, $reachable->successor->key).' WHERE '.$unresolved);
-
-        foreach ($children as $child => $related) {
-            $key = $related->table.'.'.$related->successor->key;
-            $rows = $this->connection->table($related->table)->select($key)->whereIn($related->table.'.'.$related->relatedKey, $this->reached()->whereNull(self::target($child))->whereNotNull(self::parentOf($child))->select(self::parentOf($child)));
-
-            foreach (ViewCompiler::conditions($related, false) as $condition) {
-                $rows->whereRaw($condition);
-            }
-
-            $this->lock($rows->orderBy($key));
-            $this->adopt($related, $child);
-        }
-    }
-
-    private function first(Related $related, int $index, string $column): string
-    {
-        $table = SqlFragments::identifier($related->table);
-
-        return '(SELECT '.$table.'.'.SqlFragments::identifier($column).' FROM '.$table.' WHERE '.implode(' AND ', [
-            $table.'.'.SqlFragments::identifier($related->relatedKey).' = reached.'.$this->connection->getQueryGrammar()->wrap(self::parentOf($index)),
-            ...ViewCompiler::conditions($related, false),
-        ]).($related->orders === null ? '' : ' ORDER BY '.$related->orders).' LIMIT 1)';
-    }
-
-    private static function parent(Related $related): string
-    {
-        return SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
-    }
-
-    /**
-     * @param  null|QueryBuilder|list<int|string>  $keys
-     */
-    private function reach(Related $related, null|QueryBuilder|array $keys = null): QueryBuilder
-    {
-        $primary = $this->map->primary;
-
-        return $this->connection->query()->fromRaw(SqlFragments::identifier($primary->table).' '.implode(' ', ViewCompiler::laterals($this->map, $related->table)))->whereIn($primary->table.'.'.$primary->key, $keys ?? $this->pinned());
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @param  array<string, float|int>  $amounts
-     * @return array<string, mixed>
-     */
-    private function withAmounts(array $values, array $amounts): array
-    {
-        $grammar = $this->connection->getQueryGrammar();
-
-        foreach ($amounts as $column => $amount) {
-            if (! array_key_exists($column, $values)) {
-                $values[$column] = new RawExpression($grammar->wrap($column).' + '.$amount);
-            }
-        }
-
-        return $values;
-    }
-
-    /**
-     * @param  class-string<Model>  $class
-     */
-    private function successor(string $class): Model
-    {
-        return (new $class)->setConnection($this->connection->getName());
     }
 }

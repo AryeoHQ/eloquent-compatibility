@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Carbon;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\StateMachines\StateMachine;
 
 /**
@@ -25,6 +26,7 @@ use Support\Database\Eloquent\StateMachines\StateMachine;
  */
 final class Job extends Model
 {
+    use CarriesLegacy;
     use HasUuids;
     use SoftDeletes;
 

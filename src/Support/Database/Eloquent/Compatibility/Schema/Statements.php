@@ -133,7 +133,7 @@ final readonly class Statements
 
         foreach ($external as $name) {
             if ($legacy[$name]->generated) {
-                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated column, and attribute '{$name}' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly()");
+                throw InvalidCompatibilityMap::because($map->table, "{$map->table}.{$name} is a generated column, and attribute '{$name}' is computedAs(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly()");
             }
 
             $ownedSequence = self::sequence($connection, $map->table, $name);
@@ -141,7 +141,7 @@ final readonly class Statements
             if ($ownedSequence !== null) {
                 throw InvalidCompatibilityMap::because(
                     map: $map->table,
-                    problem: "{$map->table}.{$name} owns the sequence {$ownedSequence}, and attribute '{$name}' is external(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE {$ownedSequence} OWNED BY NONE first",
+                    problem: "{$map->table}.{$name} owns the sequence {$ownedSequence}, and attribute '{$name}' is computedAs(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE {$ownedSequence} OWNED BY NONE first",
                 );
             }
         }
@@ -941,7 +941,7 @@ final readonly class Statements
         ], $rows));
     }
 
-    private static function sequence(ConnectionInterface $connection, string $table, string $column): null|string
+    public static function sequence(ConnectionInterface $connection, string $table, string $column): null|string
     {
         $sequence = $connection->scalar('select pg_get_serial_sequence(?, ?)', [SqlFragments::identifier($table), $column]);
 

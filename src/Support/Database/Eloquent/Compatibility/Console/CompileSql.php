@@ -59,7 +59,7 @@ final class CompileSql extends Command
         if ($statements->steps !== []) {
             $externals = $map->externals();
 
-            return $this->refuse("Compatibility::{$for}() reads the external() ".(count($externals) === 1 ? 'attribute ' : 'attributes ').implode(', ', $externals)." of {$map->table} through PHP between its statements, and no printed SQL runs that step. Run Compatibility::{$for}() instead.");
+            return $this->refuse("Compatibility::{$for}() reads the computedAs() ".(count($externals) === 1 ? 'attribute ' : 'attributes ').implode(', ', $externals)." of {$map->table} through PHP between its statements, and no printed SQL runs that step. Run Compatibility::{$for}() instead.");
         }
 
         $comment = fn (string $line) => '-- '.str_replace(

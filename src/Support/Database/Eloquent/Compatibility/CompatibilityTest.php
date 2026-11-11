@@ -289,9 +289,9 @@ final class CompatibilityTest extends TestCase
     }
 
     #[Test]
-    public function it_leaves_every_successor_model_free_of_the_package(): void
+    public function it_leaves_every_successor_model_free_of_the_package_apart_from_the_successor_trait(): void
     {
-        $package = fn (string $name) => str_starts_with($name, 'Support\\Database\\Eloquent\\Compatibility\\');
+        $package = fn (string $name) => str_starts_with($name, 'Support\\Database\\Eloquent\\Compatibility\\') && $name !== Provides\CarriesLegacy::class;
 
         foreach ([Job::class, Place::class, JobSite::class, File::class, Link::class, PlaceAsset::class, AssetFile::class] as $successor) {
             $this->assertSame([], array_values(array_filter([...class_implements($successor), ...class_uses_recursive($successor)], $package)), $successor);
@@ -405,7 +405,7 @@ final class CompatibilityTest extends TestCase
                             related: CompatibilityTest::$reporting,
                             foreignKey: 'link_id',
                         ),
-                        definition: fn (Successor $preview) => $preview,
+                        successor: fn (Successor $preview) => $preview,
                     ));
             }
         };
@@ -549,7 +549,7 @@ final class CompatibilityTest extends TestCase
                         related: CompatibilityTest::$reporting,
                         foreignKey: 'job_id',
                     ),
-                    definition: fn (Successor $site) => $site,
+                    successor: fn (Successor $site) => $site,
                 ));
             }
         };

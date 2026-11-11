@@ -15,7 +15,10 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesLegacy;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesSuccessors;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
+use Support\Database\Eloquent\Compatibility\Contracts\ScopesWrites;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Support\Database\Eloquent\Compatibility\Definition\Hide;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
@@ -39,6 +42,15 @@ final class Compatibility
 
     /** @var null|class-string<ManagesDependents> */
     private null|string $dependents = null;
+
+    /** @var null|class-string<InitializesSuccessors<covariant Model>> */
+    private null|string $successorsInitializer = null;
+
+    /** @var null|class-string<InitializesLegacy<covariant Model>> */
+    private null|string $legacyInitializer = null;
+
+    /** @var null|class-string<ScopesWrites> */
+    private null|string $scope = null;
 
     /** @var list<Hide> */
     private array $hides = [];
@@ -210,6 +222,51 @@ final class Compatibility
         return $this;
     }
 
+    /**
+     * @param  class-string<InitializesSuccessors<covariant Model>>  $initializer
+     */
+    public function successorsInitializedBy(string $initializer): self
+    {
+        $this->successorsInitializer = $this->hook(
+            hook: 'successorsInitializedBy()',
+            declared: $this->successorsInitializer,
+            class: $initializer,
+            interface: InitializesSuccessors::class,
+        );
+
+        return $this;
+    }
+
+    /**
+     * @param  class-string<InitializesLegacy<covariant Model>>  $initializer
+     */
+    public function legacyInitializedBy(string $initializer): self
+    {
+        $this->legacyInitializer = $this->hook(
+            hook: 'legacyInitializedBy()',
+            declared: $this->legacyInitializer,
+            class: $initializer,
+            interface: InitializesLegacy::class,
+        );
+
+        return $this;
+    }
+
+    /**
+     * @param  class-string<ScopesWrites>  $scope
+     */
+    public function writesWithin(string $scope): self
+    {
+        $this->scope = $this->hook(
+            hook: 'writesWithin()',
+            declared: $this->scope,
+            class: $scope,
+            interface: ScopesWrites::class,
+        );
+
+        return $this;
+    }
+
     public function hide(Closure $scope, string $because): self
     {
         ResolvedMap::refuseCaptures($this->map, 'a hide() scope', $scope);
@@ -285,15 +342,18 @@ final class Compatibility
     public function resolve(): ResolvedMap
     {
         return new ResolvedMap(
-            $this->model,
-            $this->map,
-            $this->retainedTable,
-            $this->successorKey,
-            $this->root,
-            $this->hides,
-            $this->guards,
-            $this->withoutForwarding,
-            $this->dependents,
+            model: $this->model,
+            table: $this->map,
+            retainedTable: $this->retainedTable,
+            successorKey: $this->successorKey,
+            primary: $this->root,
+            hides: $this->hides,
+            guards: $this->guards,
+            withoutForwarding: $this->withoutForwarding,
+            dependents: $this->dependents,
+            successorsInitializer: $this->successorsInitializer,
+            legacyInitializer: $this->legacyInitializer,
+            scope: $this->scope,
         );
     }
 
@@ -401,6 +461,28 @@ final class Compatibility
     private static function database(Connection $connection): array
     {
         return array_map($connection->getConfig(...), ['driver', 'host', 'port', 'database', 'search_path', 'prefix']);
+    }
+
+    /**
+     * @template THook of object
+     *
+     * @param  class-string<THook>  $interface
+     * @return class-string<THook>
+     */
+    private function hook(string $hook, null|string $declared, string $class, string $interface): string
+    {
+        if ($declared !== null) {
+            throw $this->invalid("{$hook} is declared twice");
+        }
+
+        if (! is_subclass_of(
+            object_or_class: $class,
+            class: $interface,
+        )) {
+            throw $this->invalid("{$hook} names {$class}, which does not implement {$interface}");
+        }
+
+        return $class;
     }
 
     private function invalid(string $problem): InvalidCompatibilityMap

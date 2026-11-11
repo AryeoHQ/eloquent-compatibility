@@ -567,11 +567,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'title_upper',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.', ignoreWrites: false),
                         ));
             }
         };
@@ -702,7 +702,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -724,7 +724,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -766,13 +766,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'mime_type',
-                            definition: fn (Attribute $attribute) => $attribute->external(
-                                read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => DB::table('photos')->where(
-                                    column: 'file_id',
-                                    operator: '=',
-                                    value: $file->getKey(),
-                                )->value('id') === 1 ? 'image/jpeg' : true])->all(),
-                                write: fn (File $file, mixed $value) => null),
+                            definition: fn (Attribute $attribute) => $attribute->computedAs(read: fn (Collection $files): array => $files->mapWithKeys(fn (Model $file) => [$file->getKey() => DB::table('photos')->where(
+                                column: 'file_id',
+                                operator: '=',
+                                value: $file->getKey(),
+                            )->value('id') === 1 ? 'image/jpeg' : true])->all())->readOnly(because: 'The map reads it from outside the database.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'size_kb',
@@ -788,7 +786,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the external() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's external() write before install(), because install() drops photos.mime_type.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
         }
 
         $this->assertSame('r', $this->kind('photos'));
@@ -808,7 +806,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is external(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type is a generated column, and attribute 'mime_type' is computedAs(), so its value would come from outside the database and nothing would keep it generated from its columns; serve it with readAs() and readOnly().", $refusal->getMessage());
         }
 
         $this->assertSame(['r', 's'], [$this->kind('photos'), DB::scalar("select attgenerated::text from pg_attribute where attrelid = 'photos'::regclass and attname = 'mime_type'")]);
@@ -831,7 +829,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is external(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
+            $this->assertSame("Compatibility map 'photos' is declared wrongly: photos.mime_type owns the sequence public.photos_mime_type_seq, and attribute 'mime_type' is computedAs(), so install() would drop the sequence with the column and rollback() could not restore the default that reads it; detach it with ALTER SEQUENCE public.photos_mime_type_seq OWNED BY NONE first.", $refusal->getMessage());
         }
 
         $this->assertSame(['r', 'public.photos_mime_type_seq'], [$this->kind('photos'), DB::scalar("select pg_get_serial_sequence('photos', 'mime_type')")]);
@@ -1280,7 +1278,7 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         ))
                     ->hide(fn (Builder $jobs) => $jobs->where('score', 0.009999999999999998), because: 'A scored job is internal.');
             }
@@ -1362,7 +1360,7 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         ))
                     ->hide(self::$hide ?? fn (Builder $jobs) => $jobs, because: 'A marked job is internal.');
             }
@@ -1446,11 +1444,11 @@ final class InstallerTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'listed_wall',
-                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."listed_before"')->readOnly(because: 'The legacy table keeps the first listing time.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs('"listings_retained"."listed_before"')->readOnly(because: 'The legacy table keeps the first listing time.', ignoreWrites: false),
                         ));
             }
         };

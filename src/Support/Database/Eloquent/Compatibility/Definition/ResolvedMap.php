@@ -9,7 +9,10 @@ use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use ReflectionFunction;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesLegacy;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesSuccessors;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
+use Support\Database\Eloquent\Compatibility\Contracts\ScopesWrites;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
@@ -41,6 +44,9 @@ final readonly class ResolvedMap
      * @param  array<string, Guard>  $guards
      * @param  array<class-string, string>  $withoutForwarding
      * @param  null|class-string<ManagesDependents>  $dependents
+     * @param  null|class-string<InitializesSuccessors<covariant Model>>  $successorsInitializer
+     * @param  null|class-string<InitializesLegacy<covariant Model>>  $legacyInitializer
+     * @param  null|class-string<ScopesWrites>  $scope
      * @param  null|class-string<Model>  $variant
      */
     public function __construct(
@@ -53,6 +59,9 @@ final readonly class ResolvedMap
         public array $guards,
         public array $withoutForwarding,
         public null|string $dependents = null,
+        public null|string $successorsInitializer = null,
+        public null|string $legacyInitializer = null,
+        public null|string $scope = null,
         null|string $variant = null,
     ) {
         if ($primary === null || $successorKey === null) {
@@ -83,6 +92,7 @@ final readonly class ResolvedMap
         [$attributes, $owners] = $this->collect(
             successors: $successors,
             successorKey: $successorKey,
+            related: $related,
         );
         $this->refuseSharedColumns(
             primary: $primary,
@@ -180,6 +190,17 @@ final readonly class ResolvedMap
         ], is_string(...))));
     }
 
+    public function relatedAt(string $table): Related
+    {
+        foreach ($this->related as $related) {
+            if ($related->table === $table) {
+                return $related;
+            }
+        }
+
+        throw new LogicException("Compatibility map '{$this->table}' reaches no table {$table} through related().");
+    }
+
     /**
      * @param  list<string>  $columns
      * @return list<string>
@@ -207,15 +228,18 @@ final readonly class ResolvedMap
 
             $tables[$related->table] = $target;
             $variants[$target] = new self(
-                $this->model,
-                $this->table,
-                $this->retainedTable,
-                $successorKey,
-                $primary,
-                $this->hides,
-                $this->guards,
-                $this->withoutForwarding,
-                $this->dependents,
+                model: $this->model,
+                table: $this->table,
+                retainedTable: $this->retainedTable,
+                successorKey: $successorKey,
+                primary: $primary,
+                hides: $this->hides,
+                guards: $this->guards,
+                withoutForwarding: $this->withoutForwarding,
+                dependents: $this->dependents,
+                successorsInitializer: $this->successorsInitializer,
+                legacyInitializer: $this->legacyInitializer,
+                scope: $this->scope,
                 variant: $target,
             );
         }
@@ -253,7 +277,7 @@ final readonly class ResolvedMap
         foreach ($branches as $successor => $branch) {
             foreach ($declaredIn as $name => $declared) {
                 if (! array_key_exists($name, $branch->attributes)) {
-                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' target and not in the '.class_basename($successor).' target; give it from(), external() or fixed() there');
+                    throw $this->invalid("attribute '{$name}' is readable in the ".class_basename($declared).' target and not in the '.class_basename($successor).' target; give it from(), computedAs() or fixed() there');
                 }
             }
         }
@@ -265,7 +289,7 @@ final readonly class ResolvedMap
                 $attribute = $branch->attributes[$name];
 
                 if (! $attribute->isExternal() && ! ($attribute->column() === null && ($attribute->conversions()[0] ?? null) instanceof Fixed)) {
-                    throw $this->invalid("attribute '{$name}' is external() in the ".class_basename((string) array_key_first($external)).' target and reads SQL in the '.class_basename($successor).' target, and the view serves an external attribute from no target; declare it external() or fixed() there');
+                    throw $this->invalid("attribute '{$name}' is computedAs() in the ".class_basename((string) array_key_first($external)).' target and reads SQL in the '.class_basename($successor).' target, and the view serves a computed attribute from no target; declare it computedAs() or fixed() there');
                 }
             }
         }
@@ -315,13 +339,19 @@ final readonly class ResolvedMap
 
     /**
      * @param  list<Successor>  $successors
+     * @param  list<Related>  $related
      * @return array{array<string, Attribute>, array<string, Successor>}
      */
-    private function collect(array $successors, string $successorKey): array
+    private function collect(array $successors, string $successorKey, array $related): array
     {
         $attributes = [];
         $owners = [];
         $key = (new $this->model)->getKeyName();
+        $tables = [];
+
+        foreach ($related as $relation) {
+            $tables[$relation->model] = $relation->table;
+        }
 
         foreach ($successors as $successor) {
             foreach ($successor->attributes() as $name => $attribute) {
@@ -340,7 +370,7 @@ final readonly class ResolvedMap
                     throw $this->invalid("attribute '{$name}' is declared twice");
                 }
 
-                $attributes[$name] = $attribute->resolve();
+                $attributes[$name] = $attribute->resolve($tables);
                 $owners[$name] = $successor;
             }
         }

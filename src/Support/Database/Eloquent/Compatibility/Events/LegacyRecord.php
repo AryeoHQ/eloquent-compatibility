@@ -5,9 +5,9 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Events;
 
 use Illuminate\Contracts\Database\Query\Expression;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Expression as QueryExpression;
-use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Schema\Column;
@@ -21,8 +21,12 @@ final class LegacyRecord
 {
     private const string WRITTEN = 'compatibility:written';
 
+    private const string MEMBER = 'compatibility:member';
+
     /** @var array<array-key, Model> */
     private array $records = [];
+
+    private null|bool $admits = null;
 
     /** @var array<array-key, array<string, mixed>> */
     private array $before = [];
@@ -69,6 +73,7 @@ final class LegacyRecord
         private readonly array $json,
         private readonly array $reads,
         public readonly bool $removes,
+        private readonly bool $membership,
     ) {}
 
     /**
@@ -112,9 +117,18 @@ final class LegacyRecord
      * @param  list<string>  $json
      * @param  list<string>  $reads
      */
-    public static function read(ResolvedMap $map, ResolvedMap $served, null|Related $dependent, array $columns, array $json, array $reads, Model $successor, bool $removes): null|self
+    public static function read(ResolvedMap $map, ResolvedMap $served, null|Related $dependent, array $columns, array $json, array $reads, Model $successor, bool $removes, bool $membership): null|self
     {
-        $record = new self($map, $served, $dependent, $columns, $json, $reads, $removes);
+        $record = new self(
+            map: $map,
+            served: $served,
+            dependent: $dependent,
+            columns: $columns,
+            json: $json,
+            reads: $reads,
+            removes: $removes,
+            membership: $membership,
+        );
 
         if ($dependent === null && ! $successor->exists) {
             $record->inserts = true;
@@ -149,13 +163,15 @@ final class LegacyRecord
 
         if ($this->dependent === null) {
             $row = reset($rows);
+            $this->admits = $row === false ? null : ($row[self::MEMBER] ?? true) === true;
 
-            if ($row === false) {
+            if ($row === false || ! $this->admits) {
                 $this->records = [];
 
                 return;
             }
 
+            unset($row[self::MEMBER]);
             $this->records = $this->records === [] ? $this->admitted : $this->records;
             $key = array_key_first($this->records) ?? '';
             $this->records[$key] ??= (new $this->map->model)->setConnection($successor->getConnectionName());
@@ -264,6 +280,11 @@ final class LegacyRecord
     public function serves(int|string $key): bool
     {
         return $this->serves[$key] ?? false;
+    }
+
+    public function admits(): null|bool
+    {
+        return $this->admits;
     }
 
     public function reread(): void
@@ -389,7 +410,9 @@ final class LegacyRecord
     private function compute(Model $successor, array $values, array $nulls, bool $after): array
     {
         if ($this->dependent === null) {
-            return array_map(fn (object $row) => (array) $row, $this->select($successor, $values, $nulls, null));
+            $inserting = ! $successor->exists;
+
+            return array_map(fn (object $row) => $inserting ? [...(array) $row, $this->served->successorKey => $successor->getKey()] : (array) $row, $this->select($successor, $values, $nulls, null));
         }
 
         $filter = $this->filter($successor, $after);
@@ -424,6 +447,18 @@ final class LegacyRecord
         $key = SqlFragments::identifier($successor->getKeyName());
         $marker = SqlFragments::identifier(self::WRITTEN);
         $stored = $successor->exists ? $successor->getRawOriginal($successor->getKeyName()) ?? $successor->getKey() : null;
+        $retained = SqlFragments::identifier(ViewCompiler::retainedTable($this->served));
+        $probe = null;
+
+        if ($this->dependent === null && ! $successor->exists) {
+            $probe = $successor->getKey() ?? $this->placeholder($successor);
+        }
+
+        if ($probe !== null && ! array_key_exists($successor->getKeyName(), $values)) {
+            $values[$successor->getKeyName()] = json_encode($probe, JSON_THROW_ON_ERROR);
+        }
+
+        $standIn = $probe === null ? '' : ', '.$retained.' AS (SELECT * FROM jsonb_populate_record(NULL::'.$retained.', CAST(? AS jsonb)))';
         $json = '{'.implode(',', array_map(fn (string $column, string $value) => json_encode($column, JSON_THROW_ON_ERROR).':'.$value, array_keys($values), $values)).'}';
         $catalog = $nulls === [] ? [] : (new ColumnCatalog($connection))->of($successor->getTable());
         $columns = $catalog === [] ? 'populated.*' : implode(', ', array_map(
@@ -438,24 +473,51 @@ final class LegacyRecord
         $others = 'SELECT '.$table.'.*, false AS '.$marker.' FROM '.$table.($stored === null ? '' : ' WHERE '.$table.'.'.$key.' <> ?');
         $owner = SqlFragments::identifier($this->dependent->table ?? $this->served->primary->table).'.'.$marker;
         $select = $this->dependent === null ? [] : [$owner.' AS '.$marker];
+        $member = $probe === null || ! $this->membership ? null : $this->member(
+            successor: $successor,
+            pending: $table.'.'.$marker,
+        );
 
         foreach ($this->columns as $name => $sql) {
             $select[] = $sql.' AS '.SqlFragments::identifier($name);
         }
 
+        if ($member !== null) {
+            $select[] = $member[0].' AS '.SqlFragments::identifier(self::MEMBER);
+        }
+
         return $connection->select(
-            'WITH '.$table.' AS ('.($hard ? $others : $others.' UNION ALL '.$row).') SELECT '.implode(
+            'WITH '.$table.' AS NOT MATERIALIZED ('.($hard ? $others : $others.' UNION ALL '.$row).')'.$standIn.' SELECT '.implode(
                 separator: ', ',
                 array: $select,
-            ).' FROM '.SqlFragments::identifier(ViewCompiler::retainedTable($this->served)).' '.ViewCompiler::root(
+            ).' FROM '.$retained.' '.ViewCompiler::root(
                 map: $this->served,
                 retained: ViewCompiler::retainedTable($this->served),
             )
                 .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
-            [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($filter === null ? [] : $filter[1])],
+            [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($probe === null ? [] : [json_encode([$this->served->successorKey => $probe], JSON_THROW_ON_ERROR)]), ...($member === null ? [] : $member[1]), ...($filter === null ? [] : $filter[1])],
             false,
         );
+    }
+
+    /**
+     * @return array{string, list<mixed>}
+     */
+    private function member(Model $successor, string $pending): array
+    {
+        $when = $this->served->primary->membershipScope();
+
+        if ($when === null) {
+            return ['true', []];
+        }
+
+        $members = $successor->newModelQuery()->whereRaw($pending)->where(function (Builder $member) use ($when): void {
+            $when($member);
+        });
+        $base = $members->toBase();
+
+        return ['EXISTS ('.$base->toSql().')', array_values($base->getBindings())];
     }
 
     /**
@@ -552,7 +614,7 @@ final class LegacyRecord
             .($related->morphType === null ? '' : ' AND '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->morphType).' = '.SqlFragments::literal((string) $related->morphAlias));
 
         while ($related->parentTable !== $primary->table) {
-            $parent = $this->relatedTo($related->parentTable);
+            $parent = $this->served->relatedAt($related->parentTable);
             $condition = SqlFragments::identifier($parent->parentTable).'.'.SqlFragments::identifier($parent->parentKey).' IN (SELECT '.SqlFragments::identifier($parent->table).'.'.SqlFragments::identifier($parent->relatedKey).' FROM '.SqlFragments::identifier($parent->table).' WHERE '.$condition.')';
             $related = $parent;
         }
@@ -612,17 +674,6 @@ final class LegacyRecord
         return $this->keys[$column];
     }
 
-    private function relatedTo(string $table): Related
-    {
-        foreach ($this->served->related as $related) {
-            if ($related->table === $table) {
-                return $related;
-            }
-        }
-
-        throw new LogicException("Compatibility map '{$this->map->table}' reaches no table {$table} through related().");
-    }
-
     /**
      * @param  array<int, object>  $rows
      * @return array<array-key, array<string, mixed>>
@@ -647,6 +698,21 @@ final class LegacyRecord
     private function legacyKey(): string
     {
         return (new $this->map->model)->getKeyName();
+    }
+
+    private function placeholder(Model $successor): string
+    {
+        $column = (new ColumnCatalog(
+            connection: $successor->getConnection(),
+            throughSearchPath: true,
+        ))->of($successor->getTable())[$successor->getKeyName()] ?? null;
+        $type = $column === null ? null : $column->baseType ?? $column->type;
+
+        return match (true) {
+            $type === 'uuid' => '00000000-0000-0000-0000-000000000000',
+            SqlFragments::isInteger($type), SqlFragments::isDecimal($type) => '0',
+            default => '',
+        };
     }
 
     private static function softDeletes(Model $successor): bool

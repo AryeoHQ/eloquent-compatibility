@@ -59,11 +59,16 @@ final class Successor
     }
 
     /**
-     * @param  Closure(Successor): mixed  $definition
+     * @param  null|Closure(Successor): mixed  $successor
      */
-    public function related(Closure $relation, Closure $definition): self
+    public function related(Closure $relation, null|Closure $successor = null): self
     {
-        $this->related[] = Related::compile($this->map, $this->model, $relation, $definition);
+        $this->related[] = Related::compile(
+            map: $this->map,
+            parent: $this->model,
+            relation: $relation,
+            definition: $successor ?? fn (Successor $related) => $related,
+        );
 
         return $this;
     }

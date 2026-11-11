@@ -23,6 +23,8 @@ use Tests\Fixtures\Support\PlaceAssets\Brochure;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\InteractiveContent as PlaceInteractiveContent;
 use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
+use Tests\Fixtures\Tooling\Operations\LegacyInvoice;
+use Tests\Fixtures\Tooling\Operations\LegacyOrder;
 use Tests\TestCase;
 
 #[CoversClass(ServedModels::class)]
@@ -54,7 +56,7 @@ final class ServedModelsTest extends TestCase
     public function it_finds_every_classmap_model_that_serves_compatibility_and_nothing_else(): void
     {
         $this->assertSame(
-            [InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class, Brochure::class, Image::class, PlaceInteractiveContent::class, PlaceVideo::class],
+            [InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class, Brochure::class, Image::class, PlaceInteractiveContent::class, PlaceVideo::class, LegacyInvoice::class, LegacyOrder::class],
             $this->app->make(ServedModels::class)->all(),
         );
     }
@@ -207,7 +209,7 @@ final class ServedModelsTest extends TestCase
         $this->app->forgetInstance(ServedModels::class);
         $stale = $this->app->make(ServedModels::class);
 
-        $this->assertSame([InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class, Brochure::class, Image::class, PlaceInteractiveContent::class, PlaceVideo::class], $cached);
+        $this->assertSame([InheritedServed::class, TraitServed::class, FloorPlan::class, InteractiveContent::class, LegacyFile::class, Photo::class, Video::class, Listing::class, Brochure::class, Image::class, PlaceInteractiveContent::class, PlaceVideo::class, LegacyInvoice::class, LegacyOrder::class], $cached);
         $this->assertSame([Photo::class], $stale->all());
         $this->assertFalse($stale->contains(Listing::class));
     }

@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Support\Carbon;
+use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 
 /**
  * @property string $id
@@ -20,6 +21,7 @@ use Illuminate\Support\Carbon;
  */
 final class PlaceAsset extends Model
 {
+    use CarriesLegacy;
     use HasUuids;
 
     protected $table = 'place_assets';

@@ -116,13 +116,8 @@ final class RelatedMorphTest extends TestCase
                     related: AssetLink::class,
                     foreignKey: 'id',
                 ),
-                definition: fn (Successor $link) => $link,
+                successor: fn (Successor $link) => $link,
             ))), 'AssetFile, which relatedMorph() reaches, declares related() or relatedMorph() of its own, and a morph target serves the columns of its own table; declare the relation on PlaceAsset'];
-        yield 'a transition on a target' => [fn () => $asset()->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(), choose: fn (Model $legacy): string => AssetFile::class,
-            targets: fn (Targets $targets) => $targets->as(target: AssetFile::class, successor: fn (Successor $file) => $file->attribute(
-                name: 'status',
-                definition: fn (Attribute $attribute) => $attribute->from('mime_type')->transitions(),
-            ))), "attribute 'status' on AssetFile, which relatedMorph() reaches, is declared transitions(), and a change of target creates its row anew; declare transitions() on an attribute of PlaceAsset"];
         yield 'a scoped target' => [fn () => $asset()->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(), choose: fn (Model $legacy): string => ScopedAssetFile::class,
             targets: fn (Targets $targets) => $targets->as(target: ScopedAssetFile::class, successor: fn (Successor $file) => $file)), 'ScopedAssetFile, which relatedMorph() reaches, applies the global scope visible, which would read the application\'s state once and keep it; only SoftDeletes may apply'];
         yield 'a second morph' => [fn () => $asset()->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(), choose: fn (Model $legacy): string => AssetFile::class,

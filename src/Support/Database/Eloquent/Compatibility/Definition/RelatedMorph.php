@@ -128,12 +128,6 @@ final readonly class RelatedMorph
             throw InvalidCompatibilityMap::because($map, "{$name} declares related() or relatedMorph() of its own, and a morph target serves the columns of its own table; declare the relation on ".class_basename($parent));
         }
 
-        foreach ($target->attributes() as $attribute => $definition) {
-            if ($definition->runsTransitions()) {
-                throw InvalidCompatibilityMap::because($map, "attribute '{$attribute}' on {$name} is declared transitions(), and a change of target creates its row anew; declare transitions() on an attribute of ".class_basename($parent));
-            }
-        }
-
         $scopes = array_keys((new $target->model)->getGlobalScopes());
 
         foreach ($scopes as $scope) {

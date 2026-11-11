@@ -26,6 +26,7 @@ use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Files\WriteFileMimeType;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -501,9 +502,7 @@ final class BackfillerTest extends TestCase
                         ->attribute(
                             name: 'mime_type',
                             definition: fn (Attribute $attribute) => $attribute
-                                ->external(
-                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                                ->computedAs(read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all())->writtenBy(WriteFileMimeType::class),
                         )
                         ->attribute(
                             name: 'is_featured',
@@ -604,9 +603,7 @@ final class BackfillerTest extends TestCase
                         ->attribute(
                             name: 'mime_type',
                             definition: fn (Attribute $attribute) => $attribute
-                                ->external(
-                                    read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all(),
-                                    write: fn (File $file, null|string $mimeType) => $file->metadata()->mimeType = $mimeType),
+                                ->computedAs(read: fn (Collection $files): array => File::metadataFor($files)->map(fn (FileMetadata $metadata) => $metadata->mimeType)->all())->writtenBy(WriteFileMimeType::class),
                         ));
             }
         };
@@ -647,7 +644,7 @@ final class BackfillerTest extends TestCase
                         )
                         ->related(
                             relation: fn (Job $job) => $job->hasOne(Place::class)->withAttributes(['city' => 'Seattle', 'created_at' => '2026-01-01 00:00:00+00']),
-                            definition: fn (Successor $place) => $place->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
+                            successor: fn (Successor $place) => $place->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
                         ));
             }
         };
@@ -712,7 +709,7 @@ final class BackfillerTest extends TestCase
                         )
                         ->related(
                             relation: self::$withAttributes ? fn (Job $job) => $job->hasOne(Place::class)->withAttributes(['city' => 'Seattle']) : fn (Job $job) => $job->hasOne(Place::class)->where('city', 'Seattle'),
-                            definition: fn (Successor $place) => $place->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
+                            successor: fn (Successor $place) => $place->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
                         ));
             }
         };

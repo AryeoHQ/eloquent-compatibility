@@ -399,7 +399,7 @@ final class CompileSqlTest extends TestCase
             command: 'compatibility:sql',
             parameters: ['operation' => 'install', 'model' => Photo::class],
         )
-            ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
+            ->expectsOutputToContain('Compatibility::install() reads the computedAs() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
 
@@ -409,7 +409,7 @@ final class CompileSqlTest extends TestCase
             command: 'compatibility:sql',
             parameters: ['operation' => 'install', 'model' => Photo::class, '--output' => $file],
         )
-            ->expectsOutputToContain('Compatibility::install() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
+            ->expectsOutputToContain('Compatibility::install() reads the computedAs() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::install() instead.')
             ->assertFailed();
         $this->assertFileDoesNotExist($file);
 
@@ -422,7 +422,7 @@ final class CompileSqlTest extends TestCase
             command: 'compatibility:sql',
             parameters: ['operation' => 'rollback', 'model' => Photo::class],
         )
-            ->expectsOutputToContain('Compatibility::rollback() reads the external() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::rollback() instead.')
+            ->expectsOutputToContain('Compatibility::rollback() reads the computedAs() attribute mime_type of photos through PHP between its statements, and no printed SQL runs that step. Run Compatibility::rollback() instead.')
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
     }
@@ -569,11 +569,11 @@ final class CompileSqlTest extends TestCase
                         )
                         ->attribute(
                             name: 'company_id',
-                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.'),
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id')->readOnly(because: 'A job never changes company.', ignoreWrites: false),
                         )
                         ->attribute(
                             name: 'listed_wall',
-                            definition: fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.'),
+                            definition: fn (Attribute $attribute) => $attribute->readAs(CompileSqlTest::$read)->readOnly(because: 'The successor records the instant.', ignoreWrites: false),
                         ));
             }
         };

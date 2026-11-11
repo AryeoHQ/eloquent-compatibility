@@ -28,7 +28,7 @@ Each class implements `Conversion`:
 
 An attribute may chain several conversions. `Attribute::read()` applies them in declaration order. `Attribute::write()` and `Attribute::filter()` apply them in reverse. Each step receives the SQL type the previous step produced, so `Attribute::exact()` can judge every step against its real input type.
 
-`fixed()` and `readAs()` replace the chain. An attribute that declares either one has no other conversion.
+`fixed()` and `readAs()` replace the chain. An attribute that declares either one has no other conversion. Neither has an inverse, so a `fixed()` attribute also declares `readOnly()`, and a `readAs()` attribute declares `writtenBy()` or `readOnly()`.
 
 ## The classes
 
@@ -41,8 +41,8 @@ An attribute may chain several conversions. `Attribute::read()` applies them in 
 | `OrDefault` | `orDefault(0)` | `COALESCE(s, 0)` | The value unchanged | `=` and `!=`, except against the default |
 | `AsType` | `asType('date')` | `CAST(s AS date)` | The value unchanged | None, and never exact |
 | `InTimeZone` | `inTimeZone('America/Chicago')` | `s AT TIME ZONE 'America/Chicago'`, an instant as that zone's wall clock | The wall clock in that zone, as an instant in the application zone | `=`, `!=`, `<`, `>`, `<=`, `>=` against a date or a wall-clock string |
-| `ReadAs` | `readAs('sql')` | The SQL as written | Only through `writeTo()`; otherwise the attribute reads only | None |
-| `Fixed` | `fixed('listing')` | The literal | Only the same value; it refuses any other | None |
+| `ReadAs` | `readAs('sql')` | The SQL as written | Never; its `writtenBy()` operation writes it, or its `readOnly()` declaration refuses or discards the write | None |
+| `Fixed` | `fixed('listing')` | The literal | Never; its `readOnly()` declaration decides: `ignoreWrites: false` refuses the write, and `true` discards it | None |
 
 `Fixed` also renders the literals the other classes embed, such as the divisor of `DividedBy`.
 

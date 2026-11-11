@@ -11,6 +11,9 @@ final class Sequence
 
     public bool $vetoed = false;
 
+    /** @var list<string> */
+    public array $deferred = [];
+
     /**
      * @param  null|array{int, string}  $frame
      */

@@ -44,7 +44,7 @@ When `choose:` picks another target class for a record, the package moves the mo
 
 The backfill's round-trip check reads through the view's compiled `SELECT`, filtered to the record's key, because no view exists before install. Declined: skipping the check before install.
 
-The root's soft-delete column and a successor's updated-at column have default operations of their own. A change of the soft-delete column queues `delete()` or `restore()` after the saves. A legacy record delete runs the root's `forceDelete()` as its own step, after the lock and in place of the assignments, the saves, the actions and the round-trip check. An assigned updated-at column survives the after-save actions, because the package runs them under `Model::withoutTimestampsOn()` for that successor. Declined: plain assignment of the soft-delete column.
+The root's soft-delete column and a successor's updated-at column have default operations of their own. A change of the soft-delete column queues `delete()` or `restore()` after the saves. A legacy record delete runs the root's `forceDelete()` as its own step, after the lock and in place of the assignments, the saves, the actions and the round-trip check. An assigned updated-at column survives the saves and the after-save actions, because the package runs both under `Model::withoutTimestampsOn()` for that successor's class. Declined: plain assignment of the soft-delete column.
 
 `delete()` always stamps the current time. After it, a base-query `UPDATE` writes the legacy `deleted_at` and `updated_at` onto the root's row, with no further events. This is the one named exception to the rule that every package path writes a successor through its model ([0017](0017-successors-are-written-through-their-models.md)), because the model's `deleting` and `deleted` events have already fired. Declined: a second model save, which fires extra `saving` and `updated` events per delete, and a round trip that compares only whether `deleted_at` is NULL, which loses backfilled deletion dates.
 
@@ -58,7 +58,7 @@ Declined: a complete column specification, and one adapter class per legacy mode
 
 - Each changed successor produces one `UPDATE` and one each of `saving`, `updating`, `updated` and `saved`. A domain action queued after the save saves again, with its own events.
 - An operation's write must agree with its attribute's read, or the write refuses.
-- The map refuses to compile a legacy-only NOT NULL column with neither a default nor an initializer. `assertServesCompatibility()` exercises a native create.
+- `assertServesCompatibility()` refuses a legacy-only NOT NULL column that has no default, that the package does not allocate, and that no `legacyInitializedBy()` initializes. Map compilation reads no database ([0011](0011-registration-needs-no-database.md)), so it cannot see the column. The assertion also exercises a native create.
 - The map's membership decides which native successor creates insert a legacy row. It decides nothing after that row exists.
 - A forwarded legacy `creating` listener still may not supply a retained value.
 - Conversions stay closed, and serve reads only.

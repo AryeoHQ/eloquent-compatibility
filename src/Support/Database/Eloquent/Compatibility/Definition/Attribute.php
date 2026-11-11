@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection as Values;
 use LogicException;
+use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\AsType;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Conversion;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\DividedBy;
@@ -23,13 +24,14 @@ use Support\Database\Eloquent\Compatibility\Definition\Conversions\OrDefault;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\ReadAs;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
-use Support\Database\Eloquent\StateMachines\Contracts\StateMachineable;
 
 final class Attribute
 {
     private null|string $column = null;
 
     private null|string $readOnly = null;
+
+    private bool $ignoreWrites = false;
 
     /** @var list<Conversion> */
     private array $conversions = [];
@@ -38,13 +40,15 @@ final class Attribute
 
     private null|string $readAs = null;
 
-    /** @var null|Closure(mixed): mixed */
-    private null|Closure $writeTo = null;
+    /** @var null|class-string<WritesAttribute<covariant Model>> */
+    private null|string $operation = null;
 
-    private bool $transitions = false;
+    private null|Closure $computed = null;
 
-    /** @var null|array{Closure, Closure|Declined} */
-    private null|array $external = null;
+    /** @var null|array{class-string<Model>, string} */
+    private null|array $orFrom = null;
+
+    private null|string $orFromTable = null;
 
     public function __construct(private readonly string $map, public readonly string $name) {}
 
@@ -63,13 +67,39 @@ final class Attribute
         return $this;
     }
 
-    public function readOnly(string $because): self
+    public function readOnly(string $because, bool $ignoreWrites): self
     {
         if (trim($because) === '') {
             throw $this->invalid('is read-only without a reason; readOnly() takes the reason a write is refused');
         }
 
+        if ($this->readOnly !== null) {
+            throw $this->invalid('is declared readOnly() twice');
+        }
+
         $this->readOnly = $because;
+        $this->ignoreWrites = $ignoreWrites;
+
+        return $this;
+    }
+
+    /**
+     * @param  class-string<Model>  $successor
+     */
+    public function orFrom(string $successor, string $column): self
+    {
+        if ($this->orFrom !== null) {
+            throw $this->invalid('reads orFrom() twice');
+        }
+
+        if ($column === '' || str_contains(
+            haystack: $column,
+            needle: '.',
+        )) {
+            throw $this->invalid("reads orFrom() the column '{$column}', which names no column of ".class_basename($successor).'; name a column of its own table');
+        }
+
+        $this->orFrom = [$successor, $column];
 
         return $this;
     }
@@ -171,38 +201,35 @@ final class Attribute
     }
 
     /**
-     * @param  Closure(mixed): mixed  $inverse
+     * @param  class-string<WritesAttribute<covariant Model>>  $operation
      */
-    public function writeTo(Closure $inverse): self
+    public function writtenBy(string $operation): self
     {
-        ResolvedMap::refuseCaptures($this->map, "the writeTo() closure of attribute '{$this->name}'", $inverse);
-
-        $this->writeTo = $inverse;
-
-        return $this;
-    }
-
-    public function transitions(): self
-    {
-        $this->transitions = true;
-
-        return $this;
-    }
-
-    public static function declined(string $because): Declined
-    {
-        return new Declined($because);
-    }
-
-    public function external(Closure $read, Closure|Declined $write): self
-    {
-        ResolvedMap::refuseCaptures($this->map, "the external() read closure of attribute '{$this->name}'", $read);
-
-        if ($write instanceof Closure) {
-            ResolvedMap::refuseCaptures($this->map, "the external() write closure of attribute '{$this->name}'", $write);
+        if ($this->operation !== null) {
+            throw $this->invalid('is writtenBy() twice');
         }
 
-        $this->external = [$read, $write];
+        if (! is_subclass_of(
+            object_or_class: $operation,
+            class: WritesAttribute::class,
+        )) {
+            throw $this->invalid("is writtenBy() {$operation}, which does not implement ".WritesAttribute::class);
+        }
+
+        $this->operation = $operation;
+
+        return $this;
+    }
+
+    public function computedAs(Closure $read): self
+    {
+        ResolvedMap::refuseCaptures($this->map, "the computedAs() read closure of attribute '{$this->name}'", $read);
+
+        if ($this->computed !== null) {
+            throw $this->invalid('is computedAs() twice');
+        }
+
+        $this->computed = $read;
 
         return $this;
     }
@@ -217,6 +244,37 @@ final class Attribute
         return $this->readOnly;
     }
 
+    public function ignoresWrites(): bool
+    {
+        return $this->ignoreWrites;
+    }
+
+    /**
+     * @return null|class-string<WritesAttribute<covariant Model>>
+     */
+    public function operation(): null|string
+    {
+        return $this->operation;
+    }
+
+    public function invertible(): bool
+    {
+        return $this->column !== null && $this->fixed === null && $this->readAs === null && $this->computed === null && $this->orFrom === null;
+    }
+
+    public function isWritable(): bool
+    {
+        return $this->invertible() && $this->operation === null && $this->readOnly === null;
+    }
+
+    /**
+     * @return null|class-string<Model>
+     */
+    public function orFromSuccessor(): null|string
+    {
+        return $this->orFrom[0] ?? null;
+    }
+
     /**
      * @return list<Conversion>
      */
@@ -224,24 +282,14 @@ final class Attribute
     {
         return match (true) {
             $this->fixed !== null => [$this->fixed],
-            $this->readAs !== null => [new ReadAs($this->readAs, $this->writeTo)],
+            $this->readAs !== null => [new ReadAs($this->readAs)],
             default => $this->conversions,
         };
     }
 
-    public function runsTransitions(): bool
-    {
-        return $this->transitions;
-    }
-
     public function isExternal(): bool
     {
-        return $this->external !== null;
-    }
-
-    public function declinedBecause(): null|string
-    {
-        return ($this->external[1] ?? null) instanceof Declined ? $this->external[1]->because : null;
+        return $this->computed !== null;
     }
 
     /**
@@ -250,12 +298,12 @@ final class Attribute
      */
     public function readExternally(Collection $successors): array
     {
-        $read = $this->external[0] ?? throw new LogicException("Attribute '{$this->name}' is not external, so no external() read serves it.");
+        $read = $this->computed ?? throw new LogicException("Attribute '{$this->name}' is not computedAs(), so no computedAs() read serves it.");
         $values = $read($successors);
         $values = match (true) {
             $values instanceof Values => $values->all(),
             is_array($values) => $values,
-            default => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns ".get_debug_type($values).', and it returns the values keyed by successor key.'),
+            default => throw new LogicException("The computedAs() read closure of attribute '{$this->name}' on {$this->map} returns ".get_debug_type($values).', and it returns the values keyed by successor key.'),
         };
         $received = array_map(fn (Model $successor) => self::keyOf($successor->getKey()), $successors->all());
         $returned = array_map(self::keyOf(...), array_keys($values));
@@ -263,45 +311,36 @@ final class Attribute
         $unexpected = array_diff($returned, $received);
 
         return match (true) {
-            $missing !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns no value for successor key ".reset($missing).'; it returns one value, or null, for each successor it receives.'),
-            $unexpected !== [] => throw new LogicException("The external() read closure of attribute '{$this->name}' on {$this->map} returns a value for successor key ".reset($unexpected).', which it did not receive; it returns one value, or null, for each successor it receives.'),
+            $missing !== [] => throw new LogicException("The computedAs() read closure of attribute '{$this->name}' on {$this->map} returns no value for successor key ".reset($missing).'; it returns one value, or null, for each successor it receives.'),
+            $unexpected !== [] => throw new LogicException("The computedAs() read closure of attribute '{$this->name}' on {$this->map} returns a value for successor key ".reset($unexpected).', which it did not receive; it returns one value, or null, for each successor it receives.'),
             default => $values,
         };
     }
 
-    public function writeExternally(Model $successor, mixed $value): void
+    /**
+     * @param  array<class-string<Model>, string>  $related
+     */
+    public function resolve(array $related = []): self
     {
-        $write = $this->external[1] ?? null;
-
-        if (! $write instanceof Closure) {
-            throw new LogicException("Attribute '{$this->name}' has no external() write closure to call.");
-        }
-
-        $write($successor, $value);
-    }
-
-    public function isWritable(): bool
-    {
-        return $this->readOnly === null && $this->column !== null && $this->fixed === null && $this->external === null;
-    }
-
-    public function resolve(): self
-    {
+        $declares = $this->operation !== null || $this->readOnly !== null;
         $problem = match (true) {
-            $this->fixed !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->external !== null) => 'is fixed(), so it reads no column and takes no other conversion',
-            $this->external !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->readOnly !== null || $this->transitions) => 'is external(), so it reads no column and takes no conversion, readOnly() or transitions(); decline its write with Attribute::declined()',
-            $this->declinedBecause() !== null && trim($this->declinedBecause()) === '' => 'declines its external() write without a reason; Attribute::declined() takes the reason a write is refused',
-            $this->readAs !== null && $this->conversions !== [] => 'reads as raw SQL with readAs(), so it takes no other conversion',
-            $this->readAs !== null && $this->writeTo === null && $this->readOnly === null => 'reads as raw SQL with readAs(), and says neither writeTo() nor readOnly()',
-            $this->writeTo !== null && $this->readAs === null => 'says writeTo(), which inverts readAs(), without readAs()',
-            $this->writeTo !== null && $this->column === null => 'says writeTo() without from(), so its inverse has no column to store',
-            $this->column === null && $this->fixed === null && $this->readAs === null && $this->external === null => 'names no column; give it from(), fixed(), readAs() or external()',
-            $this->transitions && ! interface_exists(StateMachineable::class) => 'is declared transitions(), which runs a state-machine trigger, and aryeo/eloquent-state-machines is not installed',
+            $this->fixed !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->computed !== null || $this->orFrom !== null) => 'is fixed(), so it reads no column and takes no other conversion',
+            $this->fixed !== null && $this->operation !== null => 'is fixed(), so it reads one value and no operation writes it',
+            $this->computed !== null && ($this->column !== null || $this->conversions !== [] || $this->readAs !== null || $this->orFrom !== null) => 'is computedAs(), so it reads no column and takes no conversion',
+            $this->readAs !== null && ($this->conversions !== [] || $this->orFrom !== null) => 'reads as raw SQL with readAs(), so it takes no other conversion',
+            $this->orFrom !== null && $this->column === null => 'reads orFrom() without from(), so it has no column to read first',
+            $this->operation !== null && $this->readOnly !== null => 'is both writtenBy() and readOnly(), and an attribute has one operation',
+            $this->column === null && $this->fixed === null && $this->readAs === null && $this->computed === null => 'names no column; give it from(), fixed(), readAs() or computedAs()',
+            ! $declares && ! $this->invertible() => 'has no inverse, so its read says no write; declare writtenBy() or readOnly()',
             default => null,
         };
 
         if ($problem !== null) {
             throw $this->invalid($problem);
+        }
+
+        if ($this->orFrom !== null) {
+            $this->orFromTable = $related[$this->orFrom[0]] ?? throw $this->invalid('reads orFrom() '.class_basename($this->orFrom[0]).', which the map does not relate under its root');
         }
 
         return $this;
@@ -312,11 +351,16 @@ final class Attribute
      */
     public function read(string $table, null|string $stored = null, null|Closure $baseType = null): string
     {
-        if ($this->external !== null) {
-            throw new LogicException("Attribute '{$this->name}' is external, so no SQL reads it.");
+        if ($this->computed !== null) {
+            throw new LogicException("Attribute '{$this->name}' is computedAs(), so no SQL reads it.");
         }
 
         $sql = $this->column === null ? 'NULL' : SqlFragments::identifier($table).'.'.SqlFragments::identifier($this->column);
+
+        if ($this->orFrom !== null && $this->orFromTable !== null) {
+            $sql = 'COALESCE('.$sql.', '.SqlFragments::identifier($this->orFromTable).'.'.SqlFragments::identifier($this->orFrom[1]).')';
+        }
+
         $types = $this->types($stored);
         $baseType ??= fn (null|string $type) => $type;
 
@@ -345,7 +389,7 @@ final class Attribute
      */
     public function filter(string $operator, mixed $value, null|string $stored = null): null|array
     {
-        if ($this->external !== null) {
+        if ($this->computed !== null || $this->orFrom !== null) {
             return null;
         }
 
@@ -429,7 +473,7 @@ final class Attribute
 
     private static function keyOf(mixed $key): string
     {
-        return is_int($key) || is_string($key) ? (string) $key : throw new LogicException('A successor handed to an external() read has no key, so the read cannot key its value.');
+        return is_int($key) || is_string($key) ? (string) $key : throw new LogicException('A successor handed to a computedAs() read has no key, so the read cannot key its value.');
     }
 
     private function convert(Conversion $conversion): self

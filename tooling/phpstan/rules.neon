@@ -15,3 +15,15 @@ services:
         class: Tooling\Database\Eloquent\Compatibility\PhpStan\ServesCompatibilityMustNotRedeclareBuilders
         tags:
             - phpstan.rules.rule
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\OperationMustReferenceRelatedSuccessor
+        tags:
+            - phpstan.rules.rule
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\MapRelationsCollector
+        tags:
+            - phpstan.collector
+    -
+        class: Tooling\Database\Eloquent\Compatibility\PhpStan\OperationReferencesCollector
+        tags:
+            - phpstan.collector

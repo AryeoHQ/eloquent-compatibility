@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
+use Tests\Fixtures\Support\PlaceAssets\ClassifyPlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 
 /**
@@ -46,6 +47,7 @@ final class FloorPlan extends Model implements Compatible
     {
         return $floorPlan
             ->retainedIn('floorplans_retained')
+            ->successorsInitializedBy(ClassifyPlaceAsset::class)
             ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
                 ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'floorplan'))
                 ->attribute(
@@ -70,16 +72,16 @@ final class FloorPlan extends Model implements Compatible
                             )
                             ->attribute(
                                 name: 'url',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no url.', ignoreWrites: true),
                             ))
                         ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
                             ->attribute(
                                 name: 'file_name',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'mime_type',
-                                definition: fn (Attribute $attribute) => $attribute->fixed(null),
+                                definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no mime_type.', ignoreWrites: true),
                             )
                             ->attribute(
                                 name: 'url',
