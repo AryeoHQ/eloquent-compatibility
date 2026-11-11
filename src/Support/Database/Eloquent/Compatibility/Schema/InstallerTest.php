@@ -2989,7 +2989,15 @@ final class InstallerTest extends TestCase
             array: $statements,
             callback: fn (array $statement) => $statement[1] > 0,
         ));
-        $last = end($installed);
+        $rescan = end($installed);
+        $written = array_values(array_filter(
+            array: $installed,
+            callback: fn (array $statement) => ! str_starts_with(
+                haystack: strtolower(ltrim($statement[0])),
+                needle: 'select ',
+            ),
+        ));
+        $last = end($written);
         $timeouts = array_keys(array_filter(
             array: $installed,
             callback: fn (array $statement) => str_starts_with(
@@ -3002,6 +3010,7 @@ final class InstallerTest extends TestCase
 
         $this->assertIsArray($last);
         $this->assertSame('ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID', $last[0]);
+        $this->assertStringStartsWith('select "jobs"."id" from "jobs" where NOT EXISTS (SELECT FROM "listings_retained"', (string) $rescan[0]);
         $this->assertSame(["SET LOCAL lock_timeout = '5000ms'"], array_map(
             callback: fn (int $index) => $installed[$index][0],
             array: $timeouts,
@@ -3665,6 +3674,217 @@ final class InstallerTest extends TestCase
         fflush($this->concurrent[1][0]);
 
         return (string) fgets($this->concurrent[1][1]);
+    }
+
+    #[Test]
+    public function it_installs_a_json_value_that_a_legacy_text_column_holds_in_another_key_order_than_its_jsonb_successor_serves(): void
+    {
+        DB::statement('alter table listings add column settings text');
+        DB::statement('alter table jobs add column settings jsonb');
+        DB::update(
+            query: 'update listings set settings = ? where id = 1',
+            bindings: ['{"zeta":1,"a":2}'],
+        );
+        $listing = $this->settingsListing();
+        Compatibility::prepare($listing::class);
+
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => $listing::class],
+        )->assertSuccessful();
+        Compatibility::install(
+            model: $listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame('v', $this->kind('listings'));
+        $this->assertEquals(['zeta' => 1, 'a' => 2], $listing::query()->findOrFail(1)->getAttribute('settings'));
+    }
+
+    #[Test]
+    public function it_refuses_at_the_backfill_a_sub_second_legacy_timestamp_its_successor_column_rounds_and_install_names_that_row(): void
+    {
+        DB::statement('alter table listings add column stamped_at timestamp(6) without time zone');
+        DB::statement('alter table jobs add column stamped_at timestamp(0) without time zone');
+        DB::update("update listings set stamped_at = '2026-01-01 10:00:00.4' where id = 1");
+        DB::update("update listings set stamped_at = '2026-01-01 10:00:00' where id = 2");
+        $listing = $this->stampedListing();
+        Compatibility::prepare($listing::class);
+
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => $listing::class],
+        )->assertFailed();
+
+        $this->assertSame([[1, 'refused', null], [2, 'updated', '2026-01-01 10:00:00']], array_map(
+            callback: fn (object $row) => [$row->legacy_id, $row->status, $row->stamped_at],
+            array: DB::select('select listings_backfill.legacy_id, listings_backfill.status, cast(jobs.stamped_at as text) as stamped_at from listings_backfill join listings on listings.id = listings_backfill.legacy_id join jobs on jobs.id = listings.job_id where listings_backfill.legacy_id in (1, 2) order by listings_backfill.legacy_id'),
+        ));
+
+        try {
+            Compatibility::install(
+                model: $listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringContainsString('1 listings row is refused or failed in listings_backfill', $exception->getMessage());
+            $this->assertStringContainsString('cannot take this write of $stamped_at', $exception->getMessage());
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_refuses_the_first_install_of_a_scoped_map_inside_a_caller_s_transaction_unless_unit_tests_run(): void
+    {
+        $model = $this->scopedListing();
+        Compatibility::prepare($model::class);
+        RecordingWriteScope::$received = [];
+        $environment = $this->app->environment();
+        DB::beginTransaction();
+
+        try {
+            $this->app->instance('env', 'production');
+
+            try {
+                Compatibility::install(
+                    model: $model::class,
+                    statementTimeout: CarbonInterval::seconds(30),
+                );
+                $this->fail('install() did not refuse.');
+            } catch (LogicException $exception) {
+                $this->assertSame('Compatibility::install() runs a first pass over listings before it takes the lock, and its write scope commits each row in a transaction of its own; inside the transaction the connection is already in, every row would keep its locks until that transaction commits. Run it from a migration that sets public $withinTransaction = false.', $exception->getMessage());
+                $this->assertSame([1, 'r', [], null], [DB::transactionLevel(), $this->kind('listings'), RecordingWriteScope::$received, DB::table('compatibility_backfills')->where('legacy_type', 'listings')->value('watermark_at')]);
+            }
+
+            $this->app->instance('env', $environment);
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $this->assertSame([1, 'v'], [DB::transactionLevel(), $this->kind('listings')]);
+        } finally {
+            $this->app->instance('env', $environment);
+            DB::rollBack();
+        }
+    }
+
+    #[Test]
+    public function it_inserts_a_legacy_row_for_a_root_committed_after_its_native_root_scan_under_the_lock_and_before_its_foreign_key(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $scans = 0;
+        $created = null;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$scans, &$created): void {
+            if (str_starts_with($query->sql, 'select "jobs"."id" from "jobs" where NOT EXISTS') && ++$scans === 2) {
+                $created = (string) $writer->table('jobs')->insertGetId(['name' => 'Late job', 'company_id' => ListingTables::COMPANY, 'created_at' => now(), 'updated_at' => now()]);
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertIsString($created);
+        $this->assertSame(['v', 'Late job'], [$this->kind('listings'), DB::table('listings')->where(
+            column: 'job_id',
+            operator: '=',
+            value: $created,
+        )->value('title')]);
+    }
+
+    #[Test]
+    public function it_refuses_on_its_statement_timeout_when_postgresql_cancels_the_write_of_a_final_pass_row(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->unprepared('create or replace function slow_job_update() returns trigger language plpgsql as $$ begin perform pg_sleep(3); return new; end $$; create trigger slow_job_update before update on jobs for each row execute function slow_job_update()');
+                $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(1),
+            );
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringContainsString('ms statementTimeout during the step update "jobs"', $exception->getMessage());
+        } finally {
+            DB::unprepared('drop function if exists slow_job_update() cascade');
+        }
+
+        $this->assertSame(['r', 'Oak House'], [$this->kind('listings'), DB::scalar('select jobs.name from jobs join listings on listings.job_id = jobs.id where listings.id = 1')]);
+    }
+
+    private function settingsListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $casts = ['settings' => 'array'];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'settings',
+                            definition: fn (Attribute $attribute) => $attribute->from('settings'),
+                        ));
+            }
+        };
+    }
+
+    private function stampedListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            protected $casts = ['stamped_at' => 'datetime'];
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'stamped_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('stamped_at'),
+                        ));
+            }
+        };
     }
 
     private function fileOf(int $photo): mixed

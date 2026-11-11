@@ -57,7 +57,7 @@ Each constraint takes the name `<retained table>_<key>_not_null` or `<retained t
 
 Neither constraint needs a scan, and both check every later insert and update. Install runs no `SET NOT NULL` and no `VALIDATE CONSTRAINT`, because each would scan the whole table under the lock. The existence proof before the lock, with install's catch-up of the keys it flags, stands in for the validation, and [the writer boundary](lifecycle.md#the-writer-boundary) states the window it leaves.
 
-Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. The statement is last, so install holds the root's table for that one statement plus the commit. `compatibility:sql install` prints that lock.
+Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. The statement is last, so install holds the root's table for that one statement, one indexed read of the member roots that committed while it waited, their retained-row inserts, and the commit ([Lifecycle: under the lock](lifecycle.md#under-the-lock), step 11). `compatibility:sql install` prints that lock.
 
 The lock also waits. It conflicts with the `ROW EXCLUSIVE` lock that every open transaction writing the root's table holds, so install waits for the longest of them while it still holds the legacy table. During that wait, every read of the legacy name blocks, and every later writer of the root's table queues behind install's request. A writer that holds the root's table and then waits on the legacy table deadlocks with install. A native create whose `Provides\CarriesLegacy` lock follows the successor's `INSERT` is one such writer. PostgreSQL then aborts one side with `40P01`. Install therefore runs the statement under `SET LOCAL lock_timeout`, and treats a lock timeout or a `40P01` as a lock it cannot take: it rolls back and retries. A `40P01` retries only outside a caller's transaction ([Lifecycle: inside a caller's transaction](lifecycle.md#inside-a-callers-transaction)). For a shared successor such as `place_assets`, the other legacy models' writes pause for the statement, its wait and the commit.
 
@@ -160,7 +160,7 @@ CREATE INDEX ON listings_backfill (successor_id) WHERE status = 'deleted';
 | `legacy_id` | the legacy row's key, typed as the legacy key; no foreign key to the legacy table, so the row outlives a deleted legacy row |
 | `successor_id` | the root successor last written, typed as the root's key |
 | `status` | `created`, `updated`, `unchanged`, `refused`, `failed` or `deleted` |
-| `reason` | the refusal's reason, or the exception class and first message line of a failed row |
+| `reason` | the refusal's reason, without the record's key and values for a package refusal, or the exception class and first message line of a failed row |
 | `attempts` | how many passes attempted the row |
 | `attempted_at` | when a pass last wrote the row |
 

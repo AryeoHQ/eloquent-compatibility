@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Carbon\CarbonInterval;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\Artisan;
@@ -21,6 +22,7 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\RefuseWithCutTitle;
@@ -92,6 +94,78 @@ final class BackfillTest extends TestCase
         $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class]);
 
         $this->assertSame([0, 'Walked 0 listings rows and 1 whose legacy row is gone: 0 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 1 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[0]]);
+    }
+
+    #[Test]
+    public function it_reads_the_ledger_rows_whose_legacy_row_is_gone_one_chunk_at_a_time_after_the_last_key_it_read(): void
+    {
+        Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+        DB::delete('delete from listings');
+        $reads = [];
+        DB::listen(function (QueryExecuted $query) use (&$reads): void {
+            if (str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM')) {
+                $reads[] = $query->bindings;
+            }
+        });
+
+        $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class, '--chunk' => '2']);
+
+        $this->assertSame([0, 'Walked 0 listings rows and 3 whose legacy row is gone: 0 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 3 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[0]]);
+        $this->assertSame([[2], [2, 2]], $reads);
+    }
+
+    #[Test]
+    public function it_prints_and_install_names_the_rows_one_package_refusal_refuses_under_one_reason_without_their_keys(): void
+    {
+        Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+        DB::update("update listings set title = title || ' Revised', updated_at = localtimestamp(0) where id in (1, 2)");
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(LeaveTitleUnchanged::class),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+        $reason = 'records cannot take this write of $title. Why: The write stores a value, and the view now serves title as another, so the record would not read back what was written. Instead: Make the operation of title store a value its read serves back.';
+
+        $exit = Artisan::call('compatibility:backfill', ['model' => $listing::class]);
+        $printed = Artisan::output();
+
+        $this->assertSame(1, $exit);
+        $this->assertStringContainsString('2 refused: Illuminate\\Database\\Eloquent\\Model@anonymous', $printed);
+        $this->assertStringContainsString(" {$reason} (id 1, 2)", $printed);
+        $this->assertSame([['refused', 2, true]], array_map(
+            callback: fn (object $row) => [$row->status, $row->rows, str_ends_with(
+                haystack: (string) $row->reason,
+                needle: $reason,
+            )],
+            array: DB::select("select status, reason, count(*) as rows from listings_backfill where status in ('refused', 'failed') group by status, reason"),
+        ));
+
+        try {
+            Compatibility::install(
+                model: $listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('install() did not refuse.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringContainsString('2 listings rows are refused or failed in listings_backfill, and no row installs before every row can be served: 2 refused because Illuminate\\Database\\Eloquent\\Model@anonymous', $exception->getMessage());
+            $this->assertStringContainsString(" {$reason} (id 1, 2). Fix each row", $exception->getMessage());
+        }
     }
 
     #[Test]

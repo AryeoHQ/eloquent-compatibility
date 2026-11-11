@@ -39,6 +39,8 @@ final class Backfiller
 
     private const string DATA_EXCEPTION = '22';
 
+    private const string CANCELED = '57014';
+
     private readonly ColumnCatalog $catalog;
 
     private readonly string $key;
@@ -133,6 +135,7 @@ final class Backfiller
         $this->deleteGone(
             pass: $pass,
             scoped: true,
+            chunk: self::CHUNK,
         );
 
         return $pass;
@@ -164,6 +167,17 @@ final class Backfiller
             haystack: self::WAITED_STATES,
             strict: true,
         ) ? $exception : null;
+    }
+
+    private static function canceled(Throwable $exception): null|QueryException
+    {
+        for ($cause = $exception; $cause !== null; $cause = $cause->getPrevious()) {
+            if ($cause instanceof QueryException && $cause->getCode() === self::CANCELED) {
+                return $cause;
+            }
+        }
+
+        return null;
     }
 
     public function refuseUnconvergeable(int $passSize): void
@@ -230,6 +244,7 @@ final class Backfiller
             $this->deleteGone(
                 pass: $pass,
                 scoped: $scoped,
+                chunk: $chunk,
             );
         }
 
@@ -359,6 +374,12 @@ final class Backfiller
             $this->connection->unprepared('ROLLBACK TO SAVEPOINT '.self::SAVEPOINT);
             $this->connection->unprepared('RELEASE SAVEPOINT '.self::SAVEPOINT);
 
+            $canceled = $scoped ? null : self::canceled($exception);
+
+            if ($canceled !== null) {
+                throw $canceled;
+            }
+
             if (self::waited($exception) !== null) {
                 if (! $scoped || $retried) {
                     throw $exception;
@@ -373,8 +394,18 @@ final class Backfiller
                 );
             }
 
-            if ($exception instanceof Refusal || $exception instanceof CompatibilityWriteRefused || $exception instanceof SuccessorsMoved) {
+            if ($exception instanceof Refusal) {
                 return [Outcome::Refused, $successor, $exception->getMessage()];
+            }
+
+            if ($exception instanceof CompatibilityWriteRefused || $exception instanceof SuccessorsMoved) {
+                Log::info("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} was refused: {$exception->getMessage()}");
+
+                return [Outcome::Refused, $successor, $exception instanceof CompatibilityWriteRefused ? $exception->reason : explode(
+                    separator: ' Why: ',
+                    string: $exception->getMessage(),
+                    limit: 2,
+                )[0]];
             }
 
             Log::warning("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} failed", ['exception' => $exception]);
@@ -537,6 +568,7 @@ final class Backfiller
         $mapped = $this->changed(
             variant: $this->variantFor($legacy),
             legacy: $legacy,
+            key: $key,
             row: $row,
             served: $served,
         );
@@ -564,6 +596,7 @@ final class Backfiller
         return $this->changed(
             variant: $this->variantFor($legacy),
             legacy: $legacy,
+            key: $key,
             row: $row,
             served: $this->roundTrip()->served(
                 keyName: $this->key,
@@ -654,47 +687,38 @@ final class Backfiller
      * @param  array<string, mixed>  $served
      * @return array<string, mixed>
      */
-    private function changed(ResolvedMap $variant, Model $legacy, array $row, array $served): array
+    private function changed(ResolvedMap $variant, Model $legacy, int|string $key, array $row, array $served): array
     {
-        $changed = [];
+        $candidates = [];
 
         foreach ($variant->attributes as $name => $attribute) {
             if (! array_key_exists(
                 key: $name,
                 array: $row,
-            )) {
+            ) || ($attribute->isExternal() && $attribute->operation() === null)) {
                 continue;
             }
 
-            if ($attribute->isExternal()) {
-                if ($attribute->operation() !== null) {
-                    $changed[$name] = $row[$name];
-                }
-
-                continue;
-            }
-
-            if (RoundTrip::skips(
+            if ($attribute->isExternal() || ! RoundTrip::skips(
                 attribute: $attribute,
                 origin: Origin::Backfill,
             )) {
-                continue;
+                $candidates[$name] = $row[$name];
             }
-
-            if (array_key_exists(
-                key: $name,
-                array: $served,
-            ) && $this->roundTrip()->agrees(
-                legacy: $legacy,
-                name: $name,
-                written: $row[$name],
-                served: $served[$name],
-            )) {
-                continue;
-            }
-
-            $changed[$name] = $row[$name];
         }
+
+        $agreeing = $this->roundTrip()->agreeing(
+            variant: $variant,
+            legacy: $legacy,
+            key: $key,
+            written: array_filter(
+                array: $candidates,
+                callback: fn (string $name): bool => ! $variant->attributes[$name]->isExternal(),
+                mode: ARRAY_FILTER_USE_KEY,
+            ),
+            served: $served,
+        );
+        $changed = array_diff_key($candidates, array_flip($agreeing));
 
         if ($changed === []) {
             return [];
@@ -732,9 +756,16 @@ final class Backfiller
         return $this->map->morphs === [] ? $this->map : $this->map->morphFor($legacy);
     }
 
-    private function deleteGone(Pass $pass, bool $scoped): void
+    private function deleteGone(Pass $pass, bool $scoped, int $chunk): void
     {
-        foreach (array_chunk(array: $this->ledger->gone(), length: self::CHUNK) as $batch) {
+        $after = null;
+
+        do {
+            $batch = $this->ledger->gone(
+                limit: $chunk,
+                after: $after,
+            );
+
             if ($this->commitsEachRow($scoped)) {
                 foreach ($batch as [$key, $successor, $status]) {
                     $this->connection->transaction(fn () => $this->gone(
@@ -745,22 +776,22 @@ final class Backfiller
                         scoped: $scoped,
                     ));
                 }
-
-                continue;
+            } elseif ($batch !== []) {
+                $this->connection->transaction(function () use ($batch, $pass, $scoped): void {
+                    foreach ($batch as [$key, $successor, $status]) {
+                        $this->gone(
+                            pass: $pass,
+                            key: $key,
+                            successor: $successor,
+                            status: $status,
+                            scoped: $scoped,
+                        );
+                    }
+                });
             }
 
-            $this->connection->transaction(function () use ($batch, $pass, $scoped): void {
-                foreach ($batch as [$key, $successor, $status]) {
-                    $this->gone(
-                        pass: $pass,
-                        key: $key,
-                        successor: $successor,
-                        status: $status,
-                        scoped: $scoped,
-                    );
-                }
-            });
-        }
+            $after = $batch === [] ? $after : $batch[array_key_last($batch)][0];
+        } while (count($batch) === $chunk);
     }
 
     private function gone(Pass $pass, int|string $key, null|int|string $successor, Outcome $status, bool $scoped): void

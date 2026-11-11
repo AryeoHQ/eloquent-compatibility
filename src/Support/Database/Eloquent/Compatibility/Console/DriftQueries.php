@@ -12,7 +12,6 @@ use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Schema\Column;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -435,6 +434,7 @@ final readonly class DriftQueries
             among: $among,
         );
         $conditions = [];
+        $legacy = new $map->model;
 
         foreach ($map->morphs === [] ? [$map] : $map->morphs as $variant) {
             $type = $map->morphs === [] || $variant->target === null ? null : SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $map->morph?->typeColumn).' = '.SqlFragments::literal((string) $variant->target->morphAlias);
@@ -454,9 +454,15 @@ final readonly class DriftQueries
                     continue;
                 }
 
-                [$read, $stored] = self::comparable(
+                [$read, $stored] = RoundTrip::comparable(
                     catalog: $catalog,
                     column: $shape[$name],
+                    json: RoundTrip::json(
+                        legacy: $legacy,
+                        variant: $variant,
+                        name: $name,
+                        catalog: $catalog,
+                    ),
                     read: $read,
                     stored: $retained.'.'.SqlFragments::identifier($name),
                 );
@@ -489,24 +495,6 @@ final readonly class DriftQueries
                 ),
             )))
             .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
-    }
-
-    /**
-     * @return array{string, string}
-     */
-    private static function comparable(ColumnCatalog $catalog, Column $column, string $read, string $stored): array
-    {
-        $json = match ($column->baseType ?? $column->type) {
-            'json' => 'jsonb',
-            'json[]' => 'jsonb[]',
-            default => null,
-        };
-
-        return match (true) {
-            $json !== null => ["CAST({$read} AS {$json})", "CAST({$stored} AS {$json})"],
-            $catalog->equatable($column->type) => [$read, $stored],
-            default => ["CAST({$read} AS text)", "CAST({$stored} AS text)"],
-        };
     }
 
     /**

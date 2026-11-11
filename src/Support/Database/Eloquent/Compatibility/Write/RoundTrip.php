@@ -29,11 +29,17 @@ final class RoundTrip
 {
     private const array NUMERIC_CASTS = ['int', 'integer', 'real', 'float', 'double', 'decimal'];
 
+    private const array JSON_CASTS = ['array', 'json', 'json:unicode', 'object', 'collection'];
+
+    private const array JSON_TYPES = ['json', 'jsonb'];
+
     /** @var null|WeakMap<Connection, array<class-string<Model>, string>> */
     private static null|WeakMap $unhidden = null;
 
     /** @var null|WeakMap<Connection, array<class-string<Model>, list<string>>> */
     private static null|WeakMap $numeric = null;
+
+    private null|ColumnCatalog $catalog = null;
 
     public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection, private readonly null|string $servedSelect = null, private readonly null|string $unhiddenSelect = null) {}
 
@@ -68,6 +74,25 @@ final class RoundTrip
         }
 
         $hidden = $row === null;
+        $compared = $this->compared(
+            variant: $graph->map,
+            legacy: $legacy,
+            key: $key,
+            values: array_filter(
+                array: $written,
+                callback: fn (mixed $value, string $name): bool => ! str_contains(
+                    haystack: $name,
+                    needle: '->',
+                ) && ($graph->map->attributes[$name] ?? null) !== null && ! $graph->map->attributes[$name]->isExternal() && ! self::skips(
+                    attribute: $graph->map->attributes[$name],
+                    origin: $origin,
+                ) && array_key_exists(
+                    key: $name,
+                    array: $served,
+                ),
+                mode: ARRAY_FILTER_USE_BOTH,
+            ),
+        );
 
         foreach ($written as $name => $value) {
             [$base, $path] = array_pad(
@@ -108,6 +133,24 @@ final class RoundTrip
             }
 
             if (! array_key_exists($name, $served)) {
+                continue;
+            }
+
+            if (array_key_exists(
+                key: $name,
+                array: $compared,
+            )) {
+                if ($compared[$name]) {
+                    throw CompatibilityWriteRefused::roundTrip(
+                        model: $this->map->model,
+                        attribute: $name,
+                        key: $key,
+                        written: $value,
+                        served: $served[$name],
+                        hidden: $hidden,
+                    );
+                }
+
                 continue;
             }
 
@@ -182,15 +225,171 @@ final class RoundTrip
         ) : (array) $row;
     }
 
-    public function agrees(Model $legacy, string $name, mixed $written, mixed $served): bool
+    /**
+     * @param  array<string, mixed>  $written
+     * @param  array<string, mixed>  $served
+     * @return list<string>
+     */
+    public function agreeing(ResolvedMap $variant, Model $legacy, int|string $key, array $written, array $served): array
     {
-        return self::same(
+        $compared = $this->compared(
+            variant: $variant,
             legacy: $legacy,
-            name: $name,
-            written: $written,
-            served: $served,
-            numeric: fn (): bool => $this->numeric($legacy, $name),
-        )[0];
+            key: $key,
+            values: $written,
+        );
+        $agreeing = [];
+
+        foreach ($written as $name => $value) {
+            if (array_key_exists(
+                key: $name,
+                array: $compared,
+            )) {
+                if (! $compared[$name]) {
+                    $agreeing[] = $name;
+                }
+
+                continue;
+            }
+
+            if (array_key_exists(
+                key: $name,
+                array: $served,
+            ) && self::same(
+                legacy: $legacy,
+                name: $name,
+                written: $value,
+                served: $served[$name],
+                numeric: fn (): bool => $this->numeric($legacy, $name),
+            )[0]) {
+                $agreeing[] = $name;
+            }
+        }
+
+        return $agreeing;
+    }
+
+    public static function json(Model $legacy, ResolvedMap $variant, string $name, ColumnCatalog $catalog): bool
+    {
+        if ($legacy->hasCast(
+            key: $name,
+            types: self::JSON_CASTS,
+        )) {
+            return true;
+        }
+
+        $column = ($variant->attributes[$name] ?? null)?->column();
+        $owner = $variant->owners[$name] ?? null;
+
+        return $column !== null && $owner !== null && in_array(
+            needle: $catalog->baseType($catalog->type(
+                table: $owner->table,
+                column: $column,
+            )),
+            haystack: self::JSON_TYPES,
+            strict: true,
+        );
+    }
+
+    /**
+     * @return array{string, string}
+     */
+    public static function comparable(ColumnCatalog $catalog, Column $column, bool $json, string $read, string $stored): array
+    {
+        $type = match (true) {
+            ($column->baseType ?? $column->type) === 'json[]' => 'jsonb[]',
+            $json || ($column->baseType ?? $column->type) === 'json' => 'jsonb',
+            default => null,
+        };
+
+        return match (true) {
+            $type !== null => ["CAST({$read} AS {$type})", "CAST({$stored} AS {$type})"],
+            $catalog->equatable($column->type) => [$read, $stored],
+            default => ["CAST({$read} AS text)", "CAST({$stored} AS text)"],
+        };
+    }
+
+    /**
+     * @param  array<string, mixed>  $values
+     * @return array<string, bool>
+     */
+    private function compared(ResolvedMap $variant, Model $legacy, int|string $key, array $values): array
+    {
+        $select = $this->unhiddenSelect ?? $this->servedSelect;
+
+        if ($select === null) {
+            return [];
+        }
+
+        $catalog = $this->catalog ??= new ColumnCatalog(
+            connection: $this->connection,
+            throughWriteConnection: true,
+        );
+        $shape = $catalog->of($this->map->table);
+        $record = SqlFragments::identifier($this->map->table);
+        $differences = [];
+        $bindings = [];
+
+        foreach ($values as $name => $value) {
+            $column = $shape[$name] ?? null;
+
+            if ($column === null || ! ($value === null || is_scalar($value))) {
+                continue;
+            }
+
+            [$read, $stored] = self::comparable(
+                catalog: $catalog,
+                column: $column,
+                json: self::json(
+                    legacy: $legacy,
+                    variant: $variant,
+                    name: $name,
+                    catalog: $catalog,
+                ),
+                read: $record.'.'.SqlFragments::identifier($name),
+                stored: "CAST(? AS {$column->type})",
+            );
+            $differences[$name] = "CASE WHEN {$read} IS DISTINCT FROM {$stored} THEN ".SqlFragments::literal($name).' END';
+            $bindings[] = match (true) {
+                is_bool($value) => $value ? 'true' : 'false',
+                $value === null => null,
+                default => (string) $value,
+            };
+        }
+
+        if ($differences === []) {
+            return [];
+        }
+
+        $row = $this->connection->selectOne(
+            query: 'SELECT array_to_json(array_remove(ARRAY['.implode(
+                separator: ', ',
+                array: $differences,
+            ).'], NULL)) AS differing FROM ('.$select.') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($legacy->getKeyName()).' = ?',
+            bindings: [...$bindings, $key],
+            useReadPdo: false,
+        );
+
+        if ($row === null) {
+            return [];
+        }
+
+        $differing = json_decode(
+            json: is_string($row->differing ?? null) ? $row->differing : '[]',
+            associative: true,
+        );
+
+        return array_map(
+            callback: fn (string $name): bool => in_array(
+                needle: $name,
+                haystack: is_array($differing) ? $differing : [],
+                strict: true,
+            ),
+            array: array_combine(
+                keys: array_keys($differences),
+                values: array_keys($differences),
+            ),
+        );
     }
 
     private function through(string $select, string $keyName, int|string $key): null|object

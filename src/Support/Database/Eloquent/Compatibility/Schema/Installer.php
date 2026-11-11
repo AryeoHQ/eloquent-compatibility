@@ -171,6 +171,10 @@ final readonly class Installer
             throw new LogicException("Compatibility::install() catches up {$map->table} in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public \$withinTransaction = false.");
         }
 
+        if ($remembered === null && ! $outside && $map->scope !== null && ! app()->runningUnitTests()) {
+            throw new LogicException("Compatibility::install() runs a first pass over {$map->table} before it takes the lock, and its write scope commits each row in a transaction of its own; inside the transaction the connection is already in, every row would keep its locks until that transaction commits. Run it from a migration that sets public \$withinTransaction = false.");
+        }
+
         $backfiller->refuseUnconvergeable($passSize);
         $this->refuseUnwindowed($map);
 
@@ -266,6 +270,19 @@ final readonly class Installer
                             budget: $budget,
                             moment: 'before',
                             statement: $statement,
+                        ),
+                    );
+                    $retained->carryNative(
+                        keys: $retained->unserved(
+                            table: ViewCompiler::retainedTable($map),
+                            since: $since,
+                        ),
+                        before: fn () => self::refuseSpent(
+                            map: $map,
+                            started: $started,
+                            budget: $budget,
+                            moment: 'before',
+                            statement: 'the insert of the legacy row of a root created natively before its foreign key took the lock',
                         ),
                     );
                     self::refuseSpent(
