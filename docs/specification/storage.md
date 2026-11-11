@@ -94,13 +94,17 @@ LEFT JOIN "job_sites" ON <the Job's relation to its JobSite>;
 
 - **The root** is an inner join on the successor key.
 - **A related successor** is a plain `LEFT JOIN` where the database proves at most one row: a `BelongsTo`, or a `HasOne` over a unique index.
-- **A degrade `HasOne`**, which no unique index bounds, is a `LEFT JOIN LATERAL (... LIMIT 1)`. It is the only lateral join.
+- **The proof** is a valid, immediate unique index on the related table whose one key column is the join key and which has no expression. The index has no predicate, or it is the partial index `prepare()` builds for `atMostOne()`. A `BelongsTo` to a primary key always has one. A `BelongsTo` to an owner key that no such index bounds stays lateral, because the database proves nothing about it.
+- **A relation's own conditions** sit in a select of their own, `LEFT JOIN (SELECT * FROM "places" WHERE ...) AS "places" ON ...`. A condition names its column without the table, so a legacy column of the same name would otherwise make it ambiguous. PostgreSQL still pulls that select into the join, so the related table's index serves a filter.
+- **A degrade `HasOne`**, which no unique index bounds, is a `LEFT JOIN LATERAL (... LIMIT 1)`. It is the only lateral join in the view.
 
 The view serves an added successor key, such as `floorplans.place_asset_id`, as it serves `job_id`. The legacy model hydrates that column from `prepare()` onward, so its attributes stay the same across install.
 
 The view holds no constant: no discriminator literal and no membership filter. The successor key is the membership, so a retained row with a root key is a served record.
 
-A plain join lets PostgreSQL use the related table's index for a filter on a related attribute. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+A plain join lets PostgreSQL use the related table's index for a filter on a related attribute. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view. For an attribute of a related successor, it also says whether plain joins reach it or a lateral join does. A `computedAs()` attribute has no SQL filter, and the command says so.
+
+Two package reads keep a lateral join for every relation, because they read a few rows by key: the native create's stand-in query, which replaces the written successor's table with a row set that has no unique index, and the batch read of `computedAs()` values.
 
 The view is not automatically updatable. [Lifecycle](lifecycle.md#the-writer-boundary) states which writers it refuses.
 

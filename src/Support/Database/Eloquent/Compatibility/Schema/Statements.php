@@ -333,7 +333,13 @@ final readonly class Statements
                     array: $columns,
                 ),
             )
-                ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
+                ."\nFROM {$primary}".implode(separator: '', array: array_map(callback: fn (string $join) => "\n".$join, array: ViewCompiler::joins(
+                    map: $map,
+                    proven: ViewCompiler::proven(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                )))
                 ."\nWHERE {$primary}.{$primaryKey} = {$retainedTable}.{$successorKey}"]),
         ];
         $filled = count($statements) - 1;

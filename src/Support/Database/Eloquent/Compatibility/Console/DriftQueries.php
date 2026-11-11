@@ -453,7 +453,13 @@ final readonly class DriftQueries
                 retained: ViewCompiler::retainedTable($map),
                 hides: false,
             )
-            .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($map)))
+            .implode(separator: '', array: array_map(callback: fn (string $join) => ' '.$join, array: ViewCompiler::joins(
+                map: $map,
+                proven: ViewCompiler::proven(
+                    map: $map,
+                    connection: $this->connection,
+                ),
+            )))
             .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
     }
 

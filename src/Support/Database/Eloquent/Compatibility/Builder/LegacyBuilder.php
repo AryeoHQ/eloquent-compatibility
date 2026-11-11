@@ -8,6 +8,7 @@ use Closure;
 use DateTimeInterface;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -58,6 +59,9 @@ final class LegacyBuilder extends Builder
     /** @var array<string, array<string, array{name: string, deterministic: bool, declared: bool}>> */
     private static array $collations = [];
 
+    /** @var array<string, list<string>> */
+    private static array $proven = [];
+
     private int $negations = 0;
 
     private null|Model $writeOf = null;
@@ -73,6 +77,7 @@ final class LegacyBuilder extends Builder
         ServedTable::forget();
         RoundTrip::forget();
         self::$collations = [];
+        self::$proven = [];
     }
 
     public static function insertOf(Model $model): void
@@ -149,6 +154,42 @@ final class LegacyBuilder extends Builder
     public static function mapOf(string $model): ResolvedMap
     {
         return self::$maps[$model] ??= Compatibility::of($model)->resolve();
+    }
+
+    /**
+     * @return array<string, 'computed'|'expression'|'stored'|'view'>
+     */
+    public static function placements(ResolvedMap $map, ConnectionInterface $connection): array
+    {
+        $catalog = new ColumnCatalog(
+            connection: $connection,
+            throughSearchPath: true,
+        );
+        $collations = [];
+        $placements = [];
+
+        foreach ($map->attributes as $name => $attribute) {
+            $placements[$name] = match (true) {
+                $map->isExternal($name) => 'computed',
+                $attribute->conversions() === [] || $map->isMorphed($name) => 'view',
+                self::servedOn(
+                    map: $map,
+                    attribute: $name,
+                    owner: $map->owners[$name]->table,
+                    catalog: $catalog,
+                    collations: function (string $table) use (&$collations, $connection): array {
+                        return $collations[$table] ??= ViewCompiler::collations(
+                            connection: $connection,
+                            table: $table,
+                            throughSearchPath: true,
+                        );
+                    },
+                )[1] === null => 'stored',
+                default => 'expression',
+            };
+        }
+
+        return $placements;
     }
 
     public static function refuseExternal(string $model, string $attribute, string $operation): CompatibilityQueryRefused
@@ -725,7 +766,14 @@ final class LegacyBuilder extends Builder
         if ($owner === $map->primary->table) {
             $successors->from($owner);
         } else {
-            $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(' ', ViewCompiler::laterals($map, $owner)));
+            $successors->fromRaw(SqlFragments::identifier($map->primary->table).' '.implode(separator: ' ', array: ViewCompiler::joins(
+                map: $map,
+                proven: self::$proven[$this->servedKey()] ??= ViewCompiler::proven(
+                    map: $map,
+                    connection: $this->model->getConnection(),
+                ),
+                owner: $owner,
+            )));
         }
 
         $successors->where(fn (QueryBuilder $query) => self::apply($query, $column, $filters, $combine), null, null, $negate ? 'and not' : 'and');
@@ -826,16 +874,32 @@ final class LegacyBuilder extends Builder
      */
     private function served(string $attribute, string $owner): array
     {
-        $connection = $this->model->getConnection();
-        $catalog = self::$catalogs[$this->servedKey()] ??= new ColumnCatalog($connection, throughSearchPath: true);
-        $definition = $this->definition($attribute);
+        return self::servedOn(
+            map: $this->map(),
+            attribute: $attribute,
+            owner: $owner,
+            catalog: self::$catalogs[$this->servedKey()] ??= new ColumnCatalog(
+                connection: $this->model->getConnection(),
+                throughSearchPath: true,
+            ),
+            collations: $this->collations(...),
+        );
+    }
+
+    /**
+     * @param  Closure(string): array<string, array{name: string, deterministic: bool, declared: bool}>  $collations
+     * @return array{null|string, null|string}
+     */
+    private static function servedOn(ResolvedMap $map, string $attribute, string $owner, ColumnCatalog $catalog, Closure $collations): array
+    {
+        $definition = $map->attributes[$attribute];
         $column = $definition->column();
         $stored = $column === null ? null : ($catalog->of($owner)[$column] ?? null);
         $type = $stored === null ? null : $stored->baseType ?? $stored->type;
-        $served = $catalog->of($this->map()->table)[$attribute] ?? null;
-        $collation = $this->collations($this->map()->table)[$attribute] ?? null;
+        $served = $catalog->of($map->table)[$attribute] ?? null;
+        $collation = $collations($map->table)[$attribute] ?? null;
 
-        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ($this->collations($owner)[(string) $column]['deterministic'] ?? true) && ($collation['deterministic'] ?? true))) {
+        if ($served === null || ($definition->exact($type, $served->baseType ?? $served->type) && ($collations($owner)[(string) $column]['deterministic'] ?? true) && ($collation['deterministic'] ?? true))) {
             return [$type, null];
         }
 

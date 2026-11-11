@@ -21,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -51,8 +52,8 @@ final class ViewCompilerTest extends TestCase
           CAST(("jobs"."deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone) AS "deleted_at"
         FROM "listings_retained"
         JOIN (SELECT * FROM "jobs" WHERE NOT COALESCE(("merged_into_job_id" is not null), false)) AS "jobs" ON "jobs"."id" = "listings_retained"."job_id"
-        LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
-        LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true
+        LEFT JOIN (SELECT * FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL) AS "places" ON "places"."job_id" = "jobs"."id"
+        LEFT JOIN "job_sites" ON "job_sites"."job_id" = "jobs"."id"
         SQL;
 
     /** @var list<string> */
@@ -70,6 +71,7 @@ final class ViewCompilerTest extends TestCase
         ListingTables::drop();
         FileTables::drop();
         PlaceAssetTables::drop();
+        DB::statement('drop table if exists companies cascade');
 
         parent::tearDown();
     }
@@ -92,6 +94,74 @@ final class ViewCompilerTest extends TestCase
         );
 
         $this->assertSame("CREATE OR REPLACE VIEW \"listings\" AS\n".self::LISTING_SELECT, $this->viewCompiler()->replace(Compatibility::of(Listing::class)->resolve()));
+    }
+
+    #[Test]
+    public function it_joins_a_has_one_laterally_until_the_unique_index_prepare_builds_bounds_it(): void
+    {
+        DB::statement('create unique index places_city_unique on places (job_id) where city is not null');
+        $map = Compatibility::of(Listing::class)->resolve();
+        $unbounded = $this->viewCompiler()->create($map);
+
+        Compatibility::prepare(Listing::class);
+
+        $this->assertStringContainsString("\nLEFT JOIN LATERAL (SELECT * FROM \"places\" WHERE \"places\".\"job_id\" = \"jobs\".\"id\" AND (\"places\".\"parent_id\" is null) AND \"places\".\"deleted_at\" IS NULL ORDER BY \"id\" asc LIMIT 1) AS \"places\" ON true\n", $unbounded);
+        $this->assertStringContainsString("\nLEFT JOIN \"job_sites\" ON \"job_sites\".\"job_id\" = \"jobs\".\"id\"", $unbounded);
+        $this->assertStringContainsString("\nLEFT JOIN (SELECT * FROM \"places\" WHERE (\"places\".\"parent_id\" is null) AND \"places\".\"deleted_at\" IS NULL) AS \"places\" ON \"places\".\"job_id\" = \"jobs\".\"id\"\n", $this->viewCompiler()->create($map));
+    }
+
+    #[Test]
+    public function it_joins_a_belongs_to_plainly_only_where_a_unique_index_bounds_its_owner_key(): void
+    {
+        DB::statement('create table companies (id uuid primary key, code uuid)');
+        $byKey = $this->listings(fn (Compatibility $listing) => $listing
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('name'),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
+                    successor: fn (Successor $company) => $company
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->from('code')),
+                )));
+        $byCode = $this->listings(fn (Compatibility $listing) => $listing
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('name'),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id', 'code'),
+                    successor: fn (Successor $company) => $company
+                        ->attribute('mls_number', fn (Attribute $attribute) => $attribute->from('code')),
+                )));
+
+        $this->assertStringEndsWith("\nLEFT JOIN \"companies\" ON \"companies\".\"id\" = \"jobs\".\"company_id\"", $this->viewCompiler()->create($byKey));
+        $this->assertStringEndsWith("\nLEFT JOIN LATERAL (SELECT * FROM \"companies\" WHERE \"companies\".\"code\" = \"jobs\".\"company_id\" LIMIT 1) AS \"companies\" ON true", $this->viewCompiler()->create($byCode));
+    }
+
+    #[Test]
+    public function it_reads_the_conditions_of_a_plainly_joined_relation_inside_its_own_select_so_a_legacy_column_of_the_same_name_stays_unambiguous(): void
+    {
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        $map = $this->listings(fn (Compatibility $listing) => $listing
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('name'),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->site()->where('latitude', '>', 0),
+                    successor: fn (Successor $site) => $site
+                        ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                )));
+
+        $served = DB::select($this->viewCompiler()->beforeInstall($map).' ORDER BY "id"');
+
+        $this->assertSame([1 => 47.6062, 2 => null, 3 => null], array_combine(array_map(fn (object $row) => (int) $row->id, $served), array_map(fn (object $row) => $row->latitude === null ? null : (float) $row->latitude, $served)));
     }
 
     #[Test]

@@ -8,15 +8,20 @@ use Illuminate\Console\Command;
 use Illuminate\Console\OutputStyle;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Date;
+use Support\Database\Eloquent\Compatibility\Builder\LegacyBuilder;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Definition\Related;
+use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
+use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
 final class CompileSql extends Command
 {
     protected $signature = 'compatibility:sql
         {operation : The operation whose statements to print: prepare, install, update, rollback or retire}
         {model : The class of the legacy model that declares the map}
+        {--filters : Also print, for each attribute, where a filter on it runs once the view serves the model}
         {--output= : Write the statements to this file instead of stdout}';
 
     protected $description = 'Print the SQL statements a compatibility operation runs, running only catalog reads.';
@@ -47,10 +52,21 @@ final class CompileSql extends Command
         try {
             $map = Compatibility::of($model)->resolve();
             $connection = Compatibility::connection($map);
-            [$guard, $statements, $server] = $connection->transaction(fn () => [
+            [$guard, $statements, $server, $filters] = $connection->transaction(fn () => [
                 Statements::guard($map, $connection, $for),
                 $statementsFor($map, $connection),
                 (array) $connection->selectOne("select current_database() as database, current_schema() as schema, current_setting('search_path') as search_path, current_setting('server_version') as version"),
+                $this->option('filters') === true ? self::filters(
+                    map: $map,
+                    placements: LegacyBuilder::placements(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                    proven: ViewCompiler::proven(
+                        map: $map,
+                        connection: $connection,
+                    ),
+                ) : [],
             ]);
         } catch (InvalidCompatibilityMap $exception) {
             return $this->refuse($exception->getMessage());
@@ -83,6 +99,7 @@ final class CompileSql extends Command
                     callback: fn (array $lock) => "Locks {$lock[0]} in {$lock[1]}",
                     array: $statements->locks,
                 ),
+                ...($filters === [] ? [] : ["Once the view serves {$map->table}, a filter on each attribute runs here:", ...$filters]),
             ],
         );
         $terminate = fn (string $statement) => $statement."\n;";
@@ -131,6 +148,51 @@ final class CompileSql extends Command
         $this->components->info("Wrote {$count} ".($count === 1 ? 'statement' : 'statements')." to {$file}.");
 
         return self::SUCCESS;
+    }
+
+    /**
+     * @param  array<string, 'computed'|'expression'|'stored'|'view'>  $placements
+     * @param  list<string>  $proven
+     * @return list<string>
+     */
+    private static function filters(ResolvedMap $map, array $placements, array $proven): array
+    {
+        /** @var array<string, Related> $parents */
+        $parents = [];
+
+        foreach ($map->related as $related) {
+            $parents[$related->table] = $related;
+        }
+
+        $lines = [];
+
+        foreach ($placements as $name => $placement) {
+            $owner = $map->owners[$name]->table;
+            $column = $map->attributes[$name]->column();
+            $lateral = null;
+
+            for ($table = $owner; array_key_exists(key: $table, array: $parents); $table = $parents[$table]->parentTable) {
+                if ($parents[$table]->morphType === null && ! in_array(
+                    needle: $table,
+                    haystack: $proven,
+                    strict: true,
+                )) {
+                    $lateral = $table;
+                }
+            }
+
+            $runs = match ($placement) {
+                'computed' => "{$name}: no SQL filter, because computedAs() computes it in PHP",
+                'stored' => "{$name}: the stored column {$owner}.{$column}",
+                'expression' => "{$name}: a rebuilt expression over {$owner}",
+                'view' => "{$name}: the view",
+            };
+            $lines[] = $placement === 'computed' || $map->isMorphed($name) || $owner === $map->primary->table ? $runs : $runs.($lateral === null
+                ? ", reached through plain joins, so an index on {$owner} can serve it"
+                : ", reached through a lateral join on {$lateral}, so no index on {$owner} serves it");
+        }
+
+        return $lines;
     }
 
     private function refuse(string $message): int

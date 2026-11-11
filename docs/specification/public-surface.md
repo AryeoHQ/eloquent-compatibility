@@ -62,7 +62,7 @@ Every method returns the `Compatibility` it was called on.
 | `attribute(string $name, Closure $definition)` | one attribute, over a `Definition\Attribute` |
 | `related(Closure $relation, null\|Closure $successor = null)` | a related successor: the closure returns its Eloquent relation, and `successor:` defines it |
 | `relatedMorph(Closure $relation, Closure $choose, Closure $targets)` | a `MorphTo`, the closure that picks its target class, and the targets over a `Definition\Targets` |
-| `atMostOne(string $because)` | a write refuses a second related row, with the reason; the view still uses a lateral join unless a unique index proves the relation |
+| `atMostOne(string $because)` | a write refuses a second related row, with the reason; once `prepare()` builds its unique index, the view joins the relation plainly |
 | `when(Closure $scope)` | membership: which natively created successor rows gain a legacy row |
 
 ### `Definition\Attribute`
@@ -132,7 +132,7 @@ The package has no configuration of its own. Each tuning value is a named argume
 
 `compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed.
 
-`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. It also says that the printed SQL omits the legacy rows install inserts in PHP under its lock for natively created roots. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. It also says that the printed SQL omits the legacy rows install inserts in PHP under its lock for natively created roots. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view. For an attribute of a related successor, it also says whether plain joins reach it or a lateral join does. A `computedAs()` attribute has no SQL filter.
 
 The commands are public by name. Their classes are internal.
 

@@ -494,7 +494,10 @@ final class LegacyRecord
                 map: $this->served,
                 retained: ViewCompiler::retainedTable($this->served),
             )
-                .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($this->served)))
+                .implode(separator: '', array: array_map(callback: fn (string $join) => ' '.$join, array: ViewCompiler::joins(
+                    map: $this->served,
+                    proven: [],
+                )))
                 .' WHERE '.($filter === null ? $owner : $filter[0]),
             [...($stored === null ? [] : [$stored]), ...($hard ? [] : [$json, ...($stored === null ? [] : [$stored])]), ...($probe === null ? [] : [json_encode([$this->served->successorKey => $probe], JSON_THROW_ON_ERROR)]), ...($member === null ? [] : $member[1]), ...($filter === null ? [] : $filter[1])],
             false,

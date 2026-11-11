@@ -361,6 +361,85 @@ final class CompileSqlTest extends TestCase
     }
 
     #[Test]
+    public function it_prints_where_a_filter_on_each_attribute_runs_once_installed(): void
+    {
+        $filters = function (string $model): array {
+            $this->assertSame(0, Artisan::call(
+                command: 'compatibility:sql',
+                parameters: ['operation' => 'prepare', 'model' => $model, '--filters' => true],
+            ));
+            $printed = explode(
+                separator: "\n",
+                string: explode(
+                    separator: "\n\nBEGIN;\n\n",
+                    string: Artisan::output(),
+                    limit: 2,
+                )[0],
+            );
+
+            return array_slice($printed, (int) array_search('-- Once the view serves '.(new $model)->getTable().', a filter on each attribute runs here:', $printed, true));
+        };
+
+        $rebuilt = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'latitude',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->asType('double precision'),
+                        ));
+            }
+        };
+
+        $planned = $filters(Listing::class);
+        $expression = $filters($rebuilt::class);
+        DB::statement('drop index places_listings_at_most_one');
+        $unbounded = $filters(Listing::class);
+        FileTables::create();
+        FileTables::seed();
+
+        $this->assertSame([
+            '-- Once the view serves listings, a filter on each attribute runs here:',
+            '-- created_at: the view',
+            '-- updated_at: the view',
+            '-- deleted_at: the view',
+            '-- title: the view',
+            '-- company_id: the view',
+            '-- price: the stored column jobs.price_cents',
+            '-- status: the stored column jobs.lifecycle_status',
+            '-- street: the view, reached through plain joins, so an index on places can serve it',
+            '-- city: the view, reached through plain joins, so an index on places can serve it',
+            '-- latitude: the view, reached through plain joins, so an index on job_sites can serve it',
+        ], $planned);
+        $this->assertSame([
+            '-- Once the view serves listings, a filter on each attribute runs here:',
+            '-- title: the view',
+            '-- latitude: a rebuilt expression over jobs',
+        ], $expression);
+        $this->assertSame([
+            '-- street: the view, reached through a lateral join on places, so no index on places serves it',
+            '-- city: the view, reached through a lateral join on places, so no index on places serves it',
+        ], array_slice($unbounded, 8, 2));
+        $this->assertContains('-- mime_type: no SQL filter, because computedAs() computes it in PHP', $filters(Photo::class));
+        $this->assertSame(0, Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'prepare', 'model' => Listing::class],
+        ));
+        $this->assertStringNotContainsString('a filter on each attribute', Artisan::output());
+    }
+
+    #[Test]
     public function it_prints_the_view_update_replaces_from_the_retained_table_and_its_root(): void
     {
         FileTables::create();

@@ -213,8 +213,8 @@ final class StatementsTest extends TestCase
               "updated_at" = CAST(("jobs"."updated_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone),
               "deleted_at" = CAST(("jobs"."deleted_at" AT TIME ZONE 'UTC') AS timestamp(0) without time zone)
             FROM "jobs"
-            LEFT JOIN LATERAL (SELECT * FROM "places" WHERE "places"."job_id" = "jobs"."id" AND ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL ORDER BY "id" asc LIMIT 1) AS "places" ON true
-            LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true
+            LEFT JOIN (SELECT * FROM "places" WHERE ("places"."parent_id" is null) AND "places"."deleted_at" IS NULL) AS "places" ON "places"."job_id" = "jobs"."id"
+            LEFT JOIN "job_sites" ON "job_sites"."job_id" = "jobs"."id"
             WHERE "jobs"."id" = "listings_retained"."job_id"
             SQL,
             <<<'SQL'
