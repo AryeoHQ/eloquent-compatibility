@@ -15,6 +15,8 @@ use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 
 /**
+ * @internal
+ *
  * @phpstan-type Reference array{operation: string, classes: list<string>, line: int}
  *
  * @implements Collector<MethodCall, Reference>

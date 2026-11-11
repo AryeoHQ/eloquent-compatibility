@@ -28,6 +28,9 @@ use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class RetainedRows
 {
     /** @var null|WeakMap<ServedModels, array<class-string<Model>, list<class-string<Model>>>> */

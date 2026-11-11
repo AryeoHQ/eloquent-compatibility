@@ -17,6 +17,9 @@ use Support\Database\Eloquent\Compatibility\Console\Status;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 
+/**
+ * @internal
+ */
 class Provider extends ServiceProvider
 {
     private const array WITHOUT_CACHE = ['optimize', 'optimize:clear', 'compatibility:cache', 'compatibility:clear', 'package:discover'];

@@ -22,6 +22,9 @@ use Support\Database\Eloquent\Compatibility\Write\Outcome;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
+/**
+ * @internal
+ */
 final readonly class Installer
 {
     public const int PASSES = 5;

@@ -17,6 +17,8 @@ use Illuminate\Support\Str;
 use PHPUnit\Exception as PHPUnitException;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\ExpectationFailedException;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
@@ -25,7 +27,10 @@ use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Tests\Fixtures\Support\Discovery\InheritedServed;
 use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
@@ -54,6 +59,7 @@ final class AssertsServedCompatibilityTest extends TestCase
     protected function tearDown(): void
     {
         ListingTables::drop();
+        FileTables::drop();
         PlaceAssetTables::drop();
         DB::statement('drop table if exists place_overlaps');
 
@@ -168,6 +174,43 @@ final class AssertsServedCompatibilityTest extends TestCase
                 },
             ),
         );
+    }
+
+    #[Test]
+    public function it_fails_and_names_the_exception_when_the_native_create_fails(): void
+    {
+        $this->install();
+
+        $this->assertSame(
+            'nativeCreate fails to create a Job natively: '.RuntimeException::class.': The company is closed.',
+            $this->failureOf(
+                model: Listing::class,
+                nativeCreate: fn () => throw new RuntimeException('The company is closed.'),
+            ),
+        );
+    }
+
+    #[Test]
+    public function it_fails_when_a_shared_successor_serves_a_record_of_a_sibling_map(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::update('update legacy_files_retained set file_id = (select file_id from photos_retained where id = 1) where id = 1');
+
+        try {
+            $this->assertServesCompatibility(
+                model: Photo::class,
+                nativeCreate: fn () => File::query()->create(['filename' => 'birch.jpg', 'mime_type' => 'image/jpeg']),
+            );
+        } catch (ExpectationFailedException $failure) {
+            $this->assertStringStartsWith('compatibility:check finds a membership drift in photos.', $failure->getMessage());
+            $this->assertSame(['photos#1: its files row also serves a LegacyFile record, so one shared successor serves two legacy records'], $failure->getComparisonFailure()?->getActual());
+
+            return;
+        }
+
+        $this->fail('assertServesCompatibility('.Photo::class.') passed.');
     }
 
     #[Test]

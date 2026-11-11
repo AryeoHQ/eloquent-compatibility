@@ -87,6 +87,10 @@ final class InstallerTest extends TestCase
             $this->concurrent = null;
         }
 
+        if ($this->connectionsToTransact !== []) {
+            DB::rollBack(0);
+        }
+
         ListingTables::drop();
         FileTables::drop();
 
@@ -1129,6 +1133,46 @@ final class InstallerTest extends TestCase
             );
             Compatibility::rollback(Listing::class);
         });
+
+        $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    #[Test]
+    public function it_installs_a_served_model_inside_the_transaction_refresh_database_opens(): void
+    {
+        $this->connectionsToTransact = [DB::getDefaultConnection()];
+        $this->beginDatabaseTransaction();
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(1, DB::transactionLevel());
+        $this->assertSame(['v', 'r'], [$this->kind('listings'), $this->kind('listings_retained')]);
+        $this->assertSame(['Oak House', 'Elm Cottage'], Listing::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_refuses_inside_a_caller_s_transaction_once_a_pass_left_a_watermark(): void
+    {
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertSuccessful();
+        DB::beginTransaction();
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('Compatibility::install() ran inside a caller\'s transaction after a pass left a watermark.');
+        } catch (LogicException $exception) {
+            $this->assertSame('Compatibility::install() catches up listings in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.', $exception->getMessage());
+        } finally {
+            DB::rollBack();
+        }
 
         $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
     }

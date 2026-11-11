@@ -62,6 +62,9 @@ final class Compatibility
     /** @var array<class-string, string> */
     private array $withoutForwarding = [];
 
+    /**
+     * @internal
+     */
     public function __construct(string $model)
     {
         if (! is_subclass_of($model, Model::class)) {
@@ -72,6 +75,9 @@ final class Compatibility
         $this->map = (new $model)->getTable();
     }
 
+    /**
+     * @internal
+     */
     public static function of(string $model): self
     {
         $compatibility = new self($model);
@@ -321,6 +327,8 @@ final class Compatibility
     }
 
     /**
+     * @internal
+     *
      * @return list<class-string<Model>>
      */
     public function successors(): array
@@ -343,6 +351,9 @@ final class Compatibility
         return $models;
     }
 
+    /**
+     * @internal
+     */
     public function resolve(): ResolvedMap
     {
         return new ResolvedMap(
@@ -361,6 +372,9 @@ final class Compatibility
         );
     }
 
+    /**
+     * @internal
+     */
     public static function connection(ResolvedMap $map): ConnectionInterface
     {
         $legacy = new $map->model;

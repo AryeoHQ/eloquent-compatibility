@@ -16,6 +16,9 @@ use Support\Database\Eloquent\Compatibility\Contracts\ScopesWrites;
 use Support\Database\Eloquent\Compatibility\Definition\Conversions\Fixed;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
+/**
+ * @internal
+ */
 final readonly class ResolvedMap
 {
     public Successor $primary;

@@ -6,6 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use BackedEnum;
 
+/**
+ * @internal
+ */
 final readonly class OrDefault implements Conversion
 {
     private const array INTEGER_LIMITS = ['smallint' => '32768', 'int2' => '32768', 'integer' => '2147483648', 'int' => '2147483648', 'int4' => '2147483648', 'bigint' => '9223372036854775808', 'int8' => '9223372036854775808'];

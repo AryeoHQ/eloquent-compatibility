@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
+/**
+ * @internal
+ */
 final class InvalidCompatibilityMap extends CompatibilityException
 {
     public static function because(string $map, string $problem): self

@@ -13,6 +13,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 
+/**
+ * @internal
+ */
 final class Ledger
 {
     public const int FIRST_KEYS = 5;

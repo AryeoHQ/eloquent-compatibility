@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Console;
 
+/**
+ * @internal
+ */
 enum DriftCheck: string
 {
     case NoPrimary = 'no primary';

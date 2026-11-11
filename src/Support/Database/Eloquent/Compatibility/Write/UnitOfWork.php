@@ -28,6 +28,9 @@ use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
+/**
+ * @internal
+ */
 final readonly class UnitOfWork
 {
     public const int CHUNK = 1000;

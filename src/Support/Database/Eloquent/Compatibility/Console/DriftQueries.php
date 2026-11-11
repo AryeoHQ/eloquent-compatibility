@@ -23,6 +23,9 @@ use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
 use Support\Database\Eloquent\Compatibility\Write\RoundTrip;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
+/**
+ * @internal
+ */
 final readonly class DriftQueries
 {
     private const int CHUNK = 1000;

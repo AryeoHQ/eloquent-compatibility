@@ -6,6 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
 
+/**
+ * @internal
+ */
 final class ColumnCatalog
 {
     /** @var array<string, array<string, Column>> */

@@ -15,6 +15,9 @@ use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
+/**
+ * @internal
+ */
 final readonly class Statements
 {
     private const string CAPTURED = 'compatibility install';

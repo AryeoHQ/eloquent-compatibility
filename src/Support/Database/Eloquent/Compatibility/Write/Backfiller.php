@@ -22,6 +22,9 @@ use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Throwable;
 
+/**
+ * @internal
+ */
 final class Backfiller
 {
     public const int CHUNK = 1000;

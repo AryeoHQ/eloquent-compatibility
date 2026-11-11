@@ -25,6 +25,9 @@ use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 
+/**
+ * @internal
+ */
 final class LegacyQueryBuilder extends QueryBuilder
 {
     private bool $native = false;

@@ -27,6 +27,8 @@ final class Successor
     private null|Closure $when = null;
 
     /**
+     * @internal
+     *
      * @param  class-string<Model>  $model
      */
     public function __construct(private readonly string $map, public readonly string $model)
@@ -118,6 +120,8 @@ final class Successor
     }
 
     /**
+     * @internal
+     *
      * @return array<string, Attribute>
      */
     public function attributes(): array
@@ -126,6 +130,8 @@ final class Successor
     }
 
     /**
+     * @internal
+     *
      * @return list<Related>
      */
     public function relations(): array
@@ -133,16 +139,25 @@ final class Successor
         return $this->related;
     }
 
+    /**
+     * @internal
+     */
     public function morph(): null|RelatedMorph
     {
         return $this->morph;
     }
 
+    /**
+     * @internal
+     */
     public function atMostOneBecause(): null|string
     {
         return $this->atMostOne;
     }
 
+    /**
+     * @internal
+     */
     public function membershipScope(): null|Closure
     {
         return $this->when;

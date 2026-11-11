@@ -28,6 +28,9 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use TypeError;
 
+/**
+ * @internal
+ */
 final readonly class Related
 {
     /**

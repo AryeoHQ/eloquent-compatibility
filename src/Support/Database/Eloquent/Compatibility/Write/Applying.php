@@ -11,6 +11,9 @@ use Illuminate\Events\NullDispatcher;
 use ReflectionProperty;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class Applying
 {
     /** @var null|WeakMap<Model, Model> */

@@ -8,6 +8,9 @@ use BackedEnum;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
+/**
+ * @internal
+ */
 final readonly class Fixed implements Conversion
 {
     public null|bool|int|float|string $value;

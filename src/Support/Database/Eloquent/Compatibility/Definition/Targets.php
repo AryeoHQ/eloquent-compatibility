@@ -16,6 +16,8 @@ final class Targets
     private function __construct(private readonly string $map) {}
 
     /**
+     * @internal
+     *
      * @param  Closure(self): mixed  $targets
      * @return non-empty-array<class-string<Model>, Successor>
      */

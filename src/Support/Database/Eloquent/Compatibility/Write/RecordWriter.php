@@ -17,6 +17,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
+/**
+ * @internal
+ */
 final readonly class RecordWriter
 {
     private UnitOfWork $unit;

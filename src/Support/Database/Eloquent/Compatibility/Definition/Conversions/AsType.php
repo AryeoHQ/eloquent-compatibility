@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
+/**
+ * @internal
+ */
 final readonly class AsType implements Conversion
 {
     public function __construct(public string $type) {}

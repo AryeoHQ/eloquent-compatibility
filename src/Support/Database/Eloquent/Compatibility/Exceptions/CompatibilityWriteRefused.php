@@ -10,6 +10,9 @@ use Stringable;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Throwable;
 
+/**
+ * @internal
+ */
 final class CompatibilityWriteRefused extends CompatibilityException
 {
     public function __construct(public readonly string $refused, public readonly string $because, public readonly string $instead, null|Throwable $previous = null)

@@ -23,6 +23,7 @@ use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
+use Throwable;
 
 trait AssertsServedCompatibility
 {
@@ -102,7 +103,11 @@ trait AssertsServedCompatibility
                 }
             }
 
-            $root = $nativeCreate();
+            try {
+                $root = $nativeCreate();
+            } catch (Throwable $exception) {
+                Assert::fail('nativeCreate fails to create a '.class_basename($map->primary->model).' natively: '.$exception::class.": {$exception->getMessage()}");
+            }
 
             Assert::assertInstanceOf($map->primary->model, $root, "nativeCreate creates no {$map->primary->model} to serve as the root of a new {$model}; return the root it creates.");
             Assert::assertTrue($root->exists, "nativeCreate returns a {$map->primary->model} it never saved.");

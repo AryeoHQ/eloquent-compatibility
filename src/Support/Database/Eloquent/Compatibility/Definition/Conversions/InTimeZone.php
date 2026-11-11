@@ -10,6 +10,9 @@ use DateTimeZone;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
+/**
+ * @internal
+ */
 final readonly class InTimeZone implements Conversion
 {
     public function __construct(public string $zone) {}

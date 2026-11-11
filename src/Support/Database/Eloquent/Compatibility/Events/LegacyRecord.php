@@ -17,6 +17,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Applying;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 
+/**
+ * @internal
+ */
 final class LegacyRecord
 {
     private const string WRITTEN = 'compatibility:written';

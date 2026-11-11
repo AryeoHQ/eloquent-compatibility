@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
+/**
+ * @internal
+ */
 interface Conversion
 {
     public function read(string $stored): string;

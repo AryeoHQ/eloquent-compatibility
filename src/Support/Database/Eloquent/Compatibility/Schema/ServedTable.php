@@ -14,6 +14,9 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class ServedTable
 {
     private const array VIEW_WRITE_STATES = ['55000', '42809', '42703'];

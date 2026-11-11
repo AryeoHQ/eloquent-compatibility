@@ -12,6 +12,8 @@ use Tooling\PhpStan\Rules\Rule;
 use Tooling\Rules\Attributes\NodeType;
 
 /**
+ * @internal
+ *
  * @phpstan-type Declared array{root: bool, operations: array<string, true>, relates: array<string, true>, delegates: array<string, true>}
  *
  * @extends Rule<CollectedDataNode>

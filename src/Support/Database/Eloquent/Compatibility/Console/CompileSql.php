@@ -19,6 +19,9 @@ use Support\Database\Eloquent\Compatibility\Schema\Preparer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
+/**
+ * @internal
+ */
 final class CompileSql extends Command
 {
     protected $signature = 'compatibility:sql

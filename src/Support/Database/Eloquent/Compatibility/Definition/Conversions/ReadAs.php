@@ -6,6 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 
 use LogicException;
 
+/**
+ * @internal
+ */
 final readonly class ReadAs implements Conversion
 {
     public function __construct(public string $sql) {}

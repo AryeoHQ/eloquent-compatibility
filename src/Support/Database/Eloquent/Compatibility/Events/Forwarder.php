@@ -30,6 +30,9 @@ use Support\Database\Eloquent\Compatibility\Write\UnitOfWork;
 use Throwable;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class Forwarder
 {
     private const array PRIMARY = [

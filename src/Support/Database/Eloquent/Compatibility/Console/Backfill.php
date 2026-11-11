@@ -16,6 +16,9 @@ use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Outcome;
 use Support\Database\Eloquent\Compatibility\Write\Pass;
 
+/**
+ * @internal
+ */
 final class Backfill extends Command
 {
     protected $signature = 'compatibility:backfill
