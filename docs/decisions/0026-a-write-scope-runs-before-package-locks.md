@@ -15,12 +15,12 @@ The research proposed that the package depend on eloquent-concurrency's parent-l
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root, its retained row and the touched related rows always comes inside the scope, last. The touched related rows are every related successor the map declares under the root, because an operation names the successors it writes only when it runs.
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched successors with an unlocked read, calls the scope with their keys, and locks inside it. Right after its locks, it checks that the locked keys equal the keys the scope received. A difference refuses with the retryable error `Exceptions\SuccessorsMoved`, the type the application's outermost transaction retries on.
-- The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point. Install keeps its own retries.
+- The package retries nothing inside its writers, with one exception: a pass retries a row once after a lock timeout or a deadlock ([Lifecycle: a pass](../specification/lifecycle.md#a-pass)). The application's outermost transaction is the retry point. Install keeps its own retries.
 - This amends the earlier design, which gave the mass write alone a re-check and a retry of its own. A related key can move between the unlocked read and the lock on any path. The package would then lock a row the scope never ordered.
 - Install's final catch-up pass and rollback's refill call no scope and run no key re-check. Their table lock serializes them against live writes. Rollback waits for in-flight writes to commit, so its refill reads only committed successors. A scope there would deadlock with a live write that holds its scope lock and reads through the view. This amends the earlier design, which called the scope on every path, including these two.
-- The package targets eloquent-concurrency 0.1.0 and the eloquent-ordering release after #13, never the 0.0.x triggers.
+- The package targets eloquent-concurrency 0.1.0, never the 0.0.x triggers. Once [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14) ships, it targets the eloquent-ordering release that carries #14.
 
-Declined: a dependency on eloquent-concurrency, and a lock order taken from eloquent-ordering. The package requires eloquent-ordering for position() only. The write scope still sets the lock order.
+Declined: a dependency on eloquent-concurrency, and a lock order taken from eloquent-ordering. Once eloquent-ordering#14 ships, the package requires eloquent-ordering for position() only. Until then it does not require eloquent-ordering ([Status](../specification/README.md#status)). The write scope still sets the lock order.
 
 ## Consequences
 

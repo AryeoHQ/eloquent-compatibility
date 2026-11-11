@@ -24,7 +24,7 @@ The legacy model is the source of truth until install. The successor is the sour
 
 This is documented, not enforced, because Aryeo's v2 writes Jobs live before install. `compatibility:check` reports each served value that disagrees with its legacy value, which shows what the next pass would overwrite. It compares no attribute that [Operations: what the comparisons skip](operations.md#what-the-comparisons-skip) names, so an empty report says nothing about those attributes.
 
-`compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` only when it creates a legacy row, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
+`compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` on every native create of a served root class, before and after install, and at install's insert of retained rows for natively created roots. It never evaluates `when()` to decide what an existing legacy row serves, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
 
 After install, `compatibility:check` reports each member root that no retained row names. A query-builder insert into the root table bypasses `Provides\CarriesLegacy`, so the view serves no record for that root ([The writer boundary](#the-writer-boundary)). The check excludes a root that a `deleted` ledger row names, because its legacy row is gone, and a pass recorded the deletion.
 
@@ -79,7 +79,7 @@ The ledger records one outcome per legacy row:
 | `created` | the pass created the row's successors |
 | `updated` | the pass changed at least one successor |
 | `unchanged` | every successor already served the legacy values |
-| `refused` | an operation or initializer refused the row, or the package refused the write with a `CompatibilityWriteRefused`, with its reason |
+| `refused` | an operation or initializer refused the row, or the package refused the write with a `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved`, with its reason |
 | `failed` | the row's write raised another error, recorded as the reason |
 | `deleted` | the legacy row is gone, and the pass deleted its successor |
 
@@ -152,7 +152,7 @@ The package has no partial install. A legacy row without a successor cannot be s
 
 ## Install
 
-Install runs in one transaction ([0024](../decisions/0024-install-is-one-transaction.md)).
+Install's locked phase runs in one transaction ([0024](../decisions/0024-install-is-one-transaction.md)), and a refusal under the lock commits nothing from it. The work before the lock commits as a pass does ([The backfill](#the-backfill)). A later refusal keeps that work, so a retry starts from the state it left.
 
 ### Before the lock
 
@@ -196,7 +196,7 @@ After install, a `position()` attribute reads the successor's position, not the 
 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
-- Positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
+- Positions restart in each parent. Photos are the exception: they number across the listing, ordered by subsection, then within it. Record [0032](../decisions/0032-photos-number-across-the-listing.md) supersedes the per-subsection sequence for photos.
 
 A legacy `orderBy('index')` across two parents therefore returns the positions 1, 1, 2 and 2, because it sorts by the position expression ([The map: reads are projections](the-map.md#reads-are-projections)).
 

@@ -245,7 +245,7 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. On a live write after install, its default operation moves the successor with `Placement::at()`, because the legacy value is then a served position. On a backfill row and a catch-up row, the default operation re-sequences the successor's parent in legacy order.
 
-Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor.
+Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor. Photos read their position across the listing instead, and a v1 write moves a photo within its own subsection ([0032](../decisions/0032-photos-number-across-the-listing.md)).
 
 The re-sequence runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. At step 3, Assign, the default operation queues an `afterSave()` action and assigns nothing. At step 5, Act, the parent is set, because step 4 saved the root and `successorsInitializedBy()` has run. The action then reads the successor's parent, and re-sequences it:
 
@@ -270,7 +270,7 @@ The re-sequence walks eloquent-ordering's `(parent, rank_key)` index and the leg
 
 eloquent-ordering ships `Placement::after()` and `Placement::before()` today. `Placement::at()` and the published parent key columns remain requests in https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 
-Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Such a caller reads `readAs()` with an operation instead.
+Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Record [0032](../decisions/0032-photos-number-across-the-listing.md) supersedes this for photos, and declines `readAs()` with an operation for them.
 
 A trashed record has no position. The default operation does nothing on a trashed record, and the re-sequence takes only current members. The round trip and install's value proof skip a `position()` attribute on a trashed row. After install, a trashed row reads a NULL position.
 
@@ -317,7 +317,7 @@ The reverse direction. An application creates a successor natively, and the succ
 
 The trait sees only a model insert. A query-builder insert into the root table (`Job::query()->insert()`, `upsert()`, `insertUsing()`, `DB::table('jobs')`) and an insert through another class over the root table that is not a subclass of the map's root insert no legacy row, so the view does not serve that root. [Lifecycle: the writer boundary](lifecycle.md#the-writer-boundary) lists these writers.
 
-`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Map compilation reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
+`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Registration reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
 
@@ -374,6 +374,6 @@ final class ListingWriteScope implements ScopesWrites
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
 - A difference refuses with the retryable error `Exceptions\SuccessorsMoved`, which extends `Exceptions\CompatibilityException`. It is the type the application's outermost transaction retries on. On a live write, the caller receives the error, and the outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
-- The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
+- The package retries nothing inside its writers, with one exception: a pass retries a row once after a lock timeout or a deadlock ([Lifecycle: a pass](lifecycle.md#a-pass)). The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.

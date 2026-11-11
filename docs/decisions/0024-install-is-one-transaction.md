@@ -8,7 +8,7 @@ Under the lock, install scanned whole tables to prove its invariants. `lock_time
 
 ## Decision
 
-With legacy identity on the legacy table, install needs no foreign key repointing, no generated column, no install-time key and no step after the commit. It runs in one transaction.
+With legacy identity on the legacy table, install needs no foreign key repointing, no generated column, no install-time key and no step after the commit. Its locked phase runs in one transaction.
 
 - Before the lock, install runs passes until one changes the outcome of fewer rows than its pass size. A row walked and left as it was does not count, so a pass that changes no row always stops the loop, and the gate then refuses on refused or failed rows. This amends the earlier design, which counted the rows a pass walked, so that NULL timestamps and refused rows kept install from its proofs. Install then records the start time of its read of native roots. It reads the keys of member roots without a legacy row through the indexed anti-join on the successor key, excluding a root that a `deleted` ledger row names. It writes nothing for them, and reports their count.
 - Whole-table proofs, of existence and of values, run before the lock. They read only. The existence proof checks that every non-NULL successor key names an existing root row, whatever the row's ledger state. It reads the root's table without global scopes, so a trashed root exists. Install catches up the keys the existence proof and the value proof flag, proves them again, and refuses only when they still fail. This amends the earlier design, which refused on any difference. Declined: refusing on the first difference, which blocks install forever on a write that leaves `updated_at` alone.
@@ -25,7 +25,7 @@ Declined: package-managed rebinding of dependent views, until a second adopter n
 
 ## Consequences
 
-- A failed install commits nothing, so a retry starts from the same state. Inside a caller's transaction, a refusal loses nothing, because the next install flags the same keys again.
+- A refusal under the lock commits nothing from the locked phase. The passes, the catch-up of flagged keys and the deletions before the lock commit as a pass does: each chunk, or each row for a scoped map ([0023](0023-the-backfill-records-an-outcome-per-row.md)). A later refusal keeps them. A retry therefore starts from the state those passes left. Inside a caller's transaction, a refusal loses nothing, because the next install flags the same keys again.
 - Install deletes no ledger row, so the time it holds its locks does not grow with the ledger.
 - Legacy readers do not see a successor created natively before install until install inserts its retained row. No pass walks that row, and install's pause grows with the number of such roots, inside the statement timeout.
 - The time install holds its locks does not grow with the legacy table's size. It grows with the final pass and with the number of native roots, and the budget caps it.
