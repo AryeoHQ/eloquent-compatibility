@@ -14,7 +14,46 @@ $external = [
     'Model' => Illuminate\Database\Eloquent\Model::class,
     'QueryException' => Illuminate\Database\QueryException::class,
     'QueryExecuted' => Illuminate\Database\Events\QueryExecuted::class,
+    'BelongsTo' => Illuminate\Database\Eloquent\Relations\BelongsTo::class,
+    'DateTimeInterface' => DateTimeInterface::class,
+    'HasOne' => Illuminate\Database\Eloquent\Relations\HasOne::class,
+    'MorphTo' => Illuminate\Database\Eloquent\Relations\MorphTo::class,
+    'RefreshDatabase' => Illuminate\Foundation\Testing\RefreshDatabase::class,
+    'ShouldQueue' => Illuminate\Contracts\Queue\ShouldQueue::class,
+    'SoftDeletes' => Illuminate\Database\Eloquent\SoftDeletes::class,
 ];
+$illustrative = 'an illustrative Aryeo name from the worked examples';
+$ordering = 'eloquent-ordering, which the package requires from M5b, decision 43';
+$removed = 'a removed name the specification cites on purpose';
+$unresolved = [
+    '\\Compatibility' => 'a namespace suffix, not a class',
+    'App\\Entities\\Listings\\Compatibility' => $illustrative,
+    'App\\Entities\\Listings\\Listing' => $illustrative,
+    'ChangeListingAddress' => $illustrative,
+    'InitializeFloorPlanAsset' => $illustrative,
+    'InitializeLegacyFloorPlan' => $illustrative,
+    'InitializeLegacyPhoto' => $illustrative,
+    'InitializeListingJob' => $illustrative,
+    'Listing::makeUuid()' => $illustrative,
+    'ListingDependents' => $illustrative,
+    'ListingMap' => $illustrative,
+    'ListingWriteScope' => $illustrative,
+    'MediaWriteScope' => $illustrative,
+    'PlaceAsset::factory()' => $illustrative,
+    'PublishOrDraftJob' => $illustrative,
+    'SetDownloadsPermission' => $illustrative,
+    'WriteDisplayType' => $illustrative,
+    'DB::table()' => 'a facade method, which reflection cannot see',
+    'IsOrdered' => $ordering,
+    'OrderedParents::lockFirst()' => 'stands for a routine eloquent-ordering must publish, M5b, decision 43',
+    'Placement::after()' => $ordering,
+    'Placement::at()' => $ordering,
+    'Placement::before()' => $ordering,
+    'Compatibility::state()' => $removed,
+    'Compatibility::uninstall()' => $removed,
+    'Definition\\Successors' => $removed,
+];
+$allowlisted = [];
 
 $exists = fn (string $class): bool => class_exists($class) || interface_exists($class) || trait_exists($class);
 
@@ -173,14 +212,26 @@ foreach ($documents as $document) {
                 $names++;
                 $label = $member === null ? $name : $name.'::'.$member.($called ? '()' : '');
 
+                $allowed = array_key_exists($label, $unresolved);
+
+                if ($allowed) {
+                    $allowlisted[$label] = true;
+                }
+
                 try {
                     $class = $resolve($name);
 
                     if ($member !== null) {
                         $checkMember($class, $member, $called);
                     }
+
+                    if ($allowed) {
+                        $problems[] = $at."`{$label}` now resolves, so the unresolved allowlist in bin/check-doc-names.php must drop it";
+                    }
                 } catch (UnexpectedValueException $e) {
-                    $problems[] = $at."`{$label}` ".$e->getMessage();
+                    if (! $allowed) {
+                        $problems[] = $at."`{$label}` ".$e->getMessage();
+                    }
                 }
             }
         }
@@ -205,16 +256,21 @@ foreach ($documents as $document) {
     }
 }
 
+foreach (array_diff_key($unresolved, $allowlisted) as $label => $reason) {
+    $problems[] = "bin/check-doc-names.php: the unresolved allowlist lists `{$label}` ({$reason}), which no checked document names";
+}
+
 foreach ($problems as $problem) {
     fwrite(STDERR, $problem.PHP_EOL);
 }
 
 fwrite($problems === [] ? STDOUT : STDERR, sprintf(
-    '%d %s in %d documents: %d names, %d relative links and %d invariant references checked. %d proposed %s skipped.'.PHP_EOL,
+    '%d %s in %d documents: %d names, %d allowlist entries, %d relative links and %d invariant references checked. %d proposed %s skipped.'.PHP_EOL,
     count($problems),
     count($problems) === 1 ? 'problem' : 'problems',
     count($documents) - $proposed,
     $names,
+    count($allowlisted),
     $links,
     $invariants,
     $proposed,

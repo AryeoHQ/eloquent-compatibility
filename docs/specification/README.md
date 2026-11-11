@@ -1,14 +1,14 @@
-Status: Proposed
+Status: Accepted
 
 # Interface specification
 
-This specification states the public interface of the redesigned package, before any of its code exists. Every later change is checked against it. The design comes from the planning session of 2026-11-04, after two Aryeo teams adopted the package for `Listing` and for the media models.
+This specification states the public interface of the redesigned package. It was written before the code, and the shipped code now implements it. Every later change is checked against it. The design comes from the planning session of 2026-11-04, after two Aryeo teams adopted the package for `Listing` and for the media models.
 
 ## Status
 
-`Status: Proposed` means that the code does not implement this design yet. `bin/check-doc-names.php` skips every document whose first non-empty line is `Status: Proposed`. These pages can therefore name classes and methods that do not exist yet, such as `Compatibility::rollback()` and `Contracts\WritesAttribute`.
+`Status: Accepted` means that the shipped code implements this design, except for the positions below. `bin/check-doc-names.php` verifies each class name and each class member name in an inline code span outside a fenced block. A span that names a removed name, an illustrative Aryeo class, or a class of a package this one does not require yet sits on the checker's unresolved allowlist, with its reason. The checker fails when an allowlisted name starts to resolve, and when no page names it any more.
 
-The last implementation change flips every page to `Status: Accepted`. From then on, the checker verifies the class names and `Class::member` names in inline code spans outside fenced blocks. The flip to Accepted must reword or allowlist each span that names a removed or external symbol.
+Positions land in a later milestone, M5b. They need eloquent-ordering to publish `Placement::at()`, its position expression and its parent key columns (https://github.com/AryeoHQ/eloquent-ordering/issues/14). Until then, the package ships no `position()` and does not require eloquent-ordering, so a map cannot declare an ordered attribute. Aryeo's FloorPlan `index` therefore cannot install until M5b. The pages keep the positions design: [the map](the-map.md#reads-are-projections), [Operations: positions](operations.md#positions), [Lifecycle: positions](lifecycle.md#positions) and the floor plan example's `index`.
 
 ## Deviations
 
@@ -82,7 +82,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No conflict detection and no provenance.** Catch-up overwrites native edits to mapped columns before install. This is documented, not enforced.
 - **No set-based successor writes.** Mass writes and the backfill run once per record.
 - **No identity table.** Per-successor identity tables, a shared identity table, the exclusive arc and a surrogate key are all declined.
-- **No dependency on eloquent-concurrency.** The package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
+- **No dependency on eloquent-concurrency.** From M5b, the package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
 - **No retries inside the package's writers.** The application's outermost transaction is the retry point. Install keeps its own retries.
 - **No public `Compatibility::state()`.** `compatibility:status` and idempotent operations cover its uses.
 - **No package-managed rebinding of dependent views,** until a second adopter needs plain rebinds.

@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # Listing example
 

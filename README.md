@@ -2,11 +2,13 @@
 Serve a previous Eloquent model from its current models, inside the application
 
 ## Status
-The package is under redesign. This release serves a legacy model's reads through a read-only view over its successors. A legacy model declares its map, and `Compatibility::prepare()` and `Compatibility::install()` replace its table with the view. `php artisan compatibility:sql` prints the SQL each operation runs. Each write through the legacy model runs as one unit of work: every changed attribute runs its operation, the package saves each changed successor once through its model, and the record must read back what was written.
+This release implements the design that the [interface specification](docs/specification/README.md) states. Positions are the one exception: `position()` waits on [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14). The [public surface](docs/specification/public-surface.md) lists what a consumer may use.
 
-The new design writes compatibly in the application, and the database holds no function for it. Later releases add it one part at a time.
+A legacy model declares a map: the successors it is served from, how the view reads each attribute, and the class that writes each attribute. `Compatibility::prepare()` adds the package's storage, and `php artisan compatibility:backfill` writes each legacy row's successors. Until install, the legacy table stays the source of truth. `Compatibility::install()` then replaces the legacy table with a read-only view, in one transaction. The view reads the retained table, which is the renamed legacy table, joined to its successors.
 
-A redesign of the public interface is specified, with the status Proposed, before any of its code ships. The [interface specification](docs/specification/README.md) states it, and a later 0.x minor release implements it.
+After install, each write through the legacy model runs as one unit of work. Every changed attribute runs its operation, the package saves each changed successor once through its model, and the record must read back what was written. The writes run in the application, and the database holds no trigger or function for them.
+
+`Compatibility::rollback()` reverses an install, and `Compatibility::retire()` drops the legacy storage once nothing reads it. `php artisan compatibility:sql` prints the SQL each operation runs, and `php artisan compatibility:status` prints each model's stage.
 
 ## Installation
 ```bash

@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # Lifecycle
 
@@ -114,6 +114,8 @@ Creating and linking related records is the consumer's work too. Examples are se
 Declined: related-record work in `successorsInitializedBy()`. It runs once at a root's birth, so it misses existing roots and later related rows. It also writes set-sized work row by row under the package's locks.
 
 ### Positions
+
+`position()` lands in M5b, and this release does not ship it ([Status](README.md#status)).
 
 A pass re-sequences a `position()` attribute's ordering parent on each backfill row and each catch-up row. The re-sequence runs in the default operation's `afterSave()` action, at step 5 of the unit of work, when the successor's eloquent-ordering parent is set. Its members are the parent's live legacy rows whose successors are current members: not trashed, and with a `rank_key`. It walks them in legacy order, the value with NULLs last, then the key. It moves each member that does not already follow its predecessor to just after it, so one sweep ends in legacy order. Native members keep their places. A trashed row is not placed, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the re-sequence.
 

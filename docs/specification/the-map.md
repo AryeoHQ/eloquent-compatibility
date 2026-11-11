@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # The map
 
@@ -42,7 +42,7 @@ Only the root has a successor key. A related successor is reached through the ro
 Each attribute declares how the view reads it, and nothing else about its storage. An attribute reads one successor column with `from()`, optionally through the package's conversions. Two helpers cover the common projections:
 
 - `orFrom(successor:, column:)` reads the attribute's column, or that related successor's column when the first is NULL. The class must be a successor the map relates, and the map refuses any other class when it compiles.
-- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. The attribute needs no `writtenBy()`, because its default operation places the row. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` sorts by the position expression, because `rank_key` values from two parents share no order. A query that pins one parent sorts by `rank_key` instead. A `where('index', N)` across parents compiles without a count per candidate row. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order. [Operations: positions](operations.md#positions) states the re-sequence.
+- `position()` reads the row's one-based position through eloquent-ordering's published position expression for the successor. Positions number within the successor's eloquent-ordering parent, not within a legacy parent. The attribute needs no `writtenBy()`, because its default operation places the row. The package compiles the read, so a filter on the attribute still runs as a rebuilt expression rather than on the view. A legacy `orderBy('index')` sorts by the position expression, because `rank_key` values from two parents share no order. A query that pins one parent sorts by `rank_key` instead. A `where('index', N)` across parents compiles without a count per candidate row. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order. [Operations: positions](operations.md#positions) states the re-sequence. `position()` lands in M5b, and this release does not ship it ([Status](README.md#status)).
 
 ```php
 ->attribute(name: 'created_at', definition: fn (Attribute $attribute) => $attribute->from('created_at')->inTimeZone('UTC'))
@@ -173,7 +173,7 @@ The package evaluates `when()` on every native create of a root class that a dis
 
 Membership must therefore be exclusive across the maps that share a root, and stable from creation. A root that two maps' `when()` both match gets a legacy row in each. A root that leaves its map's scope stays served by the legacy row it already has.
 
-For a root that several legacy models share, declare membership on an immutable discriminator column, such as Aryeo's `place_assets.legacy_type`. `successorsInitializedBy()` sets it for a root the package creates. A `Creating` listener on the successor sets it for a native create.
+For a root that several legacy models share, declare membership on an immutable discriminator column, such as Aryeo's `place_assets.legacy_type`. `successorsInitializedBy()` sets it for a root the package creates. A `creating` listener on the successor sets it for a native create.
 
 A change of membership after creation is a consumer reclassification: delete the record through one legacy model, then create it through the other. The package never reclassifies a record. `compatibility:check` reports a served record whose root no longer matches its map's `when()` ([Public surface: commands](public-surface.md#commands)).
 

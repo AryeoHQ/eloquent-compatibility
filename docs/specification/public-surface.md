@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # Public surface
 
@@ -73,7 +73,7 @@ Every method returns the `Compatibility` it was called on.
 | `from(string $column)` | the successor column the attribute reads |
 | `dividedBy()`, `multipliedBy()`, `mapping()`, `isNotNull()`, `orDefault()`, `asType()`, `inTimeZone()`, `fixed()` | the package's conversions, unchanged |
 | `orFrom(class-string<Model> $successor, string $column)` | reads `COALESCE(<the attribute's column>, <that related successor's column>)`; the map refuses a class it does not relate |
-| `position()` | reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order ([Operations: positions](operations.md#positions)) |
+| `position()` | lands in M5b ([Status](README.md#status)); reads the row's one-based position within the successor's eloquent-ordering parent, through eloquent-ordering's published position expression. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent in legacy order ([Operations: positions](operations.md#positions)) |
 | `readAs(string $sql)` | an SQL expression the view reads: the escape hatch for a projection the helpers do not cover; it names internal join aliases, where a helper names the successor by class |
 | `writtenBy(class-string<WritesAttribute> $operation)` | the attribute's operation |
 | `readOnly(string $because, bool $ignoreWrites)` | an attribute no write changes, and the reason; `$ignoreWrites` has no default: `false` refuses an update, and `true` discards the write and dispatches `Events\WriteIgnored` ([Operations: read-only attributes](operations.md#read-only-attributes)) |
@@ -148,7 +148,7 @@ The commands are public by name. Their classes are internal.
 - a membership query of `compatibility:check` finds a row: a served root outside its map's `when()`, or a shared successor that serves two legacy records, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.
 
-`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row catches an initializer that leaves the discriminator unset: the assertion's first install runs the full pass inside the test's transaction.
+`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row catches an initializer that leaves the discriminator unset: the assertion's first install runs the full pass inside the test's transaction.
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install, which no pass preceded, runs its full pass inside that transaction. A test that uses `RefreshDatabase` can therefore install a served model.
 

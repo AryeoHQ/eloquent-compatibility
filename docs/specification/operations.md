@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # Operations
 
@@ -8,10 +8,10 @@ Every write to a served legacy model becomes successor operations. The package r
 
 Each attribute has exactly one operation:
 
-- **`writtenBy(Operation::class)`.** The class's `write()` runs. It implements `Contracts\WritesAttribute`.
+- **`writtenBy()`.** The named class's `write()` runs. It implements `Contracts\WritesAttribute`.
 - **A default operation that assigns the inverse.** An attribute whose read the package can invert, such as `from()` with invertible conversions, assigns the inverse to its successor column.
 - **`readOnly(because:, ignoreWrites:)`.** With `ignoreWrites: false`, the default operation refuses on an update. On a create, it assigns the inverse, but only into a successor row this create creates. With `ignoreWrites: true`, it accepts and discards every write, and dispatches `Events\WriteIgnored` ([0027](../decisions/0027-the-view-is-driven-from-the-retained-table.md)). [Read-only attributes](#read-only-attributes) states both, and the rule for an attribute with no stored column.
-- **A `position()` attribute's default operation.** On a live write after install, it runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a backfill row and a catch-up row, it re-sequences the row's ordering parent in legacy order instead ([Positions](#positions)). On a trashed record, it does nothing.
+- **A `position()` attribute's default operation.** On a live write after install, it runs eloquent-ordering's `move(Placement::at($value), expected: null)` under the package's locks. A position outside the member range refuses. On a backfill row and a catch-up row, it re-sequences the row's ordering parent in legacy order instead ([Positions](#positions)). On a trashed record, it does nothing. `position()` lands in M5b, and this release does not ship it ([Status](README.md#status)).
 - **The default operations of Eloquent-managed columns.** The root's soft-delete column and a successor's updated-at column keep the record writer's current behavior. [Eloquent-managed columns](#eloquent-managed-columns) states them.
 
 An attribute with no inverse, such as a `readAs()` or `computedAs()` attribute, must declare `writtenBy()` or `readOnly()`. When it declares neither, the map refuses to compile it. Every write intent therefore maps to an operation that the map states.
@@ -239,6 +239,8 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 ## Positions
 
+`position()` lands in M5b, and this release does not ship it ([Status](README.md#status)).
+
 A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. On a live write after install, its default operation moves the successor with `Placement::at()`, because the legacy value is then a served position. On a backfill row and a catch-up row, the default operation re-sequences the successor's parent in legacy order.
 
 Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor.
@@ -317,7 +319,7 @@ The trait sees only a model insert. A query-builder insert into the root table (
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
 
-A native create on a root that several discovered maps share forwards its legacy events only to the legacy model whose `when()` admits the new row. The package raises that model's `saving` and `creating` after the successor's own `creating` event returns, and before the insert. `when()` therefore reads the values that every successor `saving` and `creating` listener set, including the `Creating` listener that sets a discriminator ([The map: membership](the-map.md#membership)). A legacy veto from either event stops the insert. `created` and `saved` follow the insert. A root that one map serves keeps the earlier order, in which the legacy `saving` and `creating` run ahead of the successor's own listeners.
+A native create on a root that several discovered maps share forwards its legacy events only to the legacy model whose `when()` admits the new row. The package raises that model's `saving` and `creating` after the successor's own `creating` event returns, and before the insert. `when()` therefore reads the values that every successor `saving` and `creating` listener set, including the `creating` listener that sets a discriminator ([The map: membership](the-map.md#membership)). A legacy veto from either event stops the insert. `created` and `saved` follow the insert. A root that one map serves keeps the earlier order, in which the legacy `saving` and `creating` run ahead of the successor's own listeners.
 
 On a shared root, a legacy `saving` listener therefore runs after the successor's `saving` and `creating` listeners, and no successor listener sees a change it makes. The package refuses that listener's change of a `computedAs()` attribute, because the attribute's operation reaches no successor `saving` listener.
 
