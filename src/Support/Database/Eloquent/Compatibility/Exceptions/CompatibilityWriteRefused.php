@@ -9,12 +9,16 @@ use Illuminate\Database\Eloquent\Model;
 use Stringable;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Throwable;
+use WeakMap;
 
 /**
  * @internal
  */
 final class CompatibilityWriteRefused extends CompatibilityException
 {
+    /** @var null|WeakMap<SuccessorsMoved, string> */
+    private static null|WeakMap $moved = null;
+
     public readonly string $reason;
 
     public function __construct(public readonly string $refused, public readonly string $because, public readonly string $instead, null|Throwable $previous = null, null|string $reason = null)
@@ -95,7 +99,26 @@ final class CompatibilityWriteRefused extends CompatibilityException
         ).(count($keys) > 10 ? ', and '.(count($keys) - 10).' more' : '').']';
         $counted = fn (array $keys): string => count($keys).(count($keys) === 1 ? ' key' : ' keys');
 
-        return new SuccessorsMoved("{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran. Why: The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.');
+        $refused = "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran';
+        $instead = 'Retry the write in a new transaction; the outermost transaction of the application is the retry point.';
+        $moved = new SuccessorsMoved(self::message(
+            refused: $refused,
+            because: 'The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered.',
+            instead: $instead,
+        ));
+        $reasons = self::$moved ??= new WeakMap;
+        $reasons[$moved] = self::message(
+            refused: $refused,
+            because: 'The package locked other keys than the write scope received, so it would write a row the scope never ordered.',
+            instead: $instead,
+        );
+
+        return $moved;
+    }
+
+    public static function movedReason(SuccessorsMoved $moved): string
+    {
+        return self::$moved[$moved] ?? $moved->getMessage();
     }
 
     /**
@@ -131,10 +154,36 @@ final class CompatibilityWriteRefused extends CompatibilityException
 
     public static function unstorable(string $model, string $attribute, string $because): self
     {
+        $refused = "{$model}::\${$attribute} cannot take a write";
+        $instead = 'Write a value its conversions can store, or write the stored column through the successor model.';
+
         return new self(
-            "{$model}::\${$attribute} cannot take a write",
-            $because,
-            'Write a value its conversions can store, or write the stored column through the successor model.',
+            refused: $refused,
+            because: $because,
+            instead: $instead,
+            reason: self::message(
+                refused: $refused,
+                because: "The conversions of {$attribute} cannot store the value written.",
+                instead: $instead,
+            ),
+        );
+    }
+
+    public static function unparsable(string $model, string $attribute, int|string $key, null|Throwable $previous = null): self
+    {
+        $because = "The backfill compares {$attribute} as jsonb, and its legacy value or the value its successors serve does not parse as JSON.";
+        $instead = "Store JSON or NULL in {$attribute}, on the legacy row and in its successors.";
+
+        return new self(
+            refused: "{$model} record {$key} cannot take this write of \${$attribute}",
+            because: $because,
+            instead: $instead,
+            previous: $previous,
+            reason: self::message(
+                refused: "{$model} records cannot take this write of \${$attribute}",
+                because: $because,
+                instead: $instead,
+            ),
         );
     }
 

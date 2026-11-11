@@ -101,7 +101,7 @@ final class StatementsTest extends TestCase
         $this->assertStringContainsString('DELETE FROM "compatibility_backfills" WHERE legacy_type = \'listings\'', $statements->transaction[count($statements->transaction) - 2]);
         $this->assertSame([
             ['listings', "SHARE UPDATE EXCLUSIVE from install's first statement, then SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit"],
-            ['jobs', "SHARE UPDATE EXCLUSIVE from install's first statement, then SHARE ROW EXCLUSIVE from the foreign key, install's last statement, until commit"],
+            ['jobs', "SHARE UPDATE EXCLUSIVE from install's first statement, then SHARE ROW EXCLUSIVE from the foreign key, install's last DDL statement, through the read and inserts of the roots created natively before it took the lock, until commit"],
             ['places', "SHARE UPDATE EXCLUSIVE from install's first statement until commit"],
             ['job_sites', "SHARE UPDATE EXCLUSIVE from install's first statement until commit"],
         ], $statements->locks);

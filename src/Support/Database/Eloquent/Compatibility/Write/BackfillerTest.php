@@ -670,7 +670,7 @@ final class BackfillerTest extends TestCase
 
         $this->assertSame([2, 1], [$pass->count(Outcome::Created), $pass->count(Outcome::Refused)]);
         $this->assertSame(2, DB::scalar('select count(*) from jobs'));
-        $this->assertStringContainsString("mapping() maps no stored value to 'Archived'", (string) DB::scalar('select reason from listings_backfill where legacy_id = 3'));
+        $this->assertStringEndsWith('::$status cannot take a write. Why: The conversions of status cannot store the value written. Instead: Write a value its conversions can store, or write the stored column through the successor model.', (string) DB::scalar('select reason from listings_backfill where legacy_id = 3'));
     }
 
     #[Test]

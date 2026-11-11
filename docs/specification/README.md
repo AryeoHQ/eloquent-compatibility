@@ -75,7 +75,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 | M6. No supported install-state check | [Public surface: operations](public-surface.md#operations) |
 | M7. Related and expression filters cannot use indexes | [Storage: the view](storage.md#the-view) and [Public surface: commands](public-surface.md#commands) |
 | M8. Identifiers of different widths cannot share a successor | [Storage: the retained table](storage.md#the-retained-table) |
-| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install). Writes to a shared successor through the other legacy models pause only for install's last statement, which adds the successor key's foreign key, plus its lock wait and the commit. That lock waits for every open writer of the successor's table, and install retries on a lock timeout or a deadlock ([Storage: the successor key](storage.md#the-successor-key)). A native create of a member root waits for the whole hold, because `Provides\CarriesLegacy` locks each legacy table whose `when()` the root matches |
+| M9. Install's write pause covers every model on a shared successor | [Lifecycle: install](lifecycle.md#install). Writes to a shared successor through the other legacy models pause only for install's last DDL statement, which adds the successor key's foreign key, plus its lock wait, the read and inserts of the member roots that committed during that wait, and the commit. That lock waits for every open writer of the successor's table, and install retries on a lock timeout or a deadlock ([Storage: the successor key](storage.md#the-successor-key)). A native create of a member root waits for the whole hold, because `Provides\CarriesLegacy` locks each legacy table whose `when()` the root matches |
 
 ## Not in this design
 
@@ -84,7 +84,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No set-based successor writes.** Mass writes and the backfill run once per record.
 - **No identity table.** Per-successor identity tables, a shared identity table, the exclusive arc and a surrogate key are all declined.
 - **No dependency on eloquent-concurrency.** Once [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14) ships, the package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
-- **No retries inside the package's writers.** The application's outermost transaction is the retry point. Install keeps its own retries, and a pass retries a row once after a lock timeout or a deadlock ([Lifecycle: a pass](lifecycle.md#a-pass)).
+- **No retries inside the package's live writers.** The application's outermost transaction is the retry point. Install keeps its own retries, and a pass retries a row once after a lock timeout or a deadlock ([Lifecycle: a pass](lifecycle.md#a-pass)).
 - **No public `Compatibility::state()`.** `compatibility:status` and idempotent operations cover its uses.
 - **No package-managed rebinding of dependent views,** until a second adopter needs plain rebinds.
 - **No declared row scope.** Per-row refusals name the rows a successor cannot represent.

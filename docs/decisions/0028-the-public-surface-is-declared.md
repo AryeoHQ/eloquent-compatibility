@@ -21,7 +21,7 @@ Everything is internal except:
 The documentation lists exactly that surface. Every parameter of a public constructor, function or method on it is public, named and stable. `serves()` on `Compatibility` is documented API, for transitional application code that bypasses the legacy model. It takes a class string, as every other operation does. Its answer can change around an install. It is stable only inside a transaction, and is never cached across requests.
 
 - Discovery lands Cory Rosenwald's fix in [#23](https://github.com/AryeoHQ/eloquent-compatibility/pull/23) (`b54ad80`), which classifies a classmap entry by its real path, with a test over an optimized classmap.
-- `install()` may run inside a caller's transaction when no catch-up is pending.
+- `install()` may run inside a caller's transaction when no catch-up is pending. Outside unit tests, a first install of a map that declares `writesWithin()` refuses there, and names `public $withinTransaction = false` ([Lifecycle: inside a caller's transaction](../specification/lifecycle.md#inside-a-callers-transaction)). This amends the earlier text, which named no exception.
 - The redesign ships as a new 0.x minor release, with no data migration, because no production install exists.
 - recompile() stays public under the new name update(). `compatibility:sql` and the testing assertion say update. Declined: keeping the name recompile().
 - `compatibility:sql` takes the operation as its first positional argument: `compatibility:sql {operation} {model}`, with the operation one of prepare, install, update, rollback and retire. Its `--for=` option is removed. Declined: keeping `--for=`.

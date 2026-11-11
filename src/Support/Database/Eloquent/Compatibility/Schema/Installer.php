@@ -34,7 +34,7 @@ final readonly class Installer
 
     public const int LOCK_TIMEOUT = 5000;
 
-    private const string CANCELED = '57014';
+    private const string RESCAN = 'the read of roots created natively before its foreign key took the lock';
 
     public function __construct(private ConnectionInterface $connection) {}
 
@@ -251,16 +251,36 @@ final readonly class Installer
                     }
 
                     $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
-                    $backfiller->finalPass(
-                        margin: $margin,
-                        before: fn (int|string $key) => self::refuseSpent(
+                    $writing = null;
+
+                    try {
+                        $backfiller->finalPass(
+                            margin: $margin,
+                            before: function (int|string $key) use ($map, $started, $budget, &$writing): void {
+                                $writing = "the final pass's write of {$map->table} ".(new $map->model)->getKeyName()." {$key}";
+                                self::refuseSpent(
+                                    map: $map,
+                                    started: $started,
+                                    budget: $budget,
+                                    moment: 'before',
+                                    statement: $writing,
+                                );
+                            },
+                        );
+                    } catch (QueryException $exception) {
+                        if ($writing === null || Backfiller::canceled($exception) === null) {
+                            throw $exception;
+                        }
+
+                        throw self::spent(
                             map: $map,
                             started: $started,
                             budget: $budget,
-                            moment: 'before',
-                            statement: "the final pass's write of {$map->table} ".(new $map->model)->getKeyName()." {$key}",
-                        ),
-                    );
+                            moment: 'during',
+                            statement: "{$writing}, at ".self::firstLine($exception->getSql()),
+                        );
+                    }
+
                     $ledger->refuseBlocked('install');
                     $this->apply(
                         statements: $install,
@@ -271,6 +291,13 @@ final readonly class Installer
                             moment: 'before',
                             statement: $statement,
                         ),
+                    );
+                    self::refuseSpent(
+                        map: $map,
+                        started: $started,
+                        budget: $budget,
+                        moment: 'before',
+                        statement: self::RESCAN,
                     );
                     $retained->carryNative(
                         keys: $retained->unserved(
@@ -290,7 +317,7 @@ final readonly class Installer
                         started: $started,
                         budget: $budget,
                         moment: 'after',
-                        statement: $install->transaction[array_key_last($install->transaction)],
+                        statement: self::RESCAN,
                     );
 
                     return true;
@@ -442,6 +469,7 @@ final readonly class Installer
             map: $map,
             operation: 'install',
             attempt: fn (): bool => $this->connection->transaction(function () use ($map, $budget, $install): bool {
+                $this->readCommitted();
                 $this->connection->statement("SET LOCAL lock_timeout = '".min(self::LOCK_TIMEOUT, max(1, intdiv(
                     num1: $budget,
                     num2: 2,
@@ -452,7 +480,7 @@ final readonly class Installer
                 try {
                     return $install($started);
                 } catch (QueryException $exception) {
-                    if ($exception->getCode() !== self::CANCELED) {
+                    if (Backfiller::canceled($exception) === null) {
                         throw $exception;
                     }
 
@@ -466,6 +494,24 @@ final readonly class Installer
                 }
             }),
         );
+    }
+
+    private function readCommitted(): void
+    {
+        if ($this->connection->transactionLevel() === 1) {
+            $this->connection->statement('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+
+            return;
+        }
+
+        $isolation = $this->connection->scalar(
+            query: "select current_setting('transaction_isolation')",
+            useReadPdo: false,
+        );
+
+        if ($isolation !== 'read committed') {
+            throw new LogicException('Compatibility::install() reads the roots created natively while it waits for its lock in a snapshot of its own per statement, and the transaction the connection is already in runs at '.(is_string($isolation) ? $isolation : 'an unknown').' isolation, so that read could miss a root and the view would serve no record for it. Run it outside a transaction, or inside one at READ COMMITTED.');
+        }
     }
 
     /**

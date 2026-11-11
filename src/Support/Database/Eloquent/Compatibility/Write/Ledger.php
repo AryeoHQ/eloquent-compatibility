@@ -191,8 +191,8 @@ final class Ledger
         return array_values(array_map(
             callback: fn (object $row) => [self::keyOf($row->legacy_id ?? null), is_int($row->successor_id ?? null) || is_string($row->successor_id ?? null) ? $row->successor_id : null, Outcome::from(is_string($row->status ?? null) ? $row->status : '')],
             array: $this->connection->select(
-                query: "SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM {$ledger} AS ledger WHERE ledger.status <> 'deleted'".($after === null ? '' : ' AND ledger.legacy_id > ?').' AND NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->key).' = ledger.legacy_id) ORDER BY ledger.legacy_id LIMIT ?',
-                bindings: $after === null ? [$limit] : [$after, $limit],
+                query: "SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM {$ledger} AS ledger WHERE ledger.status <> 'deleted'".($after === null ? '' : ' AND ledger.legacy_id > ?').' AND NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->key).' = ledger.legacy_id'.($after === null ? '' : ' AND '.$legacy.'.'.SqlFragments::identifier($this->key).' > ?').') ORDER BY ledger.legacy_id LIMIT ?',
+                bindings: $after === null ? [$limit] : [$after, $after, $limit],
                 useReadPdo: false,
             ),
         ));

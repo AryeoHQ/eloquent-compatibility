@@ -169,7 +169,7 @@ final class Backfiller
         ) ? $exception : null;
     }
 
-    private static function canceled(Throwable $exception): null|QueryException
+    public static function canceled(Throwable $exception): null|QueryException
     {
         for ($cause = $exception; $cause !== null; $cause = $cause->getPrevious()) {
             if ($cause instanceof QueryException && $cause->getCode() === self::CANCELED) {
@@ -398,14 +398,15 @@ final class Backfiller
                 return [Outcome::Refused, $successor, $exception->getMessage()];
             }
 
-            if ($exception instanceof CompatibilityWriteRefused || $exception instanceof SuccessorsMoved) {
-                Log::info("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} was refused: {$exception->getMessage()}");
+            $refusal = $exception instanceof CompatibilityWriteRefused || $exception instanceof SuccessorsMoved ? $exception : $this->unparsable(
+                key: $key,
+                exception: $exception,
+            );
 
-                return [Outcome::Refused, $successor, $exception instanceof CompatibilityWriteRefused ? $exception->reason : explode(
-                    separator: ' Why: ',
-                    string: $exception->getMessage(),
-                    limit: 2,
-                )[0]];
+            if ($refusal !== null) {
+                Log::info("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} was refused: {$refusal->getMessage()}");
+
+                return [Outcome::Refused, $successor, $refusal instanceof SuccessorsMoved ? CompatibilityWriteRefused::movedReason($refusal) : $refusal->reason];
             }
 
             Log::warning("Compatibility map '{$this->map->table}' backfill: the write of {$this->map->table} {$this->key} {$key} failed", ['exception' => $exception]);
@@ -416,6 +417,32 @@ final class Backfiller
         $this->connection->unprepared('RELEASE SAVEPOINT '.self::SAVEPOINT);
 
         return [$outcome, $written, null];
+    }
+
+    private function unparsable(int|string $key, Throwable $exception): null|CompatibilityWriteRefused
+    {
+        $row = RoundTrip::unparsed($exception) ? $this->current(
+            key: $key,
+            lock: false,
+        ) : null;
+
+        if ($row === null) {
+            return null;
+        }
+
+        $legacy = $this->legacy($row);
+        $attribute = $this->roundTrip()->unparsable(
+            variant: $this->variantFor($legacy),
+            legacy: $legacy,
+            key: $key,
+        );
+
+        return $attribute === null ? null : CompatibilityWriteRefused::unparsable(
+            model: $this->map->model,
+            attribute: $attribute,
+            key: $key,
+            previous: $exception,
+        );
     }
 
     /**
@@ -532,11 +559,12 @@ final class Backfiller
     {
         $legacy = $this->legacy($row);
 
-        if ($this->mapped(
+        if ($this->changed(
+            variant: $this->variantFor($legacy),
             legacy: $legacy,
             key: $key,
             row: $row,
-        ) === []) {
+        )[0] === []) {
             return [Outcome::Unchanged, $rootKey];
         }
 
@@ -561,16 +589,11 @@ final class Backfiller
             );
         }
 
-        $served = $this->roundTrip()->served(
-            keyName: $this->key,
-            key: $key,
-        ) ?? [];
-        $mapped = $this->changed(
+        [$mapped, $served] = $this->changed(
             variant: $this->variantFor($legacy),
             legacy: $legacy,
             key: $key,
             row: $row,
-            served: $served,
         );
 
         if ($mapped === []) {
@@ -585,24 +608,6 @@ final class Backfiller
             mapped: $mapped,
             roundTrip: $this->roundTrip(),
         ) ? Outcome::Updated : Outcome::Unchanged, $rootKey];
-    }
-
-    /**
-     * @param  array<string, mixed>  $row
-     * @return array<string, mixed>
-     */
-    private function mapped(Model $legacy, int|string $key, array $row): array
-    {
-        return $this->changed(
-            variant: $this->variantFor($legacy),
-            legacy: $legacy,
-            key: $key,
-            row: $row,
-            served: $this->roundTrip()->served(
-                keyName: $this->key,
-                key: $key,
-            ) ?? [],
-        );
     }
 
     /**
@@ -684,12 +689,12 @@ final class Backfiller
 
     /**
      * @param  array<string, mixed>  $row
-     * @param  array<string, mixed>  $served
-     * @return array<string, mixed>
+     * @return array{array<string, mixed>, array<string, mixed>}
      */
-    private function changed(ResolvedMap $variant, Model $legacy, int|string $key, array $row, array $served): array
+    private function changed(ResolvedMap $variant, Model $legacy, int|string $key, array $row): array
     {
         $candidates = [];
+        $compared = [];
 
         foreach ($variant->attributes as $name => $attribute) {
             if (! array_key_exists(
@@ -699,29 +704,31 @@ final class Backfiller
                 continue;
             }
 
-            if ($attribute->isExternal() || ! RoundTrip::skips(
+            if ($attribute->isExternal()) {
+                $candidates[$name] = $row[$name];
+            } elseif (! RoundTrip::skips(
                 attribute: $attribute,
                 origin: Origin::Backfill,
             )) {
                 $candidates[$name] = $row[$name];
+                $compared[] = $name;
             }
         }
 
-        $agreeing = $this->roundTrip()->agreeing(
+        [$served, $differs] = $this->roundTrip()->served(
             variant: $variant,
             legacy: $legacy,
             key: $key,
-            written: array_filter(
-                array: $candidates,
-                callback: fn (string $name): bool => ! $variant->attributes[$name]->isExternal(),
-                mode: ARRAY_FILTER_USE_KEY,
-            ),
-            served: $served,
+            names: $compared,
+        ) ?? [[], []];
+        $changed = array_filter(
+            array: $candidates,
+            callback: fn (string $name): bool => ($differs[$name] ?? true) === true,
+            mode: ARRAY_FILTER_USE_KEY,
         );
-        $changed = array_diff_key($candidates, array_flip($agreeing));
 
         if ($changed === []) {
-            return [];
+            return [[], $served];
         }
 
         foreach ($variant->attributes as $name => $attribute) {
@@ -739,7 +746,7 @@ final class Backfiller
             }
         }
 
-        return $changed;
+        return [$changed, $served];
     }
 
     /**
@@ -766,6 +773,12 @@ final class Backfiller
                 after: $after,
             );
 
+            if ($batch === []) {
+                return;
+            }
+
+            $after = $batch[array_key_last($batch)][0];
+
             if ($this->commitsEachRow($scoped)) {
                 foreach ($batch as [$key, $successor, $status]) {
                     $this->connection->transaction(fn () => $this->gone(
@@ -776,21 +789,21 @@ final class Backfiller
                         scoped: $scoped,
                     ));
                 }
-            } elseif ($batch !== []) {
-                $this->connection->transaction(function () use ($batch, $pass, $scoped): void {
-                    foreach ($batch as [$key, $successor, $status]) {
-                        $this->gone(
-                            pass: $pass,
-                            key: $key,
-                            successor: $successor,
-                            status: $status,
-                            scoped: $scoped,
-                        );
-                    }
-                });
+
+                continue;
             }
 
-            $after = $batch === [] ? $after : $batch[array_key_last($batch)][0];
+            $this->connection->transaction(function () use ($batch, $pass, $scoped): void {
+                foreach ($batch as [$key, $successor, $status]) {
+                    $this->gone(
+                        pass: $pass,
+                        key: $key,
+                        successor: $successor,
+                        status: $status,
+                        scoped: $scoped,
+                    );
+                }
+            });
         } while (count($batch) === $chunk);
     }
 

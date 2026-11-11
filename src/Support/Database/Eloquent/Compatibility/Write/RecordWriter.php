@@ -251,16 +251,20 @@ final readonly class RecordWriter
             record: $legacy,
             origin: Origin::Backfill,
         );
-        $this->unit->save(
-            graph: $graph,
-            legacy: $legacy,
-        );
-        $root = $graph->root();
-        $identify($root);
-        $this->unit->act(
-            graph: $graph,
-            legacy: $legacy,
-        );
+        $root = self::exactly(function () use ($graph, $legacy, $identify): Model {
+            $this->unit->save(
+                graph: $graph,
+                legacy: $legacy,
+            );
+            $root = $graph->root();
+            $identify($root);
+            $this->unit->act(
+                graph: $graph,
+                legacy: $legacy,
+            );
+
+            return $root;
+        });
         $this->refuseRepointed(
             legacy: $legacy,
             graph: $graph,
@@ -399,8 +403,16 @@ final readonly class RecordWriter
      */
     public function finish(Model $legacy, int|string $key, Staging $graph, Model $original, array $values, array $mapped, array $added, Origin $origin = Origin::Live, null|RoundTrip $roundTrip = null): int
     {
-        $this->unit->save($graph, $legacy);
-        $this->unit->act($graph, $legacy);
+        $save = function () use ($graph, $legacy): void {
+            $this->unit->save($graph, $legacy);
+            $this->unit->act($graph, $legacy);
+        };
+
+        if ($origin === Origin::Backfill) {
+            self::exactly($save);
+        } else {
+            $save();
+        }
         $this->refuseRepointed($legacy, $graph, $key);
         $after = self::keyAfter(
             legacy: $legacy,
@@ -769,6 +781,24 @@ final readonly class RecordWriter
         }
 
         return $values + $defaults;
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $write
+     * @return TResult
+     */
+    private static function exactly(Closure $write): mixed
+    {
+        $precision = (string) ini_get('precision');
+        ini_set('precision', '-1');
+
+        try {
+            return $write();
+        } finally {
+            ini_set('precision', $precision);
+        }
     }
 
     /**

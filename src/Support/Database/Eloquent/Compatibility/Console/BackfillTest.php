@@ -111,7 +111,44 @@ final class BackfillTest extends TestCase
         $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class, '--chunk' => '2']);
 
         $this->assertSame([0, 'Walked 0 listings rows and 3 whose legacy row is gone: 0 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 3 deleted.'], [$exit, explode("\n", trim(Artisan::output()))[0]]);
-        $this->assertSame([[2], [2, 2]], $reads);
+        $this->assertSame([[2], [2, 2, 2]], $reads);
+    }
+
+    #[Test]
+    public function it_reads_each_row_it_creates_once_through_the_select_it_serves_and_compares_by(): void
+    {
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use (&$reads): void {
+            if (str_contains($query->sql, "FROM (SELECT\n")) {
+                $reads++;
+            }
+        });
+
+        $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+
+        $this->assertSame([0, 'Walked 3 listings rows and 0 whose legacy row is gone: 3 created, 0 updated, 0 unchanged, 0 refused, 0 failed, 0 deleted.', 3], [$exit, explode("\n", trim(Artisan::output()))[1], $reads]);
+    }
+
+    #[Test]
+    public function it_records_a_row_a_session_statement_timeout_cancels_as_failed_and_writes_the_rows_after_it(): void
+    {
+        DB::unprepared("create function slow_pine_job() returns trigger language plpgsql as \$\$ begin if new.name = 'Pine Flat' then perform pg_sleep(2); end if; return new; end \$\$; create trigger slow_pine_job before insert on jobs for each row execute function slow_pine_job()");
+        DB::statement("set statement_timeout = '500ms'");
+
+        try {
+            $exit = Artisan::call('compatibility:backfill', ['model' => Listing::class]);
+        } finally {
+            DB::statement('reset statement_timeout');
+            DB::unprepared('drop function slow_pine_job() cascade');
+        }
+
+        $this->assertSame([1, [[1, 'created', false], [2, 'failed', true], [3, 'created', false]]], [$exit, array_map(
+            callback: fn (object $row) => [$row->legacy_id, $row->status, str_starts_with(
+                haystack: (string) $row->reason,
+                needle: 'Illuminate\Database\QueryException: SQLSTATE[57014]: Query canceled',
+            )],
+            array: DB::select('select legacy_id, status, reason from listings_backfill order by legacy_id'),
+        )]);
     }
 
     #[Test]
@@ -141,11 +178,28 @@ final class BackfillTest extends TestCase
             }
         };
         $reason = 'records cannot take this write of $title. Why: The write stores a value, and the view now serves title as another, so the record would not read back what was written. Instead: Make the operation of title store a value its read serves back.';
+        $logged = [];
+        Event::listen(MessageLogged::class, function (MessageLogged $message) use (&$logged): void {
+            if ($message->level === 'info' && str_starts_with($message->message, "Compatibility map 'listings' backfill: the write of listings id ")) {
+                $logged[] = $message->message;
+            }
+        });
 
         $exit = Artisan::call('compatibility:backfill', ['model' => $listing::class]);
         $printed = Artisan::output();
 
         $this->assertSame(1, $exit);
+        $this->assertSame([[1, true], [2, true]], array_map(
+            callback: fn (string $line): array => [(int) substr(
+                string: $line,
+                offset: strlen("Compatibility map 'listings' backfill: the write of listings id "),
+                length: 1,
+            ), preg_match(
+                pattern: '/^Compatibility map \'listings\' backfill: the write of listings id (\d) was refused: .+ record \1 cannot take this write of \$title\. Why: The write stores \'[A-Za-z]+ [A-Za-z]+ Revised\', and the view now serves title as /',
+                subject: $line,
+            ) === 1],
+            array: $logged,
+        ));
         $this->assertStringContainsString('2 refused: Illuminate\\Database\\Eloquent\\Model@anonymous', $printed);
         $this->assertStringContainsString(" {$reason} (id 1, 2)", $printed);
         $this->assertSame([['refused', 2, true]], array_map(
