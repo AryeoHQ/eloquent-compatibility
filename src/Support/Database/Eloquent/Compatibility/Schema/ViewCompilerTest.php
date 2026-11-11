@@ -9,6 +9,7 @@ use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -24,6 +25,7 @@ use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingOfAnyPlace;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\Place;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
@@ -485,6 +487,189 @@ final class ViewCompilerTest extends TestCase
         $this->expectExceptionObject(InvalidCompatibilityMap::because('listings', $problem));
 
         $this->viewCompiler()->create($map);
+    }
+
+    #[Test]
+    public function it_hides_a_soft_deleted_row_of_a_relation_it_joins_plainly_without_conditions(): void
+    {
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        DB::statement('create unique index places_job_unique on places (job_id)');
+        DB::table('places')->where('street', '1 Oak St')->update(['deleted_at' => '2026-03-01 00:00:00+00']);
+        $map = $this->anyPlace();
+
+        $this->assertStringContainsString('LEFT JOIN "places" ON "places"."job_id" = "jobs"."id" AND "places"."deleted_at" IS NULL', $this->viewCompiler()->beforeInstall($map));
+        $this->assertSame([[1, null], [2, null], [3, '3 Elm St']], $this->streets($map));
+    }
+
+    /**
+     * @return array<string, array{Closure(): void}>
+     */
+    public static function unprovenIndexes(): array
+    {
+        return [
+            'a unique index over two columns' => [function (): void {
+                DB::statement('create unique index places_job_city_unique on places (job_id, city)');
+                self::childPlace();
+            }],
+            'a unique index a failed concurrent build left invalid' => [function (): void {
+                self::childPlace();
+
+                try {
+                    DB::statement('create unique index concurrently places_job_unique on places (job_id)');
+                } catch (QueryException) {
+                }
+            }],
+            'a deferred unique constraint' => [function (): void {
+                DB::statement('alter table places add constraint places_job_unique unique (job_id) deferrable initially deferred');
+                DB::beginTransaction();
+                self::childPlace();
+            }],
+        ];
+    }
+
+    #[DataProvider('unprovenIndexes')]
+    #[Test]
+    public function it_joins_a_relation_laterally_where_its_unique_index_does_not_prove_one_row(Closure $index): void
+    {
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        $index();
+
+        try {
+            $ids = array_map(fn (array $row) => $row[0], $this->streets($this->anyPlace()));
+        } finally {
+            while (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+        }
+
+        $this->assertSame([1, 2, 3], $ids);
+    }
+
+    #[Test]
+    public function it_joins_a_relation_laterally_where_its_at_most_one_index_predates_a_change_to_its_conditions(): void
+    {
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        self::childPlace();
+        $map = ListingOfAnyPlace::compatibility(new Compatibility(Listing::class))->resolve();
+
+        $this->assertSame([1, 2, 3], array_map(fn (array $row) => $row[0], $this->streets($map)));
+    }
+
+    #[Test]
+    public function it_joins_a_relation_laterally_where_its_unique_index_compares_keys_in_another_collation(): void
+    {
+        DB::statement("create collation compatibility_case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
+
+        try {
+            DB::statement('create table companies (id uuid primary key default gen_random_uuid(), code varchar(255) collate compatibility_case_insensitive)');
+            DB::statement('create unique index companies_code_unique on companies (code collate "C")');
+            ListingTables::seed();
+            Compatibility::prepare(Listing::class);
+            ListingTables::backfill();
+            DB::table('companies')->insert([['code' => 'OAK HOUSE'], ['code' => 'oak house']]);
+            $map = $this->listings(fn (Compatibility $listing) => $listing
+                ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                    ->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    )
+                    ->related(
+                        relation: fn (Job $job) => $job->belongsTo(Company::class, 'name', 'code'),
+                        successor: fn (Successor $company) => $company
+                            ->attribute('mls_number', fn (Attribute $attribute) => $attribute->from('code')),
+                    )));
+
+            $this->assertSame([1, 2, 3], array_map(fn (object $row) => (int) $row->id, DB::select($this->viewCompiler()->beforeInstall($map).' ORDER BY "id"')));
+        } finally {
+            DB::statement('drop table if exists companies cascade');
+            DB::statement('drop collation if exists compatibility_case_insensitive');
+        }
+    }
+
+    /**
+     * @return array<string, array{Closure(Compatibility): Compatibility}>
+     */
+    public static function parentConditions(): array
+    {
+        return [
+            'a column of the parent table by name' => [fn (Compatibility $listing) => $listing
+                ->retainedIn('listings_retained')
+                ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                    ->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    )
+                    ->related(
+                        relation: fn (Job $job) => $job->site()->whereColumn('job_sites.created_at', '<=', 'jobs.updated_at'),
+                        successor: fn (Successor $site) => $site
+                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                    ))],
+            'a column only the parent table has' => [fn (Compatibility $listing) => $listing
+                ->retainedIn('listings_retained')
+                ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                    ->attribute(
+                        name: 'title',
+                        definition: fn (Attribute $attribute) => $attribute->from('name'),
+                    )
+                    ->related(
+                        relation: fn (Job $job) => $job->site()->whereNull('merged_into_job_id'),
+                        successor: fn (Successor $site) => $site
+                            ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')),
+                    ))],
+        ];
+    }
+
+    /**
+     * @param  Closure(Compatibility): Compatibility  $declare
+     */
+    #[DataProvider('parentConditions')]
+    #[Test]
+    public function it_joins_a_relation_laterally_where_its_conditions_name_the_parent_table(Closure $declare): void
+    {
+        ListingTables::seed();
+        Compatibility::prepare(Listing::class);
+        ListingTables::backfill();
+        $map = $declare(new Compatibility(Listing::class))->resolve();
+        DB::table('job_sites')->update(['created_at' => '2026-01-01 00:00:00+00']);
+
+        $served = DB::select($this->viewCompiler()->beforeInstall($map).' ORDER BY "id"');
+
+        $this->assertSame([1 => 47.6062, 2 => null, 3 => -122.3321], array_combine(array_map(fn (object $row) => (int) $row->id, $served), array_map(fn (object $row) => $row->latitude === null ? null : (float) $row->latitude, $served)));
+    }
+
+    private static function childPlace(): void
+    {
+        $job = ListingTables::jobOf(1);
+        DB::table('places')->insert(['job_id' => $job, 'parent_id' => DB::table('places')->where('job_id', $job)->value('id'), 'street' => '9 Oak St', 'city' => 'Tacoma']);
+    }
+
+    private function anyPlace(): ResolvedMap
+    {
+        return $this->listings(fn (Compatibility $listing) => $listing
+            ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                ->attribute(
+                    name: 'title',
+                    definition: fn (Attribute $attribute) => $attribute->from('name'),
+                )
+                ->related(
+                    relation: fn (Job $job) => $job->hasOne(Place::class),
+                    successor: fn (Successor $place) => $place
+                        ->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
+                )));
+    }
+
+    /**
+     * @return list<array{int, null|string}>
+     */
+    private function streets(ResolvedMap $map): array
+    {
+        return array_map(fn (object $row) => [(int) $row->id, $row->street], DB::select($this->viewCompiler()->beforeInstall($map).' ORDER BY "id"'));
     }
 
     /**

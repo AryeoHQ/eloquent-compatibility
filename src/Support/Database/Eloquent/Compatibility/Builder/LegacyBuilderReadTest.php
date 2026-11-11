@@ -170,6 +170,47 @@ final class LegacyBuilderReadTest extends TestCase
     }
 
     #[Test]
+    public function it_filters_a_converted_attribute_of_a_related_successor_on_the_read_host_while_the_write_host_is_unreachable(): void
+    {
+        $this->install();
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->related(
+                            relation: fn (Job $job) => $job->site(),
+                            successor: fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')->multipliedBy(2)),
+                        ));
+            }
+        };
+        $name = DB::getDefaultConnection();
+        $original = config("database.connections.{$name}");
+        LegacyBuilder::forgetViews();
+        config([
+            "database.connections.{$name}.read" => ['host' => [$original['host']]],
+            "database.connections.{$name}.write" => ['host' => ['127.0.0.1'], 'port' => 1],
+        ]);
+        DB::purge($name);
+
+        try {
+            $ids = $model->newQuery()->where('latitude', '>', 40)->pluck('id')->all();
+        } finally {
+            config(["database.connections.{$name}" => $original]);
+            DB::purge($name);
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([1], $ids);
+    }
+
+    #[Test]
     public function it_filters_a_plain_attribute_through_a_belongs_to_chain_on_the_index_of_the_related_table_once_installed(): void
     {
         $other = '5d2c8e1a-7b3f-4a6e-9c0d-1e2f3a4b5c6d';

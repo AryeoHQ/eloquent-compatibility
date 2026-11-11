@@ -208,7 +208,13 @@ final readonly class ViewCompiler
 
             $table = SqlFragments::identifier($related->table);
 
-            if ($related->morphType !== null) {
+            $proved = in_array(
+                needle: $related->table,
+                haystack: $proven,
+                strict: true,
+            );
+
+            if ($related->morphType !== null || ($proved && $related->conditions === null)) {
                 $joins[] = 'LEFT JOIN '.$table.' ON '.implode(
                     separator: ' AND ',
                     array: self::conditions(
@@ -216,25 +222,14 @@ final readonly class ViewCompiler
                         joined: true,
                     ),
                 );
-            } elseif (in_array(
-                needle: $related->table,
-                haystack: $proven,
-                strict: true,
-            )) {
-                $on = $table.'.'.SqlFragments::identifier($related->relatedKey).' = '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
-                $filters = self::conditions(
-                    related: $related,
-                    joined: false,
-                );
-                $joins[] = $related->conditions === null
-                    ? 'LEFT JOIN '.$table.' ON '.implode(
-                        separator: ' AND ',
-                        array: [$on, ...$filters],
-                    )
-                    : 'LEFT JOIN (SELECT * FROM '.$table.' WHERE '.implode(
-                        separator: ' AND ',
-                        array: $filters,
-                    ).') AS '.$table.' ON '.$on;
+            } elseif ($proved) {
+                $joins[] = 'LEFT JOIN (SELECT * FROM '.$table.' WHERE '.implode(
+                    separator: ' AND ',
+                    array: self::conditions(
+                        related: $related,
+                        joined: false,
+                    ),
+                ).') AS '.$table.' ON '.$table.'.'.SqlFragments::identifier($related->relatedKey).' = '.SqlFragments::identifier($related->parentTable).'.'.SqlFragments::identifier($related->parentKey);
             } else {
                 $joins[] = 'LEFT JOIN LATERAL (SELECT * FROM '.$table.' WHERE '.implode(
                     separator: ' AND ',
@@ -252,20 +247,33 @@ final readonly class ViewCompiler
     /**
      * @return list<string>
      */
-    public static function proven(ResolvedMap $map, ConnectionInterface $connection): array
+    public static function proven(ResolvedMap $map, ConnectionInterface $connection, bool $writing): array
     {
         $relations = [];
+        $partials = [];
 
         foreach ($map->related as $related) {
-            if ($related->morphType === null) {
-                $relations[] = [
-                    'relation' => $related->table,
-                    'key' => $related->relatedKey,
-                    'partial' => $related->successor->atMostOneBecause() === null || $related->belongsTo ? null : SqlFragments::objectName(
-                        map: $map->table,
-                        name: $related->table.'_'.$map->table.'_at_most_one',
-                    ),
-                ];
+            if ($related->morphType !== null || ($related->conditions !== null && $related->conditionColumns === null)) {
+                continue;
+            }
+
+            $partial = $writing && in_array(
+                needle: $related,
+                haystack: Preparer::atMostOneRelations($map),
+                strict: true,
+            ) ? Preparer::atMostOneName(
+                map: $map,
+                related: $related,
+            ) : null;
+            $relations[] = [
+                'relation' => $related->table,
+                'key' => $related->relatedKey,
+                'columns' => $related->conditionColumns ?? [],
+                'partial' => $partial,
+            ];
+
+            if ($partial !== null) {
+                $partials[$related->table] = $related;
             }
         }
 
@@ -273,25 +281,40 @@ final readonly class ViewCompiler
             return [];
         }
 
-        return array_map(
-            callback: fn (object $row) => (string) $row->relation,
-            array: $connection->select(
-                query: 'select related.relation from jsonb_to_recordset(cast(? as jsonb)) as related(relation text, key text, partial text)
-             where exists (
-                 select from pg_index table_index
-                 join pg_attribute attribute on attribute.attrelid = table_index.indrelid and attribute.attnum = table_index.indkey[0]
-                 join pg_class index_relation on index_relation.oid = table_index.indexrelid
-                 where table_index.indrelid = to_regclass(quote_ident(related.relation)) and table_index.indisunique and table_index.indisvalid and table_index.indimmediate
-                   and table_index.indnkeyatts = 1 and table_index.indexprs is null and attribute.attname = related.key and not attribute.attisdropped
-                   and (table_index.indpred is null or index_relation.relname = related.partial)
-             )',
-                bindings: [json_encode(
-                    value: $relations,
-                    flags: JSON_THROW_ON_ERROR,
-                )],
-                useReadPdo: false,
-            ),
-        );
+        $proven = [];
+
+        foreach ($connection->select(
+            query: 'select related.relation, bool_and(table_index.indpred is not null) as partial
+             from jsonb_to_recordset(cast(? as jsonb)) as related(relation text, key text, columns jsonb, partial text)
+             join pg_attribute attribute on attribute.attrelid = to_regclass(quote_ident(related.relation)) and attribute.attname = related.key and not attribute.attisdropped
+             join pg_index table_index on table_index.indrelid = attribute.attrelid and '.Preparer::uniqueOnOneColumn(
+                index: 'table_index',
+                attribute: 'attribute',
+            ).' and table_index.indcollation[0] = attribute.attcollation
+             join pg_class index_relation on index_relation.oid = table_index.indexrelid and (table_index.indpred is null or index_relation.relname = related.partial)
+             where not exists (
+                 select from jsonb_array_elements_text(related.columns) as condition(name)
+                 where not exists (select from pg_attribute condition_column where condition_column.attrelid = attribute.attrelid and condition_column.attname = condition.name and condition_column.attnum > 0 and not condition_column.attisdropped)
+             )
+             group by related.relation',
+            bindings: [json_encode(
+                value: $relations,
+                flags: JSON_THROW_ON_ERROR,
+            )],
+            useReadPdo: ! $writing,
+        ) as $row) {
+            $table = (string) $row->relation;
+
+            if ($row->partial !== true || (new Preparer(new ColumnCatalog($connection)))->bounds(
+                map: $map,
+                related: $partials[$table],
+                connection: $connection,
+            )) {
+                $proven[] = $table;
+            }
+        }
+
+        return $proven;
     }
 
     /**
@@ -402,6 +425,7 @@ final readonly class ViewCompiler
                 proven: self::proven(
                     map: $map,
                     connection: $this->connection,
+                    writing: true,
                 ),
             )));
     }
@@ -421,10 +445,7 @@ final readonly class ViewCompiler
                 .' LEFT JOIN '.SqlFragments::identifier($retainedFrom).($retainedFrom === $retainedTable ? '' : ' AS '.SqlFragments::identifier($retainedTable)).' ON false'
                 .implode(separator: '', array: array_map(callback: fn (string $join) => ' '.$join, array: self::joins(
                     map: $map,
-                    proven: self::proven(
-                        map: $map,
-                        connection: $this->connection,
-                    ),
+                    proven: [],
                 ))).' WHERE false) AS probe ON true',
         );
 
@@ -529,7 +550,7 @@ final readonly class ViewCompiler
     /**
      * @return list<string>
      */
-    private static function path(ResolvedMap $map, string $owner): array
+    public static function path(ResolvedMap $map, string $owner): array
     {
         $parents = [];
 

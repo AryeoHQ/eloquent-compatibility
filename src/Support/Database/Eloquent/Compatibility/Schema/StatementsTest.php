@@ -147,7 +147,7 @@ final class StatementsTest extends TestCase
     }
 
     #[Test]
-    public function it_lists_the_one_statement_that_updates_the_view(): void
+    public function it_lists_the_statements_that_check_each_at_most_one_index_and_update_the_view(): void
     {
         Compatibility::prepare(Listing::class);
         ListingTables::backfill();
@@ -158,10 +158,16 @@ final class StatementsTest extends TestCase
 
         $this->assertEquals(new Statements(
             operation: 'update',
-            transaction: [(new ViewCompiler(
-                columnCatalog: new ColumnCatalog(DB::connection()),
-                connection: DB::connection(),
-            ))->replace($this->map())],
+            transaction: [
+                ...(new Preparer(new ColumnCatalog(DB::connection())))->current(
+                    map: $this->map(),
+                    operation: 'update',
+                ),
+                (new ViewCompiler(
+                    columnCatalog: new ColumnCatalog(DB::connection()),
+                    connection: DB::connection(),
+                ))->replace($this->map()),
+            ],
         ), Statements::update(
             map: $this->map(),
             connection: DB::connection(),
@@ -185,6 +191,10 @@ final class StatementsTest extends TestCase
 
         $this->assertSame([
             'LOCK TABLE "jobs", "places", "job_sites" IN SHARE ROW EXCLUSIVE MODE',
+            ...(new Preparer(new ColumnCatalog(DB::connection())))->current(
+                map: $this->map(),
+                operation: 'rollback',
+            ),
             'DROP VIEW "listings"',
             'ALTER TABLE "listings_retained" RENAME TO "listings"',
             <<<'SQL'

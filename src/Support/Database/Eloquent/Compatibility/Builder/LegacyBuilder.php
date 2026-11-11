@@ -184,7 +184,7 @@ final class LegacyBuilder extends Builder
                             throughSearchPath: true,
                         );
                     },
-                )[1] === null => 'stored',
+                )[1] === null => $attribute->invertible() ? 'stored' : 'view',
                 default => 'expression',
             };
         }
@@ -771,6 +771,7 @@ final class LegacyBuilder extends Builder
                 proven: self::$proven[$this->servedKey()] ??= ViewCompiler::proven(
                     map: $map,
                     connection: $this->model->getConnection(),
+                    writing: false,
                 ),
                 owner: $owner,
             )));

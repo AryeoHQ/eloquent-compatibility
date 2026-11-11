@@ -19,6 +19,7 @@ use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\PostgresConnection;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use ReflectionClass;
@@ -34,6 +35,7 @@ final readonly class Related
      * @param  class-string<Model>  $model
      * @param  list<mixed>  $bindings
      * @param  array<string, mixed>  $attributes
+     * @param  null|list<string>  $conditionColumns
      */
     private function __construct(
         public Closure $relation,
@@ -52,6 +54,7 @@ final readonly class Related
         public Successor $successor,
         public null|string $morphType = null,
         public null|string $morphAlias = null,
+        public null|array $conditionColumns = [],
     ) {}
 
     /**
@@ -149,6 +152,10 @@ final readonly class Related
             in_array(SoftDeletingScope::class, $scopes, true) && method_exists($related, 'getDeletedAtColumn') ? (string) $related->getDeletedAtColumn() : null,
             $query->pendingAttributes,
             $successor,
+            conditionColumns: self::ownColumns(
+                table: $related->getTable(),
+                wheres: $base->wheres,
+            ),
         );
     }
 
@@ -299,9 +306,9 @@ final readonly class Related
     {
         foreach ($wheres as $where) {
             $type = is_array($where) ? $where['type'] : null;
-            $column = is_array($where) ? ($where['column'] ?? null) : null;
+            $column = self::plainColumn($where);
 
-            if (! in_array($type, ['Basic', 'Null', 'NotNull', 'In', 'NotIn'], true) || ! is_string($column) || ($type === 'Basic' && $where['value'] instanceof Expression)) {
+            if ($column === null) {
                 throw InvalidCompatibilityMap::because($map, "atMostOne() on {$name} compiles its conditions into a unique index, and a ".(is_string($type) ? $type : 'raw').' condition is not a plain column predicate');
             }
 
@@ -309,5 +316,62 @@ final readonly class Related
                 throw InvalidCompatibilityMap::because($map, "atMostOne() on {$name} compiles its conditions into a unique index on {$table}, and {$column} is not a column of {$table}");
             }
         }
+    }
+
+    private static function plainColumn(mixed $where): null|string
+    {
+        $type = is_array($where) ? $where['type'] : null;
+        $column = is_array($where) ? ($where['column'] ?? null) : null;
+
+        return in_array(
+            needle: $type,
+            haystack: ['Basic', 'Null', 'NotNull', 'In', 'NotIn'],
+            strict: true,
+        ) && is_string($column) && ! ($type === 'Basic' && $where['value'] instanceof Expression) ? $column : null;
+    }
+
+    /**
+     * @param  array<int, mixed>  $wheres
+     * @return null|list<string>
+     */
+    private static function ownColumns(string $table, array $wheres): null|array
+    {
+        $columns = [];
+
+        foreach ($wheres as $where) {
+            if (is_array($where) && $where['type'] === 'Nested' && $where['query'] instanceof Builder) {
+                $nested = self::ownColumns(
+                    table: $table,
+                    wheres: $where['query']->wheres,
+                );
+
+                if ($nested === null) {
+                    return null;
+                }
+
+                $columns = [...$columns, ...$nested];
+
+                continue;
+            }
+
+            $column = self::plainColumn($where);
+
+            if ($column === null || (str_contains(
+                haystack: $column,
+                needle: '.',
+            ) && ! str_starts_with(
+                haystack: $column,
+                needle: $table.'.',
+            ))) {
+                return null;
+            }
+
+            $columns[] = Str::after(
+                subject: $column,
+                search: $table.'.',
+            );
+        }
+
+        return array_values(array_unique($columns));
     }
 }
