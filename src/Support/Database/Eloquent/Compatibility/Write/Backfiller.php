@@ -6,7 +6,6 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Carbon\CarbonInterval;
 use Closure;
-use DateTimeImmutable;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
@@ -166,11 +165,6 @@ final class Backfiller
                 because: "{$unstamped} {$this->map->table} rows have a NULL ".$this->updatedAtOf('install').", and every pass walks them again, the final pass under the lock included; install() takes the lock only while fewer than its passSize of {$passSize} do. Stamp ".$this->updatedAtOf('install').' on those rows, then install again',
             );
         }
-    }
-
-    public function remembered(): null|string
-    {
-        return $this->watermark->remembered();
     }
 
     /**
@@ -387,13 +381,11 @@ final class Backfiller
             map: $this->map,
             connection: $this->connectionOf(),
         );
-        $updates = $named !== null && $this->rootExists($named);
         $touched = $scoped && $unit->scopes() ? $this->touched(
             unit: $unit,
             writer: $writer,
             key: $key,
             named: $named,
-            updates: $updates,
         ) : [];
         $locked = function () use ($unit, $writer, $key, $named, $touched, $scoped): array {
             $row = $this->current(key: $key, lock: false);
@@ -440,9 +432,9 @@ final class Backfiller
     /**
      * @return array<class-string<Model>, list<int|string>>
      */
-    private function touched(UnitOfWork $unit, RecordWriter $writer, int|string $key, null|int|string $named, bool $updates): array
+    private function touched(UnitOfWork $unit, RecordWriter $writer, int|string $key, null|int|string $named): array
     {
-        if ($updates && $named !== null) {
+        if ($named !== null && $this->rootExists($named)) {
             $root = $unit->roots(
                 keys: [$named],
                 lock: false,
@@ -666,7 +658,7 @@ final class Backfiller
                 continue;
             }
 
-            if ($this->roundTrip()->skips(
+            if (RoundTrip::skips(
                 attribute: $attribute,
                 origin: Origin::Backfill,
             )) {
@@ -699,7 +691,7 @@ final class Backfiller
             if (array_key_exists(
                 key: $name,
                 array: $row,
-            ) && $successor->usesTimestamps() && $attribute->column() === $successor->getUpdatedAtColumn() && ! $this->roundTrip()->skips(
+            ) && $successor->usesTimestamps() && $attribute->column() === $successor->getUpdatedAtColumn() && ! RoundTrip::skips(
                 attribute: $attribute,
                 origin: Origin::Backfill,
             )) {
@@ -928,7 +920,7 @@ final class Backfiller
             array: $this->connection->select(
                 query: "SELECT {$key} AS key FROM {$legacy} WHERE {$updated} >= {$bound}".sprintf($past, $key)
                     ." UNION SELECT {$key} FROM {$legacy} WHERE {$updated} IS NULL".sprintf($past, $key)
-                    .' UNION SELECT legacy_id FROM '.SqlFragments::identifier(Ledger::table($this->map->table))." WHERE status IN ('refused', 'failed')".sprintf($past, 'legacy_id')
+                    .' UNION '.$this->ledger->blockedKeys().sprintf($past, 'ledger.legacy_id')
                     .' ORDER BY 1 LIMIT ?',
                 bindings: $after === null ? [$since, $chunk] : [$since, $after, $after, $after, $chunk],
                 useReadPdo: false,
@@ -953,7 +945,10 @@ final class Backfiller
             return null;
         }
 
-        return (new DateTimeImmutable($bound))->sub($margin ?? CarbonInterval::seconds(self::MARGIN))->format('Y-m-d\TH:i:s.uP');
+        return Watermark::before(
+            moment: $bound,
+            margin: $margin ?? CarbonInterval::seconds(self::MARGIN),
+        );
     }
 
     private function rootExists(int|string $root): bool
@@ -969,10 +964,7 @@ final class Backfiller
     {
         if ($this->roundTrip === null) {
             $compiler = new ViewCompiler(
-                columnCatalog: new ColumnCatalog(
-                    connection: $this->connection,
-                    throughWriteConnection: true,
-                ),
+                columnCatalog: $this->catalog,
                 connection: $this->connection,
             );
             $this->roundTrip = new RoundTrip(

@@ -138,19 +138,20 @@ final readonly class DriftQueries
             return $findings;
         }
 
-        $keys = [];
-
-        foreach ($findings as $finding) {
-            if (str_starts_with(
-                haystack: $finding->record,
-                needle: $map->table.'#',
-            )) {
-                $keys[] = substr(
-                    string: $finding->record,
-                    offset: strlen($map->table) + 1,
-                );
-            }
-        }
+        $keyOf = fn (DriftFinding $finding): null|string => str_starts_with(
+            haystack: $finding->record,
+            needle: $map->table.'#',
+        ) ? substr(
+            string: $finding->record,
+            offset: strlen($map->table) + 1,
+        ) : null;
+        $keys = array_values(array_filter(
+            array: array_map(
+                callback: $keyOf,
+                array: $findings,
+            ),
+            callback: is_string(...),
+        ));
 
         if ($keys === []) {
             return $findings;
@@ -165,14 +166,8 @@ final readonly class DriftQueries
         ));
 
         return array_values(array_map(
-            callback: fn (DriftFinding $finding) => str_starts_with(
-                haystack: $finding->record,
-                needle: $map->table.'#',
-            ) && array_key_exists(
-                key: substr(
-                    string: $finding->record,
-                    offset: strlen($map->table) + 1,
-                ),
+            callback: fn (DriftFinding $finding) => ($key = $keyOf($finding)) !== null && array_key_exists(
+                key: $key,
                 array: $trashed,
             ) ? new DriftFinding(
                 model: $finding->model,
@@ -200,7 +195,7 @@ final readonly class DriftQueries
                     table: $map->primary->table,
                     key: $key,
                 ),
-                detail: 'it matches the when() of '.class_basename($map->model)." and no {$retained} row names it, so the view serves no record for it; an insert into {$map->primary->table} that bypassed ".class_basename($map->primary->model).'\'s model created it',
+                detail: 'it matches the when() of '.class_basename($map->model)." and no {$retained} row names it, so the view serves no record for it; an insert into {$map->primary->table} that bypassed ".class_basename($map->primary->model).'\'s model, or an update that moved it into when(), caused it',
             ),
             array: (new RetainedRows(
                 map: $map,
@@ -350,7 +345,7 @@ final readonly class DriftQueries
                     table: $map->table,
                     key: $row->key ?? null,
                 ),
-                detail: "its {$map->successorKey} names no {$map->primary->table} row, so install() refuses it",
+                detail: "its {$map->successorKey} names no {$map->primary->table} row, so install() recreates that {$map->primary->table} row with this key before its lock",
             ),
             $rows,
         ));
@@ -425,7 +420,7 @@ final readonly class DriftQueries
             ) as $name => $read) {
                 $attribute = $variant->attributes[$name] ?? null;
 
-                if ($attribute === null || RoundTrip::skipped(
+                if ($attribute === null || RoundTrip::skips(
                     attribute: $attribute,
                     origin: Origin::Backfill,
                 )) {
@@ -451,11 +446,6 @@ final readonly class DriftQueries
             ).') THEN '.SqlFragments::literal($name).' END';
         }
 
-        $filters = array_values(array_filter(
-            array: [$pendingSql, $within === '' ? '' : substr($within, 5)],
-            callback: fn (string $filter) => $filter !== '',
-        ));
-
         return ["SELECT compared.key, array_to_string(compared.attributes, ', ') AS attributes FROM (SELECT {$legacyKey} AS key, array_remove(ARRAY[".($differs === [] ? 'NULL::text' : implode(', ', $differs)).'], NULL) AS attributes'
             .' FROM '.SqlFragments::identifier($map->table).' AS '.$retained
             .' '.ViewCompiler::root(
@@ -464,7 +454,7 @@ final readonly class DriftQueries
                 hides: false,
             )
             .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($map)))
-            .($filters === [] ? '' : ' WHERE '.implode(' AND ', $filters)).') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
+            .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
     }
 
     /**
@@ -498,7 +488,7 @@ final readonly class DriftQueries
                     table: $map->table,
                     key: $misplaced[0],
                 ),
-                detail: "its relatedMorph() choose: closure picks {$misplaced[1]->target?->table}, and its {$map->primary->table} row points at no {$misplaced[1]->target?->table} row, so install() refuses it",
+                detail: "its relatedMorph() choose: closure picks {$misplaced[1]->target?->table}, and its {$map->primary->table} row points at no {$misplaced[1]->target?->table} row, so install() moves it to {$misplaced[1]->target?->table} before its lock, and refuses only when that move fails",
             ),
             $this->misplacedKeys(
                 map: $map,

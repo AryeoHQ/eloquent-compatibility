@@ -121,7 +121,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
                 [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
             ])
             ->expectsOutputToContain('2 drift findings in 1 served model.')
@@ -162,7 +162,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class], '--limit' => '1'])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             ])
             ->expectsOutputToContain('1 drift finding in 1 served model.')
             ->assertFailed();
@@ -208,7 +208,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [$refusing::class, Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             ])
             ->expectsOutputToContain('1 drift finding in 2 served models.')
             ->expectsOutputToContain($refusing::class.': The guard reads a service that is down.')
@@ -225,7 +225,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [Listing::class, Photo::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             ])
             ->expectsOutputToContain('1 drift finding in 2 served models.')
             ->expectsOutputToContain(Photo::class.": Compatibility map 'photos' cannot check: the stale-view check creates a temporary view, so it needs a writable connection with the TEMP privilege, and the connection refused it with SQLSTATE 25006.")
@@ -251,7 +251,7 @@ final class CheckDriftTest extends TestCase
 
         $this->artisan('compatibility:check', ['--model' => [$unresolved::class, Listing::class]])
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             ])
             ->expectsOutputToContain($unresolved::class.": Compatibility map 'listings' is declared wrongly: it says no servedFrom(), so it names no successor.")
             ->doesntExpectOutputToContain('No drift')
@@ -287,7 +287,7 @@ final class CheckDriftTest extends TestCase
             parameters: ['--model' => [Listing::class, Image::class]],
         )
             ->expectsTable(['Model', 'Check', 'Record', 'Detail'], [
-                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+                [Listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
                 [Image::class, 'outside when()', 'place_images#2', 'its place_assets row no longer matches the when() of Image'],
             ])
             ->expectsOutputToContain('2 drift findings in 2 served models.')

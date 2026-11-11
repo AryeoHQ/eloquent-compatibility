@@ -78,7 +78,7 @@ final class RoundTrip
             );
             $attribute = $graph->map->attributes[$base] ?? null;
 
-            if ($attribute === null || $this->skips(
+            if ($attribute === null || self::skips(
                 attribute: $attribute,
                 origin: $origin,
             )) {
@@ -122,7 +122,7 @@ final class RoundTrip
             $attribute = $graph->map->attributes[$name] ?? null;
             $before = $original->getAttributes()[$name] ?? null;
 
-            if ($attribute === null || $before === null || $this->skips(
+            if ($attribute === null || $before === null || self::skips(
                 attribute: $attribute,
                 origin: $origin,
             ) || ! array_key_exists($name, $served)) {
@@ -236,15 +236,7 @@ final class RoundTrip
         return $row === null ? null : (array) $row;
     }
 
-    public function skips(Attribute $attribute, Origin $origin): bool
-    {
-        return self::skipped(
-            attribute: $attribute,
-            origin: $origin,
-        );
-    }
-
-    public static function skipped(Attribute $attribute, Origin $origin): bool
+    public static function skips(Attribute $attribute, Origin $origin): bool
     {
         return match (true) {
             $attribute->ignoresWrites() => true,

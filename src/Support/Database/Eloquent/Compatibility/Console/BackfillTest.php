@@ -124,6 +124,18 @@ final class BackfillTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_backfill_without_its_ledger_and_names_prepare_before_it_counts_a_pass(): void
+    {
+        DB::statement('drop table listings_backfill');
+
+        $this->artisan('compatibility:backfill', ['model' => Listing::class])
+            ->expectsOutputToContain("Compatibility map 'listings' cannot backfill: Compatibility::prepare() adds listings.job_id, creates listings_backfill and inserts the compatibility_backfills row of listings, and it has not run; run Compatibility::prepare() first.")
+            ->assertFailed();
+
+        $this->assertSame(0, DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'"));
+    }
+
+    #[Test]
     public function it_prints_the_markup_and_control_characters_of_a_reason_as_text(): void
     {
         DB::update('update listings set status = ? where id = 3', ["<href=https://example.invalid>Archived</>\e[31m"]);

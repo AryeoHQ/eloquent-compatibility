@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Carbon\CarbonInterval;
+use DateTimeImmutable;
 use Illuminate\Database\ConnectionInterface;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 
 final readonly class Watermark
 {
@@ -16,9 +19,14 @@ final readonly class Watermark
 
     private const string SECONDS = 'YYYY-MM-DD"T"HH24:MI:SS"Z"';
 
-    private const string MICROSECONDS = 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"';
+    public const string MICROSECONDS = 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"';
 
     public function __construct(private string $legacyType, private ConnectionInterface $connection) {}
+
+    public static function before(string $moment, CarbonInterval $margin): string
+    {
+        return (new DateTimeImmutable($moment))->sub($margin)->format('Y-m-d\TH:i:s.uP');
+    }
 
     /**
      * @return list<string>
@@ -41,11 +49,10 @@ final readonly class Watermark
 
     public function exists(): bool
     {
-        return $this->connection->scalar(
-            query: "select to_regclass(quote_ident(current_schema()) || '.' || ?) is not null",
-            bindings: [SqlFragments::identifier(self::TABLE)],
-            useReadPdo: false,
-        ) === true;
+        return Statements::kind(
+            connection: $this->connection,
+            table: self::TABLE,
+        ) !== null;
     }
 
     public function tracked(): bool

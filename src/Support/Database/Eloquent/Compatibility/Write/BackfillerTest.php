@@ -158,12 +158,17 @@ final class BackfillerTest extends TestCase
     public function it_catches_up_a_row_a_transaction_stamped_before_a_pass_started_and_committed_after_it(): void
     {
         $this->backfiller(Listing::class)->run();
-        [$process, $pipes] = $this->transaction("update listings set title = 'Oak Manor', updated_at = localtimestamp - interval '1 second' where id = 1", seconds: 2);
-        $this->assertSame('written', trim((string) fgets($pipes[1])));
+        [$process, $pipes] = $this->transaction("update listings set title = 'Oak Manor', updated_at = localtimestamp - interval '1 second' where id = 1");
 
-        $during = $this->backfiller(Listing::class)->run();
-        $started = DB::scalar("select pass_started_at at time zone 'UTC' from compatibility_backfills where legacy_type = 'listings'");
-        proc_close($process);
+        try {
+            $this->assertSame('written', trim((string) fgets($pipes[1])));
+            $during = $this->backfiller(Listing::class)->run();
+            $started = DB::scalar("select pass_started_at at time zone 'UTC' from compatibility_backfills where legacy_type = 'listings'");
+            $this->assertSame('committed', $this->commit($pipes));
+        } finally {
+            $this->end($process);
+        }
+
         $after = $this->backfiller(Listing::class)->run();
 
         $this->assertSame([0, 1, 1], [$during->walked, $after->walked, $after->count(Outcome::Updated)]);
@@ -301,7 +306,10 @@ final class BackfillerTest extends TestCase
     public function it_refuses_a_pass_while_another_session_holds_the_advisory_lock_of_the_legacy_model(): void
     {
         config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
-        DB::connection('second')->select("select pg_advisory_lock(hashtextextended('compatibility_backfills:listings', 0))");
+        (new Watermark(
+            legacyType: 'listings',
+            connection: DB::connection('second'),
+        ))->hold('backfill');
 
         try {
             $this->backfiller(Listing::class)->run();
@@ -350,6 +358,41 @@ final class BackfillerTest extends TestCase
     }
 
     #[Test]
+    public function it_calls_the_write_scope_with_the_root_of_a_hard_deleted_row_around_its_delete(): void
+    {
+        $listing = $this->scopedListing();
+        $this->backfiller($listing::class)->run();
+        $job = DB::scalar('select job_id from listings where id = 3');
+        RecordingWriteScope::$received = [];
+        DB::delete('delete from listings where id = 3');
+
+        $pass = $this->backfiller($listing::class)->run();
+
+        $this->assertSame(1, $pass->count(Outcome::Deleted));
+        $this->assertCount(1, RecordingWriteScope::$received);
+        $this->assertSame([$job], RecordingWriteScope::$received[0][Job::class] ?? null);
+        $this->assertTrue(DB::scalar('select deleted_at is not null from jobs where id = ?', [$job]));
+    }
+
+    #[Test]
+    public function it_records_the_deletion_of_a_row_whose_root_is_already_trashed_without_deleting_the_root_again(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $job = DB::scalar('select job_id from listings where id = 2');
+        $before = DB::scalar('select deleted_at::text from jobs where id = ?', [$job]);
+        $fired = [];
+        Event::listen('eloquent.deleting: '.Job::class, function () use (&$fired): void {
+            $fired[] = 'deleting';
+        });
+        DB::delete('delete from listings where id = 2');
+
+        $pass = $this->backfiller(Listing::class)->run();
+
+        $this->assertNotNull($before);
+        $this->assertSame([1, [], $before, 'deleted'], [$pass->count(Outcome::Deleted), $fired, DB::scalar('select deleted_at::text from jobs where id = ?', [$job]), DB::scalar('select status from listings_backfill where legacy_id = 2')]);
+    }
+
+    #[Test]
     public function it_commits_each_row_of_a_scoped_map_with_its_ledger_row_before_the_scope_of_the_next_row_runs(): void
     {
         $listing = $this->scopedListing(TransactionRecordingWriteScope::class);
@@ -372,19 +415,24 @@ final class BackfillerTest extends TestCase
     {
         $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
         DB::update("update listings set title = 'Oak Manor', updated_at = '2030-01-01 00:00:00' where id = 1");
-        [$process, $pipes] = $this->transaction(
-            sql: 'select id from jobs where id = (select job_id from listings where id = 1) for update',
-            seconds: 1,
-        );
-        fgets($pipes[1]);
-        DB::statement("set lock_timeout = '600ms'");
+        [$process, $pipes] = $this->transaction('select id from jobs where id = (select job_id from listings where id = 1) for update');
+        $committed = null;
+        DB::listen(function (QueryExecuted $query) use ($pipes, &$committed): void {
+            if ($committed === null && $query->sql === 'ROLLBACK TO SAVEPOINT compatibility_backfill_row') {
+                $committed = $this->commit($pipes);
+            }
+        });
 
         try {
+            $this->assertSame('written', trim((string) fgets($pipes[1])));
+            DB::statement("set lock_timeout = '600ms'");
             $this->artisan('compatibility:backfill', ['model' => Listing::class])->assertExitCode(0);
         } finally {
             DB::statement('reset lock_timeout');
-            proc_close($process);
+            $this->end($process);
         }
+
+        $this->assertSame('committed', $committed);
 
         $this->assertSame(['updated', 'Oak Manor'], [DB::scalar('select status from listings_backfill where legacy_id = 1'), DB::scalar('select jobs.name from jobs join listings on listings.job_id = jobs.id where listings.id = 1')]);
     }
@@ -403,7 +451,7 @@ final class BackfillerTest extends TestCase
         DB::listen(function (QueryExecuted $query) use (&$candidates): void {
             if (str_contains(
                 haystack: $query->sql,
-                needle: ' UNION SELECT legacy_id FROM ',
+                needle: ' UNION SELECT ledger.legacy_id FROM ',
             )) {
                 $candidates[] = [str_ends_with(
                     haystack: $query->sql,
@@ -1193,18 +1241,49 @@ final class BackfillerTest extends TestCase
     /**
      * @return array{resource, array<int, resource>}
      */
-    private function transaction(string $sql, int $seconds): array
+    private function transaction(string $sql): array
     {
         $config = DB::connection()->getConfig();
         $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
-        $process = proc_open([PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
-            .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "written\n"; fflush(STDOUT); sleep('.$seconds.'); $pdo->commit();'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open(
+            command: [PHP_BINARY, '-r', '$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
+                .' $pdo->beginTransaction(); $pdo->exec('.var_export($sql, true).'); echo "written\n"; fflush(STDOUT);'
+                .' if (fgets(STDIN) === "commit\n") { $pdo->commit(); echo "committed\n"; fflush(STDOUT); }'],
+            descriptor_spec: [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            pipes: $pipes,
+        );
 
         if ($process === false) {
             $this->fail('The concurrent transaction did not start.');
         }
 
         return [$process, $pipes];
+    }
+
+    /**
+     * @param  array<int, resource>  $pipes
+     */
+    private function commit(array $pipes): string
+    {
+        fwrite(
+            stream: $pipes[0],
+            data: "commit\n",
+        );
+        fflush($pipes[0]);
+
+        return trim((string) fgets($pipes[1]));
+    }
+
+    /**
+     * @param  resource  $process
+     */
+    private function end(mixed $process): void
+    {
+        if (proc_get_status($process)['running']) {
+            proc_terminate($process);
+        }
+
+        proc_close($process);
     }
 
     private function concurrently(string $sql): string

@@ -11,6 +11,7 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
+use Support\Database\Eloquent\Compatibility\Schema\Statements;
 
 final class Ledger
 {
@@ -77,11 +78,10 @@ final class Ledger
 
     public function exists(): bool
     {
-        return $this->connection->scalar(
-            query: "select to_regclass(quote_ident(current_schema()) || '.' || ?) is not null",
-            bindings: [SqlFragments::identifier(self::table($this->map->table))],
-            useReadPdo: false,
-        ) === true;
+        return Statements::kind(
+            connection: $this->connection,
+            table: self::table($this->map->table),
+        ) !== null;
     }
 
     /**
@@ -127,20 +127,6 @@ final class Ledger
                 encoding: 'UTF-8',
             )],
         );
-    }
-
-    /**
-     * @return list<int|string>
-     */
-    public function blocking(): array
-    {
-        return array_values(array_map(
-            callback: self::keyOf(...),
-            array: $this->connection->table(self::table($this->map->table))->useWritePdo()->whereIn(
-                column: 'status',
-                values: [Outcome::Refused->value, Outcome::Failed->value],
-            )->orderBy('legacy_id')->pluck('legacy_id')->all(),
-        ));
     }
 
     public function refuseBlocked(string $operation): void
@@ -206,6 +192,11 @@ final class Ledger
                 useReadPdo: false,
             ),
         ));
+    }
+
+    public function blockedKeys(): string
+    {
+        return 'SELECT ledger.legacy_id FROM '.SqlFragments::identifier(self::table($this->map->table))." AS ledger WHERE ledger.status IN ('refused', 'failed')";
     }
 
     public function deletedRoots(string $root): string

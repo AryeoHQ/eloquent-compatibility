@@ -26,7 +26,7 @@ This is documented, not enforced, because Aryeo's v2 writes Jobs live before ins
 
 `compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` only when it creates a legacy row, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
 
-After install, `compatibility:check` reports each member root that no retained row names. A query-builder insert into the root table bypasses `Provides\CarriesLegacy`, so the view serves no record for that root ([The writer boundary](#the-writer-boundary)). The check excludes a root that a `deleted` ledger row names, because a pass trashed it on purpose.
+After install, `compatibility:check` reports each member root that no retained row names. A query-builder insert into the root table bypasses `Provides\CarriesLegacy`, so the view serves no record for that root ([The writer boundary](#the-writer-boundary)). The check excludes a root that a `deleted` ledger row names, because its legacy row is gone, and a pass recorded the deletion.
 
 ## Prepare
 
@@ -165,7 +165,7 @@ These whole-table proofs and the deletion read never run under the lock. A legac
 
 ### Under the lock
 
-1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)). It handles no deletions. When the pass refuses a row, or a row's write fails, install rolls back and refuses, naming each reason and the first keys. The gate refused such rows before the lock, so only a write that lands after the gate causes it. A row that waits past the lock timeout, deadlocks or is cancelled is not a row failure: install rolls back, and retries or reports the spent budget as it does for every statement under the lock.
+1. The final small catch-up pass. It calls no write scope and runs no key re-check, because the table lock serializes it against live writes ([the write scope](operations.md#the-write-scope)). It handles no deletions. When the pass refuses a row, or a row's write fails, install rolls back and refuses, naming each reason and the first keys. The gate refused such rows before the lock. A row that waits past the lock timeout, deadlocks or is cancelled is not a row failure: install rolls back, and retries or reports the spent budget as it does for every statement under the lock.
 2. One indexed probe for a legacy row with a NULL successor key. Install refuses when the probe finds one.
 3. `ManagesDependents::beforeInstall()`.
 4. The rename of the legacy table to the retained table.

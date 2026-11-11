@@ -81,10 +81,10 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Listing|Photo|Video|Image>  $model
      */
     #[Test]
-    #[TestWith([Listing::class, 'delete from jobs where id = (select job_id from listings where id = 2)', 'listings#2', 'its job_id names no jobs row, so install() refuses it'])]
-    #[TestWith([Photo::class, 'delete from files where id = (select file_id from photos where id = 2)', 'photos#2', 'its file_id names no files row, so install() refuses it'])]
-    #[TestWith([Video::class, 'delete from files where id = (select file_id from videos where id = 3)', 'videos#3', 'its file_id names no files row, so install() refuses it'])]
-    #[TestWith([Image::class, 'delete from place_assets where id = (select place_asset_id from place_images where id = 1)', 'place_images#1', 'its place_asset_id names no place_assets row, so install() refuses it'])]
+    #[TestWith([Listing::class, 'delete from jobs where id = (select job_id from listings where id = 2)', 'listings#2', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'])]
+    #[TestWith([Photo::class, 'delete from files where id = (select file_id from photos where id = 2)', 'photos#2', 'its file_id names no files row, so install() recreates that files row with this key before its lock'])]
+    #[TestWith([Video::class, 'delete from files where id = (select file_id from videos where id = 3)', 'videos#3', 'its file_id names no files row, so install() recreates that files row with this key before its lock'])]
+    #[TestWith([Image::class, 'delete from place_assets where id = (select place_asset_id from place_images where id = 1)', 'place_images#1', 'its place_asset_id names no place_assets row, so install() recreates that place_assets row with this key before its lock'])]
     public function it_names_each_legacy_row_no_primary_holds_before_install(string $model, string $drift, string $record, string $detail): void
     {
         $this->backfilled($model);
@@ -123,7 +123,7 @@ final class DriftQueriesTest extends TestCase
         DB::unprepared('delete from jobs where id in (select job_id from listings where id in (2, 3))');
 
         $this->assertSame([
-            [Listing::class, 'no primary', 'listings#3', 'its job_id names no jobs row, so install() refuses it'],
+            [Listing::class, 'no primary', 'listings#3', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             [Listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
         ], $this->find(Listing::class));
     }
@@ -162,7 +162,7 @@ final class DriftQueriesTest extends TestCase
         DB::unprepared("insert into listings (title, company_id) values ('Ash Barn', '0b5a4c7e-1f2d-4c3b-9a8e-7d6c5b4a3f21')");
 
         $this->assertSame([
-            [$listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() refuses it'],
+            [$listing::class, 'no primary', 'listings#4', 'its job_id names no jobs row, so install() recreates that jobs row with this key before its lock'],
             [$listing::class, 'values differ', 'listings#1', 'listings holds other values for title than the view would serve from jobs'],
         ], $this->find($listing::class));
     }
@@ -258,7 +258,7 @@ final class DriftQueriesTest extends TestCase
      * @param  class-string<Video|PlaceVideo>  $model
      */
     #[Test]
-    #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() refuses it'])]
+    #[TestWith([PlaceVideo::class, "update place_videos set youtube_embed_url = 'https://youtu.be/tour' where id = 1", 'place_videos#1', 'its relatedMorph() choose: closure picks asset_links, and its place_assets row points at no asset_links row, so install() moves it to asset_links before its lock, and refuses only when that move fails'])]
     public function it_names_a_legacy_row_that_sits_in_another_successor_than_its_selector_chooses_before_install(string $model, string $drift, string $record, string $misplaced): void
     {
         $this->backfilled($model);
@@ -279,7 +279,7 @@ final class DriftQueriesTest extends TestCase
         DB::table('listings_backfill')->insert(['legacy_id' => 99, 'successor_id' => $deleted, 'status' => 'deleted', 'attempts' => 1, 'attempted_at' => now()]);
 
         $this->assertSame([
-            [Listing::class, 'unserved root', "jobs#{$unserved}", "it matches the when() of Listing and no listings_retained row names it, so the view serves no record for it; an insert into jobs that bypassed Job's model created it"],
+            [Listing::class, 'unserved root', "jobs#{$unserved}", "it matches the when() of Listing and no listings_retained row names it, so the view serves no record for it; an insert into jobs that bypassed Job's model, or an update that moved it into when(), caused it"],
         ], $this->find(Listing::class));
     }
 

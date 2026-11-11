@@ -18,9 +18,6 @@ final class Pass
     /** @var array<value-of<Outcome>, array<string, int>> */
     public array $reasons = [];
 
-    /** @var array<value-of<Outcome>, list<int|string>> */
-    public array $blockedKeys = [];
-
     /** @var array<value-of<Outcome>, array<string, list<int|string>>> */
     public array $reasonKeys = [];
 
@@ -35,7 +32,6 @@ final class Pass
         }
 
         if ($outcome->blocks()) {
-            $this->blockedKeys[$outcome->value][] = $key;
             $reason ??= '';
             $this->reasons[$outcome->value][$reason] = ($this->reasons[$outcome->value][$reason] ?? 0) + 1;
 
@@ -63,10 +59,6 @@ final class Pass
 
         foreach ($pass->counts as $status => $count) {
             $this->counts[$status] = ($this->counts[$status] ?? 0) + $count;
-        }
-
-        foreach ($pass->blockedKeys as $status => $keys) {
-            $this->blockedKeys[$status] = [...$this->blockedKeys[$status] ?? [], ...$keys];
         }
 
         foreach ($pass->reasons as $status => $reasons) {

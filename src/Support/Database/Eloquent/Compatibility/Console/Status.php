@@ -12,7 +12,6 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Preparer;
-use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Ledger;
@@ -103,18 +102,14 @@ final class Status extends Command
             connection: $connection,
             table: ViewCompiler::retainedTable($map),
         );
-        $ledger = Statements::kind(
+        $ledger = (new Ledger(
+            map: $map,
             connection: $connection,
-            table: Ledger::table($map->table),
-        ) !== null;
-        $pass = Statements::kind(
+        ))->exists();
+        $pass = (new Watermark(
+            legacyType: $map->table,
             connection: $connection,
-            table: Watermark::TABLE,
-        ) === null ? null : $connection->scalar(
-            query: 'select pass from '.SqlFragments::identifier(Watermark::TABLE).' where legacy_type = ?',
-            bindings: [$map->table],
-            useReadPdo: false,
-        );
+        ))->pass();
 
         if ($legacy === 'v' && $retained === 'r') {
             return ['installed', ''];
@@ -146,11 +141,11 @@ final class Status extends Command
         return match (true) {
             $pass === null && ! $ledger => ['discovered', ''],
             $pass === null => ['rolled back', ''],
-            (int) $pass === 0 => ['prepared', ''],
+            $pass === 0 => ['prepared', ''],
             default => ['backfilling', self::progress(
                 map: $map,
                 connection: $connection,
-                pass: (int) $pass,
+                pass: $pass,
                 ledger: $ledger,
             )],
         };

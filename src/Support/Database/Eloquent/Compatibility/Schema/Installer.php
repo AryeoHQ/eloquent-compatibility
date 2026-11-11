@@ -6,7 +6,6 @@ namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Carbon\CarbonInterval;
 use Closure;
-use DateTimeImmutable;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\QueryException;
@@ -20,7 +19,6 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Outcome;
-use Support\Database\Eloquent\Compatibility\Write\Pass;
 use Support\Database\Eloquent\Compatibility\Write\RetainedRows;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
@@ -185,7 +183,7 @@ final readonly class Installer
             connection: $this->connection,
         );
         $read = (string) $this->connection->scalar(
-            query: "select to_char(now() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            query: "select to_char(now() at time zone 'UTC', '".Watermark::MICROSECONDS."')",
             useReadPdo: false,
         );
         $native = $retained->unserved($map->table);
@@ -210,7 +208,10 @@ final readonly class Installer
             Log::info("Compatibility map '{$map->table}' install: {$hidden}");
         }
 
-        $since = (new DateTimeImmutable($read))->sub($margin)->format('Y-m-d\TH:i:s.uP');
+        $since = Watermark::before(
+            moment: $read,
+            margin: $margin,
+        );
 
         $this->restoring(
             outside: $outside,
@@ -218,7 +219,7 @@ final readonly class Installer
             run: fn () => $this->locked(
                 map: $map,
                 budget: $budget,
-                install: function (int|float $started) use ($map, $backfiller, $retained, $native, $since, $margin, $compile, $budget): bool {
+                install: function (int|float $started) use ($map, $backfiller, $ledger, $retained, $native, $since, $margin, $compile, $budget): bool {
                     $this->lockSchema($map->tables());
                     $install = $compile(fn (ConnectionInterface $connection) => $retained->carryNative(
                         keys: $retained->unserved(
@@ -240,19 +241,17 @@ final readonly class Installer
                     }
 
                     $this->connection->statement('LOCK TABLE '.SqlFragments::identifier($map->table).' IN SHARE ROW EXCLUSIVE MODE');
-                    self::refuseBlockedFinal(
-                        map: $map,
-                        pass: $backfiller->finalPass(
-                            margin: $margin,
-                            before: fn (int|string $key) => self::refuseSpent(
-                                map: $map,
-                                started: $started,
-                                budget: $budget,
-                                moment: 'before',
-                                statement: "the final pass's write of {$map->table} ".(new $map->model)->getKeyName()." {$key}",
-                            ),
+                    $backfiller->finalPass(
+                        margin: $margin,
+                        before: fn (int|string $key) => self::refuseSpent(
+                            map: $map,
+                            started: $started,
+                            budget: $budget,
+                            moment: 'before',
+                            statement: "the final pass's write of {$map->table} ".(new $map->model)->getKeyName()." {$key}",
                         ),
                     );
+                    $ledger->refuseBlocked('install');
                     $this->apply(
                         statements: $install,
                         before: fn (string $statement) => self::refuseSpent(
@@ -344,41 +343,6 @@ final readonly class Installer
                 because: count($differing)." {$map->table} rows still hold other values than their successors serve after install caught them up; the first are {$key} ".self::first($differing).'. Run '.CheckDrift::command($map->model).' to see each value, fix it, then install again',
             );
         }
-    }
-
-    private static function refuseBlockedFinal(ResolvedMap $map, Pass $pass): void
-    {
-        if (! $pass->blocked()) {
-            return;
-        }
-
-        $reasons = [];
-
-        foreach ($pass->reasons as $status => $counts) {
-            foreach ($counts as $reason => $count) {
-                $reasons[] = "{$count} {$status} because {$reason}";
-            }
-        }
-
-        $more = count($reasons) - Ledger::FIRST_REASONS;
-        $reasons = array_slice(
-            array: $reasons,
-            offset: 0,
-            length: Ledger::FIRST_REASONS,
-        );
-
-        if ($more > 0) {
-            $reasons[] = "and {$more} more ".($more === 1 ? 'reason' : 'reasons');
-        }
-
-        throw InvalidCompatibilityMap::cannot(
-            map: $map->table,
-            operation: 'install',
-            because: 'its final pass under the lock could not write every row: '.implode(
-                separator: '; ',
-                array: $reasons,
-            ).' ('.(new $map->model)->getKeyName().' '.self::first([...$pass->blockedKeys[Outcome::Refused->value] ?? [], ...$pass->blockedKeys[Outcome::Failed->value] ?? []]).'), so it rolled back. Fix each row, then install again',
-        );
     }
 
     /**

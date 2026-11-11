@@ -287,15 +287,17 @@ final class MorphTargetTest extends TestCase
         $backfiller->run();
         $trashed = (string) $this->asset('place_brochure', 1)['asset_id'];
         TrashableAssetFile::query()->findOrFail($trashed)->delete();
+        DB::update("update place_brochures set updated_at = localtimestamp(0) + interval '1 day' where id = 1");
 
         $run = $backfiller->run();
+        $moved = (string) $this->asset('place_brochure', 1)['asset_id'];
         Compatibility::install(
             model: Brochure::class,
             statementTimeout: CarbonInterval::seconds(30),
         );
 
         $live = (string) $this->asset('place_brochure', 1)['asset_id'];
-        $this->assertSame([0, 0], [$run->walked, $run->changed]);
+        $this->assertSame([1, 1, $live], [$run->walked, $run->changed, $moved]);
         $this->assertNotSame($trashed, $live);
         $this->assertSame(['guide.pdf', true], [DB::table('trashable_asset_files')->where('id', $live)->whereNull('deleted_at')->value('filename'), DB::table('trashable_asset_files')->where('id', $trashed)->whereNotNull('deleted_at')->exists()]);
         $this->assertSame([[1, 'Guide', 'guide.pdf', null], [2, 'Map', null, 'https://maps.example/oak']], Brochure::query()->orderBy('id')->get()->map(fn (Brochure $brochure) => [$brochure->id, $brochure->title, $brochure->file_name, $brochure->url])->all());

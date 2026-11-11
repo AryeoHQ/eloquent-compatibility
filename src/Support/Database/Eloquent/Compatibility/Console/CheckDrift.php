@@ -112,25 +112,21 @@ final class CheckDrift extends Command
             callback: fn (DriftFinding $finding) => $finding->trashed,
         ));
 
+        $table = fn (array $rows) => $this->table(
+            headers: ['Model', 'Check', 'Record', 'Detail'],
+            rows: array_map(
+                callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
+                array: $rows,
+            ),
+        );
+
         if ($live !== []) {
-            $this->table(
-                headers: ['Model', 'Check', 'Record', 'Detail'],
-                rows: array_map(
-                    callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
-                    array: $live,
-                ),
-            );
+            $table($live);
         }
 
         if ($trashed !== []) {
             $this->line('Trashed records:');
-            $this->table(
-                headers: ['Model', 'Check', 'Record', 'Detail'],
-                rows: array_map(
-                    callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
-                    array: $trashed,
-                ),
-            );
+            $table($trashed);
         }
     }
 
