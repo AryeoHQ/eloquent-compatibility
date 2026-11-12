@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 use Illuminate\Console\Command;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 
+/**
+ * @internal
+ */
 final class CacheServedModels extends Command
 {
     protected $signature = 'compatibility:cache';

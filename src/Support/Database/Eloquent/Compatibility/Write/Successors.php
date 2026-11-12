@@ -13,6 +13,8 @@ use Illuminate\Database\Eloquent\Model;
 final readonly class Successors
 {
     /**
+     * @internal
+     *
      * @param  Staging<TRoot>  $staging
      */
     public function __construct(private Staging $staging) {}

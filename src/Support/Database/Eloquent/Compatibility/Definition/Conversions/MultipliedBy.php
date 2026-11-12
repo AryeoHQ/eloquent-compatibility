@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
+/**
+ * @internal
+ */
 final readonly class MultipliedBy implements Conversion
 {
     public function __construct(public int|float $factor) {}

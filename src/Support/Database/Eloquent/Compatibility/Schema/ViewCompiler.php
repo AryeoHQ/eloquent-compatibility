@@ -13,6 +13,9 @@ use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
+/**
+ * @internal
+ */
 final readonly class ViewCompiler
 {
     public function __construct(private ColumnCatalog $columnCatalog, private ConnectionInterface $connection) {}

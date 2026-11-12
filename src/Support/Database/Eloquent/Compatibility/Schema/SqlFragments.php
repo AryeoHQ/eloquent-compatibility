@@ -10,6 +10,9 @@ use Illuminate\Support\Facades\Config;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
+/**
+ * @internal
+ */
 final class SqlFragments
 {
     public const int IDENTIFIER_LIMIT = 63;

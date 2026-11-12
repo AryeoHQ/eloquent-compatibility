@@ -12,6 +12,9 @@ use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Exceptions\UndiscoveredServedModel;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 
+/**
+ * @internal
+ */
 final class ServedModels
 {
     private const string PACKAGE = 'aryeo/eloquent-compatibility';

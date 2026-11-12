@@ -25,6 +25,8 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Definition\Targets;
 
 /**
+ * @internal
+ *
  * @phpstan-type Declaration array{function: string, root: bool, kind: 'operations'|'relates'|'delegates', names: list<string>}
  *
  * @implements Collector<CallLike, Declaration>

@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
+use Support\Database\Eloquent\Compatibility\Schema\ServedTable;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 
@@ -62,6 +63,9 @@ final class Compatibility
     /** @var array<class-string, string> */
     private array $withoutForwarding = [];
 
+    /**
+     * @internal
+     */
     public function __construct(string $model)
     {
         if (! is_subclass_of($model, Model::class)) {
@@ -72,6 +76,9 @@ final class Compatibility
         $this->map = (new $model)->getTable();
     }
 
+    /**
+     * @internal
+     */
     public static function of(string $model): self
     {
         $compatibility = new self($model);
@@ -148,6 +155,14 @@ final class Compatibility
             model: $model,
             statements: Statements::retire(...),
         );
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     */
+    public static function serves(string $model): bool
+    {
+        return ServedTable::serves(new $model);
     }
 
     public function retainedIn(string $table): self
@@ -321,6 +336,8 @@ final class Compatibility
     }
 
     /**
+     * @internal
+     *
      * @return list<class-string<Model>>
      */
     public function successors(): array
@@ -343,6 +360,9 @@ final class Compatibility
         return $models;
     }
 
+    /**
+     * @internal
+     */
     public function resolve(): ResolvedMap
     {
         return new ResolvedMap(
@@ -361,6 +381,9 @@ final class Compatibility
         );
     }
 
+    /**
+     * @internal
+     */
     public static function connection(ResolvedMap $map): ConnectionInterface
     {
         $legacy = new $map->model;

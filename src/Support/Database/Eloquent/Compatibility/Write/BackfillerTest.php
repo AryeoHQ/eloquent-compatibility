@@ -29,6 +29,7 @@ use Tests\Fixtures\Support\Files\InteractiveContent;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Files\WriteFileMimeType;
+use Tests\Fixtures\Support\Listings\InterleavingWriteScope;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\LeaveTitleUnchanged;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -63,6 +64,8 @@ final class BackfillerTest extends TestCase
         WriteAssetFileMimeType::$seen = [];
         RecordingWriteScope::$received = [];
         TransactionRecordingWriteScope::$received = [];
+        InterleavingWriteScope::$interleave = null;
+        InterleavingWriteScope::$received = [];
     }
 
     protected function tearDown(): void
@@ -392,6 +395,29 @@ final class BackfillerTest extends TestCase
 
         $this->assertNotNull($before);
         $this->assertSame([1, [], $before, 'deleted'], [$pass->count(Outcome::Deleted), $fired, DB::scalar('select deleted_at::text from jobs where id = ?', [$job]), DB::scalar('select status from listings_backfill where legacy_id = 2')]);
+    }
+
+    #[Test]
+    public function it_records_a_row_whose_successor_keys_move_after_the_write_scope_ran_as_refused_and_writes_nothing(): void
+    {
+        $listing = $this->scopedListing(InterleavingWriteScope::class);
+        $this->backfiller($listing::class)->run();
+        $job = DB::scalar('select job_id from listings where id = 1');
+        $name = DB::scalar('select name from jobs where id = ?', [$job]);
+        DB::update("update listings set title = 'Oak Manor', updated_at = '2030-01-01 00:00:00' where id = 1");
+        InterleavingWriteScope::$interleave = function (array $successors): void {
+            DB::table('places')->whereIn(
+                column: 'id',
+                values: $successors[Place::class] ?? [],
+            )->update(['parent_id' => DB::raw('id')]);
+        };
+
+        $pass = $this->backfiller($listing::class)->run();
+
+        $row = (array) DB::selectOne('select status, reason from listings_backfill where legacy_id = 1');
+        $this->assertSame([1, 'refused', $name], [$pass->count(Outcome::Refused), $row['status'], DB::scalar('select name from jobs where id = ?', [$job])]);
+        $this->assertIsString($row['reason']);
+        $this->assertStringContainsString('cannot take this write now, because its Place rows moved after the write scope ran', $row['reason']);
     }
 
     #[Test]

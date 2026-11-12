@@ -22,6 +22,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Throwable;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class RoundTrip
 {
     private const array NUMERIC_CASTS = ['int', 'integer', 'real', 'float', 'double', 'decimal'];

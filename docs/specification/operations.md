@@ -341,7 +341,7 @@ Legacy readers therefore see no v2-created listing until install. Declined: mirr
 An operation or an initializer refuses with `throw Refusal::because('...')`.
 
 - **A live write.** The unit of work rolls back, and the caller receives a `Refusal` whose message names the legacy model, the record key or a new record, the attribute and the operation or initializer class, ahead of the reason. The consumer's own `Refusal` is its previous exception.
-- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues. A `CompatibilityWriteRefused` on a backfill row is recorded as `refused` too.
+- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues. A `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved` on a backfill row is recorded as `refused` too.
 - **Install's native-root insert.** Install catches nothing under its lock, so the refusal aborts install, and names the root's key and the reason.
 
 Any other exception on a backfill row rolls back that row's savepoint too, and records the row as `failed`, except a lock timeout or a deadlock, which the pass retries ([Lifecycle: a pass](lifecycle.md#a-pass)).
@@ -368,7 +368,7 @@ final class ListingWriteScope implements ScopesWrites
 - The scope adds to the package's own row locks, and never replaces them. The package's `FOR UPDATE` on the root, its retained row and the touched related rows always comes inside the scope, last.
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
-- A difference refuses with a retryable error, `CompatibilityWriteRefused::successorsMoved()`, which extends `Exceptions\CompatibilityException`. On a live write, the caller receives the error, and the application's outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
+- A difference refuses with the retryable error `Exceptions\SuccessorsMoved`, which extends `Exceptions\CompatibilityException`. It is the type the application's outermost transaction retries on. On a live write, the caller receives the error, and the outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
 - The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.

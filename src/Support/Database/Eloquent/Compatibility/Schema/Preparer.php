@@ -12,6 +12,9 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 
+/**
+ * @internal
+ */
 final readonly class Preparer
 {
     public function __construct(private ColumnCatalog $columnCatalog) {}

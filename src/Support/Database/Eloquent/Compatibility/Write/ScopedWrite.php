@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 use Closure;
 use Throwable;
 
+/**
+ * @internal
+ */
 final class ScopedWrite
 {
     public bool $ran = false;

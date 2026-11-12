@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+/**
+ * @internal
+ */
 final class Pass
 {
     public int $walked = 0;

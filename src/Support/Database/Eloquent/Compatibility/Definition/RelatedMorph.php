@@ -13,6 +13,9 @@ use Illuminate\Database\Eloquent\SoftDeletingScope;
 use ReflectionProperty;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 
+/**
+ * @internal
+ */
 final readonly class RelatedMorph
 {
     /** @var non-empty-array<class-string<Model>, Related> */

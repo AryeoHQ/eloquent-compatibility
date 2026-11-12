@@ -6,6 +6,9 @@ namespace Support\Database\Eloquent\Compatibility\Console;
 
 use Illuminate\Database\Eloquent\Model;
 
+/**
+ * @internal
+ */
 final readonly class DriftFinding
 {
     /**

@@ -23,6 +23,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 
+/**
+ * @internal
+ */
 final readonly class MassWriter
 {
     private const string TYPED = 'pg_temp.compatibility_typed';

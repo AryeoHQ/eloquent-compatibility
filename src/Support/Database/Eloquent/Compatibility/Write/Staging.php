@@ -12,6 +12,8 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
 
 /**
+ * @internal
+ *
  * @template TRoot of Model
  */
 final class Staging

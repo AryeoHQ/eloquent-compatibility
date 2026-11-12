@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
+/**
+ * @internal
+ */
 final readonly class Column
 {
     public function __construct(

@@ -7,6 +7,9 @@ namespace Support\Database\Eloquent\Compatibility\Definition\Conversions;
 use Closure;
 use InvalidArgumentException;
 
+/**
+ * @internal
+ */
 final readonly class IsNotNull implements Conversion
 {
     /**

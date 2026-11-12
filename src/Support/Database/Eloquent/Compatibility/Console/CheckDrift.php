@@ -10,6 +10,9 @@ use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Throwable;
 
+/**
+ * @internal
+ */
 final class CheckDrift extends Command
 {
     protected $signature = 'compatibility:check

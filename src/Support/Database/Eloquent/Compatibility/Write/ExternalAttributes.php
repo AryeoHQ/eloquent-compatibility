@@ -21,6 +21,9 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use WeakMap;
 use WeakReference;
 
+/**
+ * @internal
+ */
 final class ExternalAttributes
 {
     private const int CHUNK = 500;

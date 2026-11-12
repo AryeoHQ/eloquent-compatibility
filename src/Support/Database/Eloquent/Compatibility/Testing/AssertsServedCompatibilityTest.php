@@ -17,19 +17,31 @@ use Illuminate\Support\Str;
 use PHPUnit\Exception as PHPUnitException;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\ExpectationFailedException;
+use PHPUnit\Framework\SkippedTest;
+use RuntimeException;
 use Support\Database\Eloquent\Compatibility\Compatibility;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
+use Support\Database\Eloquent\Compatibility\Contracts\InitializesSuccessors;
+use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\Successor;
+use Support\Database\Eloquent\Compatibility\Definition\Targets;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Provides\CarriesLegacy;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
+use Support\Database\Eloquent\Compatibility\Write\Creation;
+use Support\Database\Eloquent\Compatibility\Write\Successors;
 use Tests\Fixtures\Support\Discovery\InheritedServed;
 use Tests\Fixtures\Support\Discovery\ResolvableServedModels;
+use Tests\Fixtures\Support\Files\File;
+use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\FloorPlan;
+use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\PlaceAssets\AssetFile;
+use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\TestCase;
@@ -53,7 +65,12 @@ final class AssertsServedCompatibilityTest extends TestCase
 
     protected function tearDown(): void
     {
+        if ($this->connectionsToTransact !== []) {
+            DB::rollBack(0);
+        }
+
         ListingTables::drop();
+        FileTables::drop();
         PlaceAssetTables::drop();
         DB::statement('drop table if exists place_overlaps');
 
@@ -168,6 +185,148 @@ final class AssertsServedCompatibilityTest extends TestCase
                 },
             ),
         );
+    }
+
+    #[Test]
+    public function it_fails_and_names_the_exception_when_the_native_create_fails_and_keeps_it_as_the_cause(): void
+    {
+        $this->install();
+        $closed = new RuntimeException('The company is closed.');
+
+        $exception = $this->exceptionOf(
+            model: Listing::class,
+            nativeCreate: fn () => throw $closed,
+        );
+
+        $this->assertSame('nativeCreate fails to create a Job natively: '.RuntimeException::class.': The company is closed.', $exception->getMessage());
+        $this->assertSame($closed, $exception->getPrevious());
+    }
+
+    #[Test]
+    public function it_skips_the_test_when_the_native_create_skips_it(): void
+    {
+        $this->install();
+
+        $exception = $this->exceptionOf(
+            model: Listing::class,
+            nativeCreate: fn () => $this->markTestSkipped('The company factory needs a seeded region.'),
+        );
+
+        $this->assertInstanceOf(SkippedTest::class, $exception); // @phpstan-ignore classConstant.internalInterface
+        $this->assertSame('The company factory needs a seeded region.', $exception->getMessage());
+    }
+
+    #[Test]
+    public function it_keeps_the_comparison_of_a_failed_assertion_inside_the_native_create(): void
+    {
+        $this->install();
+
+        $exception = $this->exceptionOf(
+            model: Listing::class,
+            nativeCreate: fn () => $this->assertSame('Birch House', Job::query()->create(['name' => 'Birch Lodge', 'company_id' => ListingTables::COMPANY])->name),
+        );
+
+        $this->assertInstanceOf(ExpectationFailedException::class, $exception);
+        $this->assertSame(['Birch House', 'Birch Lodge'], [$exception->getComparisonFailure()?->getExpected(), $exception->getComparisonFailure()?->getActual()]);
+    }
+
+    #[Test]
+    public function it_installs_inside_the_transaction_refresh_database_opens_with_no_prior_pass_and_passes_for_a_classified_native_root(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        Compatibility::prepare(FloorPlan::class);
+        $this->connectionsToTransact = [DB::getDefaultConnection()];
+        $this->beginDatabaseTransaction();
+
+        $this->assertServesCompatibility(
+            model: FloorPlan::class,
+            nativeCreate: self::floorPlan(),
+        );
+        $this->assertSame([1, 'r'], [DB::transactionLevel(), DB::scalar("select relkind::text from pg_class where oid = 'floorplans'::regclass")]);
+    }
+
+    #[Test]
+    public function it_installs_inside_the_transaction_refresh_database_opens_with_no_prior_pass_and_fails_when_the_initializer_leaves_the_discriminator_unset(): void
+    {
+        PlaceAssetTables::create();
+        PlaceAssetTables::seed();
+        $initializer = new class implements InitializesSuccessors
+        {
+            public function initialize(Successors $successors, Creation $creation): void {}
+        };
+        $model = (new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'floorplans';
+
+            protected $guarded = [];
+
+            /** @var class-string<InitializesSuccessors<PlaceAsset>> */
+            public static string $initializer;
+
+            public static function compatibility(Compatibility $floorPlan): Compatibility
+            {
+                return $floorPlan
+                    ->retainedIn('floorplans_retained')
+                    ->successorsInitializedBy(self::$initializer)
+                    ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'floorplan'))
+                        ->relatedMorph(relation: fn (PlaceAsset $asset) => $asset->asset(),
+                            choose: fn (Model $plan): string => $plan->getAttribute('url') !== null ? AssetLink::class : AssetFile::class,
+                            targets: fn (Targets $targets) => $targets
+                                ->as(target: AssetFile::class, successor: fn (Successor $file) => $file
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->from('filename'),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetFile stores no url.', ignoreWrites: true),
+                                    ))
+                                ->as(target: AssetLink::class, successor: fn (Successor $link) => $link
+                                    ->attribute(
+                                        name: 'file_name',
+                                        definition: fn (Attribute $attribute) => $attribute->fixed(null)->readOnly(because: 'An AssetLink stores no file_name.', ignoreWrites: true),
+                                    )
+                                    ->attribute(
+                                        name: 'url',
+                                        definition: fn (Attribute $attribute) => $attribute->from('url'),
+                                    ))));
+            }
+        })::class;
+        $model::$initializer = $initializer::class;
+        $this->app->instance(ServedModels::class, self::servedOnly(
+            model: $model,
+            files: new Filesystem,
+        ));
+        Compatibility::prepare($model);
+        $this->connectionsToTransact = [DB::getDefaultConnection()];
+        $this->beginDatabaseTransaction();
+
+        $this->assertStringStartsWith('compatibility:check finds a membership drift in floorplans.', $this->failureOf(
+            model: $model,
+            nativeCreate: self::floorPlan(),
+        ));
+    }
+
+    #[Test]
+    public function it_fails_when_a_shared_successor_serves_a_record_of_a_sibling_map(): void
+    {
+        FileTables::create();
+        FileTables::seed();
+        FileTables::install();
+        DB::update('update legacy_files_retained set file_id = (select file_id from photos_retained where id = 1) where id = 1');
+
+        $failure = $this->exceptionOf(
+            model: Photo::class,
+            nativeCreate: fn () => File::query()->create(['filename' => 'birch.jpg', 'mime_type' => 'image/jpeg']),
+        );
+
+        $this->assertInstanceOf(ExpectationFailedException::class, $failure);
+        $this->assertStringStartsWith('compatibility:check finds a membership drift in photos.', $failure->getMessage());
+        $this->assertSame(['photos#1: its files row also serves a LegacyFile record, so one shared successor serves two legacy records'], $failure->getComparisonFailure()?->getActual());
     }
 
     #[Test]
@@ -320,13 +479,25 @@ final class AssertsServedCompatibilityTest extends TestCase
      */
     private function failureOf(string $model, Closure $nativeCreate): string
     {
+        return $this->exceptionOf(
+            model: $model,
+            nativeCreate: $nativeCreate,
+        )->getMessage();
+    }
+
+    /**
+     * @param  class-string<Model&Compatible>  $model
+     * @param  Closure(): mixed  $nativeCreate
+     */
+    private function exceptionOf(string $model, Closure $nativeCreate): PHPUnitException
+    {
         try {
             $this->assertServesCompatibility(
                 model: $model,
                 nativeCreate: $nativeCreate,
             );
         } catch (PHPUnitException $exception) {
-            return $exception->getMessage();
+            return $exception;
         }
 
         $this->fail("assertServesCompatibility({$model}) passed.");

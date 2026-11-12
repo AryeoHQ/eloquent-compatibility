@@ -87,6 +87,10 @@ final class InstallerTest extends TestCase
             $this->concurrent = null;
         }
 
+        if ($this->connectionsToTransact !== []) {
+            DB::rollBack(0);
+        }
+
         ListingTables::drop();
         FileTables::drop();
 
@@ -1131,6 +1135,45 @@ final class InstallerTest extends TestCase
         });
 
         $this->assertSame(['r', null], [$this->kind('listings'), $this->kind('listings_retained')]);
+    }
+
+    #[Test]
+    public function it_installs_a_served_model_inside_the_transaction_refresh_database_opens(): void
+    {
+        $this->connectionsToTransact = [DB::getDefaultConnection()];
+        $this->beginDatabaseTransaction();
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(1, DB::transactionLevel());
+        $this->assertSame(['v', 'r'], [$this->kind('listings'), $this->kind('listings_retained')]);
+        $this->assertSame(['Oak House', 'Elm Cottage'], Listing::query()->orderBy('id')->pluck('title')->all());
+    }
+
+    #[Test]
+    public function it_refuses_inside_a_caller_s_transaction_once_a_pass_left_a_watermark(): void
+    {
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertSuccessful();
+        DB::beginTransaction();
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $this->fail('install() did not refuse.');
+        } catch (LogicException $exception) {
+            $this->assertSame('Compatibility::install() catches up listings in transactions of its own before it takes the lock, and the connection is already inside a transaction. Run it from a migration that sets public $withinTransaction = false.', $exception->getMessage());
+            $this->assertSame([1, 'r', null], [DB::transactionLevel(), $this->kind('listings'), $this->kind('listings_retained')]);
+        } finally {
+            DB::rollBack();
+        }
     }
 
     #[Test]
@@ -3164,6 +3207,27 @@ final class InstallerTest extends TestCase
         });
 
         $this->assertSame([['7s', '3s'], ['7s', '3s']], $timeouts);
+    }
+
+    #[Test]
+    public function it_restores_the_statement_and_lock_timeouts_of_the_caller_s_transaction_after_it_installs_an_installed_model_inside_it(): void
+    {
+        $timeouts = DB::transaction(function (): array {
+            DB::statement("set local statement_timeout = '7s'");
+            DB::statement("set local lock_timeout = '3s'");
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            return [DB::scalar('show statement_timeout'), DB::scalar('show lock_timeout'), $this->kind('listings')];
+        });
+
+        $this->assertSame(['7s', '3s', 'v'], $timeouts);
     }
 
     #[Test]

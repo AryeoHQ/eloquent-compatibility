@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Events;
 
+/**
+ * @internal
+ */
 final class Sequence
 {
     /** @var array<array-key, true> */

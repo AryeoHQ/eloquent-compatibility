@@ -11,6 +11,9 @@ use PHPStan\Type\Constant\ConstantStringType;
 use PHPStan\Type\ObjectType;
 use PHPStan\Type\Type;
 
+/**
+ * @internal
+ */
 trait ReadsCallArguments
 {
     /**

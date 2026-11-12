@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
+/**
+ * @internal
+ */
 final class CompatibilityQueryRefused extends CompatibilityException
 {
     public static function untranslatable(string $model, string $attribute, string $operation, string $because): self

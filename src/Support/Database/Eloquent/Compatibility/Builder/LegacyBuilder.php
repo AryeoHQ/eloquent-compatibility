@@ -30,6 +30,8 @@ use Support\Database\Eloquent\Compatibility\Write\RoundTrip;
 use WeakMap;
 
 /**
+ * @internal
+ *
  * @template TModel of Model
  *
  * @extends Builder<TModel>

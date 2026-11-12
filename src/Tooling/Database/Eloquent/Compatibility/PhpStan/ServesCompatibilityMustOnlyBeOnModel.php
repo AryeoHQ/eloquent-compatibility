@@ -16,6 +16,8 @@ use Tooling\PhpStan\Rules\Rule;
 use Tooling\Rules\Attributes\NodeType;
 
 /**
+ * @internal
+ *
  * @extends Rule<Class_>
  */
 #[NodeType(Class_::class)]

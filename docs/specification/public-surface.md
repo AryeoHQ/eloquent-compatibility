@@ -2,7 +2,7 @@ Status: Proposed
 
 # Public surface
 
-A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class under `src/` carries `@internal`, and any release may change it. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
+A consumer may use exactly the classes, methods, commands and interfaces on this page. Every other class the package ships carries `@internal`, and any release may change it. The package ships no `*Test.php` or `*TestCases.php` file under `src/`, because `.gitattributes` export-ignores them. [0028](../decisions/0028-the-public-surface-is-declared.md) records the decision.
 
 Every class name below is relative to `Support\Database\Eloquent\Compatibility\`. The new classes follow this layout. The operation arguments `Write\Successors`, `Write\Change`, `Write\Creation`, `Write\Origin` and `Write\Refusal` sit beside the writers. The interfaces sit in `Contracts\`, the successor trait in `Provides\`, `Targets` in `Definition\`, and the event `WriteIgnored` in `Events\`. A different namespace is a deviation under [Deviations](README.md#deviations).
 
@@ -31,9 +31,10 @@ Every parameter of a public constructor, function or method on this page is publ
 | `Write\Refusal` | exception | refuses one write or one backfill row, and extends `Exceptions\CompatibilityException` |
 | `Events\WriteIgnored` | event | a discarded non-NULL write to a `readOnly()` attribute declared with `ignoreWrites: true`; its constructor is `__construct(Change $change, mixed $value)` |
 | `Exceptions\CompatibilityException` | abstract class | the one public base of every package exception |
+| `Exceptions\SuccessorsMoved` | exception | the retryable refusal of a write whose successor keys moved after the write scope ran; the application's outermost transaction retries on it, and it extends `Exceptions\CompatibilityException` |
 | `Testing\AssertsServedCompatibility` | trait | the assertion that a served model works |
 
-`Exceptions\CompatibilityException` exists today as `abstract class CompatibilityException extends RuntimeException`. `Write\Refusal` and every package refusal extend it, so a caller catches every package exception by one supported type. The concrete exception classes stay `@internal`.
+`Exceptions\CompatibilityException` exists today as `abstract class CompatibilityException extends RuntimeException`. `Write\Refusal` and every package refusal extend it, so a caller catches every package exception by one supported type. Beside `Write\Refusal`, `Exceptions\SuccessorsMoved` is the one public concrete exception, because the application retries on it. Every other concrete exception class stays `@internal`.
 
 `Definition\Targets` replaces today's `Definition\Successors` builder. `Provides\CarriesLegacy` takes its name from the worked examples.
 
@@ -147,7 +148,7 @@ The commands are public by name. Their classes are internal.
 - a membership query of `compatibility:check` finds a row: a served root outside its map's `when()`, or a shared successor that serves two legacy records, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.
 
-`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row and runs one `compatibility:backfill` pass catches an initializer that leaves the discriminator unset.
+`$nativeCreate` creates one member root natively, such as `nativeCreate: fn () => PlaceAsset::factory()->floorPlan()->create()`. The assertion runs it after an in-transaction install. A create outside `when()` inserts nothing, so the assertion catches a discriminator that the consumer's `Creating` listener leaves unset. The membership queries run against the test database, so a test that seeds a legacy row catches an initializer that leaves the discriminator unset: the assertion's first install runs the full pass inside the test's transaction.
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install, which no pass preceded, runs its full pass inside that transaction. A test that uses `RefreshDatabase` can therefore install a served model.
 
@@ -186,7 +187,7 @@ interface ManagesDependents
 }
 ```
 
-- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. A successor the write creates appears under its class with an empty list. It returns what `$write` returns. The package opens its transaction first, and calls the scope inside it, so the locks the scope takes hold until the package's work commits. The scope needs no transaction of its own. The package reads those keys without a lock. Inside `$write`, it locks the successors and checks that their keys equal the keys `run()` received. A difference refuses the write with a retryable error, and the application's outermost transaction retries. [Operations](operations.md#the-write-scope) states the check.
+- `ScopesWrites::run()` receives `array<class-string<Model>, list<int|string>>`: the keys of the successors the write touches, by class. A successor the write creates appears under its class with an empty list. It returns what `$write` returns. The package opens its transaction first, and calls the scope inside it, so the locks the scope takes hold until the package's work commits. The scope needs no transaction of its own. The package reads those keys without a lock. Inside `$write`, it locks the successors and checks that their keys equal the keys `run()` received. A difference refuses the write with the retryable `Exceptions\SuccessorsMoved`, and the application's outermost transaction retries. [Operations](operations.md#the-write-scope) states the check.
 - Install's final catch-up pass and rollback's refill never call `ScopesWrites::run()`, and run no key re-check. Their table lock serializes them against live writes. [Operations](operations.md#the-write-scope) states why.
 - `Write\Successors` is generic over the root class, so `Successors<Job>::root()` returns a `Job`. The three hook interfaces take the root class as their template, so an operation for a Job root declares `@implements WritesAttribute<Job>`. `related()` returns `null` for an absent row. [Operations](operations.md#successors) states its methods.
 - `Write\Change` carries `record`, `original`, `attribute` and `origin`. `Write\Creation` carries `record` and `origin`. On a native create, `Creation::$record` is the new legacy model, so `InitializesLegacy::initialize()` takes no separate legacy parameter. [Operations](operations.md#the-change-context) states each one.
@@ -199,7 +200,7 @@ The package discovers served models from the Composer classmap. It classifies a 
 
 ## Internal
 
-Everything else is internal. That includes the conversion classes, `Builder\LegacyBuilder`, the writers, the schema classes, the console command classes, `Provider`, the PHPStan rules under `Tooling\`, and the concrete exception classes.
+Everything else is internal. That includes the conversion classes, `Builder\LegacyBuilder`, the writers, the schema classes, the console command classes, `Provider`, the PHPStan rules under `Tooling\`, and every concrete exception class except `Exceptions\SuccessorsMoved`.
 
 On `Compatibility`, the methods outside the tables above carry `@internal`: `of()`, `resolve()`, `successors()` and `connection()`.
 

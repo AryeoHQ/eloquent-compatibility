@@ -50,6 +50,9 @@ final class Attribute
 
     private null|string $orFromTable = null;
 
+    /**
+     * @internal
+     */
     public function __construct(private readonly string $map, public readonly string $name) {}
 
     public function from(string $column): self
@@ -234,22 +237,33 @@ final class Attribute
         return $this;
     }
 
+    /**
+     * @internal
+     */
     public function column(): null|string
     {
         return $this->column;
     }
 
+    /**
+     * @internal
+     */
     public function readOnlyBecause(): null|string
     {
         return $this->readOnly;
     }
 
+    /**
+     * @internal
+     */
     public function ignoresWrites(): bool
     {
         return $this->ignoreWrites;
     }
 
     /**
+     * @internal
+     *
      * @return null|class-string<WritesAttribute<covariant Model>>
      */
     public function operation(): null|string
@@ -257,17 +271,25 @@ final class Attribute
         return $this->operation;
     }
 
+    /**
+     * @internal
+     */
     public function invertible(): bool
     {
         return $this->column !== null && $this->fixed === null && $this->readAs === null && $this->computed === null && $this->orFrom === null;
     }
 
+    /**
+     * @internal
+     */
     public function isWritable(): bool
     {
         return $this->invertible() && $this->operation === null && $this->readOnly === null;
     }
 
     /**
+     * @internal
+     *
      * @return null|class-string<Model>
      */
     public function orFromSuccessor(): null|string
@@ -276,6 +298,8 @@ final class Attribute
     }
 
     /**
+     * @internal
+     *
      * @return list<Conversion>
      */
     public function conversions(): array
@@ -287,12 +311,17 @@ final class Attribute
         };
     }
 
+    /**
+     * @internal
+     */
     public function isExternal(): bool
     {
         return $this->computed !== null;
     }
 
     /**
+     * @internal
+     *
      * @param  Collection<array-key, covariant Model>  $successors
      * @return array<array-key, mixed>
      */
@@ -318,6 +347,8 @@ final class Attribute
     }
 
     /**
+     * @internal
+     *
      * @param  array<class-string<Model>, string>  $related
      */
     public function resolve(array $related = []): self
@@ -347,6 +378,8 @@ final class Attribute
     }
 
     /**
+     * @internal
+     *
      * @param  null|(Closure(null|string): (null|string))  $baseType
      */
     public function read(string $table, null|string $stored = null, null|Closure $baseType = null): string
@@ -375,6 +408,9 @@ final class Attribute
         return $sql;
     }
 
+    /**
+     * @internal
+     */
     public function write(mixed $value): mixed
     {
         foreach (array_reverse($this->conversions()) as $conversion) {
@@ -385,6 +421,8 @@ final class Attribute
     }
 
     /**
+     * @internal
+     *
      * @return null|array{string, mixed}
      */
     public function filter(string $operator, mixed $value, null|string $stored = null): null|array
@@ -411,6 +449,9 @@ final class Attribute
         return $filter;
     }
 
+    /**
+     * @internal
+     */
     public function type(null|string $stored): null|string
     {
         $types = $this->types($stored);
@@ -418,6 +459,9 @@ final class Attribute
         return $types[count($types) - 1];
     }
 
+    /**
+     * @internal
+     */
     public function exact(null|string $stored, string $served): bool
     {
         $conversions = $this->conversions();

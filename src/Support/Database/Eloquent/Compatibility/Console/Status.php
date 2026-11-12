@@ -18,6 +18,9 @@ use Support\Database\Eloquent\Compatibility\Write\Ledger;
 use Support\Database\Eloquent\Compatibility\Write\Watermark;
 use Throwable;
 
+/**
+ * @internal
+ */
 final class Status extends Command
 {
     protected $signature = 'compatibility:status

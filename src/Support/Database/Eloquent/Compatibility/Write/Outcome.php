@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+/**
+ * @internal
+ */
 enum Outcome: string
 {
     case Created = 'created';

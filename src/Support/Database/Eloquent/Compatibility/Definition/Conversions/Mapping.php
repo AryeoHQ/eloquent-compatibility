@@ -8,6 +8,9 @@ use BackedEnum;
 use InvalidArgumentException;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 
+/**
+ * @internal
+ */
 final readonly class Mapping implements Conversion
 {
     /** @var array<int|string, int|string> */

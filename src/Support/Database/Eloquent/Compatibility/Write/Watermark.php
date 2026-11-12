@@ -11,6 +11,9 @@ use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 
+/**
+ * @internal
+ */
 final readonly class Watermark
 {
     public const string TABLE = 'compatibility_backfills';
