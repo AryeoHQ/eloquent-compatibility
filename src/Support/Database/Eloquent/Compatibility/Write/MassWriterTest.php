@@ -488,7 +488,7 @@ final class MassWriterTest extends TestCase
     public function it_writes_a_json_path_into_the_column_that_owns_it_for_a_mapped_a_related_and_a_legacy_only_column(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
         DB::table('settings_holders')->insert([
             ['name' => 'Oak', 'settings' => '{"color": "red", "enabled": false}', 'preferences' => '{"theme": "light"}', 'options' => '{"a": 1}'],
@@ -533,7 +533,7 @@ final class MassWriterTest extends TestCase
     public function it_refuses_a_json_path_write_that_a_successor_listener_changes_and_skips_one_into_a_null_column(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
         DB::table('settings_holders')->insert([
             ['name' => 'Oak', 'settings' => '{"color": "red"}'],
@@ -573,7 +573,7 @@ final class MassWriterTest extends TestCase
     public function it_evaluates_the_json_paths_and_expressions_of_one_mass_write_against_the_values_before_the_write_as_a_native_update_does(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, label text, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz)');
         DB::table('settings_holders')->insert([
             ['name' => 'Oak', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
             ['name' => 'Pine', 'preferences' => '{"theme": "light"}', 'label' => 'serif'],
@@ -618,7 +618,7 @@ final class MassWriterTest extends TestCase
     public function it_writes_a_json_path_into_a_legacy_only_column_and_serves_no_successor_row_without_a_retained_row(): void
     {
         DB::statement("create table settings_holders (id serial primary key, name text not null, preferences jsonb not null default '{}'::jsonb, notes jsonb, created_at timestamptz, updated_at timestamptz)");
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz)');
         DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
         $holder = $this->jsonHolder();
         $rows = fn (): array => DB::table('settings_holders')->orderBy('id')->get(['id', 'preferences', 'notes'])->map(fn (object $row) => [$row->id, json_decode((string) $row->preferences, true), json_decode((string) $row->notes, true)])->all();
@@ -652,7 +652,7 @@ final class MassWriterTest extends TestCase
     public function it_writes_a_whole_json_value_into_a_mapped_and_a_related_column_for_records_with_and_without_the_related_row_as_a_native_update_does(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, preferences jsonb, options jsonb, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb)');
         DB::statement('create table configured_sites (id uuid primary key default gen_random_uuid(), configured_job_id uuid not null unique references configured_jobs, options jsonb)');
         DB::table('settings_holders')->insert([
             ['name' => 'Oak', 'options' => '{"a": 1}'],
@@ -695,7 +695,7 @@ final class MassWriterTest extends TestCase
     public function it_writes_a_whole_json_value_into_a_legacy_only_column_as_a_native_update_does(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, preferences jsonb, notes json, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz)');
         DB::table('settings_holders')->insert(['name' => 'Oak', 'preferences' => '{"theme": "light"}']);
         DB::statement('create table settings_natives as select * from settings_holders');
         $values = ['preferences' => ['theme' => 'dark'], 'notes' => ['seen', 'pinned']];
@@ -950,7 +950,7 @@ final class MassWriterTest extends TestCase
     public function it_refuses_a_json_path_write_into_a_read_only_attribute_and_discards_one_into_an_attribute_that_ignores_writes(): void
     {
         DB::statement('create table settings_holders (id serial primary key, name text not null, settings jsonb, created_at timestamptz, updated_at timestamptz)');
-        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, settings jsonb)');
+        DB::statement('create table configured_jobs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz, settings jsonb)');
         DB::table('settings_holders')->insert([['name' => 'Oak', 'settings' => '{"color": "red"}']]);
         $refusing = $this->settingsHolder(ignoreWrites: false);
         $ignoring = $this->settingsHolder(ignoreWrites: true);

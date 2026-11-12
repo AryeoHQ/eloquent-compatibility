@@ -316,6 +316,7 @@ final class LegacyBuilderReadTest extends TestCase
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set listed_at = '2026-01-01 15:30:00+00', floor_code = '01', price_mills = 1005 where id = (select job_id from listings where id = 1)");
         DB::update("update jobs set listed_at = '2026-01-02 00:30:00+00', floor_code = '2', price_mills = 1010 where id = (select job_id from listings where id = 3)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -453,6 +454,7 @@ final class LegacyBuilderReadTest extends TestCase
 
         try {
             DB::statement('alter table jobs alter column lifecycle_status type varchar(255) collate compatibility_case_insensitive');
+            DB::statement('alter table listings alter column status drop not null');
             $model = new class extends Model implements Compatible
             {
                 use ServesCompatibility;
@@ -589,6 +591,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::statement("alter table listings alter column status drop default, alter column status type integer using case status when 'Draft' then 0 when 'Active' then 1 when 'Sold' then 2 end, alter column status set default 0");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -627,6 +630,7 @@ final class LegacyBuilderReadTest extends TestCase
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set is_featured = true where id = (select job_id from listings where id = 1)');
         DB::update('update jobs set is_featured = false where id = (select job_id from listings where id = 3)');
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -685,6 +689,7 @@ final class LegacyBuilderReadTest extends TestCase
         DB::update("update jobs set cents = 500, code = 'a' where id = (select job_id from listings where id = 1)");
         DB::update('update jobs set cents = null, code = null where id = (select job_id from listings where id = 2)');
         DB::update("update jobs set cents = 0, code = 'zzz' where id = (select job_id from listings where id = 3)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -728,6 +733,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set code = case lifecycle_status when 'live' then '2' when 'closed' then '3' else '1' end");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -774,6 +780,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -830,6 +837,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1077,6 +1085,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1149,6 +1158,7 @@ final class LegacyBuilderReadTest extends TestCase
     public function it_filters_a_mapping_on_its_stored_column_only_where_postgresql_compares_the_keys_as_the_view_does(): void
     {
         DB::statement('alter table jobs add column grade numeric, add column floor integer');
+        DB::statement('alter table listings alter column status drop not null');
         $model = new class extends Model implements Compatible
         {
             use ServesCompatibility;
@@ -1174,6 +1184,7 @@ final class LegacyBuilderReadTest extends TestCase
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set grade = 1.00, floor = 1 where id = (select job_id from listings where id = 1)');
         DB::update('update jobs set grade = 2, floor = 2 where id = (select job_id from listings where id = 3)');
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1211,6 +1222,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set price_cents = 3000000 where id = (select job_id from listings where id = 1)');
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1256,6 +1268,7 @@ final class LegacyBuilderReadTest extends TestCase
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set is_featured = true, budget = 5, big = 9007199254740993 where id = (select job_id from listings where id = 1)');
         DB::update('update jobs set is_featured = false, budget = 0, big = 1 where id = (select job_id from listings where id = 3)');
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1352,6 +1365,7 @@ final class LegacyBuilderReadTest extends TestCase
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update("update jobs set listed_at = '2026-01-01 23:30:00+00', listed_instant = '2026-01-01 23:30:00+00' where id = (select job_id from listings where id = 1)");
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -1456,6 +1470,7 @@ final class LegacyBuilderReadTest extends TestCase
         Compatibility::prepare($model);
         ListingTables::backfill();
         CompletedPass::recordHandBackfill(model: $model);
+        CompletedPass::agree(model: $model);
         Compatibility::install(
             model: $model,
             statementTimeout: CarbonInterval::seconds(30),

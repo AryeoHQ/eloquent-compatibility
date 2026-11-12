@@ -93,10 +93,10 @@ final class StatementsTest extends TestCase
             'ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_not_null" CHECK ("job_id" IS NOT NULL) NOT VALID',
         ], array_slice(
             array: $leading,
-            offset: 6,
+            offset: 5,
             length: 3,
         ));
-        $this->assertSame('CREATE VIEW "listings" AS', $leading[10]);
+        $this->assertSame('CREATE VIEW "listings" AS', $leading[9]);
         $this->assertSame('ALTER TABLE "listings_retained" ADD CONSTRAINT "listings_retained_job_id_foreign" FOREIGN KEY ("job_id") REFERENCES "jobs" ("id") ON DELETE CASCADE NOT VALID', $statements->transaction[count($statements->transaction) - 1]);
         $this->assertStringContainsString('DELETE FROM "compatibility_backfills" WHERE legacy_type = \'listings\'', $statements->transaction[count($statements->transaction) - 2]);
         $this->assertSame([
@@ -112,16 +112,22 @@ final class StatementsTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_a_legacy_row_without_the_root_its_successor_key_names_in_the_install_check(): void
+    public function it_probes_under_the_lock_only_for_a_null_successor_key_and_inserts_native_roots_right_after_the_mapped_columns_drop(): void
     {
         Compatibility::prepare(Listing::class);
+        $inserts = fn () => null;
 
-        $check = Statements::install(
+        $statements = Statements::install(
             map: $this->map(),
             connection: DB::connection(),
-        )->transaction[3];
+            nativeRoots: $inserts,
+        );
 
-        $this->assertStringContainsString('FROM "listings" WHERE "listings"."job_id" IS NULL OR NOT EXISTS (SELECT FROM "jobs" WHERE "jobs"."id" = "listings"."job_id")', $check);
+        $this->assertStringContainsString('  IF EXISTS (SELECT FROM "listings" WHERE "listings"."job_id" IS NULL) THEN', $statements->transaction[3]);
+        $this->assertStringNotContainsString('NOT EXISTS (SELECT FROM "jobs"', implode("\n", $statements->transaction));
+        $this->assertSame([6], array_keys($statements->steps));
+        $this->assertSame([$inserts], $statements->steps[6]);
+        $this->assertStringStartsWith("ALTER TABLE \"listings_retained\"\n  DROP COLUMN", $statements->transaction[6]);
     }
 
     #[Test]

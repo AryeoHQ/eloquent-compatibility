@@ -12,10 +12,10 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\Preparer;
-use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
-use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\Ledger;
+use Support\Database\Eloquent\Compatibility\Write\Watermark;
 use Throwable;
 
 final class Status extends Command
@@ -102,18 +102,14 @@ final class Status extends Command
             connection: $connection,
             table: ViewCompiler::retainedTable($map),
         );
-        $ledger = Statements::kind(
+        $ledger = (new Ledger(
+            map: $map,
             connection: $connection,
-            table: Backfiller::ledger($map->table),
-        ) !== null;
-        $pass = Statements::kind(
+        ))->exists();
+        $pass = (new Watermark(
+            legacyType: $map->table,
             connection: $connection,
-            table: Backfiller::BACKFILLS,
-        ) === null ? null : $connection->scalar(
-            query: 'select pass from '.SqlFragments::identifier(Backfiller::BACKFILLS).' where legacy_type = ?',
-            bindings: [$map->table],
-            useReadPdo: false,
-        );
+        ))->pass();
 
         if ($legacy === 'v' && $retained === 'r') {
             return ['installed', ''];
@@ -145,11 +141,11 @@ final class Status extends Command
         return match (true) {
             $pass === null && ! $ledger => ['discovered', ''],
             $pass === null => ['rolled back', ''],
-            (int) $pass === 0 => ['prepared', ''],
+            $pass === 0 => ['prepared', ''],
             default => ['backfilling', self::progress(
                 map: $map,
                 connection: $connection,
-                pass: (int) $pass,
+                pass: $pass,
                 ledger: $ledger,
             )],
         };
@@ -168,15 +164,19 @@ final class Status extends Command
 
     private static function progress(ResolvedMap $map, ConnectionInterface $connection, int $pass, bool $ledger): string
     {
-        $counts = $ledger ? (array) $connection->selectOne(
-            query: "select count(*) filter (where status = 'refused') as refused, count(*) filter (where status = 'failed') as failed from ".SqlFragments::identifier(Backfiller::ledger($map->table))." where status in ('refused', 'failed')",
-            useReadPdo: false,
-        ) : [];
-
-        return "pass {$pass}, watermark ".((new Backfiller(
+        $counts = $ledger ? (new Ledger(
             map: $map,
             connection: $connection,
-        ))->remembered() ?? 'none').', '.(int) ($counts['refused'] ?? 0).' refused, '.(int) ($counts['failed'] ?? 0).' failed';
+        ))->counts() : ['refused' => 0, 'failed' => 0];
+
+        $watermark = new Watermark(
+            legacyType: $map->table,
+            connection: $connection,
+        );
+        $progress = $watermark->progress();
+        $finished = $progress['finished'] ?? null;
+
+        return "pass {$pass} started ".($progress['started'] ?? 'never').', '.($finished === null ? 'not finished' : "finished {$finished} after ".($progress['rows'] ?? 0).' rows').', watermark '.($watermark->remembered() ?? 'none').", {$counts['refused']} refused, {$counts['failed']} failed";
     }
 
     private function refuse(string $message): int

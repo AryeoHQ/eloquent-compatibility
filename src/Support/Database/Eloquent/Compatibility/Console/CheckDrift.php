@@ -103,10 +103,40 @@ final class CheckDrift extends Command
      */
     private function findings(array $findings): void
     {
-        $this->table(
-            ['Model', 'Check', 'Record', 'Detail'],
-            array_map(fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail], $findings),
+        $live = array_values(array_filter(
+            array: $findings,
+            callback: fn (DriftFinding $finding) => ! $finding->trashed,
+        ));
+        $trashed = array_values(array_filter(
+            array: $findings,
+            callback: fn (DriftFinding $finding) => $finding->trashed,
+        ));
+
+        $table = fn (array $rows) => $this->table(
+            headers: ['Model', 'Check', 'Record', 'Detail'],
+            rows: array_map(
+                callback: fn (DriftFinding $finding) => [$finding->model, $finding->check->value, $finding->record, $finding->detail],
+                array: $rows,
+            ),
         );
+
+        if ($live !== []) {
+            $table($live);
+        }
+
+        if ($trashed !== []) {
+            $this->line('Trashed records:');
+            $table($trashed);
+        }
+    }
+
+    public static function command(string $model): string
+    {
+        return "php artisan compatibility:check --model='".str_replace(
+            search: "'",
+            replace: "'\\''",
+            subject: $model,
+        )."'";
     }
 
     private function refuse(string $message): int

@@ -15,6 +15,10 @@ final class WritePlaceCity implements WritesAttribute
 {
     public function write(Successors $successors, mixed $value, Change $change): void
     {
-        $successors->relatedOrNew(Place::class)->setAttribute('city', is_string($value) ? $value : null);
+        $city = is_string($value) ? $value : null;
+        ($city === null ? $successors->related(Place::class) : $successors->relatedOrNew(Place::class))?->setAttribute(
+            key: 'city',
+            value: $city,
+        );
     }
 }

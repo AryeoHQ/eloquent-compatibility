@@ -72,7 +72,7 @@ final class StatusTest extends TestCase
             array: $stages,
             column_key: 0,
         ));
-        $this->assertMatchesRegularExpression('/^pass 1, watermark \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, 0 refused, 0 failed$/', $stages[2][1]);
+        $this->assertMatchesRegularExpression('/^pass 1 started (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ), finished \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ after 3 rows, watermark \1, 0 refused, 0 failed$/', $stages[2][1]);
     }
 
     #[Test]
@@ -150,6 +150,23 @@ final class StatusTest extends TestCase
             str: FloorPlan::class,
             delimiter: '/',
         ).'\s*\|\s*floorplans\s*\|\s*prepared/', $output);
+    }
+
+    #[Test]
+    public function it_prints_the_pass_a_backfilling_model_started_and_its_refused_and_failed_rows(): void
+    {
+        Compatibility::prepare(Listing::class);
+        DB::update("update listings set status = 'Archived' where id = 3");
+        DB::statement("alter table jobs add constraint jobs_name_is_not_oak_house check (name <> 'Oak House')");
+
+        $this->artisan(
+            command: 'compatibility:backfill',
+            parameters: ['model' => Listing::class],
+        )->assertFailed();
+
+        [$stage, $detail] = $this->stage();
+        $this->assertSame('backfilling', $stage);
+        $this->assertMatchesRegularExpression('/^pass 1 started (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ), finished \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ after 3 rows, watermark \1, 1 refused, 1 failed$/', $detail);
     }
 
     #[Test]

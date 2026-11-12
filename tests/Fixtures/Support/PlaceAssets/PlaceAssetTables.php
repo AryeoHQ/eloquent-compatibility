@@ -152,7 +152,6 @@ final class PlaceAssetTables
     {
         foreach (self::MODELS as $model) {
             (new Backfiller(Compatibility::of($model)->resolve(), DB::connection()))->run();
-            self::classify($model);
         }
     }
 

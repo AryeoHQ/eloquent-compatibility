@@ -178,6 +178,112 @@ final readonly class RecordWriter
     }
 
     /**
+     * @param  Staging<Model>  $graph
+     * @param  array<string, mixed>  $mapped
+     */
+    public function catchUp(Model $legacy, int|string $key, Staging $graph, Model $original, array $mapped, RoundTrip $roundTrip): bool
+    {
+        $chosen = $this->chosen(
+            legacy: $legacy,
+            original: $original,
+            graph: $graph,
+            mapped: $mapped,
+            added: [],
+            byHeldTarget: true,
+        );
+        [$graph, $mapped] = $this->moved($graph, $chosen, $original, $mapped);
+        $this->unit->assign(
+            graph: $graph,
+            record: $legacy,
+            original: $original,
+            values: $mapped,
+            amounts: [],
+            origin: Origin::Backfill,
+            creating: false,
+        );
+        $changed = $graph->pending();
+        $this->finish(
+            legacy: $legacy,
+            key: $key,
+            graph: $graph,
+            original: $original,
+            values: $mapped,
+            mapped: $mapped,
+            added: [],
+            origin: Origin::Backfill,
+            roundTrip: $roundTrip,
+        );
+
+        return $changed;
+    }
+
+    /**
+     * @param  Staging<Model>  $graph
+     * @param  array<string, mixed>  $mapped
+     * @param  Closure(Model): void  $identify
+     */
+    public function backfill(Model $legacy, int|string $key, Staging $graph, array $mapped, RoundTrip $roundTrip, Closure $identify): int|string
+    {
+        $variant = $graph->map;
+        $original = $legacy->newInstance()->setRawAttributes(
+            attributes: [],
+            sync: true,
+        );
+
+        if ($variant->target !== null) {
+            $graph->relatedOrNew($variant->target->model);
+        }
+
+        $this->unit->assign(
+            graph: $graph,
+            record: $legacy,
+            original: $original,
+            values: $mapped,
+            amounts: [],
+            origin: Origin::Backfill,
+            creating: true,
+        );
+        $this->unit->initialize(
+            graph: $graph,
+            record: $legacy,
+            origin: Origin::Backfill,
+        );
+        $this->unit->save(
+            graph: $graph,
+            legacy: $legacy,
+        );
+        $root = $graph->root();
+        $identify($root);
+        $this->unit->act(
+            graph: $graph,
+            legacy: $legacy,
+        );
+        $this->refuseRepointed(
+            legacy: $legacy,
+            graph: $graph,
+            key: $key,
+        );
+        $served = $roundTrip->check(
+            graph: $graph,
+            legacy: $legacy,
+            original: $original,
+            key: $key,
+            written: $mapped,
+            added: [],
+            origin: Origin::Backfill,
+        );
+        $this->refuseStoredMorph(
+            legacy: $legacy,
+            key: $key,
+            served: $served,
+            held: $variant,
+            graph: $graph,
+        );
+
+        return UnitOfWork::keyOf($root);
+    }
+
+    /**
      * @param  array<string, float|int|numeric-string>  $amounts
      * @param  array<string, mixed>  $extra
      */
@@ -288,7 +394,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
      */
-    public function finish(Model $legacy, int|string $key, Staging $graph, Model $original, array $values, array $mapped, array $added): int
+    public function finish(Model $legacy, int|string $key, Staging $graph, Model $original, array $values, array $mapped, array $added, Origin $origin = Origin::Live, null|RoundTrip $roundTrip = null): int
     {
         $this->unit->save($graph, $legacy);
         $this->unit->act($graph, $legacy);
@@ -298,16 +404,21 @@ final readonly class RecordWriter
             key: $key,
             values: $values,
         );
-        $served = (new RoundTrip($this->map, $this->connection))->check(
+        $served = ($roundTrip ?? new RoundTrip($this->map, $this->connection))->check(
             graph: $graph,
             legacy: $legacy,
             original: $original,
             key: $after,
             written: $mapped,
             added: $added,
-            origin: Origin::Live,
+            origin: $origin,
         );
         $this->refuseStoredMorph($legacy, $key, $served, $graph->map, $graph, $original);
+
+        if ($origin === Origin::Backfill) {
+            return 1;
+        }
+
         $this->readBack($legacy, $after, $served, [...array_keys($values), ...array_keys($added), ...($this->map->morphs === [] ? [] : array_values(array_filter(array_keys($legacy->getAttributes()), fn (string $name) => ! $this->map->isExternal($name))))]);
 
         if ($after !== $key) {
@@ -353,7 +464,7 @@ final readonly class RecordWriter
      * @param  array<string, mixed>  $mapped
      * @param  array<string, float|int>  $added
      */
-    public function chosen(Model $legacy, Model $original, Staging $graph, array $mapped, array $added): ResolvedMap
+    public function chosen(Model $legacy, Model $original, Staging $graph, array $mapped, array $added, bool $byHeldTarget = false): ResolvedMap
     {
         if ($this->map->morphs === [] || $added !== []) {
             return $graph->map;
@@ -372,7 +483,7 @@ final readonly class RecordWriter
             $this->refuseUnsupplied($legacy, UnitOfWork::keyOf($original), $type, $chosen, $mapped);
         }
 
-        if ($current !== null && $this->map->morphFor($original) === $chosen) {
+        if ($current !== null && ($byHeldTarget ? $current : $this->map->morphFor($original)) === $chosen) {
             return $graph->map;
         }
 

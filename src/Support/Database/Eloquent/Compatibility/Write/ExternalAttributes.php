@@ -322,7 +322,7 @@ final class ExternalAttributes
                 table: $holder,
                 column: $key,
             ).'))',
-            bindings: [self::arrayLiteral($keys)],
+            bindings: [SqlFragments::arrayLiteral($keys)],
         )->whereNotNull($map->successorKey);
 
         if ($writePdo) {
@@ -339,7 +339,7 @@ final class ExternalAttributes
             table: $holder,
             column: $map->successorKey,
         );
-        $query = $primary->newModelQuery()->whereRaw(sql: SqlFragments::identifier($primary->getTable()).'.'.SqlFragments::identifier($primary->getKeyName()).' = any(cast(? as '.$rootType.'))', bindings: [self::arrayLiteral(array_values(array_map(
+        $query = $primary->newModelQuery()->whereRaw(sql: SqlFragments::identifier($primary->getTable()).'.'.SqlFragments::identifier($primary->getKeyName()).' = any(cast(? as '.$rootType.'))', bindings: [SqlFragments::arrayLiteral(array_values(array_map(
             callback: self::key(...),
             array: $roots,
         )))]);
@@ -409,7 +409,7 @@ final class ExternalAttributes
                 catalog: $catalog,
                 table: $holder,
                 column: $legacy->getKeyName(),
-            ).'))', [self::arrayLiteral($keys)])
+            ).'))', [SqlFragments::arrayLiteral($keys)])
             ->whereNotNull($table.'.'.$model->getKeyName());
 
         if ($writePdo) {
@@ -504,14 +504,6 @@ final class ExternalAttributes
             table: $table,
             column: $column,
         ) ?? 'text').'[]';
-    }
-
-    /**
-     * @param  list<int|string>  $keys
-     */
-    private static function arrayLiteral(array $keys): string
-    {
-        return '{'.implode(',', array_map(fn (int|string $key) => '"'.addcslashes((string) $key, '"\\').'"', $keys)).'}';
     }
 
     private static function key(mixed $key): int|string

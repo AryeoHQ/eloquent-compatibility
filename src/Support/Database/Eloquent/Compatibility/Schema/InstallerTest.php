@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\QueryException;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\DB;
@@ -22,6 +23,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Compatibility;
+use Support\Database\Eloquent\Compatibility\Console\Backfill;
 use Support\Database\Eloquent\Compatibility\Contracts\Compatible;
 use Support\Database\Eloquent\Compatibility\Contracts\ManagesDependents;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
@@ -29,15 +31,22 @@ use Support\Database\Eloquent\Compatibility\Definition\Successor;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
+use Support\Database\Eloquent\Compatibility\Write\Outcome;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\File;
 use Tests\Fixtures\Support\Files\FileMetadata;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\LegacyFile;
 use Tests\Fixtures\Support\Files\Photo;
+use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
+use Tests\Fixtures\Support\Listings\InitializeNativeListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\NameJobFromTitle;
+use Tests\Fixtures\Support\Listings\RecordingWriteScope;
+use Tests\Fixtures\Support\Listings\UnstampedJob;
 use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
 use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
@@ -610,7 +619,13 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertSame([['info', "Compatibility map 'listings' install: hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1. Install read this count before it took its lock."]], $loggedBeforeTheLock);
+        $this->assertSame([['info', "Compatibility map 'listings' install: hides 1 listings rows, because a hide() rule matches their jobs row; the first are id 1. Install read this count before it took its lock."]], array_values(array_filter(
+            array: $loggedBeforeTheLock ?? [],
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' hides ',
+            ),
+        )));
         $this->assertSame([2, 3], array_map(intval(...), array_column(DB::select('select id from listings order by id'), 'id')));
     }
 
@@ -643,23 +658,464 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_while_a_legacy_row_has_no_primary(): void
+    public function it_recreates_at_install_the_root_of_a_created_row_whose_root_was_hard_deleted_with_its_key_and_links_its_surviving_place(): void
     {
         $this->backfiller(Listing::class)->run();
+        $jobs = [ListingTables::jobOf(1), ListingTables::jobOf(3)];
+        $places = DB::table('places')->orderBy('street')->pluck('id')->all();
+        DB::statement('alter table places drop constraint places_job_id_foreign');
         DB::delete('delete from jobs where id in (select job_id from listings where id in (1, 3))');
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame('v', $this->kind('listings'));
+        $this->assertSame([[1, 'Oak House', $jobs[0]], [3, 'Elm Cottage', $jobs[1]]], array_map(
+            callback: fn (array $row) => [$row['id'], $row['title'], $row['job_id']],
+            array: array_values(array_filter($this->listings(), fn (array $row) => $row['id'] !== 2)),
+        ));
+        $this->assertSame($places, DB::table('places')->orderBy('street')->pluck('id')->all());
+        $this->assertSame(['1 Oak St', '3 Elm St'], array_column(DB::select('select street from listings where id in (1, 3) order by id'), 'street'));
+    }
+
+    #[Test]
+    public function it_refuses_to_install_while_a_row_is_refused_naming_its_reason_and_installs_once_the_row_is_fixed(): void
+    {
+        DB::update("update listings set status = 'Archived' where id = 3");
+        $pass = $this->backfiller(Listing::class)->run();
 
         try {
             Compatibility::install(
                 model: Listing::class,
                 statementTimeout: CarbonInterval::seconds(30),
             );
-            $this->fail('install() did not refuse.');
-        } catch (QueryException $exception) {
-            $this->assertStringContainsString("Compatibility map 'listings' cannot install: 2 listings rows have no jobs row that their job_id names; the first are id 1, 3. Backfill them before install().", $exception->getMessage());
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
         }
 
+        $refused = $this->kind('listings');
+        DB::update("update listings set status = 'Sold', updated_at = localtimestamp(0) where id = 3");
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([2, 1], [$pass->count(Outcome::Unchanged), $pass->count(Outcome::Refused)]);
+        $this->assertStringStartsWith("Compatibility map 'listings' cannot install: 1 listings row is refused or failed in listings_backfill, and no row installs before every row can be served: 1 refused because A listing status is Draft, Active or Sold, and 'Archived' is none of them. (id 3).", $refusal);
+        $this->assertSame(['r', 'v', 'Sold'], [$refused, $this->kind('listings'), DB::table('listings')->where('id', 3)->value('status')]);
+    }
+
+    #[Test]
+    public function it_refuses_before_its_proofs_while_a_row_its_create_path_refused_has_no_root(): void
+    {
+        DB::insert("insert into listings (title, company_id, status, updated_at) values ('Ash Barn', ?, 'Archived', localtimestamp(0))", [ListingTables::COMPANY]);
+        $this->backfiller(Listing::class)->run();
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertStringStartsWith("Compatibility map 'listings' cannot install: 1 listings row is refused or failed in listings_backfill, and no row installs before every row can be served: 1 refused because A listing status is Draft, Active or Sold, and 'Archived' is none of them. (id 4).", $refusal);
+        $this->assertSame([null, 'r'], [DB::table('listings')->where('id', 4)->value('job_id'), $this->kind('listings')]);
+    }
+
+    #[Test]
+    public function it_catches_up_before_its_lock_a_value_changed_without_touching_updated_at_and_installs(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::update("update listings set title = 'Oak Manor' where id = 1");
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(['v', 'Oak Manor', 'updated'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title'), DB::table('listings_backfill')->where('legacy_id', 1)->value('status')]);
+    }
+
+    #[Test]
+    public function it_refuses_to_install_a_value_that_still_differs_after_its_catch_up(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::update("update listings set title = 'Oak Manor' where id = 1");
+        $writer = $this->writer();
+        $proving = false;
+        $reverted = false;
+        DB::listen(function (QueryExecuted $query) use (&$proving): void {
+            if (str_starts_with($query->sql, 'SELECT compared.key')) {
+                $proving = true;
+            }
+        });
+        Event::listen(TransactionCommitted::class, function () use (&$proving, &$reverted, $writer): void {
+            if ($proving && ! $reverted && DB::transactionLevel() === 0) {
+                $reverted = true;
+                $writer->update("update jobs set name = 'Oak House' where id = ?", [ListingTables::jobOf(1)]);
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertTrue($reverted);
+        $this->assertStringStartsWith("Compatibility map 'listings' cannot install: 1 listings rows still hold other values than their successors serve after install caught them up; the first are id 1.", $refusal);
         $this->assertSame('r', $this->kind('listings'));
-        $this->assertSame([], DB::select("select conname from pg_constraint where confrelid = 'jobs'::regclass and conname like 'listing%'"));
+        $this->assertSame(1, preg_match(
+            pattern: "/ Run php artisan compatibility:check --model='([^']+)' to see each value, /",
+            subject: $refusal,
+            matches: $printed,
+        ));
+        $this->artisan('compatibility:check', ['--model' => [$printed[1]]])
+            ->expectsOutputToContain('values differ')
+            ->assertExitCode(1);
+    }
+
+    #[Test]
+    public function it_logs_each_catch_up_pass_before_its_lock_with_its_counts_and_the_keys_its_proofs_flag(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::update("update jobs set name = 'Renamed natively' where id = ?", [ListingTables::jobOf(1)]);
+        $this->listenToTheLog();
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([
+            ['info', "Compatibility map 'listings' install: catch-up pass 1 walked 0 listings rows and 0 whose legacy row is gone, and changed the outcome of 0: 0 refused, 0 failed"],
+            ['info', "Compatibility map 'listings' install: its proofs flagged 1 listings rows, which it catches up before it proves them again"],
+        ], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => $logged[0] === 'info',
+        )));
+    }
+
+    #[Test]
+    public function it_keeps_a_root_a_pass_soft_deleted_out_of_every_install_and_retire_drops_the_ledger_and_the_watermark(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $root = ListingTables::jobOf(3);
+        DB::delete('delete from listings where id = 3');
+        $this->backfiller(Listing::class)->run();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $first = DB::table('listings_retained')->where('job_id', $root)->count();
+        Compatibility::rollback(Listing::class);
+        Compatibility::prepare(Listing::class);
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $second = DB::table('listings_retained')->where('job_id', $root)->count();
+        $ledger = (array) DB::selectOne('select status, attempts, successor_id from listings_backfill where legacy_id = 3');
+        DB::statement('drop table listing_photos, listing_shares');
+        DB::insert("insert into compatibility_backfills (legacy_type) values ('listings')");
+        $tracked = DB::table('compatibility_backfills')->where('legacy_type', 'listings')->count();
+        Compatibility::retire(Listing::class);
+
+        $this->assertSame([0, 0], [$first, $second]);
+        $this->assertSame(['status' => 'deleted', 'attempts' => 2, 'successor_id' => $root], $ledger);
+        $this->assertTrue(DB::scalar('select deleted_at is not null from jobs where id = ?', [$root]));
+        $this->assertSame([1, null, 0], [$tracked, DB::scalar("select to_regclass('listings_backfill')::text"), DB::table('compatibility_backfills')->where('legacy_type', 'listings')->count()]);
+    }
+
+    #[Test]
+    public function it_inserts_under_its_lock_a_legacy_row_for_each_natively_created_member_root_through_its_initializer_with_origin_backfill(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $native = Job::query()->create(['name' => 'Native job', 'company_id' => ListingTables::COMPANY]);
+        InitializeLegacyListing::$seen = [];
+        $logged = [];
+        Event::listen(MessageLogged::class, function (MessageLogged $message) use (&$logged): void {
+            $logged[] = $message->message;
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([[4, 'Native job', 'JOB-Native job', $native->getKey()]], array_map(
+            callback: fn (array $row) => [$row['id'], $row['title'], $row['mls_number'], $row['job_id']],
+            array: array_values(array_filter($this->listings(), fn (array $row) => $row['id'] === 4)),
+        ));
+        $this->assertSame([[4, $native->getKey(), Origin::Backfill]], InitializeLegacyListing::$seen);
+        $this->assertContains("Compatibility map 'listings' install: 1 natively created Job root has no listings row, so install inserts one for each under its lock", $logged);
+    }
+
+    #[Test]
+    public function it_inserts_a_legacy_row_for_a_root_created_after_its_pre_lock_read_and_within_the_margin(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $created = null;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$created): void {
+            if ($created === null && str_starts_with($query->sql, 'select "jobs"."id" from "jobs" where NOT EXISTS')) {
+                $created = (string) $writer->table('jobs')->insertGetId(['name' => 'Late job', 'company_id' => ListingTables::COMPANY, 'created_at' => now(), 'updated_at' => now()]);
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertIsString($created);
+        $this->assertSame('Late job', DB::table('listings')->where('job_id', $created)->value('title'));
+    }
+
+    #[Test]
+    public function it_aborts_install_naming_the_root_whose_legacy_initializer_refuses_under_the_lock(): void
+    {
+        $model = $this->nativeListing();
+        Compatibility::prepare($model::class);
+        $this->backfiller($model::class)->run();
+        $refused = Job::query()->create(['name' => 'Refused job', 'company_id' => ListingTables::COMPANY]);
+
+        try {
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame("Compatibility map 'listings' cannot install: InitializeNativeListing refused the legacy row of the natively created Job {$refused->getKey()}: A refused job has no listing..", $refusal);
+        $this->assertSame([null, 'r'], [$this->kind('listings_retained'), $this->kind('listings')]);
+    }
+
+    #[Test]
+    public function it_rolls_back_once_its_native_root_inserts_spend_the_statement_timeout_naming_that_step(): void
+    {
+        $model = $this->nativeListing();
+        Compatibility::prepare($model::class);
+        $this->backfiller($model::class)->run();
+
+        foreach (['Ash job', 'Birch job', 'Cedar job', 'Dogwood job'] as $name) {
+            Job::query()->create(['name' => $name, 'company_id' => ListingTables::COMPANY]);
+        }
+
+        InitializeNativeListing::$pause = 700000;
+
+        try {
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::milliseconds(1500),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        } finally {
+            InitializeNativeListing::$pause = 0;
+        }
+
+        $this->assertMatchesRegularExpression("/^Compatibility map 'listings' cannot install: it held its lock for \\d+ ms of its 1500 ms statementTimeout before the step the insert of a natively created root's legacy row, so it rolled back\\./", $refusal);
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_holds_the_advisory_lock_of_the_legacy_model_from_its_first_pass_until_it_finishes(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $taken = null;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$taken): void {
+            if ($taken === null && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $taken = $writer->scalar("select pg_try_advisory_lock(hashtextextended('compatibility_backfills:listings', 0))");
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $after = $writer->scalar("select pg_try_advisory_lock(hashtextextended('compatibility_backfills:listings', 0))");
+        $writer->scalar("select pg_advisory_unlock(hashtextextended('compatibility_backfills:listings', 0))");
+
+        $this->assertSame([false, true], [$taken, $after]);
+    }
+
+    #[Test]
+    public function it_rolls_back_when_its_final_pass_under_the_lock_refuses_a_row(): void
+    {
+        $model = $this->nativeListing();
+        Compatibility::prepare($model::class);
+        $this->backfiller($model::class)->run();
+        $blanked = false;
+        DB::listen(function (QueryExecuted $query) use (&$blanked): void {
+            if (! $blanked && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $blanked = true;
+                DB::update("update listings set title = '', updated_at = localtimestamp(0) where id = 1");
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: $model::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame("Compatibility map 'listings' cannot install: 1 listings row is refused or failed in listings_backfill, and no row installs before every row can be served: 1 refused because A job needs a name, and the listing title is blank. (id 1). Fix each row, run ".Backfill::command($model::class).', then install again.', $refusal);
+        $this->assertSame(['r', 'Oak House'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+    }
+
+    #[Test]
+    public function it_rolls_back_when_the_write_of_a_row_fails_in_its_final_pass_under_the_lock(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $failed = false;
+        DB::listen(function (QueryExecuted $query) use (&$failed): void {
+            if (! $failed && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $failed = true;
+                DB::statement("alter table jobs add constraint jobs_name_is_not_secret check (name not like 'SECRET%')");
+                DB::update("update listings set title = 'SECRET-1', updated_at = localtimestamp(0) where id = 1");
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        }
+
+        $this->assertSame("Compatibility map 'listings' cannot install: 1 listings row is refused or failed in listings_backfill, and no row installs before every row can be served: 1 failed because Illuminate\\Database\\QueryException: SQLSTATE[23514]: Check violation: 7 ERROR:  new row for relation \"jobs\" violates check constraint \"jobs_name_is_not_secret\" (id 1). Fix each row, run ".Backfill::command(Listing::class).', then install again.', $refusal);
+        $this->assertSame(['r', 'Oak House', 0], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title'), DB::scalar("select count(*) from pg_constraint where conname = 'jobs_name_is_not_secret'")]);
+    }
+
+    #[Test]
+    public function it_catches_up_before_its_lock_a_legacy_row_inserted_with_no_successor_key_and_an_updated_at_outside_its_watermark(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::insert("insert into listings (title, company_id, status, created_at, updated_at) values ('Ash Barn', ?, 'Draft', '2026-01-06 08:00:00', '2026-01-06 08:00:00')", [ListingTables::COMPANY]);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame(['v', 'Ash Barn', 'created'], [$this->kind('listings'), DB::table('listings')->where('id', 4)->value('title'), DB::table('listings_backfill')->where('legacy_id', 4)->value('status')]);
+    }
+
+    #[Test]
+    public function it_refuses_when_a_root_its_catch_up_recreated_is_missing_again_at_its_second_proof(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $job = ListingTables::jobOf(2);
+        DB::delete('delete from jobs where id = ?', [$job]);
+        $writer = $this->writer();
+        $proving = false;
+        $removed = false;
+        DB::listen(function (QueryExecuted $query) use (&$proving): void {
+            if (str_starts_with($query->sql, 'SELECT compared.key')) {
+                $proving = true;
+            }
+        });
+        Event::listen(TransactionCommitted::class, function () use (&$proving, &$removed, $writer, $job): void {
+            if ($proving && ! $removed && DB::transactionLevel() === 0) {
+                $removed = true;
+                $writer->delete('delete from jobs where id = ?', [$job]);
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+            $refusal = 'no refusal';
+        } catch (InvalidCompatibilityMap $exception) {
+            $refusal = $exception->getMessage();
+        } finally {
+            DB::purge('writer');
+        }
+
+        $this->assertTrue($removed);
+        $this->assertSame("Compatibility map 'listings' cannot install: 1 listings rows still have no jobs row that their job_id names after install caught them up; the first are id 2. Backfill them before install().", $refusal);
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_carries_under_its_lock_only_the_natively_created_roots_inside_the_margin_it_is_given(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $created = null;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$created): void {
+            if ($created === null && str_starts_with($query->sql, 'select "jobs"."id" from "jobs" where NOT EXISTS')) {
+                $created = array_map(
+                    callback: fn (string $age) => (string) $writer->scalar(
+                        query: 'insert into jobs (name, company_id, created_at, updated_at) values (?, ?, now() - cast(? as interval), now()) returning id',
+                        bindings: ["Job {$age} old", ListingTables::COMPANY, $age],
+                    ),
+                    array: ['30 seconds', '120 seconds'],
+                );
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+            margin: CarbonInterval::seconds(60),
+        );
+
+        $this->assertIsArray($created);
+        $this->assertSame(['Job 30 seconds old', null], array_map(
+            callback: fn (string $job) => DB::table('listings')->where('job_id', $job)->value('title'),
+            array: $created,
+        ));
+    }
+
+    #[Test]
+    public function it_calls_the_write_scope_in_the_passes_before_its_lock_and_not_in_its_final_pass(): void
+    {
+        $model = $this->scopedListing();
+        Compatibility::prepare($model::class);
+        $this->backfiller($model::class)->run();
+        RecordingWriteScope::$received = [];
+        DB::update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+        $locked = null;
+        DB::listen(function (QueryExecuted $query) use (&$locked): void {
+            if ($locked === null && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
+                $locked = count(RecordingWriteScope::$received);
+            }
+        });
+
+        Compatibility::install(
+            model: $model::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertGreaterThan(0, $locked);
+        $this->assertCount((int) $locked, RecordingWriteScope::$received);
+        $this->assertSame('Oak Manor', DB::table('listings')->where('id', 1)->value('title'));
     }
 
     #[Test]
@@ -677,7 +1133,7 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_while_a_legacy_row_holds_an_external_value_its_read_does_not_return(): void
+    public function it_installs_without_comparing_a_computed_value_its_read_does_not_return_and_serves_the_read(): void
     {
         $this->prepareFiles();
         $this->backfiller(Photo::class)->run();
@@ -695,43 +1151,34 @@ final class InstallerTest extends TestCase
             value: $this->fileOf(3),
         )->update(['zml_asset_id' => null]);
 
-        try {
-            Compatibility::install(
-                model: Photo::class,
-                statementTimeout: CarbonInterval::seconds(30),
-            );
-            $this->fail('install() did not refuse.');
-        } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
-        }
+        Compatibility::install(
+            model: Photo::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertSame('r', $this->kind('photos'));
-        $this->assertSame(['image/jpeg', 'image/jpeg', 'image/png'], array_column(DB::select('select mime_type from photos order by id'), 'mime_type'));
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame(['image/jpeg', 'image/png', null], Photo::query()->orderBy('id')->get()->map(fn (Photo $photo) => $photo->mime_type)->all());
     }
 
     #[Test]
-    public function it_refuses_to_install_while_a_legacy_row_holds_null_where_the_read_returns_a_value(): void
+    public function it_installs_without_comparing_a_null_legacy_value_where_the_computed_read_returns_one(): void
     {
         $this->prepareFiles();
         $this->backfiller(Photo::class)->run();
         DB::statement('alter table photos alter column mime_type drop not null');
         DB::table('photos')->where('id', 3)->update(['mime_type' => null]);
 
-        try {
-            Compatibility::install(
-                model: Photo::class,
-                statementTimeout: CarbonInterval::seconds(30),
-            );
-            $this->fail('install() did not refuse.');
-        } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 1 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
-        }
+        Compatibility::install(
+            model: Photo::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertSame('r', $this->kind('photos'));
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame('image/png', Photo::query()->findOrFail(3)->mime_type);
     }
 
     #[Test]
-    public function it_refuses_to_install_while_the_read_returns_a_boolean_for_a_legacy_value_that_is_not_that_boolean(): void
+    public function it_installs_without_comparing_a_computed_read_that_returns_a_boolean_for_a_legacy_string(): void
     {
         $this->prepareFiles();
         DB::table('photos')->where('id', 3)->update(['mime_type' => 'false']);
@@ -779,17 +1226,13 @@ final class InstallerTest extends TestCase
             }
         };
 
-        try {
-            Compatibility::install(
-                model: $truthful::class,
-                statementTimeout: CarbonInterval::seconds(30),
-            );
-            $this->fail('install() did not refuse.');
-        } catch (InvalidCompatibilityMap $refusal) {
-            $this->assertSame("Compatibility map 'photos' cannot install: 2 photos rows hold a mime_type that the computedAs() read of attribute 'mime_type' does not return; the first are id 2, 3. Write each value through the attribute's writtenBy() operation before install(), because install() drops photos.mime_type.", $refusal->getMessage());
-        }
+        Compatibility::install(
+            model: $truthful::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertSame('r', $this->kind('photos'));
+        $this->assertSame('v', $this->kind('photos'));
+        $this->assertSame(['image/jpeg', true, true], $truthful::query()->orderBy('id')->get()->map(fn (Model $photo) => $photo->getAttribute('mime_type'))->all());
     }
 
     #[Test]
@@ -887,7 +1330,7 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_pages_install_verification_and_rollback_restore_by_an_indexed_key_without_an_offset(): void
+    public function it_pages_the_rollback_restore_by_an_indexed_key_without_an_offset(): void
     {
         $this->prepareFiles();
         $statements = [];
@@ -903,9 +1346,8 @@ final class InstallerTest extends TestCase
 
         $paged = array_values(array_filter($statements, fn (string $sql) => str_contains($sql, ' limit 500')));
 
-        $this->assertCount(2, $paged);
-        $this->assertMatchesRegularExpression('/^select "id", "mime_type" from "photos" (where "id" is not null )?order by "id" asc limit 500$/', $paged[0]);
-        $this->assertMatchesRegularExpression('/^select "id" from "photos" (where "id" is not null )?order by "id" asc limit 500$/', $paged[1]);
+        $this->assertCount(1, $paged);
+        $this->assertMatchesRegularExpression('/^select "id" from "photos" (where "id" is not null )?order by "id" asc limit 500$/', $paged[0]);
         $this->assertStringEndsWith(' WHERE "photos"."id" = CAST(restored.key AS integer)', array_values(array_filter(
             array: $statements,
             callback: fn (string $sql) => str_starts_with(
@@ -1028,7 +1470,8 @@ final class InstallerTest extends TestCase
     {
         return [
             'a successor key without its unique index' => ['alter table listings drop constraint listings_job_id_unique', self::unfinished('listings.job_id has no unique index of its own')],
-            'no backfill ledger' => ['drop table listings_backfill', "Compatibility map 'listings' cannot backfill: Compatibility::prepare() adds listings.job_id and creates listings_backfill and compatibility_backfills, and it has not run; run Compatibility::prepare() first."],
+            'no backfill ledger' => ['drop table listings_backfill', "Compatibility map 'listings' cannot install: Compatibility::prepare() creates listings_backfill and inserts the compatibility_backfills row of listings, and install() records its passes in both; run Compatibility::prepare() first."],
+            'no compatibility_backfills row' => ["delete from compatibility_backfills where legacy_type = 'listings'", "Compatibility map 'listings' cannot install: Compatibility::prepare() creates listings_backfill and inserts the compatibility_backfills row of listings, and install() records its passes in both; run Compatibility::prepare() first."],
             'no at-most-one index' => ['drop index places_listings_at_most_one', self::unfinished('places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places')],
             'an at-most-one index not yet valid' => ["update pg_index set indisvalid = false where indexrelid = 'places_listings_at_most_one'::regclass", self::unfinished('places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places')],
         ];
@@ -1547,11 +1990,12 @@ final class InstallerTest extends TestCase
         );
 
         $this->assertTrue($landed);
-        $this->assertSame([[1, 'Oak Manor'], [4, 'Ash Barn']], array_map(
+        $this->assertSame([[1, 'Oak Manor'], [4, 'Ash Barn'], [5, 'Native job']], array_map(
             callback: fn (array $row) => [$row['id'], $row['title']],
             array: $this->listings(),
         ));
-        $this->assertSame(['Ash Barn', 'Native job', 'Oak Manor', 'Pine Flat'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
+        $this->assertSame(['Ash Barn', 'Elm Cottage', 'Native job', 'Oak Manor', 'Pine Flat'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
+        $this->assertSame(['Elm Cottage', 'Pine Flat'], DB::table('jobs')->whereNotNull('deleted_at')->orderBy('name')->pluck('name')->all());
     }
 
     #[Test]
@@ -1580,7 +2024,7 @@ final class InstallerTest extends TestCase
             );
             $this->fail('install() did not refuse.');
         } catch (InvalidCompatibilityMap $exception) {
-            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still read 1100 legacy rows and changed 1100 successor rows, and install() takes the lock only once a pass reads and changes fewer than 1000 rows each. Run php artisan compatibility:backfill ".Listing::class.' again, then install()', $exception->getMessage());
+            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still changed the outcome of 1100 legacy rows, and install() takes the lock only once a pass changes fewer than 1000. Run php artisan compatibility:backfill '".Listing::class."' again, then install()", $exception->getMessage());
         }
 
         $this->assertSame([5, 'r'], [$passes, $this->kind('listings')]);
@@ -1589,11 +2033,20 @@ final class InstallerTest extends TestCase
     #[Test]
     public function it_retries_the_lock_after_a_legacy_writer_holds_it_past_the_lock_timeout(): void
     {
-        $holding = $this->holdConcurrently('update listings set title = title where id = 1', 6);
+        $holding = $this->holdUntilReleased('update listings set title = title where id = 1');
         $attempts = 0;
+        $released = null;
         DB::listen(function (QueryExecuted $query) use (&$attempts): void {
             if (str_starts_with($query->sql, 'SET LOCAL lock_timeout')) {
                 $attempts++;
+            }
+        });
+        Event::listen(MessageLogged::class, function (MessageLogged $logged) use (&$released): void {
+            if ($released === null && $logged->level === 'warning' && str_contains(
+                haystack: $logged->message,
+                needle: "Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03",
+            )) {
+                $released = $this->release();
             }
         });
         $started = microtime(true);
@@ -1603,8 +2056,8 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertSame(["locked\n", 2, 'v'], [$holding, $attempts, $this->kind('listings')]);
-        $this->assertGreaterThanOrEqual(5.0, microtime(true) - $started);
+        $this->assertSame(["locked\n", "committed\n", 2, 'v'], [$holding, $released, $attempts, $this->kind('listings')]);
+        $this->assertGreaterThanOrEqual(Installer::LOCK_TIMEOUT / 1000, microtime(true) - $started);
         $this->assertSame('', $this->concurrentFailure());
     }
 
@@ -1615,20 +2068,26 @@ final class InstallerTest extends TestCase
         $config = DB::connection()->getConfig();
         $dsn = 'pgsql:host='.$config['host'].';port='.$config['port'].';dbname='.DB::connection()->getDatabaseName();
         $writer = $this->start('$pdo = new PDO('.var_export($dsn, true).', '.var_export($config['username'], true).', '.var_export($config['password'], true).', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);'
-            .' $writes = []; echo "writing\n"; fflush(STDOUT); $deadline = microtime(true) + 30;'
+            .' $pdo->exec("set lock_timeout = \'200ms\'"); $writes = []; echo "writing\n"; fflush(STDOUT);'
+            .' $go = [STDIN]; $written = null; $failed = null; stream_select($go, $written, $failed, 30); echo "started\n"; fflush(STDOUT); $deadline = microtime(true) + 30;'
             .' for ($write = 0; microtime(true) < $deadline; $write++) {'
             .'   $started = microtime(true);'
             .'   try {'
             .'     if ($write % 2 === 0) { $id = (int) $pdo->query("insert into listings (title, company_id, updated_at) values (\'Row $write\', \''.ListingTables::COMPANY.'\', localtimestamp(0)) returning id")->fetchColumn(); }'
             .'     else { $id = (int) $pdo->query("update listings set title = \'Edit $write\', updated_at = localtimestamp(0) where id = (select max(id) from listings) returning id")->fetchColumn(); }'
             .'     $writes[] = [$started, microtime(true), $id, $write % 2 === 0 ? "Row $write" : "Edit $write"];'
-            .'   } catch (PDOException $exception) { $writes[] = [$started, microtime(true), null, $exception->getCode()]; break; }'
+            .'   } catch (PDOException $exception) { $writes[] = [$started, microtime(true), null, $exception->getCode()]; if ($exception->getCode() !== "55P03") { break; } }'
             .'   usleep(5000);'
             .' }'
             .' echo json_encode($writes);');
-        usleep(300000);
+        $started = null;
         $locked = null;
-        DB::listen(function (QueryExecuted $query) use (&$locked): void {
+        DB::listen(function (QueryExecuted $query) use (&$started, &$locked): void {
+            if ($started === null && str_starts_with($query->sql, 'SET LOCAL lock_timeout')) {
+                $started = $this->release();
+                usleep(300000);
+            }
+
             if ($locked === null && $query->sql === 'LOCK TABLE "listings" IN SHARE ROW EXCLUSIVE MODE') {
                 $locked = microtime(true);
                 usleep(500000);
@@ -1641,10 +2100,11 @@ final class InstallerTest extends TestCase
         );
         $writes = json_decode($this->concurrentFailure(), true);
 
-        $this->assertSame(["writing\n", 'v'], [$writer, $this->kind('listings')]);
+        $this->assertSame(["writing\n", "started\n", 'v'], [$writer, $started, $this->kind('listings')]);
         $this->assertIsArray($writes);
         $this->assertIsFloat($locked);
         $written = array_filter($writes, fn (array $write) => $write[2] !== null);
+        $waited = array_filter($writes, fn (array $write) => $write[3] === '55P03');
         $blocked = end($writes);
         $last = [];
 
@@ -1655,34 +2115,30 @@ final class InstallerTest extends TestCase
         ksort($last);
         $this->assertNotEmpty(array_filter($written, fn (array $write) => $write[1] < $locked));
         $this->assertSame([], array_values(array_filter(
-            array: $written,
-            callback: fn (array $write) => $write[1] - $write[0] >= 0.3 && $write[1] < $locked,
+            array: $waited,
+            callback: fn (array $write) => $write[0] < $locked - 0.05,
         )));
+        $this->assertNotEmpty($waited);
         $this->assertIsArray($blocked);
         $this->assertSame([null, '55000'], [$blocked[2], $blocked[3]]);
-        $this->assertGreaterThanOrEqual($locked - 0.05, $blocked[0]);
-        $this->assertGreaterThanOrEqual(0.3, $blocked[1] - $blocked[0]);
         $this->assertSame($last, array_column(DB::select('select id, title from listings where id in ('.implode(', ', array_keys($last)).') order by id'), 'title', 'id'));
         $this->assertSame(0, DB::scalar('select count(*) from listings_retained left join jobs on jobs.id = listings_retained.job_id where jobs.id is null'));
     }
 
     #[Test]
-    public function it_refuses_to_install_a_legacy_row_whose_primary_went_missing_outside_its_watermark(): void
+    public function it_catches_up_before_its_lock_a_legacy_row_whose_primary_went_missing_outside_its_watermark(): void
     {
         $this->backfiller(Listing::class)->run();
-        DB::delete('delete from jobs where id = (select job_id from listings where id = 2)');
+        $job = ListingTables::jobOf(2);
+        DB::delete('delete from jobs where id = ?', [$job]);
 
-        try {
-            Compatibility::install(
-                model: Listing::class,
-                statementTimeout: CarbonInterval::seconds(30),
-            );
-            $this->fail('install() did not refuse.');
-        } catch (QueryException $exception) {
-            $this->assertStringContainsString("Compatibility map 'listings' cannot install: 1 listings rows have no jobs row that their job_id names; the first are id 2. Backfill them before install().", $exception->getMessage());
-        }
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
 
-        $this->assertSame('r', $this->kind('listings'));
+        $this->assertSame(['v', 'Pine Flat', $job], [$this->kind('listings'), DB::table('listings')->where('id', 2)->value('title'), DB::table('listings')->where('id', 2)->value('job_id')]);
+        $this->assertSame('created', DB::table('listings_backfill')->where('legacy_id', 2)->value('status'));
     }
 
     #[Test]
@@ -1837,7 +2293,7 @@ final class InstallerTest extends TestCase
         );
 
         $this->assertSame([1, 2], array_column($this->listings(), 'id'));
-        $this->assertSame(2, DB::table('jobs')->count());
+        $this->assertSame([3, true], [DB::table('jobs')->count(), DB::scalar("select deleted_at is not null from jobs where name = 'Elm Cottage'")]);
         $this->assertSame(['listings_backfill', 'deleted'], [DB::scalar("select to_regclass('listings_backfill')::text"), DB::table('listings_backfill')->where(
             column: 'legacy_id',
             operator: '=',
@@ -1864,9 +2320,10 @@ final class InstallerTest extends TestCase
 
         $this->assertSame([[1, 'Oak House'], [2, 'Pine Flat']], array_map(
             callback: fn (array $row) => [$row['id'], $row['title']],
-            array: $this->listings(),
+            array: array_slice($this->listings(), 0, 2),
         ));
-        $this->assertSame(['Native job', 'Oak House', 'Pine Flat', 'Prior job'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
+        $this->assertSame(['Native job', 'Prior job'], DB::table('listings')->where('id', '>', 3)->orderBy('title')->pluck('title')->all());
+        $this->assertSame(['Elm Cottage', 'Native job', 'Oak House', 'Pine Flat', 'Prior job'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
     }
 
     #[Test]
@@ -1888,11 +2345,12 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertSame([[1, 'Oak House'], [2, 'Pine Flat']], array_map(
+        $this->assertSame([[1, 'Oak House'], [2, 'Pine Flat'], [4, 'Native job']], array_map(
             callback: fn (array $row) => [$row['id'], $row['title']],
             array: $this->listings(),
         ));
-        $this->assertSame(['Native job', 'Oak House', 'Pine Flat'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
+        $this->assertSame(['Elm Cottage', 'Native job', 'Oak House', 'Pine Flat'], DB::table('jobs')->orderBy('name')->pluck('name')->all());
+        $this->assertSame([true, 0], [DB::scalar("select deleted_at is not null from jobs where name = 'Elm Cottage'"), DB::scalar("select count(*) from listings_retained join jobs on jobs.id = listings_retained.job_id where jobs.name = 'Elm Cottage'")]);
     }
 
     #[Test]
@@ -1929,14 +2387,13 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_deletes_at_install_the_job_of_a_listing_hard_deleted_between_the_two_deletes_of_an_off_lock_catch_up_pass(): void
+    public function it_reads_its_deletions_before_the_lock_and_leaves_live_for_the_check_the_job_of_a_listing_hard_deleted_after_its_last_read(): void
     {
         $this->backfiller(Listing::class)->run();
         $writer = $this->writer();
-        $deleted = false;
-        DB::listen(function (QueryExecuted $query) use ($writer, &$deleted): void {
-            if (! $deleted && $query->connectionName === DB::getDefaultConnection() && str_contains($query->sql, 'DELETE FROM "jobs"')) {
-                $deleted = true;
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
                 $writer->delete('delete from listings where id = 3');
             }
         });
@@ -1946,9 +2403,232 @@ final class InstallerTest extends TestCase
             statementTimeout: CarbonInterval::seconds(30),
         );
 
-        $this->assertTrue($deleted);
-        $this->assertSame([1, 2], array_column($this->listings(), 'id'));
-        $this->assertSame(2, DB::table('jobs')->count());
+        $this->assertSame([2, [1, 2]], [$reads, array_column($this->listings(), 'id')]);
+        $this->assertSame([3, false], [DB::table('jobs')->count(), DB::scalar("select deleted_at is not null from jobs where name = 'Elm Cottage'")]);
+        $this->artisan('compatibility:check', ['--model' => [Listing::class]])
+            ->expectsOutputToContain('unserved')
+            ->assertExitCode(1);
+    }
+
+    #[Test]
+    public function it_rolls_back_and_retries_when_its_final_pass_waits_on_a_live_writer_of_a_root_past_its_lock_timeout(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $this->listenToTheLog();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->update("update listings set title = 'Oak Manor', updated_at = localtimestamp(0) where id = 1");
+                $this->holdConcurrently(
+                    sql: 'select id from jobs where id = (select job_id from listings where id = 1) for update',
+                    seconds: 3,
+                );
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(4),
+        );
+
+        $this->assertSame(['v', 'Oak Manor'], [$this->kind('listings'), DB::table('listings')->where('id', 1)->value('title')]);
+        $this->assertSame([['warning', true]], array_values(array_map(
+            callback: fn (array $logged) => [$logged[0], str_contains(
+                haystack: $logged[1],
+                needle: "Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03",
+            )],
+            array: array_filter(
+                array: $this->logged,
+                callback: fn (array $logged) => $logged[0] === 'warning' && str_contains(
+                    haystack: $logged[1],
+                    needle: ' attempt ',
+                ),
+            ),
+        )));
+    }
+
+    #[Test]
+    public function it_refuses_once_its_final_pass_spends_the_lock_budget_and_names_the_row_it_reached(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->unprepared('create or replace function slow_job_update() returns trigger language plpgsql as $$ begin perform pg_sleep(0.6); return new; end $$; create trigger slow_job_update before update on jobs for each row execute function slow_job_update()');
+                $writer->update("update listings set title = title || ' Revised', updated_at = localtimestamp(0)");
+            }
+        });
+
+        try {
+            Compatibility::install(
+                model: Listing::class,
+                statementTimeout: CarbonInterval::seconds(1),
+            );
+            $this->fail('Install held its lock past its statementTimeout.');
+        } catch (InvalidCompatibilityMap $exception) {
+            $this->assertStringContainsString("ms statementTimeout before the step the final pass's write of listings id 3, so it rolled back.", $exception->getMessage());
+        } finally {
+            DB::unprepared('drop function if exists slow_job_update() cascade');
+        }
+
+        $this->assertSame('r', $this->kind('listings'));
+    }
+
+    #[Test]
+    public function it_carries_more_natively_created_roots_than_postgresql_binds_parameters_in_one_statement(): void
+    {
+        $this->backfiller(Listing::class)->run();
+        DB::statement("insert into jobs (name, company_id, created_at, updated_at) select 'Native ' || n, ?, now() - interval '1 day', now() - interval '1 day' from generate_series(1, 65536) as n", [ListingTables::COMPANY]);
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(600),
+        );
+
+        $this->assertSame(65539, DB::table('listings')->count());
+    }
+
+    #[Test]
+    public function it_refuses_before_any_write_a_root_model_that_stamps_no_created_at(): void
+    {
+        $listing = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: UnstampedJob::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+        Compatibility::prepare($listing::class);
+
+        $this->expectExceptionObject(InvalidCompatibilityMap::cannot(
+            map: 'listings',
+            operation: 'install',
+            because: 'UnstampedJob stamps no created_at column on jobs, so install() cannot find a root created natively between its read of native roots and its lock, and the view would serve no record for that root. Give UnstampedJob timestamps, then install again',
+        ));
+
+        try {
+            Compatibility::install(
+                model: $listing::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+        } finally {
+            $this->assertSame([3, 'r'], [DB::table('jobs')->count(), $this->kind('listings')]);
+        }
+    }
+
+    #[Test]
+    public function it_carries_a_root_created_natively_inside_its_window_into_a_wall_clock_created_at_in_the_application_zone(): void
+    {
+        config(['app.timezone' => 'America/Chicago']);
+        DB::statement('alter table jobs alter column created_at type timestamp(0) without time zone');
+        $this->backfiller(Listing::class)->run();
+        $writer = $this->writer();
+        $reads = 0;
+        DB::listen(function (QueryExecuted $query) use ($writer, &$reads): void {
+            if ($query->connectionName === DB::getDefaultConnection() && str_starts_with($query->sql, 'SELECT ledger.legacy_id, ledger.successor_id, ledger.status FROM') && ++$reads === 2) {
+                $writer->insert("insert into jobs (name, company_id, created_at, updated_at) values ('Native job', ?, now() at time zone 'America/Chicago', now())", [ListingTables::COMPANY]);
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([2, true], [$reads, DB::table('listings')->where('title', 'Native job')->exists()]);
+    }
+
+    #[Test]
+    public function it_warns_before_its_lock_when_no_index_leads_with_the_created_at_of_the_root_and_not_once_one_does(): void
+    {
+        $this->listenToTheLog();
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        Compatibility::rollback(Listing::class);
+        Compatibility::prepare(Listing::class);
+        DB::statement('create index jobs_created_at_index on jobs (created_at)');
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $this->assertSame([['warning', "Compatibility map 'listings' install: no index leads with jobs.created_at, so the read of natively created roots under the lock scans jobs. Create one before install with CREATE INDEX CONCURRENTLY ON \"jobs\" (\"created_at\")"]], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => $logged[0] === 'warning',
+        )));
+    }
+
+    #[Test]
+    public function it_catches_up_each_of_two_text_keys_that_compare_equal_as_numbers(): void
+    {
+        DB::statement('truncate jobs cascade');
+        DB::statement('create table codes (code text primary key, title text not null, company_id uuid not null, created_at timestamp(0), updated_at timestamp(0))');
+        DB::table('codes')->insert([
+            ['code' => '01', 'title' => 'First code', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-01-01 10:00:00', 'updated_at' => '2026-01-01 10:00:00'],
+            ['code' => '1', 'title' => 'Second code', 'company_id' => ListingTables::COMPANY, 'created_at' => '2026-01-01 10:00:00', 'updated_at' => '2026-01-01 10:00:00'],
+        ]);
+        $code = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            public $incrementing = false;
+
+            protected $keyType = 'string';
+
+            protected $primaryKey = 'code';
+
+            protected $table = 'codes';
+
+            public static function compatibility(Compatibility $code): Compatibility
+            {
+                return $code
+                    ->retainedIn('codes_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        ));
+            }
+        };
+
+        try {
+            Compatibility::prepare($code::class);
+            $this->artisan('compatibility:backfill', ['model' => $code::class])->assertExitCode(0);
+            DB::delete('delete from jobs where id in (select job_id from codes)');
+
+            Compatibility::install(
+                model: $code::class,
+                statementTimeout: CarbonInterval::seconds(30),
+            );
+
+            $this->assertSame(['01', '1'], DB::table('codes')->orderBy('code')->pluck('code')->all());
+        } finally {
+            DB::statement("do \$\$ begin if exists (select from pg_views where viewname = 'codes') then drop view codes; end if; end \$\$");
+            DB::statement('drop table if exists codes_retained, codes, codes_backfill cascade');
+            DB::delete("delete from compatibility_backfills where legacy_type = 'codes'");
+        }
     }
 
     #[Test]
@@ -1988,24 +2668,45 @@ final class InstallerTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_take_the_lock_while_its_last_catch_up_pass_still_reads_a_thousand_rows_it_changes_nothing_in(): void
+    public function it_refuses_before_any_write_while_as_many_rows_as_its_pass_size_have_a_null_updated_at(): void
     {
-        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), localtimestamp(0) from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), null from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
         $this->backfiller(Listing::class)->run();
-        $holding = $this->holdConcurrently('select 1', 30);
-        $this->writer()->update("update listings set title = title || '.', updated_at = localtimestamp(0) where title like 'Bulk %'");
+        $passes = (int) DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'");
 
         try {
             Compatibility::install(
                 model: Listing::class,
                 statementTimeout: CarbonInterval::seconds(30),
             );
-            $this->fail('install() did not refuse.');
+            $this->fail('Install took its lock with 1,100 rows whose updated_at is NULL.');
         } catch (InvalidCompatibilityMap $exception) {
-            $this->assertStringStartsWith("Compatibility map 'listings' cannot install: its catch-up pass 5 still read 1100 legacy rows and changed 0 successor rows, and install() takes the lock only once a pass reads and changes fewer than 1000 rows each.", $exception->getMessage());
+            $this->assertSame("Compatibility map 'listings' cannot install: 1100 listings rows have a NULL updated_at, and every pass walks them again, the final pass under the lock included; install() takes the lock only while fewer than its passSize of 1000 do. Stamp updated_at on those rows, then install again.", $exception->getMessage());
         }
 
-        $this->assertSame(["locked\n", 'r'], [$holding, $this->kind('listings')]);
+        $this->assertSame(['r', $passes], [$this->kind('listings'), (int) DB::scalar("select pass from compatibility_backfills where legacy_type = 'listings'")]);
+    }
+
+    #[Test]
+    public function it_takes_the_lock_and_walks_the_rows_with_a_null_updated_at_while_fewer_than_its_pass_size_have_one(): void
+    {
+        DB::statement("insert into listings (title, company_id, created_at, updated_at) select 'Bulk ' || n, ?, localtimestamp(0), null from generate_series(1, 1100) as n", [ListingTables::COMPANY]);
+        $this->backfiller(Listing::class)->run();
+        $walked = [];
+        DB::listen(function (QueryExecuted $query) use (&$walked): void {
+            if (str_starts_with($query->sql, 'update "compatibility_backfills" set watermark_at')) {
+                $walked[] = $query->bindings[1];
+            }
+        });
+
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+            passSize: 2000,
+        );
+
+        $this->assertSame([1100], $walked);
+        $this->assertSame(['v', 1103], [$this->kind('listings'), DB::table('listings')->count()]);
     }
 
     #[Test]
@@ -2169,6 +2870,13 @@ final class InstallerTest extends TestCase
         );
 
         $this->assertSame(["locked\n", "committed\n", 2, 'v'], [$holding, $released, $attempts, $this->kind('listings')]);
+        $this->logged = array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' attempt ',
+            ),
+        ));
         $this->assertCount(2, $this->logged);
         $this->assertSame('warning', $this->logged[0][0]);
         $this->assertMatchesRegularExpression("/^Compatibility map 'listings' install: attempt 1 of 4 could not take a lock, SQLSTATE 55P03 on ALTER TABLE \"listings_retained\" ADD CONSTRAINT \"listings_retained_job_id_foreign\" FOREIGN KEY \\(\"job_id\"\\) REFERENCES \"jobs\" \\(\"id\"\\) ON DELETE CASCADE NOT VALID after \\d+ ms, so it rolled back and retries$/", $this->logged[0][1]);
@@ -2609,7 +3317,13 @@ final class InstallerTest extends TestCase
         $this->assertSame([
             ['info', "Compatibility map 'listings' install: view listing_titles depends on listings"],
             ['info', "Compatibility map 'listings' rollback: view listing_titles depends on listings"],
-        ], $this->logged);
+        ], array_values(array_filter(
+            array: $this->logged,
+            callback: fn (array $logged) => str_contains(
+                haystack: $logged[1],
+                needle: ' depends on ',
+            ),
+        )));
     }
 
     #[Test]
@@ -2766,6 +3480,66 @@ final class InstallerTest extends TestCase
         return new Backfiller(Compatibility::of($model)->resolve(), DB::connection());
     }
 
+    private function nativeListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name')->writtenBy(NameJobFromTitle::class),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        ))
+                    ->legacyInitializedBy(InitializeNativeListing::class);
+            }
+        };
+    }
+
+    private function scopedListing(): Model
+    {
+        return new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->writesWithin(RecordingWriteScope::class)
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'company_id',
+                            definition: fn (Attribute $attribute) => $attribute->from('company_id'),
+                        )
+                        ->attribute(
+                            name: 'updated_at',
+                            definition: fn (Attribute $attribute) => $attribute->from('updated_at'),
+                        ));
+            }
+        };
+    }
+
     private function writer(): ConnectionInterface
     {
         config(['database.connections.writer' => config('database.connections.'.DB::getDefaultConnection())]);
@@ -2784,7 +3558,7 @@ final class InstallerTest extends TestCase
 
     private function start(string $concurrent): string
     {
-        $process = proc_open([PHP_BINARY, '-r', $concurrent], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open([PHP_BINARY, '-r', $concurrent], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
 
         if ($process === false) {
             $this->fail('The concurrent writer did not start.');

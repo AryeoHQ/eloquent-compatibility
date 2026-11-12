@@ -28,6 +28,7 @@ use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
 use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Support\Database\Eloquent\Compatibility\Write\ExternalAttributes;
 use Support\Database\Eloquent\Compatibility\Write\MassWriter;
+use Support\Database\Eloquent\Compatibility\Write\Outcome;
 use Support\Database\Eloquent\Compatibility\Write\RecordWriter;
 use Tests\Fixtures\Support\Files\FakeMediaLibrary;
 use Tests\Fixtures\Support\Files\FileMetadata;
@@ -109,7 +110,7 @@ final class PlaceAssetTest extends TestCase
         )->value('id');
         $file = DB::table('place_assets')->where('id', $asset)->value('asset_id');
 
-        DB::table('place_videos')->where('id', 1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'original_file_name' => null, 'size_kb' => null]);
+        DB::table('place_videos')->where('id', 1)->update(['youtube_embed_url' => 'https://youtu.be/tour', 'original_file_name' => null, 'size_kb' => null, 'updated_at' => DB::raw('localtimestamp(0)')]);
         $backfiller->run();
 
         $this->assertSame([[1, 'place_asset_link'], [2, 'place_asset_link'], [3, 'place_asset_file']], $this->assets('place_video'));
@@ -552,7 +553,7 @@ final class PlaceAssetTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_install_while_a_legacy_row_points_at_no_target_its_choice_picks(): void
+    public function it_refuses_to_install_while_the_catch_up_of_a_row_that_points_at_no_target_its_choice_picks_fails(): void
     {
         PlaceAssetTables::prepare();
         PlaceAssetTables::backfill();
@@ -568,7 +569,8 @@ final class PlaceAssetTest extends TestCase
             $refusal = $exception->getMessage();
         }
 
-        $this->assertStringContainsString("Compatibility map 'place_videos' cannot install: 1 place_videos rows point at no target their relatedMorph() choose: closure picks; the first are id 2.", $refusal);
+        $this->assertStringContainsString("Compatibility map 'place_videos' cannot install: 1 place_videos row is refused or failed in place_videos_backfill", $refusal);
+        $this->assertStringContainsString('cannot run a write that moves record 2 from AssetLink to AssetFile without $original_file_name', $refusal);
         $this->assertSame('r', DB::scalar("select relkind::text from pg_class where oid = to_regclass('place_videos')"));
     }
 
@@ -629,12 +631,13 @@ final class PlaceAssetTest extends TestCase
             )->value('place_asset_id'),
         )->value('asset_id');
         DB::update("update asset_files set featured_at = '2026-01-01 09:00:00' where id = ?", [$file(1)]);
+        DB::update("update place_videos_backfill set status = 'failed'");
         $unchanged = $backfiller->run();
-        DB::update('update place_videos set is_featured = false where id = 3');
+        DB::update('update place_videos set is_featured = false, updated_at = localtimestamp(0) where id = 3');
 
         $changed = $backfiller->run();
 
-        $this->assertSame([0, 1], [$unchanged['changed'], $changed['changed']]);
+        $this->assertSame([3, 1], [$unchanged->count(Outcome::Unchanged), $changed->count(Outcome::Updated)]);
         $this->assertSame(['2026-01-01 09:00:00', null], [DB::scalar('select cast(featured_at as text) from asset_files where id = ?', [$file(1)]), DB::table('asset_files')->where('id', $file(3))->value('featured_at')]);
     }
 

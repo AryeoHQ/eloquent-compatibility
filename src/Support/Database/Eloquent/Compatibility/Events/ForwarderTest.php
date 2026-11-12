@@ -765,7 +765,7 @@ final class ForwarderTest extends TestCase
     public function it_reads_the_stand_in_row_of_a_native_create_whose_root_key_is_a_scaled_numeric(): void
     {
         DB::statement('create sequence numbered_jobs_id_seq');
-        DB::statement("create table numbered_jobs (id numeric(20, 0) primary key default nextval('numbered_jobs_id_seq'), name text not null)");
+        DB::statement("create table numbered_jobs (id numeric(20, 0) primary key default nextval('numbered_jobs_id_seq'), name text not null, created_at timestamptz)");
         DB::statement('create table holders (id serial primary key, name text not null, job_id numeric(20, 0), created_at timestamptz, updated_at timestamptz)');
         DB::table('holders')->insert([['name' => 'Oak']]);
         $holder = new class extends Model implements Compatible

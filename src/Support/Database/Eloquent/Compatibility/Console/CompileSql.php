@@ -76,6 +76,7 @@ final class CompileSql extends Command
                 ...($for === 'install' ? [
                     'Compatibility::install() runs backfill passes in PHP before these statements, and this SQL omits them.',
                     "Running this SQL by hand skips those passes, so it drops every legacy edit that no pass has written to the successors of {$map->table}. Run Compatibility::install() instead.",
+                    "Under its lock, Compatibility::install() also inserts in PHP the {$map->table} row of each natively created root, and this SQL omits those inserts.",
                 ] : []),
                 ...$statements->notes,
                 ...array_map(

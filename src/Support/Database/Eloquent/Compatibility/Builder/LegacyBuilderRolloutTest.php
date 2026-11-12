@@ -362,6 +362,7 @@ final class LegacyBuilderRolloutTest extends TestCase
         CompletedPass::recordHandBackfill(model: $model::class);
         DB::update('update jobs set price_mills = 1005 where id = (select job_id from listings where id = 1)');
         DB::update('update jobs set price_mills = 1010 where id = (select job_id from listings where id = 3)');
+        CompletedPass::agree(model: $model::class);
         Compatibility::install(
             model: $model::class,
             statementTimeout: CarbonInterval::seconds(30),

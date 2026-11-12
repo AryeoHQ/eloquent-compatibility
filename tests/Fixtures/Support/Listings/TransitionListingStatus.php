@@ -7,6 +7,7 @@ namespace Tests\Fixtures\Support\Listings;
 use Illuminate\Support\Str;
 use Support\Database\Eloquent\Compatibility\Contracts\WritesAttribute;
 use Support\Database\Eloquent\Compatibility\Write\Change;
+use Support\Database\Eloquent\Compatibility\Write\Origin;
 use Support\Database\Eloquent\Compatibility\Write\Refusal;
 use Support\Database\Eloquent\Compatibility\Write\Successors;
 use Support\Database\Eloquent\StateMachines\Attributes\Transitions\Transition;
@@ -31,6 +32,12 @@ final class TransitionListingStatus implements WritesAttribute
         $to = self::STATES[is_string($status) ? $status : ''] ?? throw Refusal::because('A listing status is Draft, Active or Sold, and '.var_export($status, true).' is none of them.');
 
         if (! $job->exists) {
+            if ($change->origin === Origin::Backfill) {
+                $job->setRawAttributes(array_replace($job->getAttributes(), ['lifecycle_status' => $to->value]));
+
+                return;
+            }
+
             if ($to !== LifecycleStatus::Drafting) {
                 throw Refusal::because("A new listing starts as a Draft, so it cannot start as {$status}.");
             }

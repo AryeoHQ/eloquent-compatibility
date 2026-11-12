@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Compatibility\Write;
 
 use Carbon\CarbonInterval;
 use Closure;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
@@ -27,6 +28,7 @@ use Tests\Fixtures\Support\PlaceAssets\AssetFile;
 use Tests\Fixtures\Support\PlaceAssets\AssetLink;
 use Tests\Fixtures\Support\PlaceAssets\AssetNote;
 use Tests\Fixtures\Support\PlaceAssets\Brochure;
+use Tests\Fixtures\Support\PlaceAssets\ClassifyPlaceAsset;
 use Tests\Fixtures\Support\PlaceAssets\Image;
 use Tests\Fixtures\Support\PlaceAssets\InteractiveContent;
 use Tests\Fixtures\Support\PlaceAssets\NoteAuthor;
@@ -285,18 +287,39 @@ final class MorphTargetTest extends TestCase
         $backfiller->run();
         $trashed = (string) $this->asset('place_brochure', 1)['asset_id'];
         TrashableAssetFile::query()->findOrFail($trashed)->delete();
+        DB::update("update place_brochures set updated_at = localtimestamp(0) + interval '1 day' where id = 1");
 
         $run = $backfiller->run();
+        $moved = (string) $this->asset('place_brochure', 1)['asset_id'];
         Compatibility::install(
             model: Brochure::class,
             statementTimeout: CarbonInterval::seconds(30),
         );
 
         $live = (string) $this->asset('place_brochure', 1)['asset_id'];
-        $this->assertSame([2, 2], [$run['read'], $run['changed']]);
+        $this->assertSame([1, 1, $live], [$run->walked, $run->changed, $moved]);
         $this->assertNotSame($trashed, $live);
         $this->assertSame(['guide.pdf', true], [DB::table('trashable_asset_files')->where('id', $live)->whereNull('deleted_at')->value('filename'), DB::table('trashable_asset_files')->where('id', $trashed)->whereNotNull('deleted_at')->exists()]);
         $this->assertSame([[1, 'Guide', 'guide.pdf', null], [2, 'Map', null, 'https://maps.example/oak']], Brochure::query()->orderBy('id')->get()->map(fn (Brochure $brochure) => [$brochure->id, $brochure->title, $brochure->file_name, $brochure->url])->all());
+    }
+
+    #[Test]
+    public function it_moves_a_catch_up_row_into_the_target_its_legacy_edit_chooses(): void
+    {
+        PlaceAssetTables::brochures();
+        Compatibility::prepare(Brochure::class);
+        $this->artisan('compatibility:backfill', ['model' => Brochure::class])->assertExitCode(0);
+        DB::update("update place_brochures set hosted = false, file_name = null, url = 'https://guide.example/oak', updated_at = localtimestamp(0) + interval '1 day' where id = 1");
+
+        $this->artisan('compatibility:backfill', ['model' => Brochure::class])->assertExitCode(0);
+        Compatibility::install(
+            model: Brochure::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+
+        $asset = $this->asset('place_brochure', 1);
+        $this->assertSame(['place_asset_link', 'https://guide.example/oak'], [$asset['asset_type'], DB::table('asset_links')->where('id', $asset['asset_id'])->value('url')]);
+        $this->assertSame([1, 'Guide', null, 'https://guide.example/oak'], [Brochure::query()->findOrFail(1)->id, Brochure::query()->findOrFail(1)->title, Brochure::query()->findOrFail(1)->file_name, Brochure::query()->findOrFail(1)->url]);
     }
 
     #[Test]
@@ -305,11 +328,11 @@ final class MorphTargetTest extends TestCase
         PlaceAssetTables::brochures();
         Compatibility::prepare(Brochure::class);
         $backfiller = new Backfiller(Compatibility::of(Brochure::class)->resolve(), DB::connection());
-        $watermark = $backfiller->run()['watermark'];
+        $backfiller->run();
         $before = $this->asset('place_brochure', 1);
         DB::update('update place_brochures set id = 99, updated_at = localtimestamp(0) where id = 1');
 
-        $backfiller->run(since: $watermark);
+        $backfiller->run();
         Compatibility::install(
             model: Brochure::class,
             statementTimeout: CarbonInterval::seconds(30),
@@ -592,7 +615,9 @@ final class MorphTargetTest extends TestCase
     #[Test]
     public function it_refuses_a_mass_write_whose_read_as_projection_changes_the_target_its_choose_closure_reads_and_changes_nothing(): void
     {
-        $brochure = $this->installed($this->titledBrochure(), fn () => null);
+        $brochure = $this->installed($this->titledBrochure(), function (): void {
+            DB::table('place_brochures')->update(['title' => DB::raw('upper(title)')]);
+        });
         DB::table('place_assets')->where(
             column: 'id',
             operator: '=',
@@ -763,7 +788,10 @@ final class MorphTargetTest extends TestCase
         });
 
         try {
-            $brochure = $this->installed($this->linkWrittenBrochure(), fn () => Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable()));
+            $brochure = $this->installed($this->linkWrittenBrochure(), function (): void {
+                Schema::table('place_brochures', fn (Blueprint $table) => $table->string('note')->nullable());
+                DB::table('place_brochures')->where('id', 2)->update(['hosted' => true, 'file_name' => 'map.pdf']);
+            });
             DB::table('asset_notes')->insert(['place_asset_id' => $this->asset('place_brochure', 1)['id'], 'body' => 'Lobby']);
             $refusals = [];
 
@@ -874,7 +902,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1031,7 +1061,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1088,7 +1120,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1150,7 +1184,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1207,7 +1243,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1269,7 +1307,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1333,7 +1373,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),
@@ -1395,7 +1437,9 @@ final class MorphTargetTest extends TestCase
             {
                 return $brochure
                     ->retainedIn('place_brochures_retained')
+                    ->successorsInitializedBy(ClassifyPlaceAsset::class)
                     ->servedFrom(root: PlaceAsset::class, key: 'place_asset_id', successor: fn (Successor $asset) => $asset
+                        ->when(fn (Builder $assets) => $assets->where(column: 'legacy_type', operator: '=', value: 'place_brochure'))
                         ->attribute(
                             name: 'created_at',
                             definition: fn (Attribute $attribute) => $attribute->from('created_at'),

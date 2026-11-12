@@ -219,7 +219,7 @@ final class ExternalAttributesTest extends TestCase
             ListingTables::drop();
         }
 
-        $this->assertSame([[3, 6], [3, 0]], [[$first['read'], $first['changed']], [$second['read'], $second['changed']]]);
+        $this->assertSame([[3, 3], [0, 0]], [[$first->walked, $first->count(Outcome::Created)], [$second->walked, $second->changed]]);
         $this->assertSame([['1 Oak St', 'Seattle'], ['3 Elm St', null]], $places);
         $this->assertSame([[1, 'Seattle'], [2, null], [3, null]], $cities);
     }

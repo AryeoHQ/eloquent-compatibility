@@ -11,6 +11,7 @@ Aryeo's Listing team rebuilt the lifecycle for its own writer: a run table, a re
 ## Decision
 
 - Each legacy row is written in its own savepoint. A failure rolls back that row only, and the chunk continues.
+- A map that declares `writesWithin()` commits each backfill row in its own transaction, in the order scope, package locks, write, ledger row, commit, and the chunk is only a read batch. A map without a write scope keeps one transaction per chunk, with one savepoint per row. Releasing a savepoint keeps its row locks, so in a chunk transaction a row's scope ran while the package held the earlier rows' locks. This amends the earlier design, which wrote every chunk in one transaction. Declined: one scope call per chunk with every row's keys, which keeps the lock hold and the subtransactions and refuses a whole chunk on one moved key.
 - An operation or initializer refuses a row with a refusal that carries its reason.
 - Every pass retries refused and failed rows, whatever the watermark.
 - The watermark is a timestamp only: the database time at which the last completed pass started. Each pass subtracts a margin from its lower bound, and walks every row whose `updated_at` is NULL. The margin must exceed the clock skew plus the longest legacy write transaction, because a row becomes visible only when its write commits.
@@ -30,6 +31,7 @@ Declined: package-wide configuration keys, the legacy model's class as `legacy_t
 ## Consequences
 
 - `compatibility:backfill` prints counts by reason, and exits non-zero on any refused or failed row.
+- A scoped map pays one commit per row, roughly one to two hours more over 3M rows.
 - A row the successor cannot represent blocks install by name. Unblocking is the consumer's work: complete the prerequisite, widen the successor, retire rows, split the legacy table, or order the installs.
 - Aryeo's File model must serve an asset from its legacy path while `zml_asset_id` is NULL. The historic ZML migration cannot finish before compatibility rolls out. That work is Aryeo's.
 - [Lifecycle](../specification/lifecycle.md#the-backfill) and [Storage](../specification/storage.md) state the passes and the tables.

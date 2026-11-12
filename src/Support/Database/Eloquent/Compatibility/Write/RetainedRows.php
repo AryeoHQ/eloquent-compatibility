@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Write;
 
+use Closure;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Str;
@@ -19,6 +21,7 @@ use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Discovery\ServedModels;
 use Support\Database\Eloquent\Compatibility\Events\Forwarder;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
+use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
@@ -63,11 +66,120 @@ final class RetainedRows
                 continue;
             }
 
-            (new self($map, $connection))->carried($root);
+            (new self($map, $connection))->carried(
+                root: $root,
+                origin: Origin::Live,
+            );
         }
     }
 
-    private function carried(Model $root): void
+    /**
+     * @param  null|list<int|string>  $among
+     * @return list<int|string>
+     */
+    public function unserved(string $table, null|array $among = null, null|string $since = null, null|int $limit = null): array
+    {
+        $members = $this->members();
+        $root = $members->getModel();
+        $legacy = SqlFragments::identifier($table);
+        $qualified = $members->qualifyColumn($this->map->primary->key);
+        $rootKey = SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($this->map->primary->key);
+        $members->whereRaw('NOT EXISTS (SELECT FROM '.$legacy.' WHERE '.$legacy.'.'.SqlFragments::identifier($this->map->successorKey).' = '.$rootKey.')');
+
+        $ledger = new Ledger(
+            map: $this->map,
+            connection: $this->connection,
+        );
+
+        if ($ledger->exists()) {
+            $members->whereRaw('NOT EXISTS ('.$ledger->deletedRoots($rootKey).')');
+        }
+
+        if ($among !== null || $since !== null) {
+            $catalog = new ColumnCatalog(
+                connection: $this->connection,
+                throughWriteConnection: true,
+            );
+            $created = $root->usesTimestamps() ? $root->getCreatedAtColumn() : null;
+            $members->where(function (Builder $bounded) use ($among, $since, $rootKey, $root, $created, $catalog): void {
+                if ($among !== null) {
+                    $bounded->orWhereRaw(
+                        sql: $rootKey.' = any(cast(? as '.($catalog->type(
+                            table: $root->getTable(),
+                            column: $this->map->primary->key,
+                        ) ?? 'text').'[]))',
+                        bindings: [SqlFragments::arrayLiteral($among)],
+                    );
+                }
+
+                if ($since !== null && $created !== null) {
+                    $bounded->orWhereRaw(
+                        sql: SqlFragments::identifier($root->getTable()).'.'.SqlFragments::identifier($created).' >= '.(SqlFragments::isNaive($catalog->type(
+                            table: $root->getTable(),
+                            column: $created,
+                        )) ? SqlFragments::inApplicationZone('CAST(? AS timestamptz)') : 'CAST(? AS timestamptz)'),
+                        bindings: [$since],
+                    );
+                }
+            });
+        }
+
+        $members->orderBy($qualified);
+
+        if ($limit !== null) {
+            $members->limit($limit);
+        }
+
+        return array_values(array_map(
+            callback: fn (mixed $key) => is_int($key) || is_string($key) ? $key : throw new LogicException("{$this->map->primary->table} holds a row with no key."),
+            array: $members->toBase()->pluck($qualified)->all(),
+        ));
+    }
+
+    /**
+     * @param  list<int|string>  $keys
+     * @param  Closure(): void  $before
+     */
+    public function carryNative(array $keys, Closure $before): void
+    {
+        foreach (array_chunk(array: $keys, length: UnitOfWork::CHUNK) as $batch) {
+            foreach ($this->members()->whereKey($batch)->orderBy($this->map->primary->key)->get() as $root) {
+                $before();
+
+                try {
+                    $this->carried(
+                        root: $root,
+                        origin: Origin::Backfill,
+                    );
+                } catch (Refusal $refusal) {
+                    throw InvalidCompatibilityMap::cannot(
+                        map: $this->map->table,
+                        operation: 'install',
+                        because: class_basename((string) $this->map->legacyInitializer).' refused the legacy row of the natively created '.class_basename($this->map->primary->model).' '.UnitOfWork::keyOf($root).': '.$refusal->getMessage(),
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * @return Builder<Model>
+     */
+    private function members(): Builder
+    {
+        $members = (new $this->map->primary->model)->setConnection($this->connection instanceof Connection ? $this->connection->getName() : null)->newModelQuery()->useWritePdo();
+        $when = $this->map->primary->membershipScope();
+
+        if ($when !== null) {
+            $members->where(function (Builder $member) use ($when): void {
+                $when($member);
+            });
+        }
+
+        return $members;
+    }
+
+    private function carried(Model $root, Origin $origin): void
     {
         $legacy = (new $this->map->model)->setConnection($root->getConnectionName());
 
@@ -108,9 +220,9 @@ final class RetainedRows
             UnitOfWork::hook(
                 run: fn () => $instance->initialize($graphs[0]->successors(), new Creation(
                     record: $legacy,
-                    origin: Origin::Live,
+                    origin: $origin,
                 )),
-                origin: Origin::Live,
+                origin: $origin,
                 model: $this->map->model,
                 key: null,
                 attribute: null,
