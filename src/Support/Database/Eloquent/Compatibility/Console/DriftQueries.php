@@ -315,11 +315,35 @@ final readonly class DriftQueries
             return [];
         }
 
+        $tables = array_values(array_map(
+            callback: fn (Related $related) => $related->table,
+            array: array_filter(
+                array: $map->related,
+                callback: fn (Related $related) => $related->morphType === null,
+            ),
+        ));
+        $joins = $tables === [] ? [] : $this->connection->select(
+            query: "select related.name, position(') ' || quote_ident(related.name) || ' ON true' in ?) > 0 as lateral
+             from unnest(cast(? as text[])) with ordinality as related(name, position)
+             where (position(') ' || quote_ident(related.name) || ' ON true' in ?) > 0) <> (position(') ' || quote_ident(related.name) || ' ON true' in ?) > 0)
+             order by related.position",
+            bindings: [$views['installed'], SqlFragments::arrayLiteral($tables), $views['installed'], $views['compiled']],
+            useReadPdo: false,
+        );
+
         return [new DriftFinding(
             model: $map->model,
             check: DriftCheck::StaleView,
             record: $map->table,
-            detail: 'the installed view differs from the view the map compiles; run Compatibility::update()',
+            detail: 'the installed view differs from the view the map compiles'.implode(
+                separator: '',
+                array: array_map(
+                    callback: fn (object $join) => $join->lateral === true
+                        ? "; it joins {$join->name} laterally, and the map now joins it plainly"
+                        : "; it joins {$join->name} plainly, and the map now joins it laterally",
+                    array: $joins,
+                ),
+            ).'; run Compatibility::update()',
         )];
     }
 
@@ -453,7 +477,14 @@ final readonly class DriftQueries
                 retained: ViewCompiler::retainedTable($map),
                 hides: false,
             )
-            .implode('', array_map(fn (string $lateral) => ' '.$lateral, ViewCompiler::laterals($map)))
+            .implode(separator: '', array: array_map(callback: fn (string $join) => ' '.$join, array: ViewCompiler::joins(
+                map: $map,
+                proven: ViewCompiler::proven(
+                    map: $map,
+                    connection: $this->connection,
+                    writing: true,
+                ),
+            )))
             .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
     }
 

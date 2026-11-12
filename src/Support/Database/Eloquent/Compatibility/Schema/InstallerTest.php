@@ -43,6 +43,7 @@ use Tests\Fixtures\Support\Listings\InitializeLegacyListing;
 use Tests\Fixtures\Support\Listings\InitializeNativeListing;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingOfAnyPlace;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\NameJobFromTitle;
 use Tests\Fixtures\Support\Listings\RecordingWriteScope;
@@ -1962,6 +1963,49 @@ final class InstallerTest extends TestCase
 
         $this->assertSame($before, $this->listings());
         $this->assertSame(1, DB::scalar("select count(*) from information_schema.role_table_grants where table_name = 'listings' and grantee = 'PUBLIC'"));
+    }
+
+    #[Test]
+    public function it_refuses_to_update_or_roll_back_through_an_at_most_one_index_whose_conditions_the_map_changed(): void
+    {
+        Compatibility::install(
+            model: Listing::class,
+            statementTimeout: CarbonInterval::seconds(30),
+        );
+        $job = ListingTables::jobOf(1);
+        DB::table('places')->insert(['job_id' => $job, 'parent_id' => DB::table('places')->where('job_id', $job)->value('id'), 'street' => '0 Oak St, Unit B', 'city' => 'Seattle']);
+        $before = $this->listings();
+        $widened = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return ListingOfAnyPlace::compatibility($listing);
+            }
+        };
+
+        $refusal = fn (string $operation) => "Compatibility map 'listings' cannot {$operation}: places_listings_at_most_one is missing, not valid, or not the unique index prepare() builds on places for the current conditions of the relation from Job to Place, so the view cannot join it plainly. Drop places_listings_at_most_one if it exists, run Compatibility::prepare(), then {$operation} again.";
+
+        try {
+            Compatibility::update($widened::class);
+            $this->fail('update() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString($refusal('update'), $exception->getMessage());
+        }
+
+        try {
+            Compatibility::rollback($widened::class);
+            $this->fail('rollback() did not refuse.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString($refusal('rollback'), $exception->getMessage());
+        }
+
+        $this->assertSame('v', $this->kind('listings'));
+        $this->assertSame($before, $this->listings());
+        $this->assertSame([1, 2, 3], array_map(intval(...), array_column($before, 'id')));
     }
 
     #[Test]

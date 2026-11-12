@@ -25,10 +25,16 @@ use Support\Database\Eloquent\Compatibility\Write\Backfiller;
 use Tests\Fixtures\Support\Files\FileTables;
 use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
+use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
+use Tests\Fixtures\Support\Listings\JobSite;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\Listings\ListingTitles;
+use Tests\Fixtures\Support\Listings\Place;
+use Tests\Fixtures\Support\Listings\Region;
+use Tests\Fixtures\Support\PlaceAssets\PlaceAssetTables;
+use Tests\Fixtures\Support\PlaceAssets\Video as PlaceVideo;
 use Tests\TestCase;
 
 #[CoversClass(CompileSql::class)]
@@ -247,10 +253,10 @@ final class CompileSqlTest extends TestCase
                 map: $map,
                 connection: DB::connection(),
                 operation: 'update',
-            ), Statements::update(
+            ), ...Statements::update(
                 map: $map,
                 connection: DB::connection(),
-            )->transaction[0]],
+            )->transaction],
         )."\n;\n\nCOMMIT;\n", $body);
     }
 
@@ -357,6 +363,197 @@ final class CompileSqlTest extends TestCase
             $this->assertStringStartsWith('-- compatibility:sql prepare Tests\Fixtures\Support\Listings\Listing:', (string) file_get_contents((string) $file));
         } finally {
             unlink((string) $file);
+        }
+    }
+
+    #[Test]
+    public function it_prints_where_a_filter_on_each_attribute_runs_once_installed(): void
+    {
+        $rebuilt = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->attribute(
+                            name: 'latitude',
+                            definition: fn (Attribute $attribute) => $attribute->from('price_cents')->asType('double precision'),
+                        )
+                        ->attribute(
+                            name: 'mls_number',
+                            definition: fn (Attribute $attribute) => $attribute->readAs('upper("jobs"."name")')->readOnly(because: 'The legacy table generates it.', ignoreWrites: false),
+                        )
+                        ->attribute(
+                            name: 'featured',
+                            definition: fn (Attribute $attribute) => $attribute->fixed(false)->readOnly(because: 'No listing is featured any more.', ignoreWrites: false),
+                        ));
+            }
+        };
+        $unbounded = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->hasOne(Place::class),
+                            successor: fn (Successor $place) => $place
+                                ->attribute('street', fn (Attribute $attribute) => $attribute->from('street')),
+                        ));
+            }
+        };
+
+        $planned = $this->filtersOf(Listing::class);
+        $expression = $this->filtersOf($rebuilt::class);
+        $lateral = $this->filtersOf($unbounded::class);
+        DB::statement('drop index places_listings_at_most_one');
+        $unprepared = $this->filtersOf(Listing::class);
+        FileTables::create();
+        FileTables::seed();
+
+        $this->assertSame([
+            '-- Once the view serves listings, a filter on each attribute runs here:',
+            '-- created_at: the view',
+            '-- updated_at: the view',
+            '-- deleted_at: the view',
+            '-- title: the view',
+            '-- company_id: the view',
+            '-- price: the stored column jobs.price_cents when the operator can be inverted, otherwise the view',
+            '-- status: the stored column jobs.lifecycle_status when the operator can be inverted, otherwise the view',
+            '-- street: the view, reached through plain joins on jobs.id, so indexes on places.street and jobs.id can serve it',
+            '-- city: the view, reached through plain joins on jobs.id, so indexes on places.city and jobs.id can serve it',
+            '-- latitude: the view, reached through plain joins on jobs.id, so indexes on job_sites.latitude and jobs.id can serve it',
+        ], $planned);
+        $this->assertSame($planned, $unprepared);
+        $this->assertSame([
+            '-- Once the view serves listings, a filter on each attribute runs here:',
+            '-- title: the view',
+            '-- latitude: a rebuilt expression over jobs',
+            '-- mls_number: the view',
+            '-- featured: the view',
+        ], $expression);
+        $this->assertSame([
+            '-- Once the view serves listings, a filter on each attribute runs here:',
+            '-- title: the view',
+            '-- street: the view, reached through a lateral join on places, so no index on places serves it',
+        ], $lateral);
+        $this->assertContains('-- mime_type: no SQL filter, because computedAs() computes it in PHP', $this->filtersOf(Photo::class));
+        $this->assertSame(0, Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'prepare', 'model' => Listing::class],
+        ));
+        $this->assertStringNotContainsString('a filter on each attribute', Artisan::output());
+    }
+
+    #[Test]
+    public function it_claims_no_index_for_a_filter_the_view_reads_through_a_cast_or_a_fallback(): void
+    {
+        $fallback = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->retainedIn('listings_retained')
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->attribute(
+                            name: 'title',
+                            definition: fn (Attribute $attribute) => $attribute->from('name'),
+                        )
+                        ->related(
+                            relation: fn (Job $job) => $job->rootPlace(),
+                            successor: fn (Successor $place) => $place
+                                ->atMostOne(because: 'A listing has one address.')
+                                ->attribute('city', fn (Attribute $attribute) => $attribute->from('city')->orFrom(successor: JobSite::class, column: 'city')->readOnly(because: 'A listing without an address shows the city of its site.', ignoreWrites: false)),
+                        )
+                        ->related(fn (Job $job) => $job->site()));
+            }
+        };
+        DB::statement('alter table job_sites add column city varchar(255)');
+
+        $this->assertContains('-- city: the view, reached through plain joins on jobs.id, but the view reads it through orFrom(), so no index on places serves it', $this->filtersOf($fallback::class));
+
+        DB::statement('alter table job_sites alter column latitude type real');
+        DB::statement('alter table places alter column city type varchar(255) collate "C"');
+
+        $this->assertSame([
+            '-- street: the view, reached through plain joins on jobs.id, so indexes on places.street and jobs.id can serve it',
+            '-- city: the view, reached through plain joins on jobs.id, but the view casts places.city to the legacy type or collation, so no index on places serves it',
+            '-- latitude: the view, reached through plain joins on jobs.id, but the view casts job_sites.latitude to the legacy type or collation, so no index on job_sites serves it',
+        ], array_slice($this->filtersOf(Listing::class), 8, 3));
+    }
+
+    #[Test]
+    public function it_names_the_lateral_join_above_a_plainly_joined_owner(): void
+    {
+        DB::statement('create table regions (id uuid primary key, name varchar(255))');
+        DB::statement('create table companies (id uuid primary key, code uuid, region_id uuid)');
+
+        try {
+            $model = new class extends Model implements Compatible
+            {
+                use ServesCompatibility;
+
+                protected $table = 'listings';
+
+                public static function compatibility(Compatibility $listing): Compatibility
+                {
+                    return $listing
+                        ->retainedIn('listings_retained')
+                        ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                            ->attribute(
+                                name: 'title',
+                                definition: fn (Attribute $attribute) => $attribute->from('name'),
+                            )
+                            ->related(
+                                relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id', 'code'),
+                                successor: fn (Successor $company) => $company->related(
+                                    relation: fn (Company $company) => $company->belongsTo(Region::class, 'region_id'),
+                                    successor: fn (Successor $region) => $region->attribute(
+                                        name: 'city',
+                                        definition: fn (Attribute $attribute) => $attribute->from('name')->readOnly(because: 'A listing takes the region of its company.', ignoreWrites: false),
+                                    ),
+                                ),
+                            ));
+                }
+            };
+
+            $this->assertContains('-- city: the view, reached through a lateral join on companies, so no index on regions serves it', $this->filtersOf($model::class));
+        } finally {
+            DB::statement('drop table if exists companies, regions cascade');
+        }
+    }
+
+    #[Test]
+    public function it_prints_a_converted_morphed_attribute_as_filtered_on_the_view(): void
+    {
+        PlaceAssetTables::create();
+
+        try {
+            $this->assertContains('-- size_kb: the view', $this->filtersOf(PlaceVideo::class));
+        } finally {
+            PlaceAssetTables::drop();
         }
     }
 
@@ -595,5 +792,29 @@ final class CompileSqlTest extends TestCase
             ->expectsOutputToContain($refusal)
             ->doesntExpectOutputToContain('BEGIN;')
             ->assertFailed();
+    }
+
+    /**
+     * @param  class-string<Model>  $model
+     * @return list<string>
+     */
+    private function filtersOf(string $model): array
+    {
+        $exit = Artisan::call(
+            command: 'compatibility:sql',
+            parameters: ['operation' => 'prepare', 'model' => $model, '--filters' => true],
+        );
+        $output = Artisan::output();
+        $this->assertSame(0, $exit, $output);
+        $printed = explode(
+            separator: "\n",
+            string: explode(
+                separator: "\n\nBEGIN;\n\n",
+                string: $output,
+                limit: 2,
+            )[0],
+        );
+
+        return array_values(array_slice($printed, (int) array_search('-- Once the view serves '.(new $model)->getTable().', a filter on each attribute runs here:', $printed, true)));
     }
 }

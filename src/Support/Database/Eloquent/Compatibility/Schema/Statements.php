@@ -252,12 +252,20 @@ final readonly class Statements
             );
         }
 
+        $columnCatalog = new ColumnCatalog($connection);
+
         return new self(
             operation: 'update',
-            transaction: [(new ViewCompiler(
-                columnCatalog: new ColumnCatalog($connection),
-                connection: $connection,
-            ))->replace($map)],
+            transaction: [
+                ...(new Preparer($columnCatalog))->current(
+                    map: $map,
+                    operation: 'update',
+                ),
+                (new ViewCompiler(
+                    columnCatalog: $columnCatalog,
+                    connection: $connection,
+                ))->replace($map),
+            ],
         );
     }
 
@@ -312,6 +320,10 @@ final readonly class Statements
 
         $statements = [
             "LOCK TABLE {$locked} IN SHARE ROW EXCLUSIVE MODE",
+            ...($columns === [] ? [] : (new Preparer($columnCatalog))->current(
+                map: $map,
+                operation: 'rollback',
+            )),
             $readGrants,
         ];
         $beforeRollback = count($statements) - 1;
@@ -333,7 +345,14 @@ final readonly class Statements
                     array: $columns,
                 ),
             )
-                ."\nFROM {$primary}".implode('', array_map(fn (string $lateral) => "\n".$lateral, ViewCompiler::laterals($map)))
+                ."\nFROM {$primary}".implode(separator: '', array: array_map(callback: fn (string $join) => "\n".$join, array: ViewCompiler::joins(
+                    map: $map,
+                    proven: ViewCompiler::proven(
+                        map: $map,
+                        connection: $connection,
+                        writing: true,
+                    ),
+                )))
                 ."\nWHERE {$primary}.{$primaryKey} = {$retainedTable}.{$successorKey}"]),
         ];
         $filled = count($statements) - 1;

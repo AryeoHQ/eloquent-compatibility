@@ -306,10 +306,11 @@ final class BackfillerTest extends TestCase
     public function it_refuses_a_pass_while_another_session_holds_the_advisory_lock_of_the_legacy_model(): void
     {
         config(['database.connections.second' => config('database.connections.'.DB::getDefaultConnection())]);
-        (new Watermark(
+        $second = new Watermark(
             legacyType: 'listings',
             connection: DB::connection('second'),
-        ))->hold('backfill');
+        );
+        $second->hold('backfill');
 
         try {
             $this->backfiller(Listing::class)->run();
@@ -317,6 +318,7 @@ final class BackfillerTest extends TestCase
         } catch (InvalidCompatibilityMap $exception) {
             $this->assertSame("Compatibility map 'listings' cannot backfill: another backfill pass or install of listings holds its advisory lock, hashtextextended('compatibility_backfills:listings', 0), and each legacy model runs one pass at a time; wait for it to finish, then backfill again. pg_locks names the session that holds it, with locktype 'advisory'.", $exception->getMessage());
         } finally {
+            $second->release();
             DB::disconnect('second');
         }
 

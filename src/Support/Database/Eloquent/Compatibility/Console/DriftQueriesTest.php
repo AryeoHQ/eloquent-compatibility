@@ -26,6 +26,7 @@ use Tests\Fixtures\Support\Files\Photo;
 use Tests\Fixtures\Support\Files\Video;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingOfAnyPlace;
 use Tests\Fixtures\Support\Listings\ListingTables;
 use Tests\Fixtures\Support\PlaceAssets\Brochure;
 use Tests\Fixtures\Support\PlaceAssets\Image;
@@ -320,6 +321,25 @@ final class DriftQueriesTest extends TestCase
         $this->editView($view);
 
         $this->assertSame([[$model, 'stale view', $view, 'the installed view differs from the view the map compiles; run Compatibility::update()']], $this->find($model));
+    }
+
+    #[Test]
+    public function it_names_each_relation_the_installed_view_joins_plainly_where_the_map_now_joins_it_laterally(): void
+    {
+        $this->installed(Listing::class);
+        $widened = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return ListingOfAnyPlace::compatibility($listing);
+            }
+        };
+
+        $this->assertContains([$widened::class, 'stale view', 'listings', 'the installed view differs from the view the map compiles; it joins places plainly, and the map now joins it laterally; run Compatibility::update()'], $this->find($widened::class));
     }
 
     #[Test]

@@ -62,7 +62,7 @@ Every method returns the `Compatibility` it was called on.
 | `attribute(string $name, Closure $definition)` | one attribute, over a `Definition\Attribute` |
 | `related(Closure $relation, null\|Closure $successor = null)` | a related successor: the closure returns its Eloquent relation, and `successor:` defines it |
 | `relatedMorph(Closure $relation, Closure $choose, Closure $targets)` | a `MorphTo`, the closure that picks its target class, and the targets over a `Definition\Targets` |
-| `atMostOne(string $because)` | a write refuses a second related row, with the reason; the view still uses a lateral join unless a unique index proves the relation |
+| `atMostOne(string $because)` | a write refuses a second related row, with the reason; once `prepare()` builds its unique index, the view joins the relation plainly while that index matches the relation's conditions |
 | `when(Closure $scope)` | membership: which natively created successor rows gain a legacy row |
 
 ### `Definition\Attribute`
@@ -111,7 +111,7 @@ Declined: a separate `ignoresWrites()` method beside `readOnly()`. Declined: cou
 
 `Compatibility::rollback()` replaces `Compatibility::uninstall()`. The package has no public `Compatibility::state()`.
 
-`Compatibility::update()` replaces `recompile()` under a new name, and stays public. A migration that ships a map change after install calls it.
+`Compatibility::update()` replaces `recompile()` under a new name, and stays public. A migration that ships a map change after install calls it. A migration that drops or replaces an index that proves a plain join calls it too, in the same migration. It refuses while an `atMostOne()` index differs from the index `prepare()` builds for the changed conditions. The refusal names the index, and says to drop it and run `prepare()`.
 
 `Compatibility::serves()` is for transitional application code that bypasses the legacy model. It takes a class string and constructs the model internally to resolve its connection and table, as every other operation does. A connection or table set on one instance at runtime is not supported, as for every other operation. Declined: taking a model instance. Its answer can change around an install. It is stable only inside a transaction, so never cache it across requests.
 
@@ -132,7 +132,7 @@ The package has no configuration of its own. Each tuning value is a named argume
 
 `compatibility:sql` takes the operation as its first positional argument: `prepare`, `install`, `update`, `rollback` or `retire`. It refuses an unknown operation. The `--for=` option is removed.
 
-`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. It also says that the printed SQL omits the legacy rows install inserts in PHP under its lock for natively created roots. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+`compatibility:sql install` also prints each lock install takes, with its mode and table. Its header says that `install()` runs backfill passes before these statements, that the printed SQL omits them, and that running the SQL by hand can drop legacy edits that no pass has written. It also says that the printed SQL omits the legacy rows install inserts in PHP under its lock for natively created roots. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view. A stored-column filter falls back to the view where its conversion cannot invert the operator. For an attribute of a related successor, the command names the lateral join that reaches it, or the parent columns that the plain joins traverse and the indexes that can serve the filter. It claims no index where the view casts the column or reads an `orFrom()` fallback. A `computedAs()` attribute has no SQL filter.
 
 The commands are public by name. Their classes are internal.
 
@@ -142,7 +142,7 @@ The commands are public by name. Their classes are internal.
 
 - discovery does not find the model,
 - the map does not compile,
-- the installed view differs from the view the map compiles, and the message tells the developer to run `Compatibility::update()`,
+- the installed view differs from the view the map compiles, and the message tells the developer to run `Compatibility::update()`; `compatibility:check` also names each relation whose join changes between plain and lateral,
 - `$nativeCreate` fails, inserts no retained row of `$model`, or creates a root that also matches the `when()` of another discovered map with the same root class,
 - a membership query of `compatibility:check` finds a row: a served root outside its map's `when()`, or a shared successor that serves two legacy records, or
 - a legacy-only NOT NULL column has neither a default nor an initializer.

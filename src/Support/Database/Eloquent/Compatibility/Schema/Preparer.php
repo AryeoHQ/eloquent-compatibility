@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Compatibility\Schema;
 
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\QueryException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
@@ -59,6 +60,19 @@ final readonly class Preparer
             map: $map->table,
             name: $map->table.'_'.$map->successorKey.'_unique',
         );
+    }
+
+    public static function atMostOneName(ResolvedMap $map, Related $related): string
+    {
+        return SqlFragments::objectName(
+            map: $map->table,
+            name: $related->table.'_'.$map->table.'_at_most_one',
+        );
+    }
+
+    public static function uniqueOnOneColumn(string $index, string $attribute): string
+    {
+        return "{$index}.indisunique AND {$index}.indisvalid AND {$index}.indimmediate AND {$index}.indexprs IS NULL AND {$index}.indnkeyatts = 1 AND {$index}.indkey[0] = {$attribute}.attnum";
     }
 
     /**
@@ -192,26 +206,110 @@ final readonly class Preparer
             ."    RAISE EXCEPTION '%', ".$refusal(Ledger::table($map->table).' does not exist').";\n"
             ."  END IF;\nEND\n\$compatibility\$"];
 
-        foreach ($map->related as $related) {
-            if ($related->successor->atMostOneBecause() !== null && ! $related->belongsTo) {
-                [$index, $columns] = $this->atMostOneIndex($map, $related);
-                $statements[] = "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
-                    .$this->definitions($related->table, $index, $columns, true)
-                    ."  IF found IS DISTINCT FROM expected THEN\n"
-                    ."    RAISE EXCEPTION '%', ".$refusal("{$index} is missing, not valid, or not the unique index prepare() builds on {$related->table}").";\n"
-                    ."  END IF;\nEND\n\$compatibility\$";
-            }
+        foreach (self::atMostOneRelations($map) as $related) {
+            $statements[] = $this->atMostOneCheck(
+                map: $map,
+                related: $related,
+                mismatched: "    RAISE EXCEPTION '%', ".$refusal(self::atMostOneName(
+                    map: $map,
+                    related: $related,
+                )." is missing, not valid, or not the unique index prepare() builds on {$related->table}").";\n",
+            );
         }
 
         return $statements;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function current(ResolvedMap $map, string $operation): array
+    {
+        return array_map(
+            callback: function (Related $related) use ($map, $operation): string {
+                $index = self::atMostOneName(
+                    map: $map,
+                    related: $related,
+                );
+                $refusal = InvalidCompatibilityMap::cannot(
+                    map: $map->table,
+                    operation: $operation,
+                    because: "{$index} is missing, not valid, or not the unique index prepare() builds on {$related->table} for the current conditions of the relation from ".class_basename($related->parent).' to '.class_basename($related->model).", so the view cannot join it plainly. Drop {$index} if it exists, run Compatibility::prepare(), then {$operation} again",
+                );
+
+                return $this->atMostOneCheck(
+                    map: $map,
+                    related: $related,
+                    mismatched: "    RAISE EXCEPTION '%', ".SqlFragments::literal($refusal->getMessage()).";\n",
+                );
+            },
+            array: self::atMostOneRelations($map),
+        );
+    }
+
+    public function bounds(ResolvedMap $map, Related $related, ConnectionInterface $connection): bool
+    {
+        $connection->beginTransaction();
+
+        try {
+            $connection->unprepared($this->atMostOneCheck(
+                map: $map,
+                related: $related,
+                mismatched: "    RETURN;\n",
+                matched: "  PERFORM set_config('compatibility.at_most_one', 'current', true);\n",
+            ));
+
+            return $connection->scalar(
+                query: "select current_setting('compatibility.at_most_one', true)",
+                useReadPdo: false,
+            ) === 'current';
+        } catch (QueryException $exception) {
+            if (! in_array(
+                needle: (string) $exception->getCode(),
+                haystack: ['25006', '42501'],
+                strict: true,
+            )) {
+                throw $exception;
+            }
+
+            return false;
+        } finally {
+            $connection->rollBack();
+        }
+    }
+
+    /**
+     * @return list<Related>
+     */
+    public static function atMostOneRelations(ResolvedMap $map): array
+    {
+        return array_values(array_filter(
+            array: $map->related,
+            callback: fn (Related $related) => $related->successor->atMostOneBecause() !== null && ! $related->belongsTo,
+        ));
+    }
+
+    private function atMostOneCheck(ResolvedMap $map, Related $related, string $mismatched, string $matched = ''): string
+    {
+        [$index, $columns] = $this->atMostOneIndex(
+            map: $map,
+            related: $related,
+        );
+
+        return "DO \$compatibility\$\nDECLARE\n  existing regclass := ".self::relation($index).";\n  expected text;\n  found text;\nBEGIN\n"
+            .$this->definitions($related->table, $index, $columns, true)
+            ."  IF found IS DISTINCT FROM expected THEN\n"
+            .$mismatched
+            ."  END IF;\n"
+            .$matched
+            ."END\n\$compatibility\$";
     }
 
     public static function uniqueKey(ResolvedMap $map): string
     {
         return "EXISTS (\n"
             ."    SELECT FROM pg_attribute attribute\n"
-            ."    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indisunique AND table_index.indisvalid AND table_index.indimmediate\n"
-            ."      AND table_index.indpred IS NULL AND table_index.indexprs IS NULL AND table_index.indnkeyatts = 1 AND table_index.indkey[0] = attribute.attnum\n"
+            .'    JOIN pg_index table_index ON table_index.indrelid = attribute.attrelid AND table_index.indpred IS NULL AND '.self::uniqueOnOneColumn('table_index', 'attribute')."\n"
             .'    WHERE attribute.attrelid = '.self::relation($map->table).' AND attribute.attname = '.SqlFragments::literal($map->successorKey)." AND NOT attribute.attisdropped\n"
             .'  )';
     }
@@ -224,7 +322,10 @@ final readonly class Preparer
         $conditions = ViewCompiler::conditions($related, false);
 
         return [
-            SqlFragments::objectName($map->table, $related->table.'_'.$map->table.'_at_most_one'),
+            self::atMostOneName(
+                map: $map,
+                related: $related,
+            ),
             '('.SqlFragments::identifier($related->relatedKey).')'.($conditions === [] ? '' : ' WHERE '.implode(' AND ', $conditions)),
         ];
     }

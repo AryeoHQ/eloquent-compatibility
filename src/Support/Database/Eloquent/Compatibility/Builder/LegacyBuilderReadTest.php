@@ -25,10 +25,12 @@ use Support\Database\Eloquent\Compatibility\Provides\ServesCompatibility;
 use Support\Database\Eloquent\Compatibility\Schema\Installer;
 use Support\Database\Eloquent\Compatibility\Schema\Statements;
 use Tests\Fixtures\Support\Backfills\CompletedPass;
+use Tests\Fixtures\Support\Listings\Company;
 use Tests\Fixtures\Support\Listings\Job;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingStatus;
 use Tests\Fixtures\Support\Listings\ListingTables;
+use Tests\Fixtures\Support\Listings\Region;
 use Tests\TestCase;
 
 #[CoversClass(LegacyBuilder::class)]
@@ -52,6 +54,7 @@ final class LegacyBuilderReadTest extends TestCase
     protected function tearDown(): void
     {
         ListingTables::drop();
+        DB::statement('drop table if exists companies, regions cascade');
 
         parent::tearDown();
     }
@@ -160,10 +163,113 @@ final class LegacyBuilderReadTest extends TestCase
 
         $this->assertInstanceOf(LegacyBuilder::class, $query);
         $this->assertSame(
-            'select * from "listings" where "listings"."job_id" in (select "jobs"."id" from "jobs" LEFT JOIN LATERAL (SELECT * FROM "job_sites" WHERE "job_sites"."job_id" = "jobs"."id" LIMIT 1) AS "job_sites" ON true where ("job_sites"."latitude" > 20))',
+            'select * from "listings" where "listings"."job_id" in (select "jobs"."id" from "jobs" LEFT JOIN "job_sites" ON "job_sites"."job_id" = "jobs"."id" where ("job_sites"."latitude" > 20))',
             $query->toBase()->toRawSql(),
         );
         $this->assertSame([1], $query->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_filters_a_converted_attribute_of_a_related_successor_on_the_read_host_while_the_write_host_is_unreachable(): void
+    {
+        $this->install();
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return $listing
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => $job
+                        ->related(
+                            relation: fn (Job $job) => $job->site(),
+                            successor: fn (Successor $site) => $site
+                                ->attribute('latitude', fn (Attribute $attribute) => $attribute->from('latitude')->multipliedBy(2)),
+                        ));
+            }
+        };
+        $name = DB::getDefaultConnection();
+        $original = config("database.connections.{$name}");
+        LegacyBuilder::forgetViews();
+        config([
+            "database.connections.{$name}.read" => ['host' => [$original['host']]],
+            "database.connections.{$name}.write" => ['host' => ['127.0.0.1'], 'port' => 1],
+        ]);
+        DB::purge($name);
+
+        try {
+            $ids = $model->newQuery()->where('latitude', '>', 40)->pluck('id')->all();
+        } finally {
+            config(["database.connections.{$name}" => $original]);
+            DB::purge($name);
+            LegacyBuilder::forgetViews();
+        }
+
+        $this->assertSame([1], $ids);
+    }
+
+    #[Test]
+    public function it_filters_a_plain_attribute_through_a_belongs_to_chain_on_the_index_of_the_related_table_once_installed(): void
+    {
+        $other = '5d2c8e1a-7b3f-4a6e-9c0d-1e2f3a4b5c6d';
+        DB::statement('create table regions (id uuid primary key default gen_random_uuid(), name varchar(255) not null)');
+        DB::statement('create index regions_name_index on regions (name)');
+        DB::statement('create table companies (id uuid primary key, region_id uuid not null references regions (id))');
+        DB::statement("insert into regions (name) select 'Filler '||filler from generate_series(1, 2000) as filler");
+        DB::insert("insert into regions (name) values ('North'), ('South')");
+        DB::insert("insert into companies (id, region_id) select ?, id from regions where name = 'North'", [ListingTables::COMPANY]);
+        DB::insert("insert into companies (id, region_id) select ?, id from regions where name = 'South'", [$other]);
+        DB::statement('analyze regions');
+        DB::statement('alter table listings add column region varchar(255)');
+        DB::table('listings')->whereIn('id', [2, 4])->update(['company_id' => $other]);
+        DB::statement("insert into listings (title, company_id, status, updated_at) select 'Filler '||filler, ?, 'Draft', '2026-01-06 10:00:00' from generate_series(1, 3000) as filler", [$other]);
+        DB::update("update listings set region = case when company_id = ? then 'South' else 'North' end", [$other]);
+        DB::statement('create index jobs_company_id_index on jobs (company_id)');
+        $model = new class extends Model implements Compatible
+        {
+            use ServesCompatibility;
+
+            protected $table = 'listings';
+
+            public static function compatibility(Compatibility $listing): Compatibility
+            {
+                return LegacyBuilderReadTest::identified($listing)
+                    ->servedFrom(root: Job::class, key: 'job_id', successor: fn (Successor $job) => LegacyBuilderReadTest::required($job)
+                        ->related(
+                            relation: fn (Job $job) => $job->belongsTo(Company::class, 'company_id'),
+                            successor: fn (Successor $company) => $company->related(
+                                relation: fn (Company $company) => $company->belongsTo(Region::class, 'region_id'),
+                                successor: fn (Successor $region) => $region->attribute(
+                                    name: 'region',
+                                    definition: fn (Attribute $attribute) => $attribute->from('name')->readOnly(because: 'A listing takes the region of its company.', ignoreWrites: false),
+                                ),
+                            ),
+                        ));
+            }
+        };
+        $north = fn () => array_map(intval(...), $model->newQuery()->where('region', 'North')->orderBy('id')->pluck('id')->all());
+        $before = $north();
+
+        $this->installMap($model::class);
+        DB::statement('analyze listings_retained, jobs, companies, regions');
+
+        $plan = json_decode((string) DB::scalar('explain (format json) '.$model->newQuery()->where('region', 'North')->toBase()->toRawSql()), true);
+        $nodes = [];
+        $walk = function (array $node) use (&$walk, &$nodes): void {
+            $nodes[] = $node;
+
+            foreach ($node['Plans'] ?? [] as $child) {
+                $walk($child);
+            }
+        };
+        $walk($plan[0]['Plan']);
+
+        $this->assertSame([1, 3, 5], $before);
+        $this->assertSame($before, $north());
+        $this->assertNotSame([], array_filter($nodes, fn (array $node) => ($node['Index Name'] ?? null) === 'regions_name_index' && str_contains((string) ($node['Index Cond'] ?? ''), 'name')));
+        $this->assertSame([], array_filter($nodes, fn (array $node) => $node['Node Type'] === 'Limit'));
     }
 
     #[Test]

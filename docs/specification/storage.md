@@ -93,14 +93,23 @@ LEFT JOIN "job_sites" ON <the Job's relation to its JobSite>;
 ```
 
 - **The root** is an inner join on the successor key.
-- **A related successor** is a plain `LEFT JOIN` where the database proves at most one row: a `BelongsTo`, or a `HasOne` over a unique index.
-- **A degrade `HasOne`**, which no unique index bounds, is a `LEFT JOIN LATERAL (... LIMIT 1)`. It is the only lateral join.
+- **A related successor** is a plain `LEFT JOIN` where a unique index on its join key proves at most one row, and a lateral join otherwise. The join key is a `BelongsTo`'s owner key or a `HasOne`'s foreign key.
+- **The proof** is a valid, immediate unique index on the related table whose one key column is the join key, with no expression and with the column's own collation. The index has no predicate, or it is the partial index `prepare()` builds for `atMostOne()`. That partial index proves a relation only while its definition equals the one `prepare()` builds for the map's current conditions. A `BelongsTo` to a primary key always has a proof. A `BelongsTo` to an owner key that no such index bounds stays lateral, because the database proves nothing about it.
+- **A relation's own conditions** sit in a select of their own, `LEFT JOIN (SELECT * FROM "places" WHERE ...) AS "places" ON ...`. A condition names its column without the table, so a legacy column of the same name would otherwise make it ambiguous. PostgreSQL still pulls that select into the join, so the related table's index serves a filter. That select cannot see the parent table. A relation therefore stays lateral unless each of its conditions is a plain predicate on a column of its own table.
+- **A lateral join** is `LEFT JOIN LATERAL (... LIMIT 1)`. The view uses it only for a relation that no index proves.
+- **A morph target** always joins plainly, on its alias and its key.
+
+`install()`, `update()` and the refill of `rollback()` each refuse while an `atMostOne()` index differs from the index `prepare()` builds for the map's current conditions. The refusal names the index, and says to drop it and run `prepare()`. A migration that drops or replaces an index the proof relies on calls `Compatibility::update()` in the same migration. Until then, the installed view keeps the join it compiled. `compatibility:check` reports the stale view, and names each relation whose join changes between plain and lateral.
 
 The view serves an added successor key, such as `floorplans.place_asset_id`, as it serves `job_id`. The legacy model hydrates that column from `prepare()` onward, so its attributes stay the same across install.
 
 The view holds no constant: no discriminator literal and no membership filter. The successor key is the membership, so a retained row with a root key is a served record.
 
-A plain join lets PostgreSQL use the related table's index for a filter on a related attribute. `compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view.
+A plain join lets PostgreSQL use the related table's index for a filter on a related attribute. That holds only while the successor column keeps the legacy column's type, typmod and collation, and the attribute declares no `orFrom()`. Otherwise the view's cast or its `COALESCE` hides the column from the index.
+
+`compatibility:sql --filters` prints, for each attribute, whether a filter runs on a stored column, on a rebuilt expression, or on the view. A stored-column filter falls back to the view where its conversion cannot invert the operator, and the command says so. A `readAs()`, `fixed()` or `orFrom()` attribute filters on the view. For an attribute of a related successor, the command names the lateral join that reaches it, or the parent columns that the plain joins traverse. It then names the indexes that can serve the filter, except where the view casts the column or reads an `orFrom()` fallback. Before `prepare()`, it counts an `atMostOne()` relation as joined plainly, because `install()` requires its index. A `computedAs()` attribute has no SQL filter, and the command says so.
+
+Two package reads keep a lateral join for every relation except a morph target, because they read a few rows by key: the native create's stand-in query, which replaces the written successor's table with a row set that has no unique index, and the batch read of `computedAs()` values.
 
 The view is not automatically updatable. [Lifecycle](lifecycle.md#the-writer-boundary) states which writers it refuses.
 

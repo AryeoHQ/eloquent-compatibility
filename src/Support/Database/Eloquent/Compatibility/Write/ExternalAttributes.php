@@ -398,8 +398,9 @@ final class ExternalAttributes
         $query = $model->newQueryWithoutScopes()
             ->fromRaw(SqlFragments::identifier($holder).' AS '.$held.' JOIN '.SqlFragments::identifier($branch->primary->table).' ON '.SqlFragments::identifier($branch->primary->table).'.'.SqlFragments::identifier($branch->primary->key).' = '.$held.'.'.SqlFragments::identifier($map->successorKey).' '.implode(
                 separator: ' ',
-                array: ViewCompiler::laterals(
+                array: ViewCompiler::joins(
                     map: $branch,
+                    proven: [],
                     owner: $table,
                 ),
             ))

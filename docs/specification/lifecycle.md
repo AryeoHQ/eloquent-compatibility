@@ -249,6 +249,8 @@ final class ListingDependents implements ManagesDependents
 6. It runs `ManagesDependents::afterRollback()`, which recreates those objects over the restored table.
 7. It drops the successor key's foreign key and `CHECK (<key> IS NOT NULL)`, as its last statement. Native legacy inserts with a NULL key, or with a key whose root does not exist yet, resume after a rollback ([Storage](storage.md#the-successor-key)).
 
+Under its table lock, before the first step, rollback refuses when an `atMostOne()` index differs from the one `prepare()` builds for the current map, because the refill joins that relation plainly ([Storage](storage.md#the-view)).
+
 Dropping the foreign key takes an `ACCESS EXCLUSIVE` lock on the root's table, which blocks every read of the root until rollback commits. Rollback therefore drops it last, under `SET LOCAL lock_timeout`. It treats a lock timeout or a `40P01` on that statement as install does: it rolls back and retries. No earlier step needs the constraints gone, because the rename keeps them and the refill does not write the key.
 
 `beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterInstall()` recreates it.

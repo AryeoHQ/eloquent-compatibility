@@ -6,7 +6,7 @@
 
 After install, the legacy table name is a read-only view over the successors. The view serves a converted attribute as an expression over a stored column. The Listing fixture serves `price` as `jobs.price_cents / 100`.
 
-A filter on that expression returns the right rows. But PostgreSQL cannot use an index on `jobs.price_cents` for it, so a large table needs a sequential scan. An attribute that only renames a column needs no help. PostgreSQL inlines the view, so a filter on a renamed column already uses the stored column's index.
+A filter on that expression returns the right rows. But PostgreSQL cannot use an index on `jobs.price_cents` for it, so a large table needs a sequential scan. An attribute that only renames a column needs no help. PostgreSQL inlines the view, so a filter on a renamed column already uses the stored column's index. That holds for a related successor's column too, when the view joins that successor plainly and the column keeps the legacy column's type, typmod and collation. An `orFrom()` fallback or a cast hides the column from its index. `compatibility:sql --filters` names the join that reaches each attribute.
 
 `LegacyBuilder` therefore rewrites a filter on a converted attribute onto the stored column, before Laravel compiles the query. `LegacyBuilderReadTest::it_filters_a_converted_attribute_on_its_stored_column_once_installed()` pins the result:
 
@@ -23,7 +23,7 @@ where "listings"."job_id" in (select "jobs"."id" from "jobs" where ("jobs"."pric
   and "listings"."deleted_at" is null
 ```
 
-Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own lateral joins.
+Each translated filter becomes a membership test on the successor key. Its subquery reads the successor that stores the column. A related successor's column is reached from the primary table through the view's own joins: a plain join where a unique index proves one row, and a lateral join otherwise. The subquery reads that proof through the read connection, so the replica can serve it. That connection cannot build the temporary index that verifies an `atMostOne()` index, so the subquery joins such a relation laterally.
 
 Everything that does not touch a converted attribute passes through to Laravel unchanged. So does every query before install, while the legacy name is still a table.
 
