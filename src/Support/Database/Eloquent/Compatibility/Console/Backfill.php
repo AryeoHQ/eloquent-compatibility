@@ -127,8 +127,11 @@ final class Backfill extends Command
     {
         $this->output->writeln(
             messages: (string) preg_replace_callback(
-                pattern: '/[\x00-\x1F\x7F]/',
-                callback: fn (array $control) => sprintf('\\x%02X', ord($control[0])),
+                pattern: '/[\x00-\x1F\x7F]|\xC2[\x80-\x9F]/',
+                callback: fn (array $control) => sprintf('\\x%02X', ord(substr(
+                    string: $control[0],
+                    offset: -1,
+                ))),
                 subject: $line,
             ),
             type: OutputStyle::OUTPUT_RAW,

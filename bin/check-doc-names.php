@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 require __DIR__.'/../vendor/autoload.php';
 
-$root = dirname(__DIR__);
+$root = $argv[1] ?? dirname(__DIR__);
 $package = 'Support\\Database\\Eloquent\\Compatibility\\';
 $external = [
     'Connection' => Illuminate\Database\Connection::class,
@@ -14,7 +14,17 @@ $external = [
     'Model' => Illuminate\Database\Eloquent\Model::class,
     'QueryException' => Illuminate\Database\QueryException::class,
     'QueryExecuted' => Illuminate\Database\Events\QueryExecuted::class,
+    'BelongsTo' => Illuminate\Database\Eloquent\Relations\BelongsTo::class,
+    'DateTimeInterface' => DateTimeInterface::class,
+    'HasOne' => Illuminate\Database\Eloquent\Relations\HasOne::class,
+    'MorphTo' => Illuminate\Database\Eloquent\Relations\MorphTo::class,
+    'RefreshDatabase' => Illuminate\Foundation\Testing\RefreshDatabase::class,
+    'ShouldQueue' => Illuminate\Contracts\Queue\ShouldQueue::class,
+    'SoftDeletes' => Illuminate\Database\Eloquent\SoftDeletes::class,
 ];
+/** @var array<string, string> $unresolved */
+$unresolved = require $root.'/bin/doc-names-unresolved.php';
+$allowlisted = [];
 
 $exists = fn (string $class): bool => class_exists($class) || interface_exists($class) || trait_exists($class);
 
@@ -38,7 +48,7 @@ $files = function (string $directory, string $pattern): array {
 
 $classes = [];
 
-foreach ([...$files($root.'/src', '*.php'), ...$files($root.'/tests', '*.php')] as $path) {
+foreach ($files($root.'/src', '*.php') as $path) {
     $source = (string) file_get_contents($path);
     $namespace = preg_match('/^namespace\s+([^;]+);/m', $source, $match) === 1 ? $match[1].'\\' : '';
     preg_match_all('/^(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/m', $source, $declarations);
@@ -173,14 +183,26 @@ foreach ($documents as $document) {
                 $names++;
                 $label = $member === null ? $name : $name.'::'.$member.($called ? '()' : '');
 
+                $allowed = array_key_exists($label, $unresolved);
+
+                if ($allowed) {
+                    $allowlisted[$label] = true;
+                }
+
                 try {
                     $class = $resolve($name);
 
                     if ($member !== null) {
                         $checkMember($class, $member, $called);
                     }
+
+                    if ($allowed) {
+                        $problems[] = $at."`{$label}` now resolves, so the unresolved allowlist in bin/doc-names-unresolved.php must drop it";
+                    }
                 } catch (UnexpectedValueException $e) {
-                    $problems[] = $at."`{$label}` ".$e->getMessage();
+                    if (! $allowed) {
+                        $problems[] = $at."`{$label}` ".$e->getMessage();
+                    }
                 }
             }
         }
@@ -205,16 +227,21 @@ foreach ($documents as $document) {
     }
 }
 
+foreach (array_diff_key($unresolved, $allowlisted) as $label => $reason) {
+    $problems[] = "bin/doc-names-unresolved.php: the unresolved allowlist lists `{$label}` ({$reason}), which no checked document names";
+}
+
 foreach ($problems as $problem) {
     fwrite(STDERR, $problem.PHP_EOL);
 }
 
 fwrite($problems === [] ? STDOUT : STDERR, sprintf(
-    '%d %s in %d documents: %d names, %d relative links and %d invariant references checked. %d proposed %s skipped.'.PHP_EOL,
+    '%d %s in %d documents: %d names, %d allowlist entries, %d relative links and %d invariant references checked. %d proposed %s skipped.'.PHP_EOL,
     count($problems),
     count($problems) === 1 ? 'problem' : 'problems',
     count($documents) - $proposed,
     $names,
+    count($allowlisted),
     $links,
     $invariants,
     $proposed,

@@ -147,7 +147,7 @@ final readonly class Watermark
     public function hold(string $operation): void
     {
         if ($this->connection->scalar(
-            query: 'select pg_try_advisory_lock(hashtextextended(?, 0))',
+            query: 'select '.($this->insideATransaction() ? 'pg_try_advisory_xact_lock' : 'pg_try_advisory_lock').'(hashtextextended(?, 0))',
             bindings: [self::LOCK.$this->legacyType],
             useReadPdo: false,
         ) !== true) {
@@ -161,11 +161,20 @@ final readonly class Watermark
 
     public function release(): void
     {
+        if ($this->insideATransaction()) {
+            return;
+        }
+
         $this->connection->scalar(
             query: 'select pg_advisory_unlock(hashtextextended(?, 0))',
             bindings: [self::LOCK.$this->legacyType],
             useReadPdo: false,
         );
+    }
+
+    private function insideATransaction(): bool
+    {
+        return $this->connection->transactionLevel() > 0;
     }
 
     private function read(string $format): null|string

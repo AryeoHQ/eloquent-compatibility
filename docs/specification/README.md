@@ -1,14 +1,14 @@
-Status: Proposed
+Status: Accepted
 
 # Interface specification
 
-This specification states the public interface of the redesigned package, before any of its code exists. Every later change is checked against it. The design comes from the planning session of 2026-11-04, after two Aryeo teams adopted the package for `Listing` and for the media models.
+This specification states the public interface of the redesigned package. It was written before the code, and the shipped code now implements it. Every later change is checked against it. The design comes from the planning session of 2026-11-04, after two Aryeo teams adopted the package for `Listing` and for the media models.
 
 ## Status
 
-`Status: Proposed` means that the code does not implement this design yet. `bin/check-doc-names.php` skips every document whose first non-empty line is `Status: Proposed`. These pages can therefore name classes and methods that do not exist yet, such as `Compatibility::rollback()` and `Contracts\WritesAttribute`.
+`Status: Accepted` means that the shipped code implements this design, except for the positions below. Outside a fenced block, `bin/check-doc-names.php` verifies each inline code span that is a class name. It also verifies each member reference in any inline code span, such as `Compatibility::prepare()`. It resolves a name against the package's classes under `src/` and its short external allowlist, never against a test fixture. A name it must not verify sits on its unresolved allowlist, `bin/doc-names-unresolved.php`, with its reason. That allowlist holds five kinds of name: an illustrative Aryeo class or member, a removed name the specification cites on purpose, a class of a package this one does not require yet, a facade method that reflection cannot see, and a namespace suffix. The checker fails when an allowlisted name starts to resolve. It also fails when no checked document names an allowlisted name any more. It checks the root README, every page under `docs/` and every README under `src/`.
 
-The last implementation change flips every page to `Status: Accepted`. From then on, the checker verifies the class names and `Class::member` names in inline code spans outside fenced blocks. The flip to Accepted must reword or allowlist each span that names a removed or external symbol.
+Positions wait on [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14), the issue in which eloquent-ordering must publish `Placement::at()`, its position expression and its parent key columns. Until then, the package ships no `position()` and does not require eloquent-ordering, so a map cannot declare an ordered attribute. Aryeo's FloorPlan `index` therefore cannot install yet. The pages keep the positions design, and each page that keeps it links back to this section.
 
 ## Deviations
 
@@ -82,7 +82,7 @@ The Listing team reported findings L1 to L9, and the media team reported M1 to M
 - **No conflict detection and no provenance.** Catch-up overwrites native edits to mapped columns before install. This is documented, not enforced.
 - **No set-based successor writes.** Mass writes and the backfill run once per record.
 - **No identity table.** Per-successor identity tables, a shared identity table, the exclusive arc and a surrogate key are all declined.
-- **No dependency on eloquent-concurrency.** The package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
+- **No dependency on eloquent-concurrency.** Once [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14) ships, the package requires eloquent-ordering for `position()` only. The consumer's write scope sets the lock order.
 - **No retries inside the package's writers.** The application's outermost transaction is the retry point. Install keeps its own retries.
 - **No public `Compatibility::state()`.** `compatibility:status` and idempotent operations cover its uses.
 - **No package-managed rebinding of dependent views,** until a second adopter needs plain rebinds.

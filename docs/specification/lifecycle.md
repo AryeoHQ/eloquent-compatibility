@@ -1,4 +1,4 @@
-Status: Proposed
+Status: Accepted
 
 # Lifecycle
 
@@ -46,7 +46,7 @@ It allocates nothing on the successors. Running it again changes nothing. [Stora
 
 ### A pass
 
-1. The pass takes a session-level advisory lock, `pg_try_advisory_lock(hashtextextended('compatibility_backfills:<legacy>', 0))`. It holds the lock for the whole pass, across its transactions, and releases it when the pass ends. When another pass or an install holds the lock, the pass refuses with a named error, and does not wait. The error names the lock, so `pg_locks` finds the session that holds it.
+1. The pass takes a session-level advisory lock, `pg_try_advisory_lock(hashtextextended('compatibility_backfills:<legacy>', 0))`. It holds the lock for the whole pass, across its transactions, and releases it when the pass ends. Inside a caller's transaction, it takes `pg_try_advisory_xact_lock()` on the same key instead, and the lock ends with that transaction. When another pass or an install holds the lock, the pass refuses with a named error, and does not wait. The error names the lock, so `pg_locks` finds the session that holds it.
 2. The pass records its start, read from the database clock.
 3. The first pass walks every row. Each later pass walks:
    - rows whose `updated_at` is at or after the watermark minus the margin,
@@ -83,7 +83,7 @@ The ledger records one outcome per legacy row:
 | `failed` | the row's write raised another error, recorded as the reason |
 | `deleted` | the legacy row is gone, and the pass deleted its successor |
 
-A `failed` row's reason is the exception's class and the first line of its message. For a database error, that line is the driver's, which names the SQLSTATE and the constraint and carries neither the bindings nor the connection. The package writes the whole exception to the Laravel log, with the legacy key. A refusal's reason is its message. The ledger stores every reason as valid UTF-8 without NUL bytes.
+A `failed` row's reason is the exception's class and the first line of its message. For a database error, that line is the driver's, which names the SQLSTATE and the constraint and carries neither the bindings nor the connection. A data exception's line, SQLSTATE class `22`, quotes the rejected value, so its reason keeps only the SQLSTATE and its condition name, such as `SQLSTATE[22P02]: Invalid text representation`. The package writes the whole exception to the Laravel log, with the legacy key. A refusal's reason is its message. The ledger stores every reason as valid UTF-8 without NUL bytes.
 
 `compatibility:backfill` prints the counts by status. They cover the walked rows and the ledger rows whose legacy row is gone, and the command prints both totals. It prints each reason with its count and its first keys, ten reasons at most, and the count of the others. It prints a reason as text: its console markup stays literal, and each control character prints as `\xNN`. It exits non-zero when any row is `refused` or `failed`, and it names `<legacy>_backfill`. Every command it prints for the operator quotes the model's class.
 
@@ -114,6 +114,8 @@ Creating and linking related records is the consumer's work too. Examples are se
 Declined: related-record work in `successorsInitializedBy()`. It runs once at a root's birth, so it misses existing roots and later related rows. It also writes set-sized work row by row under the package's locks.
 
 ### Positions
+
+`position()` waits on [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14), and this release does not ship it ([Status](README.md#status)).
 
 A pass re-sequences a `position()` attribute's ordering parent on each backfill row and each catch-up row. The re-sequence runs in the default operation's `afterSave()` action, at step 5 of the unit of work, when the successor's eloquent-ordering parent is set. Its members are the parent's live legacy rows whose successors are current members: not trashed, and with a `rank_key`. It walks them in legacy order, the value with NULLs last, then the key. It moves each member that does not already follow its predecessor to just after it, so one sweep ends in legacy order. Native members keep their places. A trashed row is not placed, and its `position()` operation does nothing. [Operations: positions](operations.md#positions) states the re-sequence.
 
@@ -174,7 +176,7 @@ These whole-table proofs and the deletion read never run under the lock. A legac
 7. The addition of `CHECK (<key> IS NOT NULL) NOT VALID` on the successor key. It needs no scan, and it checks every later insert and update ([Storage](storage.md#the-successor-key)).
 8. The creation of the view.
 9. `ManagesDependents::afterInstall()`.
-10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)).
+10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)). A `40P01` retries only outside a caller's transaction ([Inside a caller's transaction](#inside-a-callers-transaction)).
 
 Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, before each row of the final pass, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
 
@@ -205,6 +207,8 @@ A trashed row reads a NULL `index` after install, because a trashed record has n
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install inside a caller's transaction runs its full pass inside that transaction, through nested savepoints. A test that uses `RefreshDatabase` can therefore install a served model. Install still refuses a caller's transaction once a pass has left a watermark, because its catch-up passes commit in transactions of their own before it takes the lock.
 
 Inside a caller's transaction, a refusal loses nothing. The proofs write no ledger row, and the next install's existence proof and value proof flag the same keys again.
+
+Inside a caller's transaction, install takes the advisory lock with `pg_try_advisory_xact_lock()`, so the lock ends with that transaction. A lock timeout still rolls back to install's savepoint and retries. A deadlock does not. Laravel rethrows a nested deadlock without that rollback, so the caller's transaction stays aborted. Install therefore rethrows the deadlock, and the caller rolls back.
 
 ### Dependent schema
 
@@ -251,7 +255,7 @@ final class ListingDependents implements ManagesDependents
 
 Under its table lock, before the first step, rollback refuses when an `atMostOne()` index differs from the one `prepare()` builds for the current map, because the refill joins that relation plainly ([Storage](storage.md#the-view)).
 
-Dropping the foreign key takes an `ACCESS EXCLUSIVE` lock on the root's table, which blocks every read of the root until rollback commits. Rollback therefore drops it last, under `SET LOCAL lock_timeout`. It treats a lock timeout or a `40P01` on that statement as install does: it rolls back and retries. No earlier step needs the constraints gone, because the rename keeps them and the refill does not write the key.
+Dropping the foreign key takes an `ACCESS EXCLUSIVE` lock on the root's table, which blocks every read of the root until rollback commits. Rollback therefore drops it last, under `SET LOCAL lock_timeout`. It treats a lock timeout or a `40P01` on that statement as install does: it rolls back and retries, and inside a caller's transaction a `40P01` aborts that transaction instead. No earlier step needs the constraints gone, because the rename keeps them and the refill does not write the key.
 
 `beforeRollback()` runs before the drop, because PostgreSQL refuses to drop a view that another object depends on (`2BP01`). Listing's `job_sites_view` depends on the view after `afterInstall()` recreates it.
 

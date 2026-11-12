@@ -8,6 +8,7 @@ use Carbon\CarbonInterval;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\DeadlockException;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Log;
 use LogicException;
@@ -32,8 +33,6 @@ final readonly class Installer
     public const int RETRIES = 3;
 
     public const int LOCK_TIMEOUT = 5000;
-
-    private const array RETRIED_STATES = ['55P03', '40P01'];
 
     private const string CANCELED = '57014';
 
@@ -467,16 +466,14 @@ final readonly class Installer
 
             try {
                 $result = $attempt();
-            } catch (QueryException $exception) {
-                if (! in_array(
-                    needle: $exception->getCode(),
-                    haystack: self::RETRIED_STATES,
-                    strict: true,
-                ) || $tried === $attempts) {
+            } catch (QueryException|DeadlockException $exception) {
+                $waited = Backfiller::waited($exception);
+
+                if ($waited === null || $tried === $attempts || ($exception instanceof DeadlockException && $this->connection->transactionLevel() > 0)) {
                     throw $exception;
                 }
 
-                Log::warning("Compatibility map '{$map->table}' {$operation}: attempt {$tried} of {$attempts} could not take a lock, SQLSTATE {$exception->getCode()} on ".self::firstLine($exception->getSql()).' after '.(int) ((hrtime(true) - $started) / 1e6).' ms, so it rolled back and retries');
+                Log::warning("Compatibility map '{$map->table}' {$operation}: attempt {$tried} of {$attempts} could not take a lock, SQLSTATE {$waited->getCode()} on ".self::firstLine($waited->getSql()).' after '.(int) ((hrtime(true) - $started) / 1e6).' ms, so it rolled back and retries');
 
                 continue;
             }

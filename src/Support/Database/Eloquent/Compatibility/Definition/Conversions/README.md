@@ -1,6 +1,8 @@
 # Conversions
 
-A conversion turns a stored successor value into the value the legacy model expects. A map declares it on an attribute, such as `->from('price_cents')->dividedBy(100)`. One declaration drives four things: the SQL the view serves, the value a legacy write stores, the filter `LegacyBuilder` translates, and the check that the translation is exact.
+A conversion turns a stored successor value into the value the legacy model expects. A map declares it on an attribute, such as `->from('price_cents')->dividedBy(100)`. One declaration drives four things: the SQL the view serves, the inverse the attribute's default operation assigns, the filter `LegacyBuilder` translates, and the check that the translation is exact.
+
+Conversions serve reads. A write runs the attribute's operation. A guarded write also uses a conversion, to project what each guard sees. A write that no inverse covers runs its `writtenBy()` or `readOnly()` declaration instead. The `Conversion` interface stays closed, so a consumer adds no conversion of its own.
 
 ## The contract
 
@@ -9,7 +11,7 @@ Each class implements `Conversion`:
 | Method | What it returns | Who uses it |
 | :-- | :-- | :-- |
 | `Conversion::read()` | The SQL expression the view serves, built around the stored expression it receives | `ViewCompiler`, and `LegacyBuilder::served()` for a rebuilt expression |
-| `Conversion::write()` | The stored value for a legacy value; it throws for a value it cannot store | Legacy writes, through `Attribute::write()` |
+| `Conversion::write()` | The stored value for a legacy value; it throws for a value it cannot store | The attribute's default operation, and the projection a guarded write gives each guard, through `Attribute::write()` |
 | `Conversion::filter()` | The same filter on the stored value, or null when none exists | `LegacyBuilder`, through `Attribute::filter()` |
 | `Conversion::type()` | The SQL type this step produces, from the type it receives; null when unknown | `Attribute`, to carry types through the chain |
 | `Conversion::exact()` | Whether a filter on the stored value returns exactly what a filter on the served value returns | `LegacyBuilder::served()`, through `Attribute::exact()` |
