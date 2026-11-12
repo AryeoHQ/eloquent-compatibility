@@ -80,7 +80,7 @@ final class LedgerTest extends TestCase
         $ledger->record(key: 8, successor: null, outcome: Outcome::Refused, reason: 'blank title');
         DB::delete('delete from listings where id = 3');
 
-        $this->assertSame([[3, self::SECOND, Outcome::Updated], [8, null, Outcome::Refused]], $ledger->gone());
+        $this->assertSame([[3, self::SECOND, Outcome::Updated], [8, null, Outcome::Refused]], $ledger->gone(limit: 10));
     }
 
     #[Test]

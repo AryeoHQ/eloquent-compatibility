@@ -50,7 +50,7 @@ final class FloorPlanMap
 
 `index` reads its one-based position through eloquent-ordering's published position expression. It needs no `writtenBy()`, because its default operation places the `PlaceAsset`. After install, a write moves the row with `Placement::at()`. A backfill row or catch-up row re-sequences its parent, so the parent's floor plans end in legacy order ([Operations: positions](../operations.md#positions)). `position()` waits on [eloquent-ordering#14](https://github.com/AryeoHQ/eloquent-ordering/issues/14), so this map cannot run until it ships ([Status](../README.md#status)).
 
-Positions number within each eloquent-ordering parent, so a legacy reader that needs one sequence per listing must read `readAs()` with an operation instead.
+Floor plan positions number within each eloquent-ordering parent. Photos number across the listing instead ([0032](../../decisions/0032-photos-number-across-the-listing.md)), which supersedes the earlier advice to read `readAs()` with an operation.
 
 ### What `index` reads after install
 
@@ -58,7 +58,7 @@ After install, a `position()` attribute reads the successor's position, not the 
 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
-- Positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
+- Positions restart in each parent. Photos are the exception: they number across the listing ([0032](../../decisions/0032-photos-number-across-the-listing.md)).
 
 Aryeo's `photos` holds live rows with a NULL `index`, so those photos read a number after install. A trashed row reads a NULL `index` after install, because a trashed record has no position.
 

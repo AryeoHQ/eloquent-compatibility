@@ -229,7 +229,7 @@ final readonly class Statements
             locks: array_map(
                 callback: fn (string $table) => [$table, match ($table) {
                     $map->table => 'SHARE UPDATE EXCLUSIVE from install\'s first statement, then SHARE ROW EXCLUSIVE, then ACCESS EXCLUSIVE from the rename until commit',
-                    $map->primary->table => 'SHARE UPDATE EXCLUSIVE from install\'s first statement, then SHARE ROW EXCLUSIVE from the foreign key, install\'s last statement, until commit',
+                    $map->primary->table => 'SHARE UPDATE EXCLUSIVE from install\'s first statement, then SHARE ROW EXCLUSIVE from the foreign key, install\'s last DDL statement, through the read and inserts of the roots created natively before it took the lock, until commit',
                     default => 'SHARE UPDATE EXCLUSIVE from install\'s first statement until commit',
                 }],
                 array: array_values(array_filter(

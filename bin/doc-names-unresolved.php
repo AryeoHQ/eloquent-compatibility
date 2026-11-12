@@ -24,6 +24,7 @@ return [
     'Link' => $illustrative,
     'Listing' => $illustrative,
     'Listing::makeUuid()' => $illustrative,
+    'Listing::orderedPhotos()' => $illustrative,
     'ListingDependents' => $illustrative,
     'ListingMap' => $illustrative,
     'ListingWriteScope' => $illustrative,

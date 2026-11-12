@@ -24,7 +24,7 @@ The legacy model is the source of truth until install. The successor is the sour
 
 This is documented, not enforced, because Aryeo's v2 writes Jobs live before install. `compatibility:check` reports each served value that disagrees with its legacy value, which shows what the next pass would overwrite. It compares no attribute that [Operations: what the comparisons skip](operations.md#what-the-comparisons-skip) names, so an empty report says nothing about those attributes.
 
-`compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` only when it creates a legacy row, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
+`compatibility:check` also reports a served record whose root no longer matches its map's `when()`. The package evaluates `when()` on every native create of a served root class, before and after install, and at install's insert of retained rows for natively created roots. It never evaluates `when()` to decide what an existing legacy row serves, so the successor key keeps that record bound to its root ([The map: membership](the-map.md#membership)).
 
 After install, `compatibility:check` reports each member root that no retained row names. A query-builder insert into the root table bypasses `Provides\CarriesLegacy`, so the view serves no record for that root ([The writer boundary](#the-writer-boundary)). The check excludes a root that a `deleted` ledger row names, because its legacy row is gone, and a pass recorded the deletion.
 
@@ -55,7 +55,7 @@ It allocates nothing on the successors. Running it again changes nothing. [Stora
 
    It reads these keys one chunk at a time, in key order, so a pass holds one chunk of keys in memory. Before it counts the pass, a later pass refuses a legacy table without an `updated_at` column its legacy model writes.
 4. Each row is written in its own savepoint, through the operations, and its ledger row is upserted. Inside the savepoint, the create path locks the legacy row `FOR UPDATE`, then re-reads its successor key before it creates. When the key names an existing root, the row takes the update path. The test reads the root's table without global scopes, so a trashed root exists. When the key is NULL, the create path creates a root and fills the key. When the key names no row, the create path creates the root with that key value, so the identity holds ([Storage: the successor key](storage.md#the-successor-key)).
-5. The pass handles deletions: ledger rows whose status is not `deleted` and whose legacy row is gone.
+5. The pass handles deletions: ledger rows whose status is not `deleted` and whose legacy row is gone. It reads them one chunk at a time, in key order, after the last key it read.
 6. The pass sets the watermark to its recorded start.
 
 A failure rolls back that row only, and the chunk continues. A row that waits past a lock timeout (`55P03`) or deadlocks (`40P01`) is not recorded as `failed`. The pass retries it once. When the retry waits too, the pass ends without moving its watermark, so the next pass walks the row again.
@@ -79,11 +79,11 @@ The ledger records one outcome per legacy row:
 | `created` | the pass created the row's successors |
 | `updated` | the pass changed at least one successor |
 | `unchanged` | every successor already served the legacy values |
-| `refused` | an operation or initializer refused the row, or the package refused the write with a `CompatibilityWriteRefused`, with its reason |
+| `refused` | an operation or initializer refused the row, or the package refused the write with a `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved`, with its reason |
 | `failed` | the row's write raised another error, recorded as the reason |
 | `deleted` | the legacy row is gone, and the pass deleted its successor |
 
-A `failed` row's reason is the exception's class and the first line of its message. For a database error, that line is the driver's, which names the SQLSTATE and the constraint and carries neither the bindings nor the connection. A data exception's line, SQLSTATE class `22`, quotes the rejected value, so its reason keeps only the SQLSTATE and its condition name, such as `SQLSTATE[22P02]: Invalid text representation`. The package writes the whole exception to the Laravel log, with the legacy key. A refusal's reason is its message. The ledger stores every reason as valid UTF-8 without NUL bytes.
+A `failed` row's reason is the exception's class and the first line of its message. For a database error, that line is the driver's, which names the SQLSTATE and the constraint and carries neither the bindings nor the connection. A data exception's line, SQLSTATE class `22`, quotes the rejected value, so its reason keeps only the SQLSTATE and its condition name, such as `SQLSTATE[22P02]: Invalid text representation`. The package writes the whole exception to the Laravel log, with the legacy key. A consumer `Refusal`'s reason is its message. A package refusal, a `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved`, records a reason without the record's key and values, so the rows that one cause refuses share one reason and print as one group. The package writes that refusal's whole message to the Laravel log, with the legacy key. The ledger stores every reason as valid UTF-8 without NUL bytes.
 
 `compatibility:backfill` prints the counts by status. They cover the walked rows and the ledger rows whose legacy row is gone, and the command prints both totals. It prints each reason with its count and its first keys, ten reasons at most, and the count of the others. It prints a reason as text: its console markup stays literal, and each control character prints as `\xNN`. It exits non-zero when any row is `refused` or `failed`, and it names `<legacy>_backfill`. Every command it prints for the operator quotes the model's class.
 
@@ -135,7 +135,8 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
        A pass that changes no row always stops the loop. Install then proves
        existence and values before its lock. Under the lock it runs the final small pass, the
        NULL-key probe, the rename, the drop of mapped columns, the native-root inserts, the
-       check, the view, the dependent hooks and, last, the foreign key.
+       check, the view, the dependent hooks, the foreign key and, last, the native-root
+       inserts for roots committed while the foreign key waited.
 ```
 
 ## The install gate
@@ -143,7 +144,7 @@ Trashed legacy rows follow the same rules as live ones, with one exception: a `p
 Install refuses while any row of this legacy model is `refused` or `failed`. The refusal names the reasons and the first keys of each. Before it takes its lock, install also proves two things:
 
 - **Existence.** Every legacy row has a ledger row or a successor key. Every non-NULL successor key names an existing root row, whatever the row's ledger state. The proof reads the root's table without global scopes, so a trashed root exists. The ledger gate refuses `refused` and `failed` rows on its own. When the proof still fails after install's catch-up, the refusal names the first keys.
-- **Values.** The drift check's value comparison finds no difference. For a `position()` attribute, the proof compares order, not ranks. Before `lag()` runs, it filters the rows to the current members: live legacy rows whose successors are not trashed and hold a `rank_key`. It partitions those rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous member's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents. It compares no attribute that [Operations: what the comparisons skip](operations.md#what-the-comparisons-skip) names.
+- **Values.** The drift check's value comparison finds no difference. It compares a value as `jsonb` when the legacy model casts the attribute `array`, `json`, `json:unicode`, `object` or `collection`, when the attribute serves `json` or `jsonb` after its conversions, or when the legacy column is `json`. A different key order or spacing is then no difference. When a value under that rule does not parse as JSON, such as an empty string, install refuses and names the attribute and the first keys. The backfill refuses such a row with a reason that names the attribute, and `compatibility:check` reports the record. The backfill's round trip and catch-up's equality check compare with the same rule ([Operations: the round trip](operations.md#the-round-trip)), so a row the backfill accepted passes this proof. For a `position()` attribute, the proof compares order, not ranks. Before `lag()` runs, it filters the rows to the current members: live legacy rows whose successors are not trashed and hold a `rank_key`. It partitions those rows by the successor's eloquent-ordering parent. Within one parent, each row's successor `rank_key` must exceed its previous member's, through `lag()` over the legacy order. The proof never compares `rank_key` across two parents. It compares no attribute that [Operations: what the comparisons skip](operations.md#what-the-comparisons-skip) names.
 
 The proofs read only, and write no ledger row. When either proof flags keys, install catches up those keys and proves them again. It refuses only when they still fail. For a key the existence proof flags, the catch-up takes the create path, and creates the root with the key value, so the identity holds ([Storage: the successor key](storage.md#the-successor-key)). For a key the order proof flags, the catch-up re-sequences that key's whole parent, so one catch-up puts the parent in legacy order ([Operations: positions](operations.md#positions)). A row whose write left `updated_at` alone is therefore caught up before the lock. So is a row whose root was hard-deleted, which no incremental pass walks while its `updated_at` stays unchanged. A ledger row is `failed` only when its write raised an error. Each legacy model passes its own gate, even on a shared successor.
 
@@ -151,7 +152,7 @@ The package has no partial install. A legacy row without a successor cannot be s
 
 ## Install
 
-Install runs in one transaction ([0024](../decisions/0024-install-is-one-transaction.md)).
+Install's locked phase runs in one transaction ([0024](../decisions/0024-install-is-one-transaction.md)), and a refusal under the lock commits nothing from it. The work before the lock commits as a pass does ([The backfill](#the-backfill)). A later refusal keeps that work, so a retry starts from the state it left.
 
 ### Before the lock
 
@@ -176,9 +177,10 @@ These whole-table proofs and the deletion read never run under the lock. A legac
 7. The addition of `CHECK (<key> IS NOT NULL) NOT VALID` on the successor key. It needs no scan, and it checks every later insert and update ([Storage](storage.md#the-successor-key)).
 8. The creation of the view.
 9. `ManagesDependents::afterInstall()`.
-10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)). A `40P01` retries only outside a caller's transaction ([Inside a caller's transaction](#inside-a-callers-transaction)).
+10. The addition of the successor key's foreign key to the root's primary key, `ON DELETE CASCADE NOT VALID`, as install's last DDL statement. It needs no scan, and it checks every later insert and update. It takes a `SHARE ROW EXCLUSIVE` lock on the root's table, and runs under `SET LOCAL lock_timeout`, as install's table lock does. The lock waits for every open transaction that writes the root's table, and every later writer of that table queues behind it. A writer that holds the root's table and then waits on the legacy table deadlocks with install, and PostgreSQL aborts one side with `40P01`. Install treats a lock timeout or a `40P01` on this statement as a lock it cannot take: it rolls back and retries ([Storage](storage.md#the-successor-key)). A `40P01` retries only outside a caller's transaction ([Inside a caller's transaction](#inside-a-callers-transaction)).
+11. The insert of one retained row per member root that committed after step 6 read and before the foreign key took its lock. Step 6 does not see a root whose transaction was still open, and the foreign key's lock waits for that transaction to commit. Install therefore reads again once the lock is held, through step 6's window and exclusions, and inserts a retained row for each root it finds, as step 6 does. The read sees those roots because install runs its locked transaction at `READ COMMITTED`, so each statement takes a fresh snapshot ([Inside a caller's transaction](#inside-a-callers-transaction)). This step is the last under the lock. Declined: taking the root's lock before step 6, which blocks every write of the root's table for the whole locked phase.
 
-Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, before each row of the final pass, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
+Install's required `statementTimeout:` argument sets `statement_timeout` for every statement under install's lock. It is also the total budget for the lock hold. Before every step under the lock, before each row of the final pass, and before every native-root insert, install checks the time elapsed since it took the lock. Once the budget is spent, install rolls back and refuses, and the refusal names the step it reached. When PostgreSQL cancels a final-pass row's statement on `statement_timeout`, the refusal names that row's key. The argument therefore bounds the hold. It has no default, because the hold budget depends on each application's tolerance. `compatibility:sql install` prints each lock, with its mode and table. Install keeps its own retries when it cannot take a lock, and writes one line to the Laravel log for each retry.
 
 Declined: a per-statement timeout only. Nothing would then bound the hold, and PostgreSQL 14 has no `transaction_timeout`.
 
@@ -194,7 +196,7 @@ After install, a `position()` attribute reads the successor's position, not the 
 
 - A row whose legacy value was NULL reads a number.
 - Sparse values close up: legacy values 1, 4 and 7 read 1, 2 and 3.
-- Positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
+- Positions restart in each parent. Photos are the exception: they number across the listing, ordered by subsection, then within it. Record [0032](../decisions/0032-photos-number-across-the-listing.md) supersedes the per-subsection sequence for photos.
 
 A legacy `orderBy('index')` across two parents therefore returns the positions 1, 1, 2 and 2, because it sorts by the position expression ([The map: reads are projections](the-map.md#reads-are-projections)).
 
@@ -205,6 +207,10 @@ A trashed row reads a NULL `index` after install, because a trashed record has n
 ### Inside a caller's transaction
 
 `Compatibility::install()` may run inside a caller's transaction when no catch-up is pending. A first install inside a caller's transaction runs its full pass inside that transaction, through nested savepoints. A test that uses `RefreshDatabase` can therefore install a served model. Install still refuses a caller's transaction once a pass has left a watermark, because its catch-up passes commit in transactions of their own before it takes the lock.
+
+A first install of a map that declares `writesWithin()` refuses inside a caller's transaction unless `app()->runningUnitTests()`, and names `public $withinTransaction = false`. Its full pass commits each row in a transaction of its own ([The backfill](#the-backfill)). Inside a caller's transaction each row becomes a savepoint, and every row keeps its locks until the caller commits. A `RefreshDatabase` test still installs such a map, and a production migration with `$withinTransaction = true` refuses. Declined: refusing every first install of a scoped map inside a caller's transaction, which breaks consumer tests.
+
+Outside a caller's transaction, install sets `READ COMMITTED` as the first statement of its locked transaction, which step 11's read needs. Inside a caller's transaction that runs above `READ COMMITTED`, install refuses before it takes its lock, and names both remedies: run it outside a transaction, or inside one at `READ COMMITTED`.
 
 Inside a caller's transaction, a refusal loses nothing. The proofs write no ledger row, and the next install's existence proof and value proof flag the same keys again.
 

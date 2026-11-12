@@ -136,9 +136,11 @@ The round trip binds an operation to its attribute's read. `address_id` reads th
 
 The check compares values the way the legacy model's casts do. A JSON object compares by its keys and values, in any key order. A `DateTimeInterface` value compares in the legacy model's date format. Two numbers compare by value only when the view column or the legacy cast is numeric, so a text value such as `00123` compares exactly. A JSON-path write, such as `settings->color`, compares the value at that path. A path write into a NULL column writes nothing, as it does natively, so the check skips it.
 
+Before install, the check of a backfill row and catch-up's equality check compare as install's value proof does, because the proof decides whether install proceeds ([Lifecycle: the install gate](lifecycle.md#the-install-gate)). PostgreSQL compares the served value with the legacy row's own value in the same read, typed as its legacy column. A sub-second legacy `timestamp(6)` value that a `timestamp(0)` successor column rounds therefore refuses its backfill row, with a reason, and JSON in a legacy `text` column agrees with the `jsonb` its successor serves in another key order. The backfill binds floating-point values at full precision when it saves a successor, so a `double precision` value past 14 significant digits copies exactly. Declined: filtering the proof through the casts, which installs the rounded timestamp without a refusal.
+
 A `hide()` rule can hide the record after the write, whether the write itself, a successor listener or a trigger trips it. The check then reads the record through the map's column expressions without its `hide()` conditions, filtered to the record's key. A hide that keeps every written value passes, and a hide that loses one refuses the write. When that read also finds no row, a listener or a trigger removed the record, and the check refuses the write.
 
-Before install, no view exists, and a legacy write goes to the legacy table without reaching the check. Only a backfill row reaches it then, and the check reads that record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once, at the cost of one read per row.
+Before install, no view exists, and a legacy write goes to the legacy table without reaching the check. Only a backfill row reaches it then, and the check reads that record through the view's compiled `SELECT`, filtered to the record's key. A backfill row whose operation loses a value is therefore refused at once. The record's read and its comparison run as one query. A created or unchanged row costs one read, and an updated row three: before its lock, after its lock and after its write.
 
 ### What the comparisons skip
 
@@ -243,7 +245,7 @@ When `choose:` picks another target class for a record, the package moves the ta
 
 A `position()` attribute reads the successor's one-based position through eloquent-ordering's published position expression. On a live write after install, its default operation moves the successor with `Placement::at()`, because the legacy value is then a served position. On a backfill row and a catch-up row, the default operation re-sequences the successor's parent in legacy order.
 
-Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor.
+Positions number within the successor's eloquent-ordering parent ([0030](../decisions/0030-positions-number-within-the-ordering-parent.md)). A listing's photos can span several subsections, and v2 orders within each subsection, so the legacy listing is not the ordering parent. The package reads the parent from eloquent-ordering's published parent key columns for the successor. Photos read their position across the listing instead, and a v1 write moves a photo within its own subsection ([0032](../decisions/0032-photos-number-across-the-listing.md)).
 
 The re-sequence runs in the legacy-to-successor direction only: on a backfill row and a catch-up row. At step 3, Assign, the default operation queues an `afterSave()` action and assigns nothing. At step 5, Act, the parent is set, because step 4 saved the root and `successorsInitializedBy()` has run. The action then reads the successor's parent, and re-sequences it:
 
@@ -268,7 +270,7 @@ The re-sequence walks eloquent-ordering's `(parent, rank_key)` index and the leg
 
 eloquent-ordering ships `Placement::after()` and `Placement::before()` today. `Placement::at()` and the published parent key columns remain requests in https://github.com/AryeoHQ/eloquent-ordering/issues/14.
 
-Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Such a caller reads `readAs()` with an operation instead.
+Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. Record [0032](../decisions/0032-photos-number-across-the-listing.md) supersedes this for photos, and declines `readAs()` with an operation for them.
 
 A trashed record has no position. The default operation does nothing on a trashed record, and the re-sequence takes only current members. The round trip and install's value proof skip a `position()` attribute on a trashed row. After install, a trashed row reads a NULL position.
 
@@ -315,7 +317,7 @@ The reverse direction. An application creates a successor natively, and the succ
 
 The trait sees only a model insert. A query-builder insert into the root table (`Job::query()->insert()`, `upsert()`, `insertUsing()`, `DB::table('jobs')`) and an insert through another class over the root table that is not a subclass of the map's root insert no legacy row, so the view does not serve that root. [Lifecycle: the writer boundary](lifecycle.md#the-writer-boundary) lists these writers.
 
-`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Map compilation reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
+`assertServesCompatibility()` refuses a legacy-only NOT NULL column that nothing initializes. Registration reads no database ([0011](../decisions/0011-registration-needs-no-database.md)), so it cannot see the column. A column counts as initialized when it has a default, when the package allocates it, or when the map declares `legacyInitializedBy()`. The package allocates the legacy key, and a `newUniqueId()` column when the model overrides `newUniqueId()`. `assertServesCompatibility()` runs the native create a test supplies. For a root inside `when()`, a test therefore proves the initializer sets what the column needs ([Public surface: testing](public-surface.md#testing)).
 
 A forwarded legacy `creating` listener may not supply a retained value. The package refuses one that tries, as it does today.
 
@@ -331,6 +333,7 @@ When the inserted row joins another legacy model than the one the `creating` eve
 
 - **Before the lock**, install records the start time of its read. It then reads the keys of member roots that no legacy row's successor key matches, through the indexed anti-join on the successor key. The read excludes every root that a `deleted` ledger row names in `successor_id`. Install writes nothing for these roots, and it reports their count.
 - **Under the lock**, after the final pass, the rename and the drop of the mapped columns, install inserts one retained row per root. The set holds each key the pre-lock read found, plus every member root whose `created_at` is at or after the read's start time minus the margin. Install anti-joins both against the retained table's successor key, so a root the final pass just created is excluded. It also excludes every root that a `deleted` ledger row names in `successor_id`, because the application hard-deleted that root's legacy row.
+- **After the foreign key takes its lock on the root's table**, install reads again through the same window and exclusions, and inserts a retained row for each root that committed while the lock waited.
 - Each row holds the root's key in the successor key. Install runs `legacyInitializedBy()` for it, with `Creation::$origin` set to `Origin::Backfill`.
 - Under the lock, install catches nothing from an initializer. A `Refusal` from `legacyInitializedBy()` therefore ends the transaction and aborts install, and the refusal names the root's key and the reason.
 
@@ -343,10 +346,10 @@ Legacy readers therefore see no v2-created listing until install. Declined: mirr
 An operation or an initializer refuses with `throw Refusal::because('...')`.
 
 - **A live write.** The unit of work rolls back, and the caller receives a `Refusal` whose message names the legacy model, the record key or a new record, the attribute and the operation or initializer class, ahead of the reason. The consumer's own `Refusal` is its previous exception.
-- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues. A `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved` on a backfill row is recorded as `refused` too.
+- **A backfill row.** The package rolls back that row's savepoint, and records the row as `refused` with the reason. The pass continues. A `CompatibilityWriteRefused` or an `Exceptions\SuccessorsMoved` on a backfill row is recorded as `refused` too, with a reason that leaves out the record's key and values, so the rows that one cause refuses share one reason. So is a row whose value under the `jsonb` rule does not parse as JSON, and its reason names the attribute ([Lifecycle: the install gate](lifecycle.md#the-install-gate)). The package writes the whole message, with the key, to the Laravel log.
 - **Install's native-root insert.** Install catches nothing under its lock, so the refusal aborts install, and names the root's key and the reason.
 
-Any other exception on a backfill row rolls back that row's savepoint too, and records the row as `failed`, except a lock timeout or a deadlock, which the pass retries ([Lifecycle: a pass](lifecycle.md#a-pass)).
+Any other exception on a backfill row rolls back that row's savepoint too, and records the row as `failed`, except a lock timeout or a deadlock, which the pass retries ([Lifecycle: a pass](lifecycle.md#a-pass)). In install's final pass, a statement that PostgreSQL cancels with `57014` records no outcome: install rolls back, and its refusal names the spent budget and the row's key ([Lifecycle: under the lock](lifecycle.md#under-the-lock)).
 
 ## The write scope
 
@@ -371,6 +374,6 @@ final class ListingWriteScope implements ScopesWrites
 - Without a scope, the package locks as it does today.
 - Every scoped path resolves the touched keys with an unlocked read before it calls the scope. After it locks, it checks that the keys of the existing successors it locked equal the keys `run()` received. A related key can move between the two steps, and the package would then lock a row the scope never ordered.
 - A difference refuses with the retryable error `Exceptions\SuccessorsMoved`, which extends `Exceptions\CompatibilityException`. It is the type the application's outermost transaction retries on. On a live write, the caller receives the error, and the outermost transaction retries. On a backfill row, the row's savepoint rolls back, and the next pass retries the row.
-- The package retries nothing inside its writers, on any path. The application's outermost transaction is the retry point.
+- The package retries nothing inside its writers, with one exception: a pass retries a row once after a lock timeout or a deadlock ([Lifecycle: a pass](lifecycle.md#a-pass)). The application's outermost transaction is the retry point.
 
 A map over ordered successors without a write scope can deadlock against an ordering writer. The package documents that risk and does not detect it.

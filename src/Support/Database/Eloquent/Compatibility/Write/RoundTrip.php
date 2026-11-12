@@ -12,6 +12,7 @@ use DateTimeInterface;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Support\Database\Eloquent\Compatibility\Definition\Attribute;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\CompatibilityWriteRefused;
@@ -29,11 +30,21 @@ final class RoundTrip
 {
     private const array NUMERIC_CASTS = ['int', 'integer', 'real', 'float', 'double', 'decimal'];
 
+    private const array JSON_CASTS = ['array', 'json', 'json:unicode', 'object', 'collection'];
+
+    private const array JSON_TYPES = ['json', 'jsonb'];
+
+    private const array UNPARSABLE = ['22P02', '22P05'];
+
+    private const string DIFFERS = 'compatibility_differs_';
+
     /** @var null|WeakMap<Connection, array<class-string<Model>, string>> */
     private static null|WeakMap $unhidden = null;
 
     /** @var null|WeakMap<Connection, array<class-string<Model>, list<string>>> */
     private static null|WeakMap $numeric = null;
+
+    private null|ColumnCatalog $catalog = null;
 
     public function __construct(private readonly ResolvedMap $map, private readonly Connection $connection, private readonly null|string $servedSelect = null, private readonly null|string $unhiddenSelect = null) {}
 
@@ -51,23 +62,19 @@ final class RoundTrip
      */
     public function check(Staging $graph, Model $legacy, Model $original, int|string $key, array $written, array $added, Origin $origin): null|array
     {
-        $row = $this->read(
-            keyName: $legacy->getKeyName(),
+        [$served, $hidden, $differs] = $this->fetch(
+            variant: $graph->map,
+            legacy: $legacy,
+            key: $key,
+            names: $this->compared(
+                variant: $graph->map,
+                names: array_keys($written),
+                origin: $origin,
+            ),
+        ) ?? throw CompatibilityWriteRefused::roundTripLost(
+            model: $this->map->model,
             key: $key,
         );
-        $served = $row === null ? $this->hidden(
-            keyName: $legacy->getKeyName(),
-            key: $key,
-        ) : (array) $row;
-
-        if ($served === null) {
-            throw CompatibilityWriteRefused::roundTripLost(
-                model: $this->map->model,
-                key: $key,
-            );
-        }
-
-        $hidden = $row === null;
 
         foreach ($written as $name => $value) {
             [$base, $path] = array_pad(
@@ -108,6 +115,24 @@ final class RoundTrip
             }
 
             if (! array_key_exists($name, $served)) {
+                continue;
+            }
+
+            if (array_key_exists(
+                key: $name,
+                array: $differs,
+            )) {
+                if ($differs[$name]) {
+                    throw CompatibilityWriteRefused::roundTrip(
+                        model: $this->map->model,
+                        attribute: $name,
+                        key: $key,
+                        written: $value,
+                        served: $served[$name],
+                        hidden: $hidden,
+                    );
+                }
+
                 continue;
             }
 
@@ -153,55 +178,250 @@ final class RoundTrip
         return $hidden ? null : $served;
     }
 
-    public function read(string $keyName, int|string $key): null|object
+    /**
+     * @param  list<string>  $names
+     * @return null|array{array<string, mixed>, array<string, bool>}
+     */
+    public function served(ResolvedMap $variant, Model $legacy, int|string $key, array $names): null|array
     {
-        return $this->servedSelect === null ? $this->connection->table($this->map->table)->useWritePdo()->where(
-            column: $keyName,
-            operator: '=',
-            value: $key,
-        )->first() : $this->through(
-            select: $this->servedSelect,
-            keyName: $keyName,
+        $read = $this->fetch(
+            variant: $variant,
+            legacy: $legacy,
             key: $key,
+            names: $this->compared(
+                variant: $variant,
+                names: $names,
+                origin: Origin::Backfill,
+            ),
+        );
+
+        return $read === null ? null : [$read[0], $read[2]];
+    }
+
+    public function unparsable(ResolvedMap $variant, Model $legacy, int|string $key): null|string
+    {
+        $select = $this->unhiddenSelect ?? $this->servedSelect;
+
+        if ($select === null) {
+            return null;
+        }
+
+        $catalog = $this->catalog();
+        $shape = $catalog->of($this->map->table);
+        $record = SqlFragments::identifier($this->map->table);
+        $retained = SqlFragments::identifier(ViewCompiler::retainedTable($this->map));
+        $keyColumn = SqlFragments::identifier($legacy->getKeyName());
+
+        foreach ($this->compared(
+            variant: $variant,
+            names: array_keys($variant->attributes),
+            origin: Origin::Backfill,
+        ) as $name) {
+            if (! self::json(
+                legacy: $legacy,
+                variant: $variant,
+                name: $name,
+                catalog: $catalog,
+            )) {
+                continue;
+            }
+
+            [$read, $stored] = self::comparable(
+                catalog: $catalog,
+                column: $shape[$name],
+                json: true,
+                read: $record.'.'.SqlFragments::identifier($name),
+                stored: $retained.'.'.SqlFragments::identifier($name),
+            );
+
+            try {
+                $this->connection->transaction(fn () => $this->connection->selectOne(
+                    query: "SELECT {$read} IS NULL AS served, {$stored} IS NULL AS stored FROM ".SqlFragments::identifier($this->map->table)." AS {$retained} LEFT JOIN ({$select}) AS {$record} ON {$record}.{$keyColumn} = {$retained}.{$keyColumn} WHERE {$retained}.{$keyColumn} = ?",
+                    bindings: [$key],
+                    useReadPdo: false,
+                ));
+            } catch (QueryException $exception) {
+                if (self::unparsed($exception)) {
+                    return $name;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public static function unparsed(Throwable $exception): bool
+    {
+        return $exception instanceof QueryException && in_array(
+            needle: $exception->getCode(),
+            haystack: self::UNPARSABLE,
+            strict: true,
+        );
+    }
+
+    public static function json(Model $legacy, ResolvedMap $variant, string $name, ColumnCatalog $catalog): bool
+    {
+        if ($legacy->hasCast(
+            key: $name,
+            types: self::JSON_CASTS,
+        )) {
+            return true;
+        }
+
+        $attribute = $variant->attributes[$name] ?? null;
+        $column = $attribute?->column();
+        $owner = $variant->owners[$name] ?? null;
+        $stored = $column === null || $owner === null ? null : $catalog->of($owner->table)[$column] ?? null;
+
+        return $attribute !== null && $stored !== null && in_array(
+            needle: $attribute->type($stored->baseType ?? $stored->type),
+            haystack: self::JSON_TYPES,
+            strict: true,
         );
     }
 
     /**
-     * @return null|array<string, mixed>
+     * @return array{string, string}
      */
-    public function served(string $keyName, int|string $key): null|array
+    public static function comparable(ColumnCatalog $catalog, Column $column, bool $json, string $read, string $stored): array
     {
-        $row = $this->read(
-            keyName: $keyName,
+        $type = match (true) {
+            ($column->baseType ?? $column->type) === 'json[]' => 'jsonb[]',
+            $json || ($column->baseType ?? $column->type) === 'json' => 'jsonb',
+            default => null,
+        };
+
+        return match (true) {
+            $type !== null => ["CAST({$read} AS {$type})", "CAST({$stored} AS {$type})"],
+            $catalog->equatable($column->type) => [$read, $stored],
+            default => ["CAST({$read} AS text)", "CAST({$stored} AS text)"],
+        };
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<string>
+     */
+    private function compared(ResolvedMap $variant, array $names, Origin $origin): array
+    {
+        if ($this->servedSelect === null) {
+            return [];
+        }
+
+        $shape = $this->catalog()->of($this->map->table);
+
+        return array_values(array_filter(
+            array: $names,
+            callback: fn (string $name): bool => array_key_exists(
+                key: $name,
+                array: $shape,
+            ) && ($variant->attributes[$name] ?? null) !== null && ! $variant->attributes[$name]->isExternal() && ! self::skips(
+                attribute: $variant->attributes[$name],
+                origin: $origin,
+            ),
+        ));
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return null|array{array<string, mixed>, bool, array<string, bool>}
+     */
+    private function fetch(ResolvedMap $variant, Model $legacy, int|string $key, array $names): null|array
+    {
+        $keyName = $legacy->getKeyName();
+
+        if ($this->servedSelect === null) {
+            $row = $this->connection->table($this->map->table)->useWritePdo()->where(
+                column: $keyName,
+                operator: '=',
+                value: $key,
+            )->first();
+            $hidden = $row === null ? $this->hidden(
+                keyName: $keyName,
+                key: $key,
+            ) : null;
+
+            return match (true) {
+                $row !== null => [(array) $row, false, []],
+                $hidden !== null => [$hidden, true, []],
+                default => null,
+            };
+        }
+
+        $served = $this->through(
+            select: $this->servedSelect,
+            variant: $variant,
+            legacy: $legacy,
             key: $key,
+            names: $names,
         );
 
-        return $row === null ? $this->hidden(
-            keyName: $keyName,
-            key: $key,
-        ) : (array) $row;
-    }
+        if ($served !== null) {
+            return [$served[0], false, $served[1]];
+        }
 
-    public function agrees(Model $legacy, string $name, mixed $written, mixed $served): bool
-    {
-        return self::same(
+        $hidden = $this->through(
+            select: $this->unhiddenSelect ?? $this->unhidden(),
+            variant: $variant,
             legacy: $legacy,
-            name: $name,
-            written: $written,
-            served: $served,
-            numeric: fn (): bool => $this->numeric($legacy, $name),
-        )[0];
+            key: $key,
+            names: $names,
+        );
+
+        return $hidden === null ? null : [$hidden[0], true, $hidden[1]];
     }
 
-    private function through(string $select, string $keyName, int|string $key): null|object
+    /**
+     * @param  list<string>  $names
+     * @return null|array{array<string, mixed>, array<string, bool>}
+     */
+    private function through(string $select, ResolvedMap $variant, Model $legacy, int|string $key, array $names): null|array
     {
+        $catalog = $this->catalog();
+        $shape = $catalog->of($this->map->table);
         $record = SqlFragments::identifier($this->map->table);
+        $retained = SqlFragments::identifier(ViewCompiler::retainedTable($this->map));
+        $keyColumn = SqlFragments::identifier($legacy->getKeyName());
+        $differences = [];
 
-        return $this->connection->selectOne(
-            query: 'SELECT * FROM ('.$select.') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($keyName).' = ?',
+        foreach ($names as $index => $name) {
+            [$read, $stored] = self::comparable(
+                catalog: $catalog,
+                column: $shape[$name],
+                json: self::json(
+                    legacy: $legacy,
+                    variant: $variant,
+                    name: $name,
+                    catalog: $catalog,
+                ),
+                read: $record.'.'.SqlFragments::identifier($name),
+                stored: $retained.'.'.SqlFragments::identifier($name),
+            );
+            $differences[] = "{$read} IS DISTINCT FROM {$stored} AS ".self::DIFFERS.$index;
+        }
+
+        $row = $this->connection->selectOne(
+            query: 'SELECT '.implode(
+                separator: ', ',
+                array: [$record.'.*', ...$differences],
+            ).' FROM ('.$select.') AS '.$record.($differences === [] ? '' : ' JOIN '.$record.' AS '.$retained.' ON '.$retained.'.'.$keyColumn.' = '.$record.'.'.$keyColumn).' WHERE '.$record.'.'.$keyColumn.' = ?',
             bindings: [$key],
             useReadPdo: false,
         );
+
+        if ($row === null) {
+            return null;
+        }
+
+        $served = (array) $row;
+        $differs = [];
+
+        foreach ($names as $index => $name) {
+            $differs[$name] = ($served[self::DIFFERS.$index] ?? null) === true;
+            unset($served[self::DIFFERS.$index]);
+        }
+
+        return [$served, $differs];
     }
 
     /**
@@ -209,16 +429,18 @@ final class RoundTrip
      */
     private function hidden(string $keyName, int|string $key): null|array
     {
-        if ($this->unhiddenSelect !== null) {
-            $row = $this->through(
-                select: $this->unhiddenSelect,
-                keyName: $keyName,
-                key: $key,
-            );
+        $record = SqlFragments::identifier($this->map->table);
+        $row = $this->connection->selectOne(
+            query: 'SELECT * FROM ('.$this->unhidden().') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($keyName).' = ?',
+            bindings: [$key],
+            useReadPdo: false,
+        );
 
-            return $row === null ? null : (array) $row;
-        }
+        return $row === null ? null : (array) $row;
+    }
 
+    private function unhidden(): string
+    {
         $compiled = self::$unhidden ??= new WeakMap;
         $selects = $compiled[$this->connection] ?? [];
         $selects[$this->map->model] ??= (new ViewCompiler(
@@ -229,14 +451,16 @@ final class RoundTrip
             connection: $this->connection,
         ))->unhidden($this->map);
         $compiled[$this->connection] = $selects;
-        $record = SqlFragments::identifier($this->map->table);
-        $row = $this->connection->selectOne(
-            query: 'SELECT * FROM ('.$selects[$this->map->model].') AS '.$record.' WHERE '.$record.'.'.SqlFragments::identifier($keyName).' = ?',
-            bindings: [$key],
-            useReadPdo: false,
-        );
 
-        return $row === null ? null : (array) $row;
+        return $selects[$this->map->model];
+    }
+
+    private function catalog(): ColumnCatalog
+    {
+        return $this->catalog ??= new ColumnCatalog(
+            connection: $this->connection,
+            throughWriteConnection: true,
+        );
     }
 
     public static function skips(Attribute $attribute, Origin $origin): bool

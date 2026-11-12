@@ -9,42 +9,76 @@ use Illuminate\Database\Eloquent\Model;
 use Stringable;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Throwable;
+use WeakMap;
 
 /**
  * @internal
  */
 final class CompatibilityWriteRefused extends CompatibilityException
 {
-    public function __construct(public readonly string $refused, public readonly string $because, public readonly string $instead, null|Throwable $previous = null)
+    /** @var null|WeakMap<SuccessorsMoved, string> */
+    private static null|WeakMap $moved = null;
+
+    public readonly string $reason;
+
+    public function __construct(public readonly string $refused, public readonly string $because, public readonly string $instead, null|Throwable $previous = null, null|string $reason = null)
     {
-        parent::__construct("{$refused}. Why: {$because} Instead: {$instead}", previous: $previous);
+        parent::__construct(self::message(
+            refused: $refused,
+            because: $because,
+            instead: $instead,
+        ), previous: $previous);
+        $this->reason = $reason ?? $this->getMessage();
     }
 
     public static function readOnly(string $model, string $attribute, null|int|string $key, string $because): self
     {
+        $instead = "Leave {$attribute} unchanged in writes through ".class_basename($model).'.';
+
         return new self(
-            ($key === null ? "{$model} records" : "{$model} record {$key}")." cannot change \${$attribute}",
-            $because,
-            "Leave {$attribute} unchanged in writes through ".class_basename($model).'.',
+            refused: ($key === null ? "{$model} records" : "{$model} record {$key}")." cannot change \${$attribute}",
+            because: $because,
+            instead: $instead,
+            reason: self::message(
+                refused: "{$model} records cannot change \${$attribute}",
+                because: $because,
+                instead: $instead,
+            ),
         );
     }
 
     public static function roundTrip(string $model, string $attribute, int|string $key, mixed $written, mixed $served, bool $hidden = false, null|Throwable $previous = null): self
     {
+        $read = $hidden ? "the record, which a hide() rule now hides, reads {$attribute} as " : "the view now serves {$attribute} as ";
+        $instead = "Make the operation of {$attribute} store a value its read serves back.";
+
         return new self(
             refused: "{$model} record {$key} cannot take this write of \${$attribute}",
-            because: 'The write stores '.self::shown($written).', and '.($hidden ? "the record, which a hide() rule now hides, reads {$attribute} as " : "the view now serves {$attribute} as ").self::shown($served).', so the record would not read back what was written.',
-            instead: "Make the operation of {$attribute} store a value its read serves back.",
+            because: 'The write stores '.self::shown($written).', and '.$read.self::shown($served).', so the record would not read back what was written.',
+            instead: $instead,
             previous: $previous,
+            reason: self::message(
+                refused: "{$model} records cannot take this write of \${$attribute}",
+                because: 'The write stores a value, and '.$read.'another, so the record would not read back what was written.',
+                instead: $instead,
+            ),
         );
     }
 
     public static function roundTripLost(string $model, int|string $key): self
     {
+        $refused = "{$model} record {$key} cannot take this write, because no row holds the record after it";
+        $instead = 'Keep the successors of the record in place while a write through '.class_basename($model).' runs.';
+
         return new self(
-            refused: "{$model} record {$key} cannot take this write, because no row holds the record after it",
+            refused: $refused,
             because: "Read without its hide() rules, no row serves record {$key} once the write has saved, so a listener or a trigger removed the record the write stored.",
-            instead: 'Keep the successors of the record in place while a write through '.class_basename($model).' runs.',
+            instead: $instead,
+            reason: self::message(
+                refused: "{$model} records cannot take this write, because no row holds the record after it",
+                because: 'Read without its hide() rules, no row serves the record once the write has saved, so a listener or a trigger removed the record the write stored.',
+                instead: $instead,
+            ),
         );
     }
 
@@ -65,7 +99,26 @@ final class CompatibilityWriteRefused extends CompatibilityException
         ).(count($keys) > 10 ? ', and '.(count($keys) - 10).' more' : '').']';
         $counted = fn (array $keys): string => count($keys).(count($keys) === 1 ? ' key' : ' keys');
 
-        return new SuccessorsMoved("{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran. Why: The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered. Instead: Retry the write in a new transaction; the outermost transaction of the application is the retry point.');
+        $refused = "{$model} cannot take this write now, because its ".class_basename($successor).' rows moved after the write scope ran';
+        $instead = 'Retry the write in a new transaction; the outermost transaction of the application is the retry point.';
+        $moved = new SuccessorsMoved(self::message(
+            refused: $refused,
+            because: 'The write scope received '.$counted($scoped).', and the package then locked '.$counted($locked).'. It locked '.$keys(array_values(array_diff($locked, $scoped))).', which the scope never received, and no longer found '.$keys(array_values(array_diff($scoped, $locked))).', so it would write a row the scope never ordered.',
+            instead: $instead,
+        ));
+        $reasons = self::$moved ??= new WeakMap;
+        $reasons[$moved] = self::message(
+            refused: $refused,
+            because: 'The package locked other keys than the write scope received, so it would write a row the scope never ordered.',
+            instead: $instead,
+        );
+
+        return $moved;
+    }
+
+    public static function movedReason(SuccessorsMoved $moved): string
+    {
+        return self::$moved[$moved] ?? $moved->getMessage();
     }
 
     /**
@@ -101,10 +154,36 @@ final class CompatibilityWriteRefused extends CompatibilityException
 
     public static function unstorable(string $model, string $attribute, string $because): self
     {
+        $refused = "{$model}::\${$attribute} cannot take a write";
+        $instead = 'Write a value its conversions can store, or write the stored column through the successor model.';
+
         return new self(
-            "{$model}::\${$attribute} cannot take a write",
-            $because,
-            'Write a value its conversions can store, or write the stored column through the successor model.',
+            refused: $refused,
+            because: $because,
+            instead: $instead,
+            reason: self::message(
+                refused: $refused,
+                because: "The conversions of {$attribute} cannot store the value written.",
+                instead: $instead,
+            ),
+        );
+    }
+
+    public static function unparsable(string $model, string $attribute, int|string $key, null|Throwable $previous = null): self
+    {
+        $because = "The backfill compares {$attribute} as jsonb, and its legacy value or the value its successors serve does not parse as JSON.";
+        $instead = "Store JSON or NULL in {$attribute}, on the legacy row and in its successors.";
+
+        return new self(
+            refused: "{$model} record {$key} cannot take this write of \${$attribute}",
+            because: $because,
+            instead: $instead,
+            previous: $previous,
+            reason: self::message(
+                refused: "{$model} records cannot take this write of \${$attribute}",
+                because: $because,
+                instead: $instead,
+            ),
         );
     }
 
@@ -157,7 +236,21 @@ final class CompatibilityWriteRefused extends CompatibilityException
 
     public static function byGuard(string $model, Guard $guard, int|string $key): self
     {
-        return new self("{$model} record {$key} cannot take this write, because guard '{$guard->name}' refuses it", $guard->because, $guard->instead);
+        return new self(
+            refused: "{$model} record {$key} cannot take this write, because guard '{$guard->name}' refuses it",
+            because: $guard->because,
+            instead: $guard->instead,
+            reason: self::message(
+                refused: "{$model} records cannot take this write, because guard '{$guard->name}' refuses it",
+                because: $guard->because,
+                instead: $guard->instead,
+            ),
+        );
+    }
+
+    private static function message(string $refused, string $because, string $instead): string
+    {
+        return "{$refused}. Why: {$because} Instead: {$instead}";
     }
 
     private static function shown(mixed $value): string
@@ -176,11 +269,18 @@ final class CompatibilityWriteRefused extends CompatibilityException
     {
         $name = class_basename($successor);
         $successorKey = $successor->getKey();
+        $because = "The write stores its values through {$name}, and that model's own listeners refused them.";
+        $instead = "Make the write satisfy the rules of {$name}.";
 
         return new self(
             refused: ($key === null ? $model : "{$model} record {$key}").' cannot take this write, because a listener of '.$name.(is_int($successorKey) || is_string($successorKey) ? " {$successorKey}" : '').' refused its save',
-            because: "The write stores its values through {$name}, and that model's own listeners refused them.",
-            instead: "Make the write satisfy the rules of {$name}.",
+            because: $because,
+            instead: $instead,
+            reason: self::message(
+                refused: "{$model} cannot take this write, because a listener of {$name} refused its save",
+                because: $because,
+                instead: $instead,
+            ),
         );
     }
 

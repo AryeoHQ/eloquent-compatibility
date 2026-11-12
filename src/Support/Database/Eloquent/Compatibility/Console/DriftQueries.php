@@ -12,7 +12,6 @@ use LogicException;
 use Support\Database\Eloquent\Compatibility\Definition\Related;
 use Support\Database\Eloquent\Compatibility\Definition\ResolvedMap;
 use Support\Database\Eloquent\Compatibility\Exceptions\InvalidCompatibilityMap;
-use Support\Database\Eloquent\Compatibility\Schema\Column;
 use Support\Database\Eloquent\Compatibility\Schema\ColumnCatalog;
 use Support\Database\Eloquent\Compatibility\Schema\SqlFragments;
 use Support\Database\Eloquent\Compatibility\Schema\ViewCompiler;
@@ -95,18 +94,56 @@ final readonly class DriftQueries
                 useReadPdo: false,
             ),
         ));
-        [$sql, $differingBindings] = $this->differences(
+        [$sql, $differingBindings, $json] = $this->differences(
             map: $map,
             pending: false,
             among: $among,
         );
-        $differing = array_map(
-            callback: fn (object $row) => self::keyOf($row->key ?? null),
-            array: $this->connection->select(
+
+        try {
+            $rows = $this->guarded(fn () => $this->connection->select(
                 query: $sql.' ORDER BY compared.key',
                 bindings: $differingBindings,
                 useReadPdo: false,
-            ),
+            ));
+        } catch (QueryException $exception) {
+            $unparsable = RoundTrip::unparsed($exception) ? $this->unparsable(
+                map: $map,
+                names: $json,
+                pending: false,
+                among: $among,
+                limit: Ledger::FIRST_KEYS,
+            ) : [];
+
+            if ($unparsable === []) {
+                throw $exception;
+            }
+
+            $found = [];
+
+            foreach ($unparsable as $name => $keys) {
+                $found[] = "{$name} at ".self::key($map).' '.implode(
+                    separator: ', ',
+                    array: $keys,
+                );
+            }
+
+            throw InvalidCompatibilityMap::cannot(
+                map: $map->table,
+                operation: 'install',
+                because: 'it compares '.implode(
+                    separator: ' and ',
+                    array: array_keys($unparsable),
+                ).' as jsonb, and a legacy value or the value its successors serve does not parse as JSON: '.implode(
+                    separator: '; ',
+                    array: $found,
+                ).'. Store JSON or NULL there, then install again',
+            );
+        }
+
+        $differing = array_map(
+            callback: fn (object $row) => self::keyOf($row->key ?? null),
+            array: $rows,
         );
         $misplaced = array_map(
             callback: fn (array $found) => $found[0],
@@ -383,13 +420,62 @@ final readonly class DriftQueries
      */
     private function differing(ResolvedMap $map, int $limit): array
     {
-        [$sql, $bindings] = $this->differences(
+        [$sql, $bindings, $json] = $this->differences(
             map: $map,
             pending: true,
             among: null,
         );
+        $unparsable = [];
 
-        return array_values(array_map(
+        try {
+            $rows = $this->guarded(fn () => $this->connection->select(
+                query: $sql.' ORDER BY compared.key LIMIT ?',
+                bindings: [...$bindings, $limit],
+                useReadPdo: false,
+            ));
+        } catch (QueryException $exception) {
+            $unparsable = RoundTrip::unparsed($exception) ? $this->unparsable(
+                map: $map,
+                names: $json,
+                pending: true,
+                among: null,
+                limit: $limit,
+            ) : [];
+
+            if ($unparsable === []) {
+                throw $exception;
+            }
+
+            [$sql, $bindings] = $this->differences(
+                map: $map,
+                pending: true,
+                among: null,
+                except: array_keys($unparsable),
+            );
+            $rows = $this->connection->select(
+                query: $sql.' ORDER BY compared.key LIMIT ?',
+                bindings: [...$bindings, $limit],
+                useReadPdo: false,
+            );
+        }
+
+        $findings = [];
+
+        foreach ($unparsable as $name => $keys) {
+            foreach ($keys as $key) {
+                $findings[] = new DriftFinding(
+                    model: $map->model,
+                    check: DriftCheck::ValuesDiffer,
+                    record: self::record(
+                        table: $map->table,
+                        key: $key,
+                    ),
+                    detail: "the package compares {$name} as jsonb, and {$map->table} holds a value of {$name} that does not parse as JSON, or the view would serve one; store JSON or NULL there",
+                );
+            }
+        }
+
+        return [...$findings, ...array_values(array_map(
             callback: fn (object $row) => new DriftFinding(
                 model: $map->model,
                 check: DriftCheck::ValuesDiffer,
@@ -399,19 +485,118 @@ final readonly class DriftQueries
                 ),
                 detail: "{$map->table} holds other values for ".self::text($row->attributes ?? null).' than the view would serve from '.$map->primary->table,
             ),
-            array: $this->connection->select(
-                query: $sql.' ORDER BY compared.key LIMIT ?',
-                bindings: [...$bindings, $limit],
+            array: $rows,
+        ))];
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  null|list<int|string>  $among
+     * @return array<string, list<int|string>>
+     */
+    private function unparsable(ResolvedMap $map, array $names, bool $pending, null|array $among, int $limit): array
+    {
+        $unparsable = [];
+
+        foreach ($names as $name) {
+            [$sql, $bindings] = $this->differences(
+                map: $map,
+                pending: $pending,
+                among: $among,
+                only: [$name],
+            );
+
+            if (! $this->fails(
+                sql: $sql,
+                bindings: $bindings,
+            )) {
+                continue;
+            }
+
+            [$sql, $bindings] = $this->differences(
+                map: $map,
+                pending: $pending,
+                among: [],
+                only: [$name],
+            );
+            $fails = fn (array $keys): bool => $this->fails(
+                sql: $sql,
+                bindings: [...array_slice(
+                    array: $bindings,
+                    offset: 0,
+                    length: -1,
+                ), SqlFragments::arrayLiteral($keys)],
+            );
+            $keys = [];
+
+            $this->walk(
+                map: $map,
+                chunk: function (array $rows) use ($fails, $limit, &$keys): bool {
+                    if (! $fails(array_keys($rows))) {
+                        return true;
+                    }
+
+                    foreach (array_keys($rows) as $key) {
+                        if ($fails([$key])) {
+                            $keys[] = $key;
+                        }
+
+                        if (count($keys) === $limit) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                },
+                pending: $pending,
+                among: $among,
+            );
+            $unparsable[$name] = $keys;
+        }
+
+        return $unparsable;
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $read
+     * @return TResult
+     */
+    private function guarded(Closure $read): mixed
+    {
+        return $this->connection->transactionLevel() === 0 ? $read() : $this->connection->transaction($read);
+    }
+
+    /**
+     * @param  list<mixed>  $bindings
+     */
+    private function fails(string $sql, array $bindings): bool
+    {
+        try {
+            $this->guarded(fn () => $this->connection->select(
+                query: $sql,
+                bindings: $bindings,
                 useReadPdo: false,
-            ),
-        ));
+            ));
+        } catch (QueryException $exception) {
+            if (RoundTrip::unparsed($exception)) {
+                return true;
+            }
+
+            throw $exception;
+        }
+
+        return false;
     }
 
     /**
      * @param  null|list<int|string>  $among
-     * @return array{string, list<int|string>}
+     * @param  null|list<string>  $only
+     * @param  list<string>  $except
+     * @return array{string, list<int|string>, list<string>}
      */
-    private function differences(ResolvedMap $map, bool $pending, null|array $among): array
+    private function differences(ResolvedMap $map, bool $pending, null|array $among, null|array $only = null, array $except = []): array
     {
         $catalog = new ColumnCatalog(
             connection: $this->connection,
@@ -435,6 +620,8 @@ final readonly class DriftQueries
             among: $among,
         );
         $conditions = [];
+        $json = [];
+        $legacy = new $map->model;
 
         foreach ($map->morphs === [] ? [$map] : $map->morphs as $variant) {
             $type = $map->morphs === [] || $variant->target === null ? null : SqlFragments::identifier($map->primary->table).'.'.SqlFragments::identifier((string) $map->morph?->typeColumn).' = '.SqlFragments::literal((string) $variant->target->morphAlias);
@@ -450,13 +637,37 @@ final readonly class DriftQueries
                 if ($attribute === null || RoundTrip::skips(
                     attribute: $attribute,
                     origin: Origin::Backfill,
-                )) {
+                ) || in_array(
+                    needle: $name,
+                    haystack: $except,
+                    strict: true,
+                ) || ($only !== null && ! in_array(
+                    needle: $name,
+                    haystack: $only,
+                    strict: true,
+                ))) {
                     continue;
                 }
 
-                [$read, $stored] = self::comparable(
+                $parsed = RoundTrip::json(
+                    legacy: $legacy,
+                    variant: $variant,
+                    name: $name,
+                    catalog: $catalog,
+                );
+
+                if ($parsed && ! in_array(
+                    needle: $name,
+                    haystack: $json,
+                    strict: true,
+                )) {
+                    $json[] = $name;
+                }
+
+                [$read, $stored] = RoundTrip::comparable(
                     catalog: $catalog,
                     column: $shape[$name],
+                    json: $parsed,
                     read: $read,
                     stored: $retained.'.'.SqlFragments::identifier($name),
                 );
@@ -488,25 +699,7 @@ final readonly class DriftQueries
                     writing: true,
                 ),
             )))
-            .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings]];
-    }
-
-    /**
-     * @return array{string, string}
-     */
-    private static function comparable(ColumnCatalog $catalog, Column $column, string $read, string $stored): array
-    {
-        $json = match ($column->baseType ?? $column->type) {
-            'json' => 'jsonb',
-            'json[]' => 'jsonb[]',
-            default => null,
-        };
-
-        return match (true) {
-            $json !== null => ["CAST({$read} AS {$json})", "CAST({$stored} AS {$json})"],
-            $catalog->equatable($column->type) => [$read, $stored],
-            default => ["CAST({$read} AS text)", "CAST({$stored} AS text)"],
-        };
+            .' WHERE TRUE'.($pendingSql === '' ? '' : " AND {$pendingSql}").$within.') AS compared WHERE cardinality(compared.attributes) > 0', [...$bindings, ...$amongBindings], $json];
     }
 
     /**

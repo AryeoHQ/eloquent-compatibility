@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Compatibility\Exceptions;
 
+use Closure;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Compatibility\Definition\Guard;
 use Tests\Fixtures\Support\Files\File;
@@ -89,6 +91,78 @@ final class CompatibilityWriteRefusedTest extends TestCase
                 key: 3,
             )->refused,
         );
+    }
+
+    /**
+     * @return array<string, array{Closure(int): (CompatibilityWriteRefused|SuccessorsMoved)}>
+     */
+    public static function refusalsOfARecord(): array
+    {
+        return [
+            'readOnly' => [fn (int $key) => CompatibilityWriteRefused::readOnly(
+                model: Listing::class,
+                attribute: 'company_id',
+                key: $key,
+                because: 'A job never changes company.',
+            )],
+            'roundTrip' => [fn (int $key) => CompatibilityWriteRefused::roundTrip(
+                model: Listing::class,
+                attribute: 'title',
+                key: $key,
+                written: "Oak {$key}",
+                served: "OAK {$key}",
+            )],
+            'roundTripLost' => [fn (int $key) => CompatibilityWriteRefused::roundTripLost(
+                model: Listing::class,
+                key: $key,
+            )],
+            'byGuard' => [fn (int $key) => CompatibilityWriteRefused::byGuard(
+                model: Listing::class,
+                guard: new Guard('sold price frozen', fn () => true, 'A sold listing keeps the price it sold for.', 'Change the price before the sale.'),
+                key: $key,
+            )],
+            'bySuccessorListener' => [fn (int $key) => CompatibilityWriteRefused::bySuccessorListener(
+                model: Listing::class,
+                successor: (new Place)->forceFill(['id' => "a1b2c3d4-0000-4000-8000-00000000000{$key}"]),
+                key: $key,
+            )],
+            'unstorable' => [fn (int $key) => CompatibilityWriteRefused::unstorable(
+                model: Listing::class,
+                attribute: 'status',
+                because: "mapping() maps no stored value to 'Status {$key}'.",
+            )],
+            'unparsable' => [fn (int $key) => CompatibilityWriteRefused::unparsable(
+                model: Listing::class,
+                attribute: 'settings',
+                key: $key,
+            )],
+            'successorsMoved' => [fn (int $key) => CompatibilityWriteRefused::successorsMoved(
+                model: Listing::class,
+                successor: JobSite::class,
+                scoped: ["k{$key}"],
+                locked: [],
+            )],
+        ];
+    }
+
+    /**
+     * @param  Closure(int): (CompatibilityWriteRefused|SuccessorsMoved)  $refuse
+     */
+    #[DataProvider('refusalsOfARecord')]
+    #[Test]
+    public function it_gives_the_refusals_of_two_records_one_reason_without_their_keys_or_values(Closure $refuse): void
+    {
+        $refusals = [$refuse(1), $refuse(2)];
+        $reasons = array_map(
+            callback: fn (CompatibilityWriteRefused|SuccessorsMoved $refusal): string => $refusal instanceof SuccessorsMoved ? CompatibilityWriteRefused::movedReason($refusal) : $refusal->reason,
+            array: $refusals,
+        );
+
+        $this->assertNotSame($refusals[0]->getMessage(), $refusals[1]->getMessage());
+        $this->assertSame($reasons[0], $reasons[1]);
+        $this->assertStringStartsWith(Listing::class, $reasons[0]);
+        $this->assertStringContainsString('. Why: ', $reasons[0]);
+        $this->assertStringContainsString(' Instead: ', $reasons[0]);
     }
 
     #[Test]

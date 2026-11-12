@@ -24,7 +24,7 @@ That assumption does not hold. A listing's photos can span several subsections, 
 
 This amends the earlier design, which placed only the written row after its nearest previous legacy neighbour, or before its nearest next one. One v1 reorder of A, B, C and D to C, D, A and B then refused A on every pass, because A could not sit after D and before B at once. A v2 reorder that no pass walked blocked install the same way.
 
-Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing.
+Declined: a per-listing parent override on `position()`, until a caller needs one sequence per listing. [0032](0032-photos-number-across-the-listing.md) supersedes this for photos, which v1 reads as one sequence per listing.
 
 Declined: placing only the written row after its nearest previous neighbour, checking only that neighbour, and repeating catch-up rounds until a round makes no progress. Those rounds iterate under install's lock, and they need a stop rule.
 
@@ -33,7 +33,7 @@ Declined: moving a backfill row to its rank among the legacy rows with Placement
 ## Consequences
 
 - eloquent-ordering ships Placement::after() today. It must still publish an ordered item's parent key columns and add Placement::at(). These are the requests in https://github.com/AryeoHQ/eloquent-ordering/issues/14.
-- After install, positions restart in each parent. A listing whose photos span two subsections reads one sequence per subsection.
-- A legacy reader that needs one sequence per listing reads `readAs()` with an operation instead.
+- After install, positions restart in each parent. Photos are the exception: they number across the listing ([0032](0032-photos-number-across-the-listing.md)), which supersedes the per-subsection sequence this record gave them.
+- [0032](0032-photos-number-across-the-listing.md) also supersedes the advice to read `readAs()` with an operation for one sequence per listing. Install's value proof refuses such an attribute over sparse legacy values.
 - A consumer creates no index on the legacy table for a `position()` attribute.
 - [Operations: positions](../specification/operations.md#positions) states the re-sequence.

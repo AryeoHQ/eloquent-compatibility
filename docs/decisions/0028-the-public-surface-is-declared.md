@@ -14,13 +14,14 @@ Everything is internal except:
 - the `Compatibility` operations,
 - the commands,
 - the testing trait, and
-- the operation and hook interfaces, with their arguments: the unit of work, the change context, the origin and the refusal, and
-- one exception base, `Exceptions\CompatibilityException`, which the refusal and every package refusal extend.
+- the operation and hook interfaces, with their arguments: the unit of work, the change context, the origin and the refusal,
+- one exception base, `Exceptions\CompatibilityException`, which the refusal and every package refusal extend, and
+- the retryable error `Exceptions\SuccessorsMoved`, which a scoped write raises when a successor key moved before its lock. The application's outermost transaction retries on it ([0026](0026-a-write-scope-runs-before-package-locks.md)). This amends the earlier list, which named the exception base alone.
 
 The documentation lists exactly that surface. Every parameter of a public constructor, function or method on it is public, named and stable. `serves()` on `Compatibility` is documented API, for transitional application code that bypasses the legacy model. It takes a class string, as every other operation does. Its answer can change around an install. It is stable only inside a transaction, and is never cached across requests.
 
-- Discovery lands commit `6ec7755`, which classifies a classmap entry by its real path, with a test over an optimized classmap.
-- `install()` may run inside a caller's transaction when no catch-up is pending.
+- Discovery lands Cory Rosenwald's fix in [#23](https://github.com/AryeoHQ/eloquent-compatibility/pull/23) (`b54ad80`), which classifies a classmap entry by its real path, with a test over an optimized classmap.
+- `install()` may run inside a caller's transaction when no catch-up is pending. Outside unit tests, a first install of a map that declares `writesWithin()` refuses there, and names `public $withinTransaction = false` ([Lifecycle: inside a caller's transaction](../specification/lifecycle.md#inside-a-callers-transaction)). This amends the earlier text, which named no exception.
 - The redesign ships as a new 0.x minor release, with no data migration, because no production install exists.
 - recompile() stays public under the new name update(). `compatibility:sql` and the testing assertion say update. Declined: keeping the name recompile().
 - `compatibility:sql` takes the operation as its first positional argument: `compatibility:sql {operation} {model}`, with the operation one of prepare, install, update, rollback and retire. Its `--for=` option is removed. Declined: keeping `--for=`.

@@ -47,7 +47,7 @@ Under its lock, after the final pass, the NULL-key probe and the insert of retai
 ALTER TABLE listings_retained ADD CONSTRAINT listings_retained_job_id_not_null CHECK (job_id IS NOT NULL) NOT VALID;
 ```
 
-Install's last statement under the lock, after `ManagesDependents::afterInstall()`, adds the foreign key to the root:
+Install's last DDL statement under the lock, after `ManagesDependents::afterInstall()`, adds the foreign key to the root:
 
 ```sql
 ALTER TABLE listings_retained ADD CONSTRAINT listings_retained_job_id_foreign FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE NOT VALID;
@@ -57,9 +57,9 @@ Each constraint takes the name `<retained table>_<key>_not_null` or `<retained t
 
 Neither constraint needs a scan, and both check every later insert and update. Install runs no `SET NOT NULL` and no `VALIDATE CONSTRAINT`, because each would scan the whole table under the lock. The existence proof before the lock, with install's catch-up of the keys it flags, stands in for the validation, and [the writer boundary](lifecycle.md#the-writer-boundary) states the window it leaves.
 
-Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. The statement is last, so install holds the root's table for that one statement plus the commit. `compatibility:sql install` prints that lock.
+Adding the foreign key takes a `SHARE ROW EXCLUSIVE` lock on the root's table, which blocks writes to it until install commits. It is the last DDL statement. Install then holds the root's table for one read of the member roots that committed while it waited, their retained-row inserts, and the commit ([Lifecycle: under the lock](lifecycle.md#under-the-lock), step 11). Each insert runs `legacyInitializedBy()`. The read filters on the root's `created_at`, so it scans the root's table when no index leads with that column. `compatibility:sql install` prints that lock.
 
-The lock also waits. It conflicts with the `ROW EXCLUSIVE` lock that every open transaction writing the root's table holds, so install waits for the longest of them while it still holds the legacy table. During that wait, every read of the legacy name blocks, and every later writer of the root's table queues behind install's request. A writer that holds the root's table and then waits on the legacy table deadlocks with install. A native create whose `Provides\CarriesLegacy` lock follows the successor's `INSERT` is one such writer. PostgreSQL then aborts one side with `40P01`. Install therefore runs the statement under `SET LOCAL lock_timeout`, and treats a lock timeout or a `40P01` as a lock it cannot take: it rolls back and retries. A `40P01` retries only outside a caller's transaction ([Lifecycle: inside a caller's transaction](lifecycle.md#inside-a-callers-transaction)). For a shared successor such as `place_assets`, the other legacy models' writes pause for the statement, its wait and the commit.
+The lock also waits. It conflicts with the `ROW EXCLUSIVE` lock that every open transaction writing the root's table holds, so install waits for the longest of them while it still holds the legacy table. During that wait, every read of the legacy name blocks, and every later writer of the root's table queues behind install's request. A writer that holds the root's table and then waits on the legacy table deadlocks with install. A native create whose `Provides\CarriesLegacy` lock follows the successor's `INSERT` is one such writer. PostgreSQL then aborts one side with `40P01`. Install therefore runs the statement under `SET LOCAL lock_timeout`, and treats a lock timeout or a `40P01` as a lock it cannot take: it rolls back and retries. A `40P01` retries only outside a caller's transaction ([Lifecycle: inside a caller's transaction](lifecycle.md#inside-a-callers-transaction)). For a shared successor such as `place_assets`, the other legacy models' writes pause for the statement, its wait, step 11's read and inserts, and the commit.
 
 Prepare adds neither constraint. A `NOT VALID` constraint still applies to new rows. Before install, the legacy model inserts natively with a NULL key that a pass fills later, and with a key whose root the backfill creates later. The check would fail every NULL-key insert with `23514`, and the foreign key would fail every insert whose root does not exist yet with `23503`. A foreign key at prepare would also cascade a successor delete into the live legacy row, which is still the source of truth. Placing the foreign key at install removes that cascade.
 
@@ -160,7 +160,7 @@ CREATE INDEX ON listings_backfill (successor_id) WHERE status = 'deleted';
 | `legacy_id` | the legacy row's key, typed as the legacy key; no foreign key to the legacy table, so the row outlives a deleted legacy row |
 | `successor_id` | the root successor last written, typed as the root's key |
 | `status` | `created`, `updated`, `unchanged`, `refused`, `failed` or `deleted` |
-| `reason` | the refusal's reason, or the exception class and first message line of a failed row |
+| `reason` | the refusal's reason, without the record's key and values for a package refusal, or the exception class and first message line of a failed row |
 | `attempts` | how many passes attempted the row |
 | `attempted_at` | when a pass last wrote the row |
 
